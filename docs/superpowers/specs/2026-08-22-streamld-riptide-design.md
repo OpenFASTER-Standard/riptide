@@ -75,7 +75,7 @@ design:
    independently-versioned Event Format docs + independently-versioned Protocol Binding docs +
    satellite specs (Subscriptions, a Primer) + per-language SDKs in separate repos. AsyncAPI
    independently converged on the same layering discipline (data format / stream discovery /
-   subscribe-vs-publish direction / per-protocol bindings). StreamLD's spec structure (§4.4)
+   subscribe-vs-publish direction / per-protocol bindings). StreamLD's spec structure (§4.5)
    follows this template directly.
 7. For the transport layer specifically: **SSE is the only mainstream option with a native,
    browser-built-in resumption cursor** (`Last-Event-ID`); WebSocket and MQTT both leave
@@ -83,6 +83,19 @@ design:
    *genuinely unsolved* in the wider ecosystem (Kafka only appears as an ingestion path into a
    single server, never as federation between two servers) — this is real, novel
    standardization work, not something to copy from prior art.
+8. **Schema source of truth: SHACL, not JSON Schema.** JSON Schema validates the literal JSON
+   tree, but the same RDF graph can serialize into many different valid JSON-LD documents
+   (depending on `@context`, compaction, expansion) — a real, documented brittleness when
+   generic JSON Schema is applied to JSON-LD. SHACL avoids this by construction: shapes are
+   themselves RDF, and validation operates on the abstract RDF graph, invariant to which
+   concrete JSON-LD serialization produced it. SHACL is also the established norm in
+   OpenFASTER's own governance neighborhood — it's mainstream and normative in EU/SEMIC
+   semantic-interoperability standards (DCAT-AP, DCAT-AP-ES), and the SEMIC Style Guide
+   explicitly mandates SHACL over ShEx. Real production precedent for SHACL-driven codegen
+   exists: [`shacl2code`](https://github.com/JPEWdev/shacl2code) (an active, OpenSSF-certified
+   tool) is used by [SPDX 3.0](https://spdx.org) (the Linux Foundation's SBOM standard) to
+   generate Python/Go/C++/Rust bindings *and* a derived JSON Schema, all from one SHACL/RDF
+   model.
 
 ## 4. Architecture
 
@@ -126,7 +139,28 @@ structure:
   semantics (MQTT4SSN/MQTT2RDF), useful for IoT-sourced streams, but standard MQTT has no
   replay/resumption story, so it can't be a mandatory binding.
 
-### 4.4 Spec document structure (CloudEvents-style)
+### 4.4 Schema source of truth
+
+**SHACL is the single source of truth** for StreamLD's three data-shape artifacts (the event
+envelope, the WebSocket replication frame format, subscription request/response shapes) — not
+JSON Schema, for the reasons in §3.8. Everything else is a generated, derived artifact from the
+SHACL model, mirroring `shacl2code`'s role in SPDX 3.0:
+
+- The Bikeshed spec's data-dictionary tables (mirroring how `mikadiv/`'s tables are generated
+  from its XSD, though this specific SHACL-to-Bikeshed renderer has no prior art to build on —
+  it needs to be written from scratch, unlike the XSD path which reuses OpenFASTER's existing
+  engine).
+- A derived JSON Schema (via `shacl2code`'s existing `jsonschema` backend), for tooling that
+  wants plain-JSON validation convenience despite the brittleness noted in §3.8.
+- Riptide's Elixir structs/validation — **the one real gap**: there is no Elixir/BEAM SHACL
+  validator, and `shacl2code` has no Elixir backend (only C++/Go/JSON Schema/Python/Rust). This
+  needs one of three approaches, to be decided during implementation planning, not here: (a)
+  contribute a new Elixir backend to `shacl2code` upstream, (b) hand-write Elixir structs kept
+  in sync with the SHACL model by review discipline (a PR checklist linking schema changes to
+  affected code), or (c) shell out to Jena or pySHACL at validation time and accept the
+  cross-language runtime dependency.
+
+### 4.5 Spec document structure (CloudEvents-style)
 
 Within `OpenFASTER-Standard/spec`'s `streamld/` directory:
 
@@ -206,3 +240,8 @@ the core:
 - Retention policy semantics (how long a stream keeps old sequence numbers before a subscriber
   hits the gap signal) — not yet designed, needed before the gap-handling behavior in §4.2 is
   fully specifiable.
+- Which of the three options in §4.4 to pursue for Riptide's Elixir SHACL tooling gap (new
+  `shacl2code` backend, hand-written structs kept in sync by review, or a Jena/pySHACL
+  shell-out) — a real implementation decision, not yet made.
+- The SHACL-to-Bikeshed data-dictionary renderer (§4.4) has no prior art to build on, unlike
+  `mikadiv/`'s XSD path — needs its own design pass during implementation planning.
