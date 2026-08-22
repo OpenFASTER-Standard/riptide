@@ -36,6 +36,9 @@ defmodule Riptide.Stream.StreamServer do
   def handle_call({:append, event}, _from, state) do
     stamped = Event.with_sequence(event, state.next_sequence)
     new_state = %{state | next_sequence: state.next_sequence + 1, events: state.events ++ [stamped]}
+
+    Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> state.stream_id, {:new_event, stamped})
+
     {:reply, stamped, new_state}
   end
 

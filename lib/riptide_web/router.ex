@@ -14,5 +14,7 @@ defmodule RiptideWeb.Router do
     put "/resources/*path", RiptideWeb.LDP.ResourceController, :replace
     delete "/resources/*path", RiptideWeb.LDP.ResourceController, :delete
     patch "/resources/*path", RiptideWeb.LDP.ResourceController, :patch
+
+    get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end
 end
