@@ -58,6 +58,18 @@ defmodule RiptideWeb.LDP.ResourceController do
       removals: RDF.Graph.triples(removals_graph)
     }
 
+    # KNOWN LIMITATION: `removals` are currently non-functional. We apply
+    # the patch against an empty graph (rather than against the resource's
+    # currently-folded state) before storing it, so `Patch.apply/2`'s
+    # `RDF.Graph.delete(removals)` step always deletes from nothing — a
+    # no-op — and only `additions` ever survive into `delta_only_graph`.
+    # Even if we applied the patch against the real current state here,
+    # storing the *result* wouldn't help: `current_state/1`'s fold (below)
+    # only knows how to add a non-snapshot event's payload triples on top
+    # of the accumulator, never subtract, so a stored removal has no way
+    # to be represented or replayed. Fixing this needs an Event/payload
+    # redesign (e.g. Event carrying separate additions/removals fields
+    # instead of one payload graph) — out of scope for this task.
     delta_only_graph = Patch.apply(RDF.Graph.new(), patch)
 
     StreamSupervisor.get_or_start(stream_id)
@@ -90,6 +102,16 @@ defmodule RiptideWeb.LDP.ResourceController do
         # visible state is exactly what DELETE is supposed to produce, and
         # the controller test asserts GET returns 404 after DELETE, not
         # 200 with an empty body.
+        #
+        # KNOWN LIMITATION: this makes a DELETEd resource indistinguishable
+        # from a resource that was explicitly PUT with a genuinely empty
+        # Turtle body (`""`) — both fold to a zero-triple graph and both
+        # read back as 404. The Event model has no tombstone / distinct-
+        # "explicitly empty" marker separate from "the payload graph has no
+        # triples," so there's no way to tell these two cases apart from
+        # the event log alone. Fixing this needs an Event/payload redesign
+        # (e.g. an explicit `deleted?` flag or tombstone event distinct
+        # from an empty-graph snapshot) — out of scope for this task.
         if Enum.empty?(RDF.Graph.triples(graph)) do
           :not_found
         else
