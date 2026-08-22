@@ -37,4 +37,17 @@ defmodule Riptide.RDF.PatchTest do
     refute RDF.Graph.include?(result, {@alice, @name, RDF.literal("Alice")})
     assert RDF.Graph.include?(result, {@alice, @name, RDF.literal("Alicia")})
   end
+
+  test "apply/2 has additions win when the same triple is both added and removed" do
+    graph = RDF.Graph.new()
+
+    patch = %Patch{
+      additions: [{@alice, @name, RDF.literal("Alice")}],
+      removals: [{@alice, @name, RDF.literal("Alice")}]
+    }
+
+    result = Patch.apply(graph, patch)
+
+    assert RDF.Graph.include?(result, {@alice, @name, RDF.literal("Alice")})
+  end
 end
