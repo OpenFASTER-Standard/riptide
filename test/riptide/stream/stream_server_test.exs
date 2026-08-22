@@ -43,4 +43,16 @@ defmodule Riptide.Stream.StreamServerTest do
 
     assert Enum.map(events, & &1.sequence) == [2, 3]
   end
+
+  test "a stream started with a retention limit trims old events", %{stream_id: _unused} do
+    stream_id = "stream-retention-#{System.unique_integer([:positive])}"
+    start_supervised!({StreamServer, {stream_id, retention: 2}}, id: :retained_stream)
+
+    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+
+    assert {:gap, 2} = StreamServer.get_since(stream_id, 0)
+    assert {:ok, [%{sequence: 3}]} = StreamServer.get_since(stream_id, 2)
+  end
 end

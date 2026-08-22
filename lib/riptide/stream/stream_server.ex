@@ -8,8 +8,12 @@ defmodule Riptide.Stream.StreamServer do
 
   alias Riptide.Event
 
-  def start_link(stream_id) do
-    GenServer.start_link(__MODULE__, stream_id, name: via(stream_id))
+  def start_link({stream_id, opts}) do
+    GenServer.start_link(__MODULE__, {stream_id, opts}, name: via(stream_id))
+  end
+
+  def start_link(stream_id) when is_binary(stream_id) do
+    start_link({stream_id, []})
   end
 
   def via(stream_id) do
@@ -28,14 +32,16 @@ defmodule Riptide.Stream.StreamServer do
   end
 
   @impl true
-  def init(stream_id) do
-    {:ok, %{stream_id: stream_id, next_sequence: 1, events: []}}
+  def init({stream_id, opts}) do
+    retention = Keyword.get(opts, :retention, :infinity)
+    {:ok, %{stream_id: stream_id, next_sequence: 1, events: [], retention: retention}}
   end
 
   @impl true
   def handle_call({:append, event}, _from, state) do
     stamped = Event.with_sequence(event, state.next_sequence)
-    new_state = %{state | next_sequence: state.next_sequence + 1, events: state.events ++ [stamped]}
+    events = trim(state.events ++ [stamped], state.retention)
+    new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
 
     Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> state.stream_id, {:new_event, stamped})
 
@@ -55,5 +61,12 @@ defmodule Riptide.Stream.StreamServer do
       matching = Enum.filter(state.events, &(&1.sequence > cursor))
       {:reply, {:ok, matching}, state}
     end
+  end
+
+  defp trim(events, :infinity), do: events
+
+  defp trim(events, retention) when is_integer(retention) do
+    count = length(events)
+    if count > retention, do: Enum.drop(events, count - retention), else: events
   end
 end

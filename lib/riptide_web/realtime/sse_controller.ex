@@ -10,18 +10,21 @@ defmodule RiptideWeb.Realtime.SseController do
 
     cursor = last_event_id(conn)
 
-    conn =
-      conn
-      |> put_resp_content_type("text/event-stream", nil)
-      |> send_chunked(200)
+    case StreamServer.get_since(stream_id, cursor) do
+      {:gap, oldest} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(409, Jason.encode!(%{"oldestAvailable" => oldest}))
 
-    conn =
-      case StreamServer.get_since(stream_id, cursor) do
-        {:ok, backlog} -> Enum.reduce(backlog, conn, &write_event(&2, &1))
-        {:gap, _oldest} -> conn
-      end
+      {:ok, backlog} ->
+        conn =
+          conn
+          |> put_resp_content_type("text/event-stream", nil)
+          |> send_chunked(200)
 
-    loop(conn)
+        conn = Enum.reduce(backlog, conn, &write_event(&2, &1))
+        loop(conn)
+    end
   end
 
   defp loop(conn) do

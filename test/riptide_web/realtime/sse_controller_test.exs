@@ -29,4 +29,21 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     assert get_resp_header(conn, "content-type") == ["text/event-stream"]
     assert conn.resp_body =~ "id: 1\n"
   end
+
+  test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
+    stream_id = "sse-gap-test-#{System.unique_integer([:positive])}"
+    {:ok, _pid} = Riptide.Stream.StreamServer.start_link({stream_id, retention: 1})
+
+    Riptide.Stream.StreamServer.append(stream_id, Riptide.Event.new(stream_id, RDF.Graph.new()))
+    Riptide.Stream.StreamServer.append(stream_id, Riptide.Event.new(stream_id, RDF.Graph.new()))
+
+    conn =
+      :get
+      |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+      |> put_req_header("last-event-id", "0")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 409
+    assert Jason.decode!(conn.resp_body) == %{"oldestAvailable" => 2}
+  end
 end
