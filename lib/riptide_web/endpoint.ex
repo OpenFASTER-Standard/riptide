@@ -44,5 +44,8 @@ defmodule RiptideWeb.Endpoint do
   plug Plug.MethodOverride
   plug Plug.Head
   plug Plug.Session, @session_options
+
+  socket "/replication", RiptideWeb.Realtime.Socket, websocket: true
+
   plug RiptideWeb.Router
 end
