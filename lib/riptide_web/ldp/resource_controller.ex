@@ -5,6 +5,8 @@ defmodule RiptideWeb.LDP.ResourceController do
   alias Riptide.RDF.{Patch, TurtleCodec}
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
+  @ldp_contains RDF.iri("http://www.w3.org/ns/ldp#contains")
+
   def show(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(path_segments)
 
@@ -76,6 +78,34 @@ defmodule RiptideWeb.LDP.ResourceController do
     StreamServer.append(stream_id, Event.new(stream_id, delta_only_graph, false))
 
     send_resp(conn, 200, "")
+  end
+
+  def create_child(conn, %{"path" => path_segments}) do
+    container_stream_id = stream_id_for(path_segments)
+    {:ok, body, conn} = Plug.Conn.read_body(conn)
+    {:ok, child_graph} = TurtleCodec.decode(body)
+
+    child_id = Uniq.UUID.uuid4()
+    child_stream_id = container_stream_id <> "/" <> child_id
+
+    StreamSupervisor.get_or_start(child_stream_id)
+    StreamServer.append(child_stream_id, Event.new(child_stream_id, child_graph, true))
+
+    containment_triple = {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
+    containment_graph = RDF.Graph.new() |> RDF.Graph.add(containment_triple)
+
+    StreamSupervisor.get_or_start(container_stream_id)
+
+    StreamServer.append(
+      container_stream_id,
+      Event.new(container_stream_id, containment_graph, false)
+    )
+
+    location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
+
+    conn
+    |> put_resp_header("location", location)
+    |> send_resp(201, "")
   end
 
   defp stream_id_for(path_segments) do

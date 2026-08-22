@@ -71,4 +71,26 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     get_conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
     assert get_conn.status == 404
   end
+
+  test "POST to a container creates a child resource and records ldp:contains" do
+    container_path = unique_path()
+    child_turtle = "<https://pod.example/a> <https://pod.example/b> \"c\" .\n"
+
+    post_conn =
+      :post
+      |> conn(container_path, child_turtle)
+      |> put_req_header("content-type", "text/turtle")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert post_conn.status == 201
+    [location] = Plug.Conn.get_resp_header(post_conn, "location")
+    assert location =~ container_path
+
+    child_get_conn = :get |> conn(location) |> RiptideWeb.Endpoint.call(@opts)
+    assert child_get_conn.status == 200
+    assert child_get_conn.resp_body =~ "\"c\""
+
+    container_get_conn = :get |> conn(container_path) |> RiptideWeb.Endpoint.call(@opts)
+    assert container_get_conn.resp_body =~ "ldp#contains"
+  end
 end
