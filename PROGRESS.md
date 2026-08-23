@@ -11,7 +11,7 @@ first place to check for current status, not a historical log.
 
 | # | Sub-project | Status |
 |---|---|---|
-| 1 | Persistence & durability | **In design** — see below |
+| 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | Not started |
 | 3 | Clustering / horizontal scale / HA | Not started (multi-node `Ra` replication belongs here — see §1) |
 | 4 | Security & multi-tenancy (auth, WAC/ACP, TLS) | Not started |
@@ -20,7 +20,7 @@ first place to check for current status, not a historical log.
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
 
-## 1. Persistence & durability — in design
+## 1. Persistence & durability — shipped
 
 **Scope for this sub-project**: a single-node `Ra`-replicated (cluster size 1) durable log per
 stream, replacing the current in-memory `state.events` list in `Riptide.Stream.StreamServer`.
@@ -58,25 +58,10 @@ contention can collapse throughput by orders of magnitude (RabbitMQ's own publis
 13k→6k→300 msg/s as contention increased). High-volume streams need real disk isolation, not
 just "add more Ra groups on the same disk."
 
-**Status**: design doc written and committed —
-[`docs/superpowers/specs/2026-08-23-persistence-durability-design.md`](docs/superpowers/specs/2026-08-23-persistence-durability-design.md).
-Awaiting spec review before moving to an implementation plan.
+**Status**: implementation complete, PR pending — see
+[`docs/superpowers/specs/2026-08-23-persistence-durability-design.md`](docs/superpowers/specs/2026-08-23-persistence-durability-design.md)
+for the design and its implementation plan.
 
 ## 2-5. Not yet started
 
 Will be filled in as each sub-project reaches design.
-
-## Cleanup folded into Persistence work (resolves the old PR #1 carry-forward list)
-
-**Revised 2026-08-23**: rather than carry these as an indefinitely-growing "known issues" list,
-they're scheduled as small, well-understood fixes bundled into the Persistence & durability
-implementation plan (§1). Once that lands, this section goes away entirely — nothing should be
-"carried forward" a second time.
-
-- Give `Event` an explicit operation type (add/remove/replace) instead of inferring it from body
-  shape. This one model change fixes two related bugs at once: PATCH `removals` currently can't
-  be represented at all, and an empty-body PUT is indistinguishable from DELETE.
-- Add the missing regression tests: WebSocket cross-stream isolation, and SHACL-shape vs.
-  `shacl2code`-mirror drift detection (spec repo).
-- The in-memory-only durability limitation this list used to flag is resolved directly by
-  Persistence & durability shipping — no separate doc update needed once that's done.

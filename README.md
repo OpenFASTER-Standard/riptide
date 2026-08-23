@@ -18,13 +18,16 @@ The StreamLD specification itself lives in a separate repo:
 ## How the pieces fit together
 
 At the core of Riptide is a per-stream, sequence-numbered event log:
-`Riptide.Stream.StreamServer` is a GenServer (one process per stream, supervised by
-`Riptide.Stream.StreamSupervisor` and looked up via a `Registry`) that owns write
-serialization and the in-memory list of `Riptide.Event` structs for that stream, assigning each
-appended event the next sequence number. Every append also broadcasts the new event over
-`Phoenix.PubSub` on the `"stream:<stream_id>"` topic — this is the internal fan-out mechanism
-that both realtime surfaces below subscribe to, decoupling the write path from however many
-readers are currently attached.
+`Riptide.Stream.StreamServer` is a thin client (no GenServer of its own) over a single-node
+`Ra`-replicated (Raft) cluster, one per stream, dynamically started/restarted on demand via
+`Riptide.RaCluster` — the only module that talks to `:ra` directly. Each stream's log is a
+`Riptide.Stream.RaMachine`, a pure `:ra_machine` that assigns each appended event the next
+sequence number and applies retention trimming, with events committed durably to disk through
+Ra's write-ahead log instead of living only in process memory, so a stream survives a crash or
+restart with its data and sequence numbers intact. Every append also broadcasts the new event
+over `Phoenix.PubSub` on the `"stream:<stream_id>"` topic — this is the internal fan-out
+mechanism that both realtime surfaces below subscribe to, decoupling the write path from however
+many readers are currently attached.
 
 Riptide exposes that event log through three HTTP/WS surfaces:
 
