@@ -12,7 +12,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
     case StreamServer.get_since(stream_id, cursor) do
       {:gap, oldest} ->
-        {:error, %{"gap" => oldest}}
+        {:error, %{"oldestAvailable" => oldest}}
 
       {:ok, events} ->
         socket = assign(socket, :stream_id, stream_id)
@@ -28,6 +28,15 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   defp frame(%Event{} = event) do
     {:ok, turtle} = TurtleCodec.encode(event.payload)
-    %{"cursor" => event.sequence, "event" => %{"sequence" => event.sequence, "payload" => turtle}}
+
+    %{
+      "cursor" => event.sequence,
+      "event" => %{
+        "sequence" => event.sequence,
+        "streamId" => event.stream_id,
+        "isSnapshot" => event.is_snapshot?,
+        "payload" => turtle
+      }
+    }
   end
 end

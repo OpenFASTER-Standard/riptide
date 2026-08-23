@@ -23,12 +23,17 @@ defmodule RiptideWeb.LDP.ResourceController do
   def replace(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
-    {:ok, graph} = TurtleCodec.decode(body)
 
-    StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, graph, true))
+    case TurtleCodec.decode(body) do
+      {:ok, graph} ->
+        StreamSupervisor.get_or_start(stream_id)
+        StreamServer.append(stream_id, Event.new(stream_id, graph, true))
 
-    send_resp(conn, 201, "")
+        send_resp(conn, 201, "")
+
+      {:error, _reason} ->
+        send_resp(conn, 400, "")
+    end
   end
 
   def delete(conn, %{"path" => path_segments}) do
@@ -50,62 +55,70 @@ defmodule RiptideWeb.LDP.ResourceController do
     # earlier draft did, mirroring the brief's literal example) reads an
     # already-drained body and crashes `Jason.decode!/1` on an empty
     # string. Read the already-decoded fields from `params` instead.
-    %{"additions" => additions_turtle, "removals" => removals_turtle} = params
+    with {:ok, additions_turtle} <- Map.fetch(params, "additions"),
+         {:ok, removals_turtle} <- Map.fetch(params, "removals"),
+         {:ok, additions_graph} <- TurtleCodec.decode(additions_turtle),
+         {:ok, removals_graph} <- TurtleCodec.decode(removals_turtle) do
+      patch = %Patch{
+        additions: RDF.Graph.triples(additions_graph),
+        removals: RDF.Graph.triples(removals_graph)
+      }
 
-    {:ok, additions_graph} = TurtleCodec.decode(additions_turtle)
-    {:ok, removals_graph} = TurtleCodec.decode(removals_turtle)
+      # KNOWN LIMITATION: `removals` are currently non-functional. We apply
+      # the patch against an empty graph (rather than against the resource's
+      # currently-folded state) before storing it, so `Patch.apply/2`'s
+      # `RDF.Graph.delete(removals)` step always deletes from nothing — a
+      # no-op — and only `additions` ever survive into `delta_only_graph`.
+      # Even if we applied the patch against the real current state here,
+      # storing the *result* wouldn't help: `current_state/1`'s fold (below)
+      # only knows how to add a non-snapshot event's payload triples on top
+      # of the accumulator, never subtract, so a stored removal has no way
+      # to be represented or replayed. Fixing this needs an Event/payload
+      # redesign (e.g. Event carrying separate additions/removals fields
+      # instead of one payload graph) — out of scope for this task.
+      delta_only_graph = Patch.apply(RDF.Graph.new(), patch)
 
-    patch = %Patch{
-      additions: RDF.Graph.triples(additions_graph),
-      removals: RDF.Graph.triples(removals_graph)
-    }
+      StreamSupervisor.get_or_start(stream_id)
+      StreamServer.append(stream_id, Event.new(stream_id, delta_only_graph, false))
 
-    # KNOWN LIMITATION: `removals` are currently non-functional. We apply
-    # the patch against an empty graph (rather than against the resource's
-    # currently-folded state) before storing it, so `Patch.apply/2`'s
-    # `RDF.Graph.delete(removals)` step always deletes from nothing — a
-    # no-op — and only `additions` ever survive into `delta_only_graph`.
-    # Even if we applied the patch against the real current state here,
-    # storing the *result* wouldn't help: `current_state/1`'s fold (below)
-    # only knows how to add a non-snapshot event's payload triples on top
-    # of the accumulator, never subtract, so a stored removal has no way
-    # to be represented or replayed. Fixing this needs an Event/payload
-    # redesign (e.g. Event carrying separate additions/removals fields
-    # instead of one payload graph) — out of scope for this task.
-    delta_only_graph = Patch.apply(RDF.Graph.new(), patch)
-
-    StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, delta_only_graph, false))
-
-    send_resp(conn, 200, "")
+      send_resp(conn, 200, "")
+    else
+      :error -> send_resp(conn, 400, "")
+      {:error, _reason} -> send_resp(conn, 400, "")
+    end
   end
 
   def create_child(conn, %{"path" => path_segments}) do
     container_stream_id = stream_id_for(path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
-    {:ok, child_graph} = TurtleCodec.decode(body)
 
-    child_id = Uniq.UUID.uuid4()
-    child_stream_id = container_stream_id <> "/" <> child_id
+    case TurtleCodec.decode(body) do
+      {:ok, child_graph} ->
+        child_id = Uniq.UUID.uuid4()
+        child_stream_id = container_stream_id <> "/" <> child_id
 
-    StreamSupervisor.get_or_start(child_stream_id)
-    StreamServer.append(child_stream_id, Event.new(child_stream_id, child_graph, true))
+        StreamSupervisor.get_or_start(child_stream_id)
+        StreamServer.append(child_stream_id, Event.new(child_stream_id, child_graph, true))
 
-    containment_triple = {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
-    containment_graph = RDF.Graph.new() |> RDF.Graph.add(containment_triple)
+        containment_triple = {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
+        containment_graph = RDF.Graph.new() |> RDF.Graph.add(containment_triple)
 
-    StreamSupervisor.get_or_start(container_stream_id)
+        StreamSupervisor.get_or_start(container_stream_id)
 
-    StreamServer.append(
-      container_stream_id,
-      Event.new(container_stream_id, containment_graph, false)
-    )
+        StreamServer.append(
+          container_stream_id,
+          Event.new(container_stream_id, containment_graph, false)
+        )
 
-    location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
+        location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
 
-    conn
-    |> put_resp_header("location", location)
-    |> send_resp(201, "")
+        conn
+        |> put_resp_header("location", location)
+        |> send_resp(201, "")
+
+      {:error, _reason} ->
+        send_resp(conn, 400, "")
+    end
   end
 
   defp stream_id_for(path_segments) do

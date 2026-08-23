@@ -41,7 +41,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     {:ok, socket} = connect(Socket, %{})
 
-    assert {:error, %{"gap" => 2}} =
+    assert {:error, %{"oldestAvailable" => 2}} =
              subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
   end
 
@@ -55,6 +55,13 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
 
-    assert_push "replication_frame", %{"cursor" => 1}
+    assert_push "replication_frame", %{
+      "cursor" => 1,
+      "event" => %{
+        "sequence" => 1,
+        "streamId" => ^stream_id,
+        "isSnapshot" => false
+      }
+    }
   end
 end

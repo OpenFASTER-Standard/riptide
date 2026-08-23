@@ -72,6 +72,72 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     assert get_conn.status == 404
   end
 
+  test "PUT with malformed Turtle returns 400 instead of crashing" do
+    path = unique_path()
+
+    put_conn =
+      :put
+      |> conn(path, "this is not valid turtle <<<")
+      |> put_req_header("content-type", "text/turtle")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert put_conn.status == 400
+  end
+
+  test "PATCH with malformed Turtle in additions returns 400 instead of crashing" do
+    path = unique_path()
+
+    :put
+    |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"1\" .\n")
+    |> put_req_header("content-type", "text/turtle")
+    |> RiptideWeb.Endpoint.call(@opts)
+
+    patch_body =
+      Jason.encode!(%{
+        "additions" => "this is not valid turtle <<<",
+        "removals" => ""
+      })
+
+    patch_conn =
+      :patch
+      |> conn(path, patch_body)
+      |> put_req_header("content-type", "application/json")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert patch_conn.status == 400
+  end
+
+  test "PATCH with a missing additions/removals key returns 400 instead of crashing" do
+    path = unique_path()
+
+    :put
+    |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"1\" .\n")
+    |> put_req_header("content-type", "text/turtle")
+    |> RiptideWeb.Endpoint.call(@opts)
+
+    patch_body = Jason.encode!(%{"additions" => ""})
+
+    patch_conn =
+      :patch
+      |> conn(path, patch_body)
+      |> put_req_header("content-type", "application/json")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert patch_conn.status == 400
+  end
+
+  test "POST to a container with malformed Turtle returns 400 instead of crashing" do
+    container_path = unique_path()
+
+    post_conn =
+      :post
+      |> conn(container_path, "this is not valid turtle <<<")
+      |> put_req_header("content-type", "text/turtle")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert post_conn.status == 400
+  end
+
   test "POST to a container creates a child resource and records ldp:contains" do
     container_path = unique_path()
     child_turtle = "<https://pod.example/a> <https://pod.example/b> \"c\" .\n"
