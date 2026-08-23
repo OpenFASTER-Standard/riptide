@@ -12,6 +12,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining with after: 0 receives no backlog on an empty stream" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
@@ -23,6 +24,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining with after: 0 on a non-empty stream replies with the existing backlog" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
 
@@ -35,6 +37,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining with a cursor older than the retention window is rejected with a gap" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = StreamServer.start_link({stream_id, retention: 1})
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
@@ -47,6 +50,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "new appends after joining are pushed as replication_frame messages" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
 
     {:ok, socket} = connect(Socket, %{})

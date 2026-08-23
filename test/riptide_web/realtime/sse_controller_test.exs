@@ -11,6 +11,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   test "subscribing with no Last-Event-ID and then appending pushes one SSE frame" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
 
     task =
@@ -32,6 +33,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
     stream_id = "sse-gap-test-#{System.unique_integer([:positive])}"
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = Riptide.Stream.StreamServer.start_link({stream_id, retention: 1})
 
     Riptide.Stream.StreamServer.append(stream_id, Riptide.Event.new(stream_id, RDF.Graph.new()))

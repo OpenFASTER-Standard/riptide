@@ -6,7 +6,8 @@ defmodule Riptide.Stream.StreamServerTest do
 
   setup do
     stream_id = "stream-#{System.unique_integer([:positive])}"
-    start_supervised!({StreamServer, stream_id})
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    {:ok, _pid} = StreamServer.start_link(stream_id)
     {:ok, stream_id: stream_id}
   end
 
@@ -46,7 +47,8 @@ defmodule Riptide.Stream.StreamServerTest do
 
   test "a stream started with a retention limit trims old events", %{stream_id: _unused} do
     stream_id = "stream-retention-#{System.unique_integer([:positive])}"
-    start_supervised!({StreamServer, {stream_id, retention: 2}}, id: :retained_stream)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    {:ok, _pid} = StreamServer.start_link({stream_id, retention: 2})
 
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
     StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
@@ -54,5 +56,24 @@ defmodule Riptide.Stream.StreamServerTest do
 
     assert {:gap, 2} = StreamServer.get_since(stream_id, 0)
     assert {:ok, [%{sequence: 3}]} = StreamServer.get_since(stream_id, 2)
+  end
+
+  test "events and sequence numbers survive killing and restarting the Ra process" do
+    stream_id = "stream-" <> Uniq.UUID.uuid4()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+    {:ok, pid} = StreamServer.start_link(stream_id)
+    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+
+    Process.exit(pid, :kill)
+    refute Process.alive?(pid)
+
+    {:ok, _pid} = StreamServer.start_link(stream_id)
+
+    assert {:ok, [%{sequence: 1}, %{sequence: 2}]} = StreamServer.get_since(stream_id, 0)
+
+    third = StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    assert third.sequence == 3
   end
 end
