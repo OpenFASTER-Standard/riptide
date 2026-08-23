@@ -41,12 +41,13 @@ citations):**
 - **Ordering guarantee**: StreamLD's single monotonic sequence-number-per-stream guarantee is
   preserved, not sacrificed for throughput (a deliberate choice — Kafka's own per-partition
   model was the recommended alternative and was explicitly turned down).
-- **Horizontal throughput beyond one `Ra` group**: deferred behind an explicit "measure first"
-  gate. No production system on any stack has done this at Kafka-adjacent scale — the closest
-  precedent (Scalog, NSDI'20) needs a Paxos-coordinated ordering layer on top of sharded storage
-  and only hit 255K/sec in its real (non-emulated) prototype. Build the proven single-shard
-  durable log first, benchmark it for real, and only build the sequencer layer if a real ceiling
-  shows up for a specific high-volume stream.
+- **Horizontal throughput beyond one `Ra` group**: not being pursued. **Revised 2026-08-23** —
+  the earlier "Kafka-scale from the start" ambition is walked back in favor of a simple system
+  that is efficient and actually works: a single `Ra` group (the same model RabbitMQ quorum
+  queues run in production) comfortably handles tens of thousands of msgs/sec per stream, well
+  above real workload needs, with none of the unproven-coordinator risk a multi-shard sequencer
+  would add. Not scoped as future work at all — only revisited if a real, measured stream ever
+  actually hits that ceiling.
 - **Khepri (RabbitMQ's `Ra`-based Mnesia replacement) is NOT the storage engine** — it keeps the
   entire dataset in memory as well as on disk, a hard ceiling below multi-TB/PB retention. `Ra`
   itself (the underlying Raft library) is the right substrate; Riptide builds its own segment-log
@@ -65,20 +66,17 @@ Awaiting spec review before moving to an implementation plan.
 
 Will be filled in as each sub-project reaches design.
 
-## Carried-forward open items (from the initial implementation, PR #1)
+## Cleanup folded into Persistence work (resolves the old PR #1 carry-forward list)
 
-These predate this roadmap but are real, tracked gaps — not to be lost:
+**Revised 2026-08-23**: rather than carry these as an indefinitely-growing "known issues" list,
+they're scheduled as small, well-understood fixes bundled into the Persistence & durability
+implementation plan (§1). Once that lands, this section goes away entirely — nothing should be
+"carried forward" a second time.
 
-- **PATCH `removals` are non-functional.** `Event`'s payload model has no way to represent a
-  delta removal. Needs an Event/payload redesign (e.g. separate additions/removals fields).
-  Documented in-code (`resource_controller.ex`).
-- **PUT with an empty body is indistinguishable from DELETE** (both 404 on GET) — same root
-  cause as above.
-- **No committed test for WebSocket cross-stream isolation** (verified correct ad-hoc during
-  review, no regression guard).
-- **No automated drift-detection test** between the SHACL shapes and their `shacl2code`-mirror
-  copies in the spec repo's `envelope.ttl` (comment-enforced only).
-- **StreamLD's design doc doesn't yet document the in-memory-only durability limitation** and
-  its sharper-than-usual consequence (silent sequence-number reissue after a crash breaks
-  `Last-Event-ID` resumption without a gap signal) — this roadmap is the interim record until
-  that's folded into the design doc.
+- Give `Event` an explicit operation type (add/remove/replace) instead of inferring it from body
+  shape. This one model change fixes two related bugs at once: PATCH `removals` currently can't
+  be represented at all, and an empty-body PUT is indistinguishable from DELETE.
+- Add the missing regression tests: WebSocket cross-stream isolation, and SHACL-shape vs.
+  `shacl2code`-mirror drift detection (spec repo).
+- The in-memory-only durability limitation this list used to flag is resolved directly by
+  Persistence & durability shipping — no separate doc update needed once that's done.

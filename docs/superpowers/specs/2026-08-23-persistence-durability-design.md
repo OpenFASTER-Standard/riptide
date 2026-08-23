@@ -3,6 +3,13 @@
 **Status:** Approved 2026-08-23. Sub-project 1 of Riptide's production-readiness roadmap (see
 `PROGRESS.md`).
 
+**Revision, same day**: the "Kafka-scale from the start" ambition originally driving §6's deferred
+work is walked back. Explicit operator direction: prioritize a system that is simple, efficient,
+and actually works over one architected for a scale target that was never a measured requirement.
+Phase 1 (below) is unchanged — it was already the efficient, unglamorous choice. What changes is
+that the speculative follow-on (a Scalog-style multi-shard sequencer) is no longer scoped as future
+work at all; see the shortened §6.
+
 ## 1. Context and motivation
 
 Riptide's event log (`Riptide.Stream.StreamServer`) is currently fully in-memory: a plain list
@@ -139,16 +146,15 @@ Three things are explicitly deferred:
 
 - **Multi-node `Ra` replication** — next sub-project (Clustering/HA).
 - **Tiered/cold object storage** — additive future work once local durability is solid.
-- **Horizontal per-stream throughput beyond one `Ra` group** — explicitly gated behind measuring
-  a real single-`Ra`-group throughput ceiling on real hardware once this sub-project ships; no
-  published `Ra` throughput/latency benchmark for this exact workload shape exists anywhere, so
-  this number needs to come from Riptide's own measurement, not an assumed industry figure. If a
-  genuine ceiling is hit for a specific high-volume stream, the next step is a Scalog-style
-  ordering layer (shards independently append locally; a small Raft/Paxos-replicated "ordering
-  log" merges their local positions into one global sequence, acknowledged asynchronously
-  relative to local durability) — this is genuine novel engineering with no BEAM precedent
-  anywhere, not a known pattern to follow, and should be scoped as its own sub-project when/if
-  it's triggered.
+- **Horizontal per-stream throughput beyond one `Ra` group** — not being designed, scoped, or
+  built, full stop. A single `Ra` group is the same replication model RabbitMQ quorum queues run
+  in production, where a single queue comfortably handles tens of thousands of messages/sec — far
+  above what a real Solid-pod-style workload needs per stream. There is no measured need driving a
+  multi-shard sequencer, and no production system anywhere has actually built the kind of
+  coordinator that would require (see §2 finding 4) — building it speculatively would trade a
+  simple, working system for unproven complexity in exchange for headroom nothing has asked for.
+  If a specific stream's real, measured throughput ever exceeds one `Ra` group's ceiling, that
+  measurement is the trigger to design a solution then, not before.
 - **Disk-isolation guidance for operators** is named as a requirement here but not yet written
   as actual deployment documentation — a real gap to close before this ships to a real operator,
   not before the code itself is written.
