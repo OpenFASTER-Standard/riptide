@@ -4,9 +4,18 @@ defmodule Riptide.Stream.RaMachineTest do
   alias Riptide.Event
   alias Riptide.Stream.RaMachine
 
-  defp append(state, stream_id) do
-    {new_state, event, []} =
-      RaMachine.apply(%{}, {:append, Event.new(stream_id, :replace, RDF.Graph.new())}, state)
+  # Real Ra always passes a `%{index: ...}` meta into `apply/3`; supply one so
+  # the release_cursor path (which reads `meta.index` when retention trims an
+  # event) has what it needs. Effects are ignored here — the pure-state-machine
+  # tests below assert on state/reply, not on Ra effects; the release_cursor
+  # effect's actual on-disk consequence is covered in `RaClusterTest`.
+  defp append(state, stream_id, index \\ 1) do
+    {new_state, event, _effects} =
+      RaMachine.apply(
+        %{index: index},
+        {:append, Event.new(stream_id, :replace, RDF.Graph.new())},
+        state
+      )
 
     {new_state, event}
   end
