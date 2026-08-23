@@ -25,3 +25,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 riptide-*.tar
 
+# Ra's on-disk Raft log/data directories.
+priv/ra_data/
+priv/ra_data_test/

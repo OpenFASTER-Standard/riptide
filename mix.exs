@@ -29,7 +29,8 @@ defmodule Riptide.MixProject do
       {:jason, "~> 1.4"},
       {:rdf, "~> 3.0"},
       {:json_ld, "~> 1.0"},
-      {:uniq, "~> 0.6"}
+      {:uniq, "~> 0.6"},
+      {:ra, "~> 2.15.0"}
     ]
   end
 end

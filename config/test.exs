@@ -16,3 +16,6 @@ config :phoenix, :plug_init_mode, :runtime
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# See config.exs for why this must be a charlist, not a binary.
+config :ra, data_dir: ~c"priv/ra_data_test"
