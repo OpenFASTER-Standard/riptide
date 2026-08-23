@@ -58,9 +58,11 @@ contention can collapse throughput by orders of magnitude (RabbitMQ's own publis
 13k→6k→300 msg/s as contention increased). High-volume streams need real disk isolation, not
 just "add more Ra groups on the same disk."
 
-**Status**: implementation complete, PR pending — see
+**Status**: shipped — see
+[PR #2](https://github.com/OpenFASTER-Standard/riptide/pull/2) (implementation) and
 [`docs/superpowers/specs/2026-08-23-persistence-durability-design.md`](docs/superpowers/specs/2026-08-23-persistence-durability-design.md)
-for the design and its implementation plan.
+(design). Companion regression test in the spec repo:
+[OpenFASTER-Standard/spec#3](https://github.com/OpenFASTER-Standard/spec/pull/3).
 
 ## 2-5. Not yet started
 
