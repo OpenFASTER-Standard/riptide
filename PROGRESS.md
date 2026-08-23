@@ -57,8 +57,9 @@ contention can collapse throughput by orders of magnitude (RabbitMQ's own publis
 13k→6k→300 msg/s as contention increased). High-volume streams need real disk isolation, not
 just "add more Ra groups on the same disk."
 
-**Status**: design approved through the "Testing" section; not yet written to a formal design
-doc or implementation plan.
+**Status**: design doc written and committed —
+[`docs/superpowers/specs/2026-08-23-persistence-durability-design.md`](docs/superpowers/specs/2026-08-23-persistence-durability-design.md).
+Awaiting spec review before moving to an implementation plan.
 
 ## 2-5. Not yet started
 
