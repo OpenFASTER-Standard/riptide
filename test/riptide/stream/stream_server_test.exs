@@ -2,7 +2,8 @@ defmodule Riptide.Stream.StreamServerTest do
   use ExUnit.Case, async: true
 
   alias Riptide.Event
-  alias Riptide.Stream.StreamServer
+  alias Riptide.RaCluster
+  alias Riptide.Stream.{RaMachine, StreamServer}
 
   setup do
     stream_id = "stream-#{System.unique_integer([:positive])}"
@@ -71,6 +72,32 @@ defmodule Riptide.Stream.StreamServerTest do
 
     {:ok, _pid} = StreamServer.start_link(stream_id)
 
+    # What this test proves: the two acknowledged appends were durably
+    # committed to Ra's on-disk WAL (fsync happens as part of the commit path,
+    # *before* the append is acknowledged — verified in the final-fix-wave
+    # investigation report) and survive the Ra server process being killed.
+    #
+    # It deliberately asserts durability via a linearizable `consistent_query`,
+    # NOT via `StreamServer.get_since/2`. `get_since/2` uses `:ra.local_query`,
+    # a fast but *possibly stale* read of the local server's already-applied
+    # state. Immediately after a restart the recovered server has its full
+    # durable log on disk but re-applies it asynchronously, so for a few
+    # milliseconds a `local_query` can observe a state caught up to only the
+    # first of the two committed entries. That is a read-freshness window, not
+    # data loss — the second event is on disk and committed the whole time.
+    # Under full-suite scheduler contention that window widened enough that the
+    # original immediate-`local_query` assertion here flaked ~1-in-12 runs
+    # (right side `{:ok, [%{sequence: 1}]}`, never empty, never a gap). A
+    # `consistent_query` only answers after the server has applied everything
+    # committed as of the query, so it deterministically observes the fully
+    # recovered log.
+    server_id = RaCluster.server_id(stream_id)
+
+    assert {:ok, [%{sequence: 1}, %{sequence: 2}]} =
+             RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, 0))
+
+    # The consistent read above forced the server fully caught up, so the
+    # ordinary local_query read path now deterministically sees both events too.
     assert {:ok, [%{sequence: 1}, %{sequence: 2}]} = StreamServer.get_since(stream_id, 0)
 
     third = StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))

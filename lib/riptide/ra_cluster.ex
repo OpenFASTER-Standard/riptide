@@ -63,6 +63,13 @@ defmodule Riptide.RaCluster do
     end
   end
 
+  # NOTE: raising on `{:error, _}`/`{:timeout, _}` is deliberate for the
+  # single-node Phase 1 cluster — at cluster size 1 there is no other replica
+  # to fail over to, so a command that can't reach consensus is a genuine
+  # local fault the caller should see. Once the Clustering/HA sub-project adds
+  # multi-node membership, these paths need graceful handling/retry (e.g.
+  # redirecting to the current leader on `{:error, {:redirect, _}}` or backing
+  # off and retrying a transient `{:timeout, _}`) rather than raising.
   @spec process_command(:ra.server_id(), term()) :: term()
   def process_command(server_id, command) do
     case :ra.process_command(server_id, command) do
@@ -72,12 +79,40 @@ defmodule Riptide.RaCluster do
     end
   end
 
+  # A fast, *possibly stale* read of the local server's already-applied
+  # machine state — reads deliberately skip consensus (see `RaMachine`'s
+  # moduledoc). Right after a server restart the recovered process holds its
+  # full durable log on disk but re-applies it asynchronously, so a
+  # `local_query` can briefly observe a not-yet-fully-caught-up state. Use
+  # `consistent_query/2` when you need a linearizable read that reflects
+  # everything committed so far (e.g. asserting durability right after a
+  # crash-restart). Same single-node error-handling caveat as
+  # `process_command/2` above applies.
   @spec local_query(:ra.server_id(), (term() -> term())) :: term()
   def local_query(server_id, query_fun) do
     case :ra.local_query(server_id, query_fun) do
       {:ok, {_index_term, result}, _leader} -> result
       {:error, reason} -> raise "Ra query failed for #{inspect(server_id)}: #{inspect(reason)}"
       {:timeout, _} -> raise "Ra query timed out for #{inspect(server_id)}"
+    end
+  end
+
+  # Linearizable read: unlike `local_query/2` this goes through the leader and,
+  # by Raft's definition, only answers after the server has applied everything
+  # committed as of the query — so it deterministically observes the fully
+  # recovered log even immediately after a restart. Reply shape is
+  # `{:ok, Reply, Leader}` (no index/term wrapper, unlike `local_query`).
+  @spec consistent_query(:ra.server_id(), (term() -> term())) :: term()
+  def consistent_query(server_id, query_fun) do
+    case :ra.consistent_query(server_id, query_fun) do
+      {:ok, result, _leader} ->
+        result
+
+      {:error, reason} ->
+        raise "Ra consistent query failed for #{inspect(server_id)}: #{inspect(reason)}"
+
+      {:timeout, _} ->
+        raise "Ra consistent query timed out for #{inspect(server_id)}"
     end
   end
 
