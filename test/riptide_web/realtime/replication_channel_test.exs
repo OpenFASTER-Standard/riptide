@@ -77,4 +77,55 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
       }
     }
   end
+
+  # `assert_push`/`refute_push` scope to the calling *process*'s mailbox, not
+  # to a particular socket: `Phoenix.ChannelTest.__connect__/4` sets
+  # `transport_pid: self()` at connect time, and `assert_push`/`refute_push`
+  # match on event+payload only (not topic) against whatever lands in that
+  # mailbox (see `deps/phoenix/lib/phoenix/test/channel_test.ex`). Two
+  # sockets connected from the same test process therefore share one
+  # mailbox, and a push meant for either one satisfies `assert_push`/
+  # `refute_push` run from that process — proven live: appending to the
+  # *wrong* stream still made the naive single-process version of this test
+  # pass (a false pass), because `assert_push` matched socket B's push and
+  # `refute_push` then trivially found nothing left to match. Joining
+  # socket B from a separate `Task` gives it its own `transport_pid`/
+  # mailbox, so `refute_push` in the task can only match a push actually
+  # delivered to socket B.
+  test "an append to stream A is not pushed to a socket joined to stream B" do
+    stream_a = "stream-a-" <> Uniq.UUID.uuid4()
+    stream_b = "stream-b-" <> Uniq.UUID.uuid4()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_a) end)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_b) end)
+
+    test_pid = self()
+
+    task_b =
+      Task.async(fn ->
+        {:ok, socket_b} = connect(Socket, %{}, test_process: test_pid)
+
+        {:ok, _reply, _socket_b} =
+          subscribe_and_join(socket_b, ReplicationChannel, "replication:" <> stream_b, %{
+            "after" => 0
+          })
+
+        send(test_pid, :socket_b_joined)
+
+        refute_push "replication_frame", %{}, 400
+      end)
+
+    {:ok, socket_a} = connect(Socket, %{})
+
+    {:ok, _reply, _socket_a} =
+      subscribe_and_join(socket_a, ReplicationChannel, "replication:" <> stream_a, %{"after" => 0})
+
+    assert_receive :socket_b_joined, 500
+
+    StreamSupervisor.get_or_start(stream_a)
+    StreamServer.append(stream_a, Event.new(stream_a, :replace, RDF.Graph.new()))
+
+    assert_push "replication_frame", %{}, 500
+
+    Task.await(task_b)
+  end
 end
