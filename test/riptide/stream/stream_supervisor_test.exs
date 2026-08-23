@@ -30,7 +30,10 @@ defmodule Riptide.Stream.StreamSupervisorTest do
     StreamSupervisor.get_or_start(stream_a)
     StreamSupervisor.get_or_start(stream_b)
 
-    Riptide.Stream.StreamServer.append(stream_a, Riptide.Event.new(stream_a, RDF.Graph.new()))
+    Riptide.Stream.StreamServer.append(
+      stream_a,
+      Riptide.Event.new(stream_a, :replace, RDF.Graph.new())
+    )
 
     {:ok, events_b} = Riptide.Stream.StreamServer.get_since(stream_b, 0)
     assert events_b == []

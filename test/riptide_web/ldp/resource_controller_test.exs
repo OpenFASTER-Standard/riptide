@@ -72,6 +72,51 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     assert get_conn.status == 404
   end
 
+  test "PATCH removals actually remove a triple on the next GET" do
+    path = unique_path()
+
+    :put
+    |> conn(path, "<https://s> <https://p> <https://o> .\n")
+    |> put_req_header("content-type", "text/turtle")
+    |> RiptideWeb.Endpoint.call(@opts)
+
+    patch_body =
+      Jason.encode!(%{
+        "additions" => "",
+        "removals" => "<https://s> <https://p> <https://o> .\n"
+      })
+
+    patch_conn =
+      :patch
+      |> conn(path, patch_body)
+      |> put_req_header("content-type", "application/json")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert patch_conn.status == 200
+
+    get_conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+    assert get_conn.status == 404
+  end
+
+  test "PUT with an empty body is visible (200, empty) and distinct from DELETE (404)" do
+    path = unique_path()
+
+    :put
+    |> conn(path, "")
+    |> put_req_header("content-type", "text/turtle")
+    |> RiptideWeb.Endpoint.call(@opts)
+
+    get_conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+    assert get_conn.status == 200
+    assert get_conn.resp_body == ""
+
+    delete_conn = :delete |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+    assert delete_conn.status == 204
+
+    get_conn2 = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+    assert get_conn2.status == 404
+  end
+
   test "PUT with malformed Turtle returns 400 instead of crashing" do
     path = unique_path()
 

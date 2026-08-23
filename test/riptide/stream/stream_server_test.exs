@@ -12,7 +12,7 @@ defmodule Riptide.Stream.StreamServerTest do
   end
 
   test "append/2 assigns sequence numbers starting at 1", %{stream_id: stream_id} do
-    event = Event.new(stream_id, RDF.Graph.new())
+    event = Event.new(stream_id, :replace, RDF.Graph.new())
 
     appended = StreamServer.append(stream_id, event)
 
@@ -20,8 +20,8 @@ defmodule Riptide.Stream.StreamServerTest do
   end
 
   test "append/2 assigns strictly increasing sequence numbers", %{stream_id: stream_id} do
-    first = StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    second = StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    first = StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    second = StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     assert first.sequence == 1
     assert second.sequence == 2
@@ -30,15 +30,15 @@ defmodule Riptide.Stream.StreamServerTest do
   test "get_since/2 with nil cursor returns no historical events (live-tail semantics)", %{
     stream_id: stream_id
   } do
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     assert {:ok, []} = StreamServer.get_since(stream_id, nil)
   end
 
   test "get_since/2 returns events after the given cursor, in order", %{stream_id: stream_id} do
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, events} = StreamServer.get_since(stream_id, 1)
 
@@ -50,9 +50,9 @@ defmodule Riptide.Stream.StreamServerTest do
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = StreamServer.start_link({stream_id, retention: 2})
 
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     assert {:gap, 2} = StreamServer.get_since(stream_id, 0)
     assert {:ok, [%{sequence: 3}]} = StreamServer.get_since(stream_id, 2)
@@ -63,8 +63,8 @@ defmodule Riptide.Stream.StreamServerTest do
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
     {:ok, pid} = StreamServer.start_link(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     Process.exit(pid, :kill)
     refute Process.alive?(pid)
@@ -73,7 +73,7 @@ defmodule Riptide.Stream.StreamServerTest do
 
     assert {:ok, [%{sequence: 1}, %{sequence: 2}]} = StreamServer.get_since(stream_id, 0)
 
-    third = StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    third = StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
     assert third.sequence == 3
   end
 end

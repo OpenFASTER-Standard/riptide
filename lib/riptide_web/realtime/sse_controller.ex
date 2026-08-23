@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Realtime.SseController do
   use Phoenix.Controller
 
+  alias Riptide.Event
   alias Riptide.RDF.TurtleCodec
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
@@ -38,7 +39,7 @@ defmodule RiptideWeb.Realtime.SseController do
   end
 
   defp write_event(conn, event) do
-    {:ok, turtle} = TurtleCodec.encode(event.payload)
+    {:ok, turtle} = TurtleCodec.encode(Event.wire_payload(event))
     frame = "id: #{event.sequence}\ndata: #{String.replace(turtle, "\n", "\ndata: ")}\n\n"
     {:ok, conn} = Plug.Conn.chunk(conn, frame)
     conn

@@ -5,7 +5,9 @@ defmodule Riptide.Stream.RaMachineTest do
   alias Riptide.Stream.RaMachine
 
   defp append(state, stream_id) do
-    {new_state, event, []} = RaMachine.apply(%{}, {:append, Event.new(stream_id, RDF.Graph.new())}, state)
+    {new_state, event, []} =
+      RaMachine.apply(%{}, {:append, Event.new(stream_id, :replace, RDF.Graph.new())}, state)
+
     {new_state, event}
   end
 

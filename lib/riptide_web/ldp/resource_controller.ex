@@ -27,7 +27,7 @@ defmodule RiptideWeb.LDP.ResourceController do
     case TurtleCodec.decode(body) do
       {:ok, graph} ->
         StreamSupervisor.get_or_start(stream_id)
-        StreamServer.append(stream_id, Event.new(stream_id, graph, true))
+        StreamServer.append(stream_id, Event.new(stream_id, :replace, graph))
 
         send_resp(conn, 201, "")
 
@@ -40,7 +40,7 @@ defmodule RiptideWeb.LDP.ResourceController do
     stream_id = stream_id_for(path_segments)
 
     StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new(), true))
+    StreamServer.append(stream_id, Event.new(stream_id, :delete, RDF.Graph.new()))
 
     send_resp(conn, 204, "")
   end
@@ -64,22 +64,8 @@ defmodule RiptideWeb.LDP.ResourceController do
         removals: RDF.Graph.triples(removals_graph)
       }
 
-      # KNOWN LIMITATION: `removals` are currently non-functional. We apply
-      # the patch against an empty graph (rather than against the resource's
-      # currently-folded state) before storing it, so `Patch.apply/2`'s
-      # `RDF.Graph.delete(removals)` step always deletes from nothing — a
-      # no-op — and only `additions` ever survive into `delta_only_graph`.
-      # Even if we applied the patch against the real current state here,
-      # storing the *result* wouldn't help: `current_state/1`'s fold (below)
-      # only knows how to add a non-snapshot event's payload triples on top
-      # of the accumulator, never subtract, so a stored removal has no way
-      # to be represented or replayed. Fixing this needs an Event/payload
-      # redesign (e.g. Event carrying separate additions/removals fields
-      # instead of one payload graph) — out of scope for this task.
-      delta_only_graph = Patch.apply(RDF.Graph.new(), patch)
-
       StreamSupervisor.get_or_start(stream_id)
-      StreamServer.append(stream_id, Event.new(stream_id, delta_only_graph, false))
+      StreamServer.append(stream_id, Event.new(stream_id, :patch, patch))
 
       send_resp(conn, 200, "")
     else
@@ -98,16 +84,18 @@ defmodule RiptideWeb.LDP.ResourceController do
         child_stream_id = container_stream_id <> "/" <> child_id
 
         StreamSupervisor.get_or_start(child_stream_id)
-        StreamServer.append(child_stream_id, Event.new(child_stream_id, child_graph, true))
+        StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
 
-        containment_triple = {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
-        containment_graph = RDF.Graph.new() |> RDF.Graph.add(containment_triple)
+        containment_triple =
+          {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
+
+        containment_patch = %Patch{additions: [containment_triple], removals: []}
 
         StreamSupervisor.get_or_start(container_stream_id)
 
         StreamServer.append(
           container_stream_id,
-          Event.new(container_stream_id, containment_graph, false)
+          Event.new(container_stream_id, :patch, containment_patch)
         )
 
         location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
@@ -133,32 +121,41 @@ defmodule RiptideWeb.LDP.ResourceController do
         :not_found
 
       {:ok, events} ->
-        graph =
-          Enum.reduce(events, RDF.Graph.new(), fn
-            %Event{is_snapshot?: true, payload: payload}, _acc -> payload
-            %Event{is_snapshot?: false, payload: delta}, acc -> RDF.Graph.add(acc, RDF.Graph.triples(delta))
-          end)
+        last_event = List.last(events)
 
-        # A DELETE (Task spec: "appends an empty-graph snapshot event")
-        # leaves the stream with events but a folded graph with zero
-        # triples. Treat that the same as "never written to" — an empty
-        # visible state is exactly what DELETE is supposed to produce, and
-        # the controller test asserts GET returns 404 after DELETE, not
-        # 200 with an empty body.
-        #
-        # KNOWN LIMITATION: this makes a DELETEd resource indistinguishable
-        # from a resource that was explicitly PUT with a genuinely empty
-        # Turtle body (`""`) — both fold to a zero-triple graph and both
-        # read back as 404. The Event model has no tombstone / distinct-
-        # "explicitly empty" marker separate from "the payload graph has no
-        # triples," so there's no way to tell these two cases apart from
-        # the event log alone. Fixing this needs an Event/payload redesign
-        # (e.g. an explicit `deleted?` flag or tombstone event distinct
-        # from an empty-graph snapshot) — out of scope for this task.
-        if Enum.empty?(RDF.Graph.triples(graph)) do
-          :not_found
-        else
-          {:ok, graph}
+        case last_event do
+          %Event{operation: :delete} ->
+            :not_found
+
+          _ ->
+            graph =
+              Enum.reduce(events, RDF.Graph.new(), fn
+                %Event{operation: :replace, payload: payload}, _acc ->
+                  payload
+
+                %Event{operation: :delete}, _acc ->
+                  RDF.Graph.new()
+
+                %Event{operation: :patch, payload: %Patch{} = patch}, acc ->
+                  Patch.apply(acc, patch)
+              end)
+
+            # An empty result is only a visible ("found") state when the
+            # most recent event explicitly asserted the full state as-is
+            # (a :replace, i.e. PUT — including an intentionally-empty PUT
+            # body: that's bug 2, distinguishing PUT-empty from DELETE).
+            # An empty result produced by a :patch removing the last
+            # triple(s) is not itself a state-defining assertion — treat it
+            # the same as "never written to", consistent with how any other
+            # empty state has always read back here. This is what makes
+            # bug 1's fix (removals actually taking effect) observable via
+            # a GET: the triple is actually gone, so the resource reads as
+            # not found rather than merely losing its content.
+            if Enum.empty?(RDF.Graph.triples(graph)) and last_event.operation != :replace do
+              :not_found
+            else
+              {:ok, graph}
+            end
         end
     end
   end

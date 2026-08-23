@@ -22,7 +22,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       end)
 
     Process.sleep(300)
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     conn = Task.await(task, 3_000)
 
@@ -36,8 +36,15 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = Riptide.Stream.StreamServer.start_link({stream_id, retention: 1})
 
-    Riptide.Stream.StreamServer.append(stream_id, Riptide.Event.new(stream_id, RDF.Graph.new()))
-    Riptide.Stream.StreamServer.append(stream_id, Riptide.Event.new(stream_id, RDF.Graph.new()))
+    Riptide.Stream.StreamServer.append(
+      stream_id,
+      Riptide.Event.new(stream_id, :replace, RDF.Graph.new())
+    )
+
+    Riptide.Stream.StreamServer.append(
+      stream_id,
+      Riptide.Event.new(stream_id, :replace, RDF.Graph.new())
+    )
 
     conn =
       :get

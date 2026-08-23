@@ -3,6 +3,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   import Phoenix.ChannelTest
 
   alias Riptide.Event
+  alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.Realtime.{ReplicationChannel, Socket}
 
@@ -17,7 +18,8 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     {:ok, socket} = connect(Socket, %{})
 
-    {:ok, reply, _socket} = subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
+    {:ok, reply, _socket} =
+      subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
     assert reply == %{"backlog" => []}
   end
@@ -26,9 +28,10 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, socket} = connect(Socket, %{})
+
     {:ok, reply, _socket} =
       subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
@@ -39,13 +42,15 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = StreamServer.start_link({stream_id, retention: 1})
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, socket} = connect(Socket, %{})
 
     assert {:error, %{"oldestAvailable" => 2}} =
-             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
+             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+               "after" => 0
+             })
   end
 
   test "new appends after joining are pushed as replication_frame messages" do
@@ -54,10 +59,14 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     StreamSupervisor.get_or_start(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
+
     {:ok, _reply, _socket} =
       subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(
+      stream_id,
+      Event.new(stream_id, :patch, %Patch{additions: [], removals: []})
+    )
 
     assert_push "replication_frame", %{
       "cursor" => 1,
