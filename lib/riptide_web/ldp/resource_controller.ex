@@ -140,22 +140,13 @@ defmodule RiptideWeb.LDP.ResourceController do
                   Patch.apply(acc, patch)
               end)
 
-            # An empty result is only a visible ("found") state when the
-            # most recent event explicitly asserted the full state as-is
-            # (a :replace, i.e. PUT — including an intentionally-empty PUT
-            # body: that's bug 2, distinguishing PUT-empty from DELETE).
-            # An empty result produced by a :patch removing the last
-            # triple(s) is not itself a state-defining assertion — treat it
-            # the same as "never written to", consistent with how any other
-            # empty state has always read back here. This is what makes
-            # bug 1's fix (removals actually taking effect) observable via
-            # a GET: the triple is actually gone, so the resource reads as
-            # not found rather than merely losing its content.
-            if Enum.empty?(RDF.Graph.triples(graph)) and last_event.operation != :replace do
-              :not_found
-            else
-              {:ok, graph}
-            end
+            # An empty representation is not the same as not-found: only an
+            # explicit DELETE reads as not-found. A PUT with an empty body
+            # and a PATCH that removes the last remaining triple both leave
+            # the resource visible as 200 with an empty body — the fold
+            # above already reflects the real accumulated state either way,
+            # including a removal actually taking effect (bug 1's fix).
+            {:ok, graph}
         end
     end
   end
