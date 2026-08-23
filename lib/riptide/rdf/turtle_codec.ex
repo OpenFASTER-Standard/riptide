@@ -20,6 +20,12 @@ defmodule Riptide.RDF.TurtleCodec do
     # (rdf:/rdfs:/xsd:) for a graph with zero triples, which would make a
     # genuinely-empty resource body (e.g. after a PUT with an empty body)
     # indistinguishable from actual content on the wire.
+    #
+    # This is an INTENTIONAL, in-scope wire-behavior change for the
+    # empty-graph case only (it fixes the empty-PUT bug). Non-empty graphs are
+    # unchanged and remain byte-compatible with the previous output. Do not
+    # "restore" the prefix-only boilerplate for empty graphs — it is
+    # load-bearing, not an oversight.
     if Enum.empty?(RDF.Graph.triples(graph)) do
       {:ok, ""}
     else

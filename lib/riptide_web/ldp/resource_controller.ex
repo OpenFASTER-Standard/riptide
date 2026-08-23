@@ -120,6 +120,15 @@ defmodule RiptideWeb.LDP.ResourceController do
       {:ok, []} ->
         :not_found
 
+      # LDP streams use `:infinity` retention today, so `get_since/2` from
+      # cursor 0 can't currently return a gap. Handle it defensively anyway:
+      # if a future retention change trims the oldest events, a full-history
+      # fold from 0 can no longer be reconstructed, so the resource can't be
+      # faithfully rendered — treat it as not-found (404) rather than letting
+      # an unmatched `{:gap, _}` crash the request into a 500.
+      {:gap, _} ->
+        :not_found
+
       {:ok, events} ->
         last_event = List.last(events)
 

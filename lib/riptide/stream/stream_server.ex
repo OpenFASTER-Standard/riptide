@@ -9,6 +9,13 @@ defmodule Riptide.Stream.StreamServer do
   alias Riptide.RaCluster
   alias Riptide.Stream.RaMachine
 
+  # NOTE: `retention` is only applied when a stream's Ra cluster is first
+  # created. On any later call for an existing stream this just restarts the
+  # already-persisted server from disk (via `RaCluster.start_or_restart/2`),
+  # which keeps its original machine config — so passing a *different*
+  # `retention:` here for a stream that already exists is silently ignored.
+  # Changing a live stream's retention would need an explicit reconfiguration
+  # path (not in scope for Phase 1).
   @spec start_link({String.t(), keyword()}) :: {:ok, pid()} | {:error, term()}
   def start_link({stream_id, opts}) do
     retention = Keyword.get(opts, :retention, :infinity)
