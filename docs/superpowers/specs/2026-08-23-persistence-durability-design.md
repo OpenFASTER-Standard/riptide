@@ -158,3 +158,28 @@ Three things are explicitly deferred:
 - **Disk-isolation guidance for operators** is named as a requirement here but not yet written
   as actual deployment documentation — a real gap to close before this ships to a real operator,
   not before the code itself is written.
+- **No schema-versioning envelope on persisted `Event`/`Patch` terms.** `Ra` persists raw
+  `%Riptide.Event{}` (and the `%Patch{}` payloads inside them) as Erlang terms straight to disk,
+  with no version tag. A future change to `Event`'s struct shape — like the one this sub-project
+  itself made (dropping `is_snapshot?`, adding `operation`) — would make previously-persisted
+  production data unreadable at recovery time (a `FunctionClauseError`/`KeyError` in
+  `RaMachine.apply/3` or the query-fold path). This does not bite yet because no deployment has
+  persisted data across such a change, but before Riptide runs in a real deployment that must
+  survive an `Event`/`Patch` shape change, persisted terms need a versioned envelope (e.g.
+  `{:v1, event}`) plus an upgrade/migration path (Ra's own `ra_machine` versioning +
+  `apply/3`-time term upcasting is the natural mechanism). Deferred deliberately: building the
+  envelope now, before any second shape, would be speculative.
+- **Post-restart read-freshness window (not a durability gap).** `StreamServer.get_since/2` uses
+  `:ra.local_query`, a fast read of the local server's *already-applied* machine state that
+  deliberately skips consensus (reads don't need it). Acknowledged writes are durable before ack —
+  `Ra`'s WAL fsyncs (default `wal_sync_method` `datasync`, `default` write strategy) *before* the
+  `written` notification that lets the commit index advance and the caller get its reply, so
+  §3.3/§3.4's "durable before ack" holds for a genuine process/host crash. But in the brief window
+  right after a server restart, the recovered server has its full durable log on disk yet re-applies
+  it asynchronously, so a `local_query` issued in that window can momentarily observe a state caught
+  up to only part of the committed log. This is a read-freshness window, not data loss — the data is
+  on disk and committed the whole time, and the window self-heals in milliseconds as the server
+  catches up. Callers that need a linearizable read (e.g. asserting durability immediately after a
+  crash) should use `RaCluster.consistent_query/2`. Closing the window for the ordinary read path
+  (e.g. having `start_or_restart/2` block until the server is caught up before returning) is a small
+  future refinement, not needed for correctness under normal operation.

@@ -58,6 +58,22 @@ contention can collapse throughput by orders of magnitude (RabbitMQ's own publis
 13k→6k→300 msg/s as contention increased). High-volume streams need real disk isolation, not
 just "add more Ra groups on the same disk."
 
+**Honest limits (see design doc §6 for the full list):**
+
+- **Durability is real, before ack.** `Ra` fsyncs its WAL (`datasync`, `default` write strategy)
+  *before* acknowledging a write, so an acknowledged append survives a genuine process/host crash.
+  One subtlety worth knowing: `get_since/2` is a fast, possibly-stale local read, so in the brief
+  window right after a server restart it can momentarily reflect a not-yet-fully-re-applied log —
+  a read-freshness window, not data loss (the data is on disk and committed the whole time; use
+  `RaCluster.consistent_query/2` for a linearizable read). This was the root cause of the
+  crash-recovery test's earlier ~1-in-12 flake, now fixed by asserting durability via a consistent
+  read.
+- **No schema-versioning envelope on persisted `Event`/`Patch` terms.** `Ra` stores raw Erlang
+  terms; a future `Event` struct-shape change (like this sub-project's own `is_snapshot?` →
+  `operation` change) would make previously-persisted data unreadable. Fine today (no deployment
+  has data across such a change), but needs a versioned envelope + migration path before Riptide
+  runs somewhere with existing persisted data. Deferred deliberately.
+
 **Status**: shipped — see
 [PR #2](https://github.com/OpenFASTER-Standard/riptide/pull/2) (implementation) and
 [`docs/superpowers/specs/2026-08-23-persistence-durability-design.md`](docs/superpowers/specs/2026-08-23-persistence-durability-design.md)
