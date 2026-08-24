@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Configures main's branch protection to match the Docker/CI/CD sub-project's
 # design (docs/superpowers/specs/2026-08-24-docker-cicd-design.md §3.5):
-# require the ci.yml `test` job, require a PR (no direct pushes), no mandatory
+# require the ci.yml `test` and `docker-build-check` jobs, require a PR (no direct pushes), no mandatory
 # approval count (effectively solo-maintained today; every PR already goes
 # through this project's own AI-driven review process before merge).
 #
@@ -19,7 +19,7 @@ gh api \
 {
   "required_status_checks": {
     "strict": true,
-    "checks": [{"context": "test"}]
+    "checks": [{"context": "test"}, {"context": "docker-build-check"}]
   },
   "enforce_admins": false,
   "required_pull_request_reviews": {
