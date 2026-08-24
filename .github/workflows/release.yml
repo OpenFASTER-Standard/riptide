@@ -93,6 +93,8 @@ jobs:
     outputs:
       digest: ${{ steps.merge.outputs.digest }}
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
