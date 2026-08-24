@@ -101,7 +101,13 @@ defmodule Riptide.EventTest do
 
     test "decode/1 raises a clear error on an unrecognized version" do
       assert_raise RuntimeError, ~r/Unknown Event wire version: 99/, fn ->
-        Event.decode(%{v: 99, sequence: nil, stream_id: "s", operation: :replace, payload: RDF.Graph.new()})
+        Event.decode(%{
+          v: 99,
+          sequence: nil,
+          stream_id: "s",
+          operation: :replace,
+          payload: RDF.Graph.new()
+        })
       end
     end
   end
