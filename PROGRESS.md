@@ -192,7 +192,8 @@ sub-projects 1 and 2 did internally):
   terms so a future struct change doesn't break reading old data. Originally deferred in
   sub-project 1's design doc §6; pulled forward here because multi-node rolling deploys turn this
   from a someday-risk into a live one (nodes can briefly run different code versions mid-deploy).
-  Fully self-contained — doesn't depend on anything else in this sub-project. **Not yet designed.**
+  Fully self-contained — doesn't depend on anything else in this sub-project. **Shipped
+  2026-08-24** — see `docs/superpowers/specs/2026-08-24-phase-3a-schema-versioning-envelope-design.md`.
 - **Phase 3b — Real multi-node connectivity.** Re-enable distributed Erlang properly (not
   `RELEASE_DISTRIBUTION=none`), solve the stable-node-identity problem for real this time,
   `libcluster` + Kubernetes DNS discovery, prove N nodes actually see and stay connected to each
@@ -205,7 +206,7 @@ sub-projects 1 and 2 did internally):
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
   deferring sophisticated auto-rebalancing. **Not yet designed.**
 
-**Status**: phasing agreed with the operator; Phase 3a's own brainstorm/design has not started yet.
+**Status**: Phase 3a shipped. Phase 3b (real multi-node connectivity) not yet started.
 
 ## 4-5. Not yet started
 
