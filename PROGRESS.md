@@ -12,7 +12,7 @@ first place to check for current status, not a historical log.
 | # | Sub-project | Status |
 |---|---|---|
 | 1 | Persistence & durability | **Shipped** — see below |
-| 2 | Docker image + CI/CD | **In design** — see below |
+| 2 | Docker image + CI/CD | **Shipped** — see below |
 | 3 | Clustering / horizontal scale / HA | Not started (multi-node `Ra` replication belongs here — see §1) |
 | 4 | Security & multi-tenancy (auth, WAC/ACP, TLS) | Not started |
 | 5 | Observability & operability (metrics, logging, health probes) | Not started |
@@ -80,7 +80,19 @@ just "add more Ra groups on the same disk."
 (design). Companion regression test in the spec repo:
 [OpenFASTER-Standard/spec#3](https://github.com/OpenFASTER-Standard/spec/pull/3).
 
-## 2. Docker image + CI/CD — in design
+**Caveat added 2026-08-24, discovered during sub-project 2's Task 8 end-to-end verification**:
+the "durable before ack" claim above (and in the design doc's §6) holds for the write's own WAL
+entry, but *not* unconditionally for the whole system — a genuine process/host crash landing
+shortly after a stream's first write in a fresh process lifetime can leave that entry orphaned
+and unreachable (the data is still on disk, but the Ra server registration needed to find it
+again after a cold restart isn't durably flushed on the same timeline as the WAL fsync). Confirmed
+live and 100%-reproducible under tight timing against the real published `ghcr.io` image; not
+caught by the existing `ra_cluster_test.exs` crash-recovery test because that test kills the Ra
+server process within the same live BEAM node rather than exercising a real cold restart. Tracked
+as [OpenFASTER-Standard/riptide#6](https://github.com/OpenFASTER-Standard/riptide/issues/6); not
+yet fixed.
+
+## 2. Docker image + CI/CD — shipped
 
 **Scope for this sub-project**: a real, published `ghcr.io` Docker image (multi-stage `mix
 release` build, multi-arch amd64/arm64, non-root, SBOM + provenance attestations), a `ci.yml`
@@ -115,9 +127,22 @@ on `main`.
   `gh release create --generate-notes` is enough; the git tag itself is already the deliberate
   release decision.
 
-**Status**: design doc written and committed —
-[`docs/superpowers/specs/2026-08-24-docker-cicd-design.md`](docs/superpowers/specs/2026-08-24-docker-cicd-design.md).
-Approved; moving to implementation plan.
+**Status**: shipped — see
+[PR #3](https://github.com/OpenFASTER-Standard/riptide/pull/3) (main implementation: Dockerfile,
+`ci.yml`, `release.yml`, branch protection, README) and
+[`docs/superpowers/specs/2026-08-24-docker-cicd-design.md`](docs/superpowers/specs/2026-08-24-docker-cicd-design.md)
+(design, revised — see the design doc's own revision note for the QEMU→native-arm64 and
+CRITICAL-gate `ignore-unfixed` changes). End-to-end verification against real tag-triggered
+release runs (multi-arch build, OCI labels/annotations, SBOM, vulnerability scan, GitHub Release
+automation, durability-through-container-recreation) surfaced real bugs, fixed in
+[PR #4](https://github.com/OpenFASTER-Standard/riptide/pull/4) (invalid `trivy-action` tag pin)
+and [PR #5](https://github.com/OpenFASTER-Standard/riptide/pull/5) (QEMU-under-JIT segfaults on
+arm64 → native `ubuntu-24.04-arm` runners; a digest-merge `printf` bug; the CRITICAL gate missing
+`ignore-unfixed`; a missing `checkout` step; OCI labels/annotations dropped by the job
+restructuring). Final verification against `main` itself (commit `5801afe`) confirmed a clean,
+first-try, no-fixes-needed release run with everything above genuinely present on the published
+`ghcr.io` image. See §1's caveat above for one durability finding from that same verification
+pass — real, but in sub-project 1's code, not this sub-project's own deliverables.
 
 ## 3-5. Not yet started
 
