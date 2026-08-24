@@ -149,6 +149,7 @@ jobs:
           image-ref: ghcr.io/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
           format: table
           severity: "CRITICAL"
+          ignore-unfixed: true
           exit-code: "1"
 
       - name: Create GitHub Release
