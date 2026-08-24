@@ -10,9 +10,12 @@ defmodule Riptide.RDF.TurtleCodecTest do
     """
 
     assert {:ok, graph} = TurtleCodec.decode(turtle)
-    assert RDF.Graph.include?(graph, {RDF.iri("https://pod.example/alice"),
-                                       RDF.iri("https://pod.example/name"),
-                                       RDF.literal("Alice")})
+
+    assert RDF.Graph.include?(
+             graph,
+             {RDF.iri("https://pod.example/alice"), RDF.iri("https://pod.example/name"),
+              RDF.literal("Alice")}
+           )
   end
 
   test "decode/1 returns an error for invalid Turtle" do
