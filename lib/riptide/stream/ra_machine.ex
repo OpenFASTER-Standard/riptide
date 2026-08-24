@@ -10,9 +10,14 @@ defmodule Riptide.Stream.RaMachine do
 
   alias Riptide.Event
 
+  # `events` holds each event's *encoded* wire-form map (see `Riptide.Event.encode/1`),
+  # not a raw `%Event{}` struct — this is what actually gets persisted (both in Ra's
+  # command log and in machine-state snapshots), so it must stay in the versioned
+  # format regardless of whether this stream's Ra cluster ever triggers a snapshot.
+  # See Phase 3a design spec, §4.
   @type state :: %{
           next_sequence: pos_integer(),
-          events: [Event.t()],
+          events: [map()],
           retention: :infinity | pos_integer()
         }
 
@@ -22,9 +27,11 @@ defmodule Riptide.Stream.RaMachine do
   end
 
   @impl :ra_machine
-  def apply(meta, {:append, %Event{} = event}, state) do
+  def apply(meta, {:append, wire}, state) do
+    event = Event.decode(wire)
     stamped = Event.with_sequence(event, state.next_sequence)
-    {events, trimmed?} = trim(state.events ++ [stamped], state.retention)
+    stamped_wire = Event.encode(stamped)
+    {events, trimmed?} = trim(state.events ++ [stamped_wire], state.retention)
     new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
     {new_state, stamped, release_cursor_effects(trimmed?, meta, new_state)}
   end
@@ -67,7 +74,7 @@ defmodule Riptide.Stream.RaMachine do
     if oldest != nil and cursor < oldest - 1 do
       {:gap, oldest}
     else
-      {:ok, Enum.filter(state.events, &(&1.sequence > cursor))}
+      {:ok, state.events |> Enum.filter(&(&1.sequence > cursor)) |> Enum.map(&Event.decode/1)}
     end
   end
 

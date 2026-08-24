@@ -36,7 +36,7 @@ defmodule Riptide.Stream.StreamServer do
   @spec append(String.t(), Event.t()) :: Event.t()
   def append(stream_id, %Event{} = event) do
     server_id = RaCluster.server_id(stream_id)
-    stamped = RaCluster.process_command(server_id, {:append, event})
+    stamped = RaCluster.process_command(server_id, {:append, Event.encode(event)})
     Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> stream_id, {:new_event, stamped})
     stamped
   end
