@@ -50,4 +50,33 @@ defmodule Riptide.RDF.PatchTest do
 
     assert RDF.Graph.include?(result, {@alice, @name, RDF.literal("Alice")})
   end
+
+  describe "encode/1 and decode/1" do
+    test "round-trips a patch with both additions and removals" do
+      patch = %Patch{
+        additions: [{@alice, @name, RDF.literal("Alice")}],
+        removals: [{@alice, @name, RDF.literal("Bob")}]
+      }
+
+      assert Patch.decode(Patch.encode(patch)) == patch
+    end
+
+    test "round-trips a patch with empty additions and removals" do
+      patch = %Patch{additions: [], removals: []}
+
+      assert Patch.decode(Patch.encode(patch)) == patch
+    end
+
+    test "encode/1 produces a version-tagged map" do
+      patch = %Patch{additions: [], removals: []}
+
+      assert Patch.encode(patch) == %{v: 1, additions: [], removals: []}
+    end
+
+    test "decode/1 raises a clear error on an unrecognized version" do
+      assert_raise RuntimeError, ~r/Unknown Patch wire version: 99/, fn ->
+        Patch.decode(%{v: 99, additions: [], removals: []})
+      end
+    end
+  end
 end
