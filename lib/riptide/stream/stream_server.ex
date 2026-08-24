@@ -41,10 +41,20 @@ defmodule Riptide.Stream.StreamServer do
     stamped
   end
 
+  # Uses `consistent_query/2`, not `local_query/2` — see issue #8. At
+  # Riptide's current cluster size of 1, this closes a real post-restart
+  # staleness window (`local_query` could observe a not-yet-fully-replayed
+  # state right after a restart) essentially for free: `:ra` skips its
+  # peer-heartbeat step entirely when there are zero peers, so
+  # `consistent_query` costs no network round-trip here, only ~14% on an
+  # already-sub-4-microsecond local read (measured against the pinned `:ra`
+  # version). Revisit if/when a future Clustering/HA sub-project makes
+  # cluster size > 1 the norm, since the heartbeat-round-trip cost this
+  # avoided only exists once there are real peers to contact.
   @spec get_since(String.t(), non_neg_integer() | nil) ::
           {:ok, [Event.t()]} | {:gap, pos_integer() | nil}
   def get_since(stream_id, cursor) do
     server_id = RaCluster.server_id(stream_id)
-    RaCluster.local_query(server_id, &RaMachine.get_since(&1, cursor))
+    RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
   end
 end
