@@ -116,4 +116,16 @@ defmodule Riptide.RaClusterTest do
     assert String.starts_with?(Atom.to_string(name), "riptide_")
     assert RaCluster.server_id(stream_id) == RaCluster.server_id(stream_id)
   end
+
+  test "the started Ra system's data_dir and wal_data_dir are HOSTNAME-derived, not node()-derived",
+       %{stream_id: stream_id} do
+    machine = {:module, EchoMachine, %{}}
+    RaCluster.start_or_restart(stream_id, machine)
+
+    config = :ra_system.fetch(:default)
+    expected = RaCluster.data_dir()
+
+    assert config.data_dir == expected
+    assert config.wal_data_dir == expected
+  end
 end

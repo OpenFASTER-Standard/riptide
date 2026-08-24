@@ -165,12 +165,43 @@ defmodule Riptide.RaCluster do
   # entry point that needs the system stays self-sufficient.
   @spec ensure_system_started() :: :ok
   defp ensure_system_started do
-    case :ra_system.start_default() do
+    dir = data_dir()
+    File.mkdir_p!(dir)
+
+    config =
+      :ra_system.default_config()
+      |> Map.put(:data_dir, dir)
+      |> Map.put(:wal_data_dir, dir)
+
+    case :ra_system.start(config) do
       {:ok, _pid} -> :ok
       {:ok, _pid, _info} -> :ok
       {:error, {:already_started, _pid}} -> :ok
       {:error, reason} -> raise "Failed to start the default Ra system: #{inspect(reason)}"
     end
+  end
+
+  # Stable across pod restarts/rescheduling even though Erlang distribution identity
+  # (node()) is now IP-based and NOT stable — see Phase 3b design spec §1/§3.
+  # Kubernetes sets a StatefulSet pod's HOSTNAME to its stable pod name (e.g.
+  # "riptide-0"); outside Kubernetes (local dev, docker-compose, tests) HOSTNAME
+  # still resolves to something stable per-container/per-host, so this doesn't
+  # regress non-clustered environments. Both `data_dir` and `wal_data_dir` are
+  # pinned here — `:ra`'s own `default_config/0` would otherwise leave
+  # `wal_data_dir` defaulted to the OLD node()-derived directory
+  # (`ra_system.erl`'s `WalDataDir = application:get_env(ra, wal_data_dir,
+  # DataDir)`), silently splitting a stream's WAL from the rest of its data
+  # across two different, inconsistently-keyed directories.
+  #
+  # `to_string/1` on the configured base handles both shapes `:ra, :data_dir`
+  # can arrive in: a plain binary (the `File.cwd!()` fallback) or a charlist
+  # (config/runtime.exs stores `RIPTIDE_RA_DATA_DIR` as a charlist, since it's
+  # passed straight into Erlang code that expects `file:filename()`) — `Path.join/2`
+  # raises on a charlist, unlike Erlang's more permissive `filename:join/2`.
+  @spec data_dir() :: String.t()
+  def data_dir do
+    base = Application.get_env(:ra, :data_dir, File.cwd!()) |> to_string()
+    Path.join(base, System.get_env("HOSTNAME", "nonode"))
   end
 
   @spec server_alive?(atom()) :: boolean()
