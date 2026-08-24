@@ -1,4 +1,10 @@
 defmodule RiptideWeb.Realtime.ReplicationChannel do
+  @moduledoc """
+  WebSocket replication transport for StreamLD's `binding-websocket` — joins
+  `"replication:<stream_id>"` with an `"after"` cursor, replies with a backlog,
+  and pushes further events as `"replication_frame"` messages. Mirrors the SSE
+  controller's cursor/gap semantics over Phoenix Channels instead of SSE.
+  """
   use Phoenix.Channel
 
   alias Riptide.Event

@@ -130,33 +130,38 @@ defmodule RiptideWeb.LDP.ResourceController do
         :not_found
 
       {:ok, events} ->
-        last_event = List.last(events)
-
-        case last_event do
-          %Event{operation: :delete} ->
-            :not_found
-
-          _ ->
-            graph =
-              Enum.reduce(events, RDF.Graph.new(), fn
-                %Event{operation: :replace, payload: payload}, _acc ->
-                  payload
-
-                %Event{operation: :delete}, _acc ->
-                  RDF.Graph.new()
-
-                %Event{operation: :patch, payload: %Patch{} = patch}, acc ->
-                  Patch.apply(acc, patch)
-              end)
-
-            # An empty representation is not the same as not-found: only an
-            # explicit DELETE reads as not-found. A PUT with an empty body
-            # and a PATCH that removes the last remaining triple both leave
-            # the resource visible as 200 with an empty body — the fold
-            # above already reflects the real accumulated state either way,
-            # including a removal actually taking effect (bug 1's fix).
-            {:ok, graph}
-        end
+        resolve_state(events)
     end
+  end
+
+  defp resolve_state(events) do
+    last_event = List.last(events)
+
+    case last_event do
+      %Event{operation: :delete} ->
+        :not_found
+
+      _ ->
+        # An empty representation is not the same as not-found: only an
+        # explicit DELETE reads as not-found. A PUT with an empty body
+        # and a PATCH that removes the last remaining triple both leave
+        # the resource visible as 200 with an empty body — the fold
+        # below already reflects the real accumulated state either way,
+        # including a removal actually taking effect (bug 1's fix).
+        {:ok, fold_events(events)}
+    end
+  end
+
+  defp fold_events(events) do
+    Enum.reduce(events, RDF.Graph.new(), fn
+      %Event{operation: :replace, payload: payload}, _acc ->
+        payload
+
+      %Event{operation: :delete}, _acc ->
+        RDF.Graph.new()
+
+      %Event{operation: :patch, payload: %Patch{} = patch}, acc ->
+        Patch.apply(acc, patch)
+    end)
   end
 end

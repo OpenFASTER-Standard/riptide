@@ -46,19 +46,23 @@ defmodule Riptide.RaCluster do
         if server_alive?(name) do
           server_id
         else
-          cluster_name = uid_for(stream_id) <> "_cluster"
+          start_fresh_cluster(stream_id, machine, server_id, name)
+        end
+    end
+  end
 
-          case :ra.start_cluster(@system, cluster_name, machine, [server_id]) do
-            {:ok, [_server_id], []} ->
-              server_id
+  defp start_fresh_cluster(stream_id, machine, server_id, name) do
+    cluster_name = uid_for(stream_id) <> "_cluster"
 
-            {:error, reason} ->
-              if server_alive?(name) do
-                server_id
-              else
-                raise "Failed to start or restart Ra server #{inspect(server_id)}: #{inspect(reason)}"
-              end
-          end
+    case :ra.start_cluster(@system, cluster_name, machine, [server_id]) do
+      {:ok, [_server_id], []} ->
+        server_id
+
+      {:error, reason} ->
+        if server_alive?(name) do
+          server_id
+        else
+          raise "Failed to start or restart Ra server #{inspect(server_id)}: #{inspect(reason)}"
         end
     end
   end

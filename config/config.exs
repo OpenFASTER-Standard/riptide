@@ -28,12 +28,14 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
-# `:ra`'s data_dir is passed straight into Erlang code (`dets:open_file/2`
-# among others) that expects a `file:filename()` charlist, not an Elixir
-# binary — passing a binary here compiles fine but blows up at runtime with
-# a `dets:open_file` badarg the first time a Ra system tries to start.
-config :ra,
-  data_dir: System.get_env("RIPTIDE_RA_DATA_DIR", "priv/ra_data") |> String.to_charlist()
+# `:ra`'s data_dir is env-var-driven (`RIPTIDE_RA_DATA_DIR`, see
+# config/runtime.exs) so it must NOT be set here: config.exs is compile-time
+# config, baked into a `mix release` at build time, so reading the env var
+# here would bake in whatever (or nothing) was set in the *builder* container
+# rather than the value the *runtime* container actually sets — silently
+# ignoring the `-e RIPTIDE_RA_DATA_DIR=/data` convention documented on the
+# Dockerfile's `VOLUME ["/data"]`. See config/runtime.exs for the real
+# config, and its comment for the `dets:open_file/2` charlist requirement.
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.

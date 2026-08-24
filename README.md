@@ -47,3 +47,48 @@ Riptide exposes that event log through three HTTP/WS surfaces:
   subsequent events are pushed as `"replication_frame"` messages. A cursor outside the
   retention window is rejected at join time with `{"oldestAvailable": <seq>}`, matching the SSE
   gap-signal shape.
+
+## Running via Docker
+
+A published image is available at `ghcr.io/openfaster-standard/riptide` — see the
+[Releases](https://github.com/OpenFASTER-Standard/riptide/releases) page for available tags.
+
+Riptide's durability model (see `PROGRESS.md`) depends on its Ra data directory surviving
+container restarts — always mount a volume at `/data`, or you'll silently lose every stream on
+container recreation:
+
+```bash
+docker volume create riptide_data
+docker run -d \
+  -p 4000:4000 \
+  -e SECRET_KEY_BASE="$(openssl rand -base64 48)" \
+  -v riptide_data:/data \
+  ghcr.io/openfaster-standard/riptide:latest
+```
+
+Or with `docker-compose.yml` (included in this repo):
+
+```bash
+export SECRET_KEY_BASE=$(openssl rand -base64 48)
+docker compose up
+```
+
+`SECRET_KEY_BASE` is required (Phoenix uses it to sign/encrypt cookies and tokens); generate one
+with `openssl rand -base64 48` or `mix phx.gen.secret`. `PHX_HOST` defaults to `localhost` in the
+compose file — set it to your real hostname for anything beyond local testing.
+
+## Releasing
+
+Riptide uses plain [semver](https://semver.org/) tags (`vMAJOR.MINOR.PATCH`, optionally with a
+`-rc1`-style pre-release suffix). Pushing a tag matching `v*.*.*` to `main` triggers
+`.github/workflows/release.yml`, which builds and publishes a multi-arch
+(`linux/amd64`/`linux/arm64`) image to `ghcr.io/openfaster-standard/riptide`, scans it for
+vulnerabilities, attaches an SBOM, and creates a GitHub Release with auto-generated notes.
+
+Version bumps are a judgment call made when tagging, not automated:
+- **major** — breaking StreamLD protocol or LDP API changes
+- **minor** — new capability, backward-compatible
+- **patch** — fixes, no behavior change
+
+A "clean" tag (`v0.2.0`) also gets the `latest` image tag; a pre-release tag (`v0.2.0-rc1`) does
+not.
