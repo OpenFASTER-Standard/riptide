@@ -1,0 +1,14 @@
+_build/
+deps/
+.git/
+.gitignore
+.github/
+.superpowers/
+docs/
+test/
+priv/ra_data/
+priv/ra_data_test/
+erl_crash.dump
+*.md
+.formatter.exs
+.credo.exs

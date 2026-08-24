@@ -1,0 +1,14 @@
+services:
+  riptide:
+    build: .
+    image: ghcr.io/openfaster-standard/riptide:latest
+    ports:
+      - "4000:4000"
+    environment:
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?Set SECRET_KEY_BASE, e.g. via: openssl rand -base64 48}
+      PHX_HOST: ${PHX_HOST:-localhost}
+    volumes:
+      - riptide_data:/data
+
+volumes:
+  riptide_data:
