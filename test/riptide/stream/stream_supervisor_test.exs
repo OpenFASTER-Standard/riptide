@@ -1,7 +1,8 @@
 defmodule Riptide.Stream.StreamSupervisorTest do
   use ExUnit.Case, async: true
 
-  alias Riptide.Stream.StreamSupervisor
+  alias Riptide.Event
+  alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
   test "get_or_start/1 starts a new process for an unseen stream id" do
     stream_id = "stream-#{System.unique_integer([:positive])}"
@@ -30,12 +31,12 @@ defmodule Riptide.Stream.StreamSupervisorTest do
     StreamSupervisor.get_or_start(stream_a)
     StreamSupervisor.get_or_start(stream_b)
 
-    Riptide.Stream.StreamServer.append(
+    StreamServer.append(
       stream_a,
-      Riptide.Event.new(stream_a, :replace, RDF.Graph.new())
+      Event.new(stream_a, :replace, RDF.Graph.new())
     )
 
-    {:ok, events_b} = Riptide.Stream.StreamServer.get_since(stream_b, 0)
+    {:ok, events_b} = StreamServer.get_since(stream_b, 0)
     assert events_b == []
   end
 end
