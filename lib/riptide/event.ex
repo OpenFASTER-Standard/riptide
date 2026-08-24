@@ -44,6 +44,35 @@ defmodule Riptide.Event do
     %{event | sequence: sequence}
   end
 
+  @spec encode(t()) :: map()
+  def encode(%__MODULE__{} = event) do
+    %{
+      v: 1,
+      sequence: event.sequence,
+      stream_id: event.stream_id,
+      operation: event.operation,
+      payload: encode_payload(event.operation, event.payload)
+    }
+  end
+
+  defp encode_payload(:patch, %Patch{} = payload), do: Patch.encode(payload)
+  defp encode_payload(_operation, payload), do: payload
+
+  @spec decode(map()) :: t()
+  def decode(%{v: 1} = wire) do
+    %__MODULE__{
+      sequence: wire.sequence,
+      stream_id: wire.stream_id,
+      operation: wire.operation,
+      payload: decode_payload(wire.operation, wire.payload)
+    }
+  end
+
+  def decode(%{v: unknown}), do: raise("Unknown Event wire version: #{inspect(unknown)}")
+
+  defp decode_payload(:patch, payload), do: Patch.decode(payload)
+  defp decode_payload(_operation, payload), do: payload
+
   @spec wire_snapshot?(t()) :: boolean()
   def wire_snapshot?(%__MODULE__{operation: :replace}), do: true
   def wire_snapshot?(%__MODULE__{operation: :delete}), do: true
