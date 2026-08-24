@@ -41,6 +41,24 @@ if config_env() != :test do
     data_dir: System.get_env("RIPTIDE_RA_DATA_DIR", "priv/ra_data") |> String.to_charlist()
 end
 
+# Only present when the k8s/statefulset.yaml pod spec's Downward API sets it —
+# everywhere else (local dev, docker-compose, tests) libcluster stays configured
+# with an empty topology list, making Cluster.Supervisor an inert no-op (see
+# Riptide.Application). See Phase 3b design spec §4.
+if System.get_env("POD_IP") do
+  config :libcluster,
+    topologies: [
+      riptide: [
+        strategy: Cluster.Strategy.Kubernetes.DNS,
+        config: [
+          service: System.get_env("RIPTIDE_HEADLESS_SERVICE", "riptide-headless"),
+          application_name: "riptide",
+          polling_interval: 5_000
+        ]
+      ]
+    ]
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

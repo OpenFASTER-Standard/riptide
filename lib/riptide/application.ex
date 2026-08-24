@@ -9,6 +9,8 @@ defmodule Riptide.Application do
   def start(_type, _args) do
     children = [
       {Phoenix.PubSub, name: Riptide.PubSub},
+      {Cluster.Supervisor,
+       [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]},
       # Start a worker by calling: Riptide.Worker.start_link(arg)
       # {Riptide.Worker, arg},
       # Start to serve requests, typically the last entry
