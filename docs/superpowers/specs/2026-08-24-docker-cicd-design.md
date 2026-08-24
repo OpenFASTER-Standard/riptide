@@ -3,6 +3,19 @@
 **Status:** Approved 2026-08-24. Sub-project 2 of Riptide's production-readiness roadmap (see
 `PROGRESS.md`).
 
+**Revised 2026-08-24**: §2's "Multi-arch strategy" decision (Buildx + QEMU emulation) and §3.4's
+`release.yml` description are now factually wrong and superseded — see the notes inline in both
+sections. Task 8 end-to-end verification found that QEMU user-mode emulation of `linux/arm64`
+reproducibly segfaults while cross-building this image (`mix deps.compile` crashes with `qemu:
+uncaught target signal 11`), because BEAM's JIT generates native machine code at compile/runtime
+and QEMU's user-mode emulation of freshly-generated, self-modifying target-arch code is a known
+weak spot for JIT/compiled-language toolchains — not a QEMU version quirk to pin around. The
+pipeline now builds each platform **natively** instead: `linux/amd64` on `ubuntu-latest`,
+`linux/arm64` on `ubuntu-24.04-arm` (a free GitHub-hosted runner for public repos), merged into
+one multi-arch manifest list via `docker buildx imagetools create` — Docker's own documented
+"distribute build across multiple runners" pattern for exactly this scenario. §6's "Native arm64
+runners" deferred-work bullet is removed accordingly: it's implemented now, not deferred.
+
 ## 1. Context and motivation
 
 Riptide has no Dockerfile, no CI, and no repo-specific `CLAUDE.md` today — every `mix test` run
@@ -47,18 +60,33 @@ implicitly a later concern once there's an image worth deploying.
 - **Workflow structure: two files, `ci.yml` and `release.yml`**, not one workflow with
   conditional jobs — clean separation between "is this change good" (every push/PR) and "ship a
   release" (tag-triggered only).
-- **Multi-arch strategy: Docker Buildx + QEMU emulation** on standard GitHub-hosted runners.
-  Native arm64 runners would build faster but depend on this org's GitHub plan/runner
-  availability — worth revisiting later if release build times become a real problem; QEMU
-  emulation is the portable, dependency-free default.
+- **Multi-arch strategy: native per-platform runners, merged via `docker buildx imagetools
+  create`.** *(Revised 2026-08-24 — originally specified as Buildx + QEMU emulation; see the
+  revision note at the top of this doc.)* `linux/amd64` builds on `ubuntu-latest`, `linux/arm64`
+  builds on `ubuntu-24.04-arm` (a free GitHub-hosted runner for public repos, so no dependency on
+  paid runner minutes), each pushed by digest, then merged into one multi-arch manifest list.
+  QEMU emulation was the original default on the reasoning that it's "portable,
+  dependency-free" and native runners were "worth revisiting later if release build times become
+  a real problem" — that framing assumed the only downside was speed. In practice, QEMU
+  user-mode emulation of `linux/arm64` reproducibly segfaults while compiling this app (BEAM's
+  JIT generates native machine code at runtime; QEMU's emulation of freshly-generated, target-arch
+  machine code is a known weak spot for JIT/compiled-language toolchains) — not a "someday"
+  performance concern but an outright correctness failure discovered the first time the pipeline
+  was actually run end to end (Task 8). Native runners aren't just faster here, they're the only
+  approach that works.
 - **No automated changelog/semver tooling.** Releases use `gh release create --generate-notes`
   (auto-generated from merged PRs) rather than a hand-maintained `CHANGELOG.md` or a
   conventional-commits-driven semantic-release tool. Both were considered; both are ceremony this
   project doesn't need while releases are cut manually and infrequently — the tag itself already
   *is* the deliberate release decision.
-- **Vulnerability scan gate: fail only on CRITICAL severity.** HIGH-and-below findings are
-  surfaced (uploaded to GitHub code scanning) but non-blocking. A hard fail on any HIGH finding
-  would make releases hostage to upstream base-image CVEs with no available fix.
+- **Vulnerability scan gate: fail only on CRITICAL severity with an available fix
+  (`ignore-unfixed: true`).** HIGH-and-below findings are surfaced (uploaded to GitHub code
+  scanning) but non-blocking. A hard fail on any HIGH finding would make releases hostage to
+  upstream base-image CVEs with no available fix — and the same reasoning turned out to apply one
+  level up too: Task 8 end-to-end verification hit exactly this at CRITICAL severity (a
+  Debian-`will_not_fix` `zlib1g` CVE with no fix ever coming), which without `ignore-unfixed`
+  would have permanently blocked every release. `ignore-unfixed` is scoped to the blocking gate
+  only; the non-blocking report-everything scan still surfaces unfixed findings for visibility.
 - **Branch protection: require passing CI + PR-before-merge; no mandatory approval count.** This
   is effectively a solo-maintainer project today, and every PR already goes through this
   project's own AI-driven code-review process before merge. A required-external-reviewer setting
@@ -117,21 +145,37 @@ task, not bundled into this sub-project.
 
 ### 3.4 Release workflow (`release.yml`)
 
-Triggers only on tags matching `v*.*.*`. Single `build-and-publish` job (each step depends on the
-last, so splitting into multiple jobs would only add coordination overhead):
+*(Revised 2026-08-24 — originally specified as a single `build-and-publish` job using Buildx +
+QEMU emulation; see the revision note at the top of this doc. QEMU emulation of `linux/arm64`
+reproducibly segfaulted during `mix deps.compile`, so this now builds each platform natively and
+merges the result, which needs multiple jobs to fan out across two differently-architected
+runners.)*
 
-1. Buildx + QEMU setup; login to `ghcr.io` using the automatic `GITHUB_TOKEN`.
-2. `docker/metadata-action` derives image tags from the git tag: the exact semver (e.g. `0.2.0`)
-   plus `latest` — but `latest` only for a clean tag like `v0.2.0`, never for a pre-release tag
-   like `v0.2.0-rc1` (standard `metadata-action` semver-pattern behavior, not custom logic).
-3. `docker/build-push-action` builds `linux/amd64,linux/arm64` and pushes, with BuildKit's native
-   SBOM and provenance attestations enabled (`sbom: true`, `provenance: true`) — a first-class
-   Buildx feature, not a separate tool to wire in and maintain.
-4. `aquasecurity/trivy-action` scans the published image; results upload to GitHub's code-scanning
-   tab; the job fails only on CRITICAL-severity findings (HIGH-and-below are surfaced,
-   non-blocking).
-5. `gh release create --generate-notes` creates a GitHub Release from the tag, with
-   auto-generated notes from merged PRs since the last tag.
+Triggers only on tags matching `v*.*.*`. Three jobs:
+
+1. **`meta`**: lowercases the image name (`ghcr.io` requires it; this org/repo has mixed case)
+   and runs `docker/metadata-action` once, up front, deriving tags from the git tag — the exact
+   semver (e.g. `0.2.0`) plus `latest`, but `latest` only for a clean tag like `v0.2.0`, never a
+   pre-release tag like `v0.2.0-rc1` (standard `metadata-action` semver-pattern behavior) — plus
+   the OCI `labels`/`annotations` values, exposed as job outputs so both jobs below can reuse
+   them without re-deriving.
+2. **`build`** (matrix: `linux/amd64` on `ubuntu-latest`, `linux/arm64` on `ubuntu-24.04-arm`):
+   each leg logs into `ghcr.io`, then `docker/build-push-action` builds and pushes *that
+   platform only*, by digest (`push-by-digest=true`), with `labels:` from `meta` baked into that
+   platform's image config and BuildKit's native SBOM/provenance attestations enabled (`sbom:
+   true`, `provenance: true` — a first-class Buildx feature, not a separate tool). Each leg
+   uploads its digest as a build artifact for the next job to pick up.
+3. **`publish`**: downloads both digests, merges them into one multi-arch manifest list via
+   `docker buildx imagetools create` (tagged with `meta`'s tags, annotated at the index level
+   with `meta`'s OCI annotations — `imagetools create` doesn't inherit per-platform image-config
+   labels, so the same `org.opencontainers.image.*` values are re-attached here as manifest-list
+   annotations instead). Then: `aquasecurity/trivy-action` scans the merged image, results upload
+   to GitHub's code-scanning tab, and the job fails only on CRITICAL-severity findings with an
+   available fix (`ignore-unfixed: true` — HIGH-and-below are surfaced non-blocking, and a
+   CRITICAL finding with no fix available, e.g. Debian-`will_not_fix` CVEs, is surfaced but
+   doesn't block; see §2's blocking-gate rationale). Finally, `gh release create
+   --generate-notes` creates a GitHub Release from the tag, with auto-generated notes from merged
+   PRs since the last tag.
 
 ### 3.5 Branch protection (repo setting, not a workflow file)
 
@@ -175,8 +219,5 @@ Once implemented, the pipeline needs to be exercised end-to-end for real, not ju
   it actually runs in production is a separate, later concern.
 - **Dialyzer** is a real, valuable addition, deliberately not bundled here (see §2) — a good
   candidate for its own small follow-up once there's bandwidth to triage its first-run findings.
-- **Native arm64 runners** (instead of QEMU emulation) — worth revisiting if multi-arch release
-  build times become a real problem; not pursued now since it adds a dependency on this org's
-  GitHub plan/runner availability that QEMU doesn't have.
 - **Automated semver/changelog tooling** (conventional commits, semantic-release) — deliberately
   declined for now (see §2); revisit only if manual tagging becomes a real bottleneck.

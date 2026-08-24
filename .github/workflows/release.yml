@@ -11,10 +11,18 @@ permissions:
   security-events: write
 
 jobs:
-  image-name:
+  # Computed once, up front, so both the per-platform `build` jobs (which need
+  # `labels:` baked into each platform's image config) and `publish` (which
+  # needs `tags`/`annotations`/`version` for the merged manifest list) can
+  # consume the same values without re-deriving them.
+  meta:
     runs-on: ubuntu-latest
     outputs:
-      name: ${{ steps.set.outputs.name }}
+      image_name: ${{ steps.set.outputs.name }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
       # ghcr.io requires a lowercase image path; this org/repo
       # (OpenFASTER-Standard/riptide) has mixed case, so `github.repository`
@@ -22,6 +30,16 @@ jobs:
       - name: Lowercase image name
         id: set
         run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ steps.set.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
   # Built per-platform on the runner that's *natively* that architecture,
   # rather than cross-building both platforms via QEMU emulation on a single
@@ -34,7 +52,7 @@ jobs:
   # runner for public repos, so this avoids emulation entirely instead of
   # working around a specific QEMU version's bug.
   build:
-    needs: image-name
+    needs: meta
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +63,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     env:
-      IMAGE_NAME: ${{ needs.image-name.outputs.name }}
+      IMAGE_NAME: ${{ needs.meta.outputs.image_name }}
     steps:
       - uses: actions/checkout@v7
 
@@ -67,6 +85,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          labels: ${{ needs.meta.outputs.labels }}
           sbom: true
           provenance: true
           outputs: type=image,name=ghcr.io/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -86,10 +105,10 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [image-name, build]
+    needs: [meta, build]
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: ${{ needs.image-name.outputs.name }}
+      IMAGE_NAME: ${{ needs.meta.outputs.image_name }}
     outputs:
       digest: ${{ steps.merge.outputs.digest }}
     steps:
@@ -111,24 +130,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-
+      # `imagetools create` only merges digests into a manifest list; it
+      # doesn't inherit the `labels:` baked into each platform image's config
+      # by the `build` job above. OCI annotations are the manifest-list-level
+      # equivalent, so re-attach the same org.opencontainers.image.* values
+      # there too (as "index:"-scoped annotations — the only annotation type
+      # `imagetools create` currently supports; "manifest:"-scoped is
+      # rejected as of buildx v0.36, confirmed locally with --dry-run) so
+      # they're inspectable directly on the published multi-arch manifest,
+      # not just buried in each platform's image config.
       - name: Create manifest list and push
         id: merge
         working-directory: /tmp/digests
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+          ANNOTATIONS: ${{ needs.meta.outputs.annotations }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "ghcr.io/$IMAGE_NAME@sha256:%s " *)
-          digest=$(docker buildx imagetools inspect "ghcr.io/$IMAGE_NAME:${{ steps.meta.outputs.version }}" --format '{{json .Manifest}}' | jq -r '.digest')
+          args=()
+
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=(-t "$t")
+          done <<< "$TAGS"
+
+          while IFS= read -r a; do
+            [ -n "$a" ] && args+=(--annotation "index:${a#manifest:}")
+          done <<< "$ANNOTATIONS"
+
+          for f in *; do
+            args+=("ghcr.io/$IMAGE_NAME@sha256:$f")
+          done
+
+          docker buildx imagetools create "${args[@]}"
+
+          digest=$(docker buildx imagetools inspect "ghcr.io/$IMAGE_NAME:$VERSION" --format '{{json .Manifest}}' | jq -r '.digest')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Scan image for vulnerabilities (report all, non-blocking)
