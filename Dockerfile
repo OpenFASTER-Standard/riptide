@@ -16,6 +16,7 @@ RUN mix deps.compile
 COPY config config
 COPY lib lib
 COPY priv priv
+COPY rel rel
 
 RUN mix compile
 RUN mix release
