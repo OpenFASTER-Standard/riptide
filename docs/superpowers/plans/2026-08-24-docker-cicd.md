@@ -1,5 +1,11 @@
 # Riptide Docker Image & CI/CD Implementation Plan
 
+> **Note:** this plan is a frozen execution record of what was originally designed — it still
+> describes the QEMU-based multi-arch approach that was later found to be non-functional (BEAM's
+> JIT segfaults under QEMU emulation) and replaced with native per-architecture runners during
+> implementation. See `docs/superpowers/specs/2026-08-24-docker-cicd-design.md`'s revision note
+> for what actually shipped. This plan's historical content below is left as-is.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give Riptide a real, published, multi-arch Docker image on `ghcr.io`, a CI workflow that gates every change, a tag-triggered release workflow that builds/scans/publishes that image, and the branch-protection settings that make `main` trustworthy.

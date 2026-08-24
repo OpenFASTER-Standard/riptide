@@ -142,7 +142,10 @@ on `main`.
 CRITICAL-gate `ignore-unfixed` changes). End-to-end verification against real tag-triggered
 release runs (multi-arch build, OCI labels/annotations, SBOM, vulnerability scan, GitHub Release
 automation, durability-through-container-recreation) surfaced real bugs, fixed in
-[PR #4](https://github.com/OpenFASTER-Standard/riptide/pull/4) (invalid `trivy-action` tag pin)
+[PR #4](https://github.com/OpenFASTER-Standard/riptide/pull/4) (invalid `trivy-action` tag pin —
+shows as "Closed" rather than "Merged" on GitHub because a transient API error interrupted the
+merge response after the squash commit had already landed on `main`; the content is genuinely
+there, only the PR's own state label is misleading)
 and [PR #5](https://github.com/OpenFASTER-Standard/riptide/pull/5) (QEMU-under-JIT segfaults on
 arm64 → native `ubuntu-24.04-arm` runners; a digest-merge `printf` bug; the CRITICAL gate missing
 `ignore-unfixed`; a missing `checkout` step; OCI labels/annotations dropped by the job
