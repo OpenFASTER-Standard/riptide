@@ -125,7 +125,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/%s@sha256:%s ' "$IMAGE_NAME" *)
+            $(printf "ghcr.io/$IMAGE_NAME@sha256:%s " *)
           digest=$(docker buildx imagetools inspect "ghcr.io/$IMAGE_NAME:${{ steps.meta.outputs.version }}" --format '{{json .Manifest}}' | jq -r '.digest')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
