@@ -24,41 +24,66 @@ defmodule Riptide.RaCluster do
     server_id = server_id(stream_id)
     {name, _node} = server_id
 
-    case :ra.restart_server(@system, server_id) do
-      :ok ->
-        server_id
-
-      {:error, _reason} ->
-        # `:ra.restart_server/2` fails with a variety of shapes here — a clean
-        # `{:error, {:already_started, pid}}` if it notices the server is
-        # already up, but also a `{:error, {:shutdown, {:failed_to_start_child,
-        # Name, {:already_started, pid}}}}` when it loses a race against Ra's
-        # *own* automatic restart of a crashed server (the per-server
-        # `ra_server_sup` supervises its `ra_server_proc` worker with a
-        # restart strategy that already brings a merely-crashed process back
-        # up on its own — confirmed empirically: killing the server's pid and
-        # immediately calling this function reliably hits this branch with
-        # the process already alive again under the same name, well before
-        # any explicit restart/start_cluster call could have run). Matching
-        # every error shape `:ra` might use for "it's already running" is
-        # fragile, so instead we check the one thing that actually matters:
-        # is a process registered under this server's name right now?
-        if server_alive?(name) do
-          server_id
-        else
-          start_fresh_cluster(stream_id, machine, server_id, name)
-        end
+    # Fast path: a process is already registered and alive under this
+    # server's deterministic name — nothing to (re)start. This only ever
+    # matters for a live-in-this-BEAM race (e.g. Ra's own `ra_server_sup`
+    # restart strategy already brought a merely-crashed process back up
+    # before this function got a chance to run), never for a genuine cold
+    # restart (a fresh BEAM VM starts with no such process registered).
+    if server_alive?(name) do
+      server_id
+    else
+      start_new_cluster(server_id, name, stream_id, machine)
     end
   end
 
-  defp start_fresh_cluster(stream_id, machine, server_id, name) do
-    cluster_name = uid_for(stream_id) <> "_cluster"
+  # `:ra.start_cluster/2`, unlike `:ra.start_server/2`, also triggers a
+  # leader election after starting the local server — required for a
+  # genuinely brand-new server (one with no prior Raft term/log on disk),
+  # which otherwise sits idle waiting for a leader's heartbeat forever
+  # (confirmed empirically: `:ra.start_server/2` alone never became ready,
+  # even after 10s, for a fresh uid). Passing our own already-computed
+  # deterministic `uid` (rather than letting `:ra` mint a random one, as the
+  # old `start_fresh_cluster/4` did via the legacy `:ra.start_cluster/4`
+  # API) is what makes this idempotent: calling it again for the same
+  # `stream_id` — whether because the local process just isn't running yet,
+  # or because a real crash left `:ra`'s DETS-backed server registry with no
+  # memory of it at all — always resolves to the same on-disk directory and
+  # recovers whatever was durably written there, rather than silently
+  # minting a fresh empty log under a new identity.
+  defp start_new_cluster(server_id, name, stream_id, machine) do
+    uid = uid_for(stream_id)
 
-    case :ra.start_cluster(@system, cluster_name, machine, [server_id]) do
-      {:ok, [_server_id], []} ->
+    config = %{
+      id: server_id,
+      uid: uid,
+      cluster_name: uid <> "_cluster",
+      log_init_args: %{uid: uid},
+      initial_members: [server_id],
+      machine: machine
+    }
+
+    case :ra.start_cluster(@system, [config]) do
+      {:ok, [^server_id], []} ->
+        server_id
+
+      {:error, {:already_started, _pid}} ->
         server_id
 
       {:error, reason} ->
+        # Loses the same race the fast-path check in `start_or_restart/2`
+        # guards against, just later: `ra_server_sup`'s own restart strategy
+        # can bring the crashed process back up under this name in the gap
+        # between that check and this call, making `:ra.start_server/2`
+        # (called internally, per member, by `:ra.start_cluster/2`) return
+        # `{:error, {:already_started, pid}}` for our one-and-only member —
+        # which `:ra.start_cluster/2` then reports as the group-level
+        # `{:error, :cluster_not_formed}` seen here, since it only treats a
+        # bare `:ok` as a successful member start. Confirmed flaky without
+        # this recheck: `mix test` run 5x in a row surfaced it in 3/5 runs,
+        # always in a test that kills a live server's pid and immediately
+        # calls `start_or_restart/2` again. Give the racing restart one
+        # last chance to have already won before giving up.
         if server_alive?(name) do
           server_id
         else

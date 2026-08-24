@@ -88,9 +88,16 @@ and unreachable (the data is still on disk, but the Ra server registration neede
 again after a cold restart isn't durably flushed on the same timeline as the WAL fsync). Confirmed
 live and 100%-reproducible under tight timing against the real published `ghcr.io` image; not
 caught by the existing `ra_cluster_test.exs` crash-recovery test because that test kills the Ra
-server process within the same live BEAM node rather than exercising a real cold restart. Tracked
-as [OpenFASTER-Standard/riptide#6](https://github.com/OpenFASTER-Standard/riptide/issues/6); not
-yet fixed.
+server process within the same live BEAM node rather than exercising a real cold restart. Fixed —
+see [OpenFASTER-Standard/riptide#6](https://github.com/OpenFASTER-Standard/riptide/issues/6) (now
+closed) for the full root-cause/verification writeup; `RaCluster.start_or_restart/2` now always
+uses an explicit, deterministic Ra server UID instead of depending on `:ra`'s crash-fragile
+registry to decide "restart vs. start fresh." Verifying this fix against a real container surfaced
+a separate, narrower, pre-existing characteristic — `GET /resources/:id` can see a transient,
+self-healing (not data-loss) staleness window on the very first read after a stream's first cold
+boot, because it reads via `RaCluster.local_query/2` rather than `consistent_query/2` — tracked
+separately, unrelated to and unaffected by this fix, as
+[OpenFASTER-Standard/riptide#8](https://github.com/OpenFASTER-Standard/riptide/issues/8).
 
 ## 2. Docker image + CI/CD — shipped
 
@@ -135,7 +142,10 @@ on `main`.
 CRITICAL-gate `ignore-unfixed` changes). End-to-end verification against real tag-triggered
 release runs (multi-arch build, OCI labels/annotations, SBOM, vulnerability scan, GitHub Release
 automation, durability-through-container-recreation) surfaced real bugs, fixed in
-[PR #4](https://github.com/OpenFASTER-Standard/riptide/pull/4) (invalid `trivy-action` tag pin)
+[PR #4](https://github.com/OpenFASTER-Standard/riptide/pull/4) (invalid `trivy-action` tag pin —
+shows as "Closed" rather than "Merged" on GitHub because a transient API error interrupted the
+merge response after the squash commit had already landed on `main`; the content is genuinely
+there, only the PR's own state label is misleading)
 and [PR #5](https://github.com/OpenFASTER-Standard/riptide/pull/5) (QEMU-under-JIT segfaults on
 arm64 → native `ubuntu-24.04-arm` runners; a digest-merge `printf` bug; the CRITICAL gate missing
 `ignore-unfixed`; a missing `checkout` step; OCI labels/annotations dropped by the job
