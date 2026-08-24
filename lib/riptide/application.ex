@@ -8,8 +8,6 @@ defmodule Riptide.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Registry, keys: :unique, name: Riptide.Stream.Registry},
-      Riptide.Stream.StreamSupervisor,
       {Phoenix.PubSub, name: Riptide.PubSub},
       # Start a worker by calling: Riptide.Worker.start_link(arg)
       # {Riptide.Worker, arg},

@@ -27,14 +27,14 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   end
 
   defp frame(%Event{} = event) do
-    {:ok, turtle} = TurtleCodec.encode(event.payload)
+    {:ok, turtle} = TurtleCodec.encode(Event.wire_payload(event))
 
     %{
       "cursor" => event.sequence,
       "event" => %{
         "sequence" => event.sequence,
         "streamId" => event.stream_id,
-        "isSnapshot" => event.is_snapshot?,
+        "isSnapshot" => Event.wire_snapshot?(event),
         "payload" => turtle
       }
     }

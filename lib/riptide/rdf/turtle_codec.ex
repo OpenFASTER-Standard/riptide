@@ -15,9 +15,24 @@ defmodule Riptide.RDF.TurtleCodec do
 
   @spec encode(RDF.Graph.t()) :: {:ok, String.t()} | {:error, term()}
   def encode(%RDF.Graph{} = graph) do
-    case RDF.Turtle.write_string(graph) do
-      {:ok, turtle} -> {:ok, turtle}
-      {:error, reason} -> {:error, reason}
+    # An empty graph should round-trip as an empty string. Without this,
+    # RDF.Turtle.write_string/1 still emits its default prefix directives
+    # (rdf:/rdfs:/xsd:) for a graph with zero triples, which would make a
+    # genuinely-empty resource body (e.g. after a PUT with an empty body)
+    # indistinguishable from actual content on the wire.
+    #
+    # This is an INTENTIONAL, in-scope wire-behavior change for the
+    # empty-graph case only (it fixes the empty-PUT bug). Non-empty graphs are
+    # unchanged and remain byte-compatible with the previous output. Do not
+    # "restore" the prefix-only boilerplate for empty graphs — it is
+    # load-bearing, not an oversight.
+    if Enum.empty?(RDF.Graph.triples(graph)) do
+      {:ok, ""}
+    else
+      case RDF.Turtle.write_string(graph) do
+        {:ok, turtle} -> {:ok, turtle}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 end

@@ -1,72 +1,50 @@
 defmodule Riptide.Stream.StreamServer do
   @moduledoc """
-  One GenServer per stream. Owns sequence assignment (serializing writes
-  without external locking) and holds the in-memory event log for that
-  stream.
+  Per-stream durable event log. A thin client over a single-node `Ra`
+  cluster (see `Riptide.RaCluster`) running `Riptide.Stream.RaMachine` —
+  no GenServer of our own; Ra owns the process and its durability.
   """
-  use GenServer
 
   alias Riptide.Event
+  alias Riptide.RaCluster
+  alias Riptide.Stream.RaMachine
 
+  # NOTE: `retention` is only applied when a stream's Ra cluster is first
+  # created. On any later call for an existing stream this just restarts the
+  # already-persisted server from disk (via `RaCluster.start_or_restart/2`),
+  # which keeps its original machine config — so passing a *different*
+  # `retention:` here for a stream that already exists is silently ignored.
+  # Changing a live stream's retention would need an explicit reconfiguration
+  # path (not in scope for Phase 1).
+  @spec start_link({String.t(), keyword()}) :: {:ok, pid()} | {:error, term()}
   def start_link({stream_id, opts}) do
-    GenServer.start_link(__MODULE__, {stream_id, opts}, name: via(stream_id))
+    retention = Keyword.get(opts, :retention, :infinity)
+    machine = {:module, RaMachine, %{retention: retention}}
+    {name, _node} = RaCluster.start_or_restart(stream_id, machine)
+
+    case Process.whereis(name) do
+      pid when is_pid(pid) -> {:ok, pid}
+      nil -> {:error, :not_started}
+    end
   end
 
+  @spec start_link(String.t()) :: {:ok, pid()} | {:error, term()}
   def start_link(stream_id) when is_binary(stream_id) do
     start_link({stream_id, []})
   end
 
-  def via(stream_id) do
-    {:via, Registry, {Riptide.Stream.Registry, stream_id}}
-  end
-
   @spec append(String.t(), Event.t()) :: Event.t()
   def append(stream_id, %Event{} = event) do
-    GenServer.call(via(stream_id), {:append, event})
+    server_id = RaCluster.server_id(stream_id)
+    stamped = RaCluster.process_command(server_id, {:append, event})
+    Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> stream_id, {:new_event, stamped})
+    stamped
   end
 
   @spec get_since(String.t(), non_neg_integer() | nil) ::
           {:ok, [Event.t()]} | {:gap, pos_integer() | nil}
   def get_since(stream_id, cursor) do
-    GenServer.call(via(stream_id), {:get_since, cursor})
-  end
-
-  @impl true
-  def init({stream_id, opts}) do
-    retention = Keyword.get(opts, :retention, :infinity)
-    {:ok, %{stream_id: stream_id, next_sequence: 1, events: [], retention: retention}}
-  end
-
-  @impl true
-  def handle_call({:append, event}, _from, state) do
-    stamped = Event.with_sequence(event, state.next_sequence)
-    events = trim(state.events ++ [stamped], state.retention)
-    new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
-
-    Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> state.stream_id, {:new_event, stamped})
-
-    {:reply, stamped, new_state}
-  end
-
-  def handle_call({:get_since, nil}, _from, state) do
-    {:reply, {:ok, []}, state}
-  end
-
-  def handle_call({:get_since, cursor}, _from, state) do
-    oldest = List.first(state.events) |> then(&(&1 && &1.sequence))
-
-    if oldest != nil and cursor < oldest - 1 do
-      {:reply, {:gap, oldest}, state}
-    else
-      matching = Enum.filter(state.events, &(&1.sequence > cursor))
-      {:reply, {:ok, matching}, state}
-    end
-  end
-
-  defp trim(events, :infinity), do: events
-
-  defp trim(events, retention) when is_integer(retention) do
-    count = length(events)
-    if count > retention, do: Enum.drop(events, count - retention), else: events
+    server_id = RaCluster.server_id(stream_id)
+    RaCluster.local_query(server_id, &RaMachine.get_since(&1, cursor))
   end
 end

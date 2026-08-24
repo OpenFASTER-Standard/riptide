@@ -3,6 +3,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   import Phoenix.ChannelTest
 
   alias Riptide.Event
+  alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.Realtime.{ReplicationChannel, Socket}
 
@@ -12,21 +13,25 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining with after: 0 receives no backlog on an empty stream" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
 
-    {:ok, reply, _socket} = subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
+    {:ok, reply, _socket} =
+      subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
     assert reply == %{"backlog" => []}
   end
 
   test "joining with after: 0 on a non-empty stream replies with the existing backlog" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, socket} = connect(Socket, %{})
+
     {:ok, reply, _socket} =
       subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
@@ -35,25 +40,33 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining with a cursor older than the retention window is rejected with a gap" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = StreamServer.start_link({stream_id, retention: 1})
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, socket} = connect(Socket, %{})
 
     assert {:error, %{"oldestAvailable" => 2}} =
-             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
+             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+               "after" => 0
+             })
   end
 
   test "new appends after joining are pushed as replication_frame messages" do
     stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     StreamSupervisor.get_or_start(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
+
     {:ok, _reply, _socket} =
       subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
 
-    StreamServer.append(stream_id, Event.new(stream_id, RDF.Graph.new()))
+    StreamServer.append(
+      stream_id,
+      Event.new(stream_id, :patch, %Patch{additions: [], removals: []})
+    )
 
     assert_push "replication_frame", %{
       "cursor" => 1,
@@ -63,5 +76,56 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
         "isSnapshot" => false
       }
     }
+  end
+
+  # `assert_push`/`refute_push` scope to the calling *process*'s mailbox, not
+  # to a particular socket: `Phoenix.ChannelTest.__connect__/4` sets
+  # `transport_pid: self()` at connect time, and `assert_push`/`refute_push`
+  # match on event+payload only (not topic) against whatever lands in that
+  # mailbox (see `deps/phoenix/lib/phoenix/test/channel_test.ex`). Two
+  # sockets connected from the same test process therefore share one
+  # mailbox, and a push meant for either one satisfies `assert_push`/
+  # `refute_push` run from that process — proven live: appending to the
+  # *wrong* stream still made the naive single-process version of this test
+  # pass (a false pass), because `assert_push` matched socket B's push and
+  # `refute_push` then trivially found nothing left to match. Joining
+  # socket B from a separate `Task` gives it its own `transport_pid`/
+  # mailbox, so `refute_push` in the task can only match a push actually
+  # delivered to socket B.
+  test "an append to stream A is not pushed to a socket joined to stream B" do
+    stream_a = "stream-a-" <> Uniq.UUID.uuid4()
+    stream_b = "stream-b-" <> Uniq.UUID.uuid4()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_a) end)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_b) end)
+
+    test_pid = self()
+
+    task_b =
+      Task.async(fn ->
+        {:ok, socket_b} = connect(Socket, %{}, test_process: test_pid)
+
+        {:ok, _reply, _socket_b} =
+          subscribe_and_join(socket_b, ReplicationChannel, "replication:" <> stream_b, %{
+            "after" => 0
+          })
+
+        send(test_pid, :socket_b_joined)
+
+        refute_push "replication_frame", %{}, 400
+      end)
+
+    {:ok, socket_a} = connect(Socket, %{})
+
+    {:ok, _reply, _socket_a} =
+      subscribe_and_join(socket_a, ReplicationChannel, "replication:" <> stream_a, %{"after" => 0})
+
+    assert_receive :socket_b_joined, 500
+
+    StreamSupervisor.get_or_start(stream_a)
+    StreamServer.append(stream_a, Event.new(stream_a, :replace, RDF.Graph.new()))
+
+    assert_push "replication_frame", %{}, 500
+
+    Task.await(task_b)
   end
 end
