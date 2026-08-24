@@ -12,7 +12,7 @@ first place to check for current status, not a historical log.
 | # | Sub-project | Status |
 |---|---|---|
 | 1 | Persistence & durability | **Shipped** — see below |
-| 2 | Docker image + CI/CD | Not started |
+| 2 | Docker image + CI/CD | **In design** — see below |
 | 3 | Clustering / horizontal scale / HA | Not started (multi-node `Ra` replication belongs here — see §1) |
 | 4 | Security & multi-tenancy (auth, WAC/ACP, TLS) | Not started |
 | 5 | Observability & operability (metrics, logging, health probes) | Not started |
@@ -80,6 +80,45 @@ just "add more Ra groups on the same disk."
 (design). Companion regression test in the spec repo:
 [OpenFASTER-Standard/spec#3](https://github.com/OpenFASTER-Standard/spec/pull/3).
 
-## 2-5. Not yet started
+## 2. Docker image + CI/CD — in design
+
+**Scope for this sub-project**: a real, published `ghcr.io` Docker image (multi-stage `mix
+release` build, multi-arch amd64/arm64, non-root, SBOM + provenance attestations), a `ci.yml`
+workflow gating every push/PR (tests, Credo, format check, a Dockerfile build-check), a
+tag-triggered `release.yml` (build/scan/publish/GitHub Release), and branch-protection settings
+on `main`.
+
+**Key decisions made (with rationale — see design doc for full detail):**
+
+- **Registry**: GitHub Container Registry, not Docker Hub — reuses the auto-provisioned
+  `GITHUB_TOKEN`, no separate account/secret to manage.
+- **Release trigger**: tag-triggered semver (`v*.*.*`), not every merge to `main` — a release is
+  a deliberate action, not an automatic side effect of merging.
+- **Branch model**: trunk-based + branch protection (continuing what this project already does),
+  not GitFlow — `develop`/`release`/`hotfix` branches would be pure ceremony at this project's
+  size.
+- **Static analysis**: Credo + `mix format --check-formatted` in CI now; Dialyzer deliberately
+  deferred (real value, but its PLT build is slow and a first run tends to surface a wave of
+  pre-existing findings to triage — a separate follow-up, not bundled here).
+- **The Ra data volume is the one part of this sub-project with real correctness stakes**: the
+  image declares `VOLUME ["/data"]` + `RIPTIDE_RA_DATA_DIR=/data` by default, documented with a
+  `docker run -v` / `docker-compose.yml` example. Without this, a naive `docker run` would
+  silently throw away every stream's durable log on container recreation — reintroducing, at the
+  infrastructure layer, exactly the bug sub-project 1 fixed in the application layer.
+- **OTP version in the image is load-bearing, not a style choice**: the builder/runtime images
+  must use Erlang/OTP 25, matching `:ra`'s `~> 2.15.0` pin from sub-project 1 (newer `:ra`
+  requires/breaks on a different OTP line — see that sub-project's honest-limits note above).
+- **Vulnerability scan gate**: Trivy scan on every release, but only fails the build on
+  CRITICAL-severity findings — HIGH-and-below are surfaced (GitHub code scanning) but
+  non-blocking, so releases aren't held hostage to unfixable upstream base-image CVEs.
+- **No automated changelog/semver tooling** (no conventional-commits/semantic-release) —
+  `gh release create --generate-notes` is enough; the git tag itself is already the deliberate
+  release decision.
+
+**Status**: design doc written and committed —
+[`docs/superpowers/specs/2026-08-24-docker-cicd-design.md`](docs/superpowers/specs/2026-08-24-docker-cicd-design.md).
+Approved; moving to implementation plan.
+
+## 3-5. Not yet started
 
 Will be filled in as each sub-project reaches design.
