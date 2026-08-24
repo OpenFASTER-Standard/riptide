@@ -51,6 +51,13 @@ defmodule Riptide.Stream.StreamServer do
   # version). Revisit if/when a future Clustering/HA sub-project makes
   # cluster size > 1 the norm, since the heartbeat-round-trip cost this
   # avoided only exists once there are real peers to contact.
+  #
+  # This is called exactly once per connection/request by every caller (LDP
+  # GET, SSE subscribe, WebSocket replication join) — live delivery after
+  # that point is `Phoenix.PubSub`-only (see `append/2`), not repeated
+  # `get_since/2` polling. So the cost above is paid once per connection,
+  # never per event, and a stale backlog here wouldn't just be a freshness
+  # blip — it would permanently omit events from that connection's history.
   @spec get_since(String.t(), non_neg_integer() | nil) ::
           {:ok, [Event.t()]} | {:gap, pos_integer() | nil}
   def get_since(stream_id, cursor) do

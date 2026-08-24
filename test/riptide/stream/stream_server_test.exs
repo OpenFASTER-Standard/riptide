@@ -98,8 +98,10 @@ defmodule Riptide.Stream.StreamServerTest do
     # exactly the guarantee `RaCluster.consistent_query/2` provides
     # deterministically (verified separately: 30/30 trials of this identical
     # race showed zero stale reads and zero crashes once `get_since/2` uses
-    # `consistent_query`).
-    for _ <- 1..30 do
+    # `consistent_query`). 100 trials here (not 30) so a single CI run's
+    # detection probability stays high even at the pessimistic ~1-in-20 rate
+    # (1 - (19/20)^100 ≈ 99.4%, vs. ~78% at 30 trials).
+    for _ <- 1..100 do
       stream_id = "stream-issue8-" <> Uniq.UUID.uuid4()
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
