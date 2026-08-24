@@ -8,6 +8,7 @@ defmodule Riptide.MixProject do
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
+      releases: releases(),
       deps: deps()
     ]
   end
@@ -21,6 +22,15 @@ defmodule Riptide.MixProject do
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
+
+  defp releases do
+    [
+      riptide: [
+        include_executables_for: [:unix],
+        steps: [:assemble]
+      ]
+    ]
+  end
 
   defp deps do
     [
