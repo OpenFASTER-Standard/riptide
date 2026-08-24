@@ -23,6 +23,24 @@ end
 config :riptide, RiptideWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# `:ra`'s data_dir must be read here, not in config.exs: config.exs is
+# compile-time config baked into a `mix release` at *build* time, so it can
+# only ever see the builder container's environment. This has to be runtime
+# config so a released image honors whatever `RIPTIDE_RA_DATA_DIR` (e.g.
+# `/data`, matching the Dockerfile's `VOLUME ["/data"]`) the *runtime*
+# container is actually started with. `:test` is excluded so
+# config/test.exs's fixed `priv/ra_data_test` (isolated from dev data, no
+# env var involved) keeps taking precedence, matching prior behavior.
+#
+# Also passed straight into Erlang code (`dets:open_file/2` among others)
+# that expects a `file:filename()` charlist, not an Elixir binary — passing
+# a binary here compiles fine but blows up at runtime with a
+# `dets:open_file` badarg the first time a Ra system tries to start.
+if config_env() != :test do
+  config :ra,
+    data_dir: System.get_env("RIPTIDE_RA_DATA_DIR", "priv/ra_data") |> String.to_charlist()
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you
