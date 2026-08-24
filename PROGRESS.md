@@ -13,7 +13,7 @@ first place to check for current status, not a historical log.
 |---|---|---|
 | 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | **Shipped** — see below |
-| 3 | Clustering / horizontal scale / HA | Not started (multi-node `Ra` replication belongs here — see §1) |
+| 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
 | 4 | Security & multi-tenancy (auth, WAC/ACP, TLS) | Not started |
 | 5 | Observability & operability (metrics, logging, health probes) | Not started |
 
@@ -154,6 +154,59 @@ first-try, no-fixes-needed release run with everything above genuinely present o
 `ghcr.io` image. See §1's caveat above for one durability finding from that same verification
 pass — real, but in sub-project 1's code, not this sub-project's own deliverables.
 
-## 3-5. Not yet started
+## 3. Clustering / horizontal scale / HA — decomposed into phases
+
+**Goal for this sub-project**: both halves of the name, deliberately combined — surviving a node
+failure without losing data or availability (HA), and handling more streams/throughput by adding
+nodes (horizontal scale). Chosen together because the natural solution covers both at once: a
+per-stream replica *placement* decision determines which nodes host a stream (enabling scale as
+the fleet grows) and how many (enabling HA), the same way RabbitMQ's quorum queues — the closest
+real precedent, sharing Riptide's exact "one Ra cluster per unit of data" architecture and the
+same underlying `:ra` library — already do it.
+
+**Key research findings driving the phasing (see chat history / eventual phase specs for full
+detail):**
+
+- `:ra` itself provides only low-level membership primitives (`add_member`/`remove_member`) —
+  zero built-in policy for when/how to grow a cluster. Any placement/rebalancing logic is
+  Riptide's own to build, same as RabbitMQ built theirs in the `rabbit` app, not in `:ra`.
+- RabbitMQ's real precedent at scale: each queue's Ra cluster is a *subset* of the fleet (default
+  3 nodes), not full N-way replication — confirms sharded placement, not "every stream on every
+  node," is the right model once the fleet is expected to grow past a handful of nodes.
+- RabbitMQ's own automatic rebalancing is deliberately conservative (manual CLI-driven grow/
+  shrink is the primary mechanism; automatic reconciliation is slow-interval and only reacts to
+  an operator-*confirmed* permanent node removal, never a merely-offline node) — informs Phase 3d
+  leaning manual-first rather than building a continuous rebalancing allocator up front.
+- Real distributed Erlang needs to be genuinely re-enabled (`RELEASE_DISTRIBUTION=none` is
+  currently set as a workaround for a different bug — see §1's honest-limits note) with a
+  properly stable node identity this time, not just flipping the flag back.
+- Target deployment: Kubernetes (matches this box's own environment) — node discovery via
+  `libcluster`'s Kubernetes DNS strategy against a headless Service.
+- Target fleet size: large and growing (10+ nodes over time), not a small fixed set — this is
+  what makes sharded placement worth the complexity rather than "just replicate everywhere."
+
+**Phasing** (each phase gets its own brainstorm → spec → plan → implementation cycle, same as
+sub-projects 1 and 2 did internally):
+
+- **Phase 3a — Schema-versioning envelope.** A versioned wrapper around persisted `Event`/`Patch`
+  terms so a future struct change doesn't break reading old data. Originally deferred in
+  sub-project 1's design doc §6; pulled forward here because multi-node rolling deploys turn this
+  from a someday-risk into a live one (nodes can briefly run different code versions mid-deploy).
+  Fully self-contained — doesn't depend on anything else in this sub-project. **Not yet designed.**
+- **Phase 3b — Real multi-node connectivity.** Re-enable distributed Erlang properly (not
+  `RELEASE_DISTRIBUTION=none`), solve the stable-node-identity problem for real this time,
+  `libcluster` + Kubernetes DNS discovery, prove N nodes actually see and stay connected to each
+  other. Foundational for 3c/3d, testable in isolation. **Not yet designed.**
+- **Phase 3c — Sharded per-stream placement + real multi-member Ra clusters.** The core
+  clustering work: replication factor (almost certainly 3), which subset of the fleet a given
+  stream's replicas land on, actually creating multi-member Ra clusters instead of always-size-1.
+  **Not yet designed.**
+- **Phase 3d — HA proof + operator tooling.** Actually kill a node and prove streams keep
+  working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
+  deferring sophisticated auto-rebalancing. **Not yet designed.**
+
+**Status**: phasing agreed with the operator; Phase 3a's own brainstorm/design has not started yet.
+
+## 4-5. Not yet started
 
 Will be filled in as each sub-project reaches design.
