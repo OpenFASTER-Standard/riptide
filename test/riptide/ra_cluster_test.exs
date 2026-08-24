@@ -4,19 +4,7 @@ defmodule Riptide.RaClusterTest do
   alias Riptide.Event
   alias Riptide.RaCluster
   alias Riptide.Stream.RaMachine
-
-  defmodule EchoMachine do
-    @behaviour :ra_machine
-
-    @impl :ra_machine
-    def init(_config), do: []
-
-    @impl :ra_machine
-    def apply(_meta, {:add, item}, state) do
-      new_state = [item | state]
-      {new_state, new_state, []}
-    end
-  end
+  alias Riptide.Test.EchoMachine
 
   setup do
     stream_id = "ra-spike-" <> Uniq.UUID.uuid4()
