@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-23
+**Last updated:** 2026-08-24
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
