@@ -75,7 +75,10 @@ defmodule Riptide.RaClusterTest do
     # accumulated log comfortably exceeds min_snapshot_interval (8).
     for _ <- 1..50 do
       {:ok, %Event{}, _leader} =
-        :ra.process_command(server_id, {:append, Event.new(stream_id, :replace, RDF.Graph.new())})
+        :ra.process_command(
+          server_id,
+          {:append, Event.encode(Event.new(stream_id, :replace, RDF.Graph.new()))}
+        )
     end
 
     # Snapshotting is asynchronous, so poll (bounded) for it to land. A

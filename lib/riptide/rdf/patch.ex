@@ -16,4 +16,16 @@ defmodule Riptide.RDF.Patch do
     |> RDF.Graph.delete(removals)
     |> RDF.Graph.add(additions)
   end
+
+  @spec encode(t()) :: map()
+  def encode(%__MODULE__{additions: additions, removals: removals}) do
+    %{v: 1, additions: additions, removals: removals}
+  end
+
+  @spec decode(map()) :: t()
+  def decode(%{v: 1, additions: additions, removals: removals}) do
+    %__MODULE__{additions: additions, removals: removals}
+  end
+
+  def decode(%{v: unknown}), do: raise("Unknown Patch wire version: #{inspect(unknown)}")
 end

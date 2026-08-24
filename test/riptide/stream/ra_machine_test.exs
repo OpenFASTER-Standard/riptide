@@ -13,7 +13,7 @@ defmodule Riptide.Stream.RaMachineTest do
     {new_state, event, _effects} =
       RaMachine.apply(
         %{index: index},
-        {:append, Event.new(stream_id, :replace, RDF.Graph.new())},
+        {:append, Event.encode(Event.new(stream_id, :replace, RDF.Graph.new()))},
         state
       )
 
