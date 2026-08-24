@@ -198,10 +198,31 @@ defmodule Riptide.RaCluster do
   # (config/runtime.exs stores `RIPTIDE_RA_DATA_DIR` as a charlist, since it's
   # passed straight into Erlang code that expects `file:filename()`) — `Path.join/2`
   # raises on a charlist, unlike Erlang's more permissive `filename:join/2`.
-  @spec data_dir() :: String.t()
+  #
+  # Returns a charlist, not a `String.t()` binary, despite the `String.t()`
+  # produced by `Path.join/2` being the more idiomatic Elixir shape: `:ra`'s
+  # own config typespec declares `data_dir`/`wal_data_dir` as `file:filename()`
+  # (an Erlang charlist), and — critically — this isn't just a typespec nicety.
+  # `:ra_directory`'s DETS-backed server registry (`ra_directory:init/2`) joins
+  # this path with a literal filename and hands the result straight to
+  # `:dets.open_file/2`; on the OTP/stdlib version pinned here (stdlib 4.2),
+  # that call raises `ArgumentError` (`badarg` from `dets.erl:658`) if given a
+  # binary path — confirmed by isolating the exact call outside of `:ra`
+  # entirely (`:dets.open_file(:x, file: "some/binary/path")` fails the same
+  # way with zero `:ra` code involved). `:ra`'s own `default_config/0` never
+  # hits this because `ra_env:data_dir/0` always produces a charlist (either
+  # from a charlist app-env value or from `file:get_cwd/0`, which itself
+  # returns a charlist) — this function preserves that same invariant instead
+  # of introducing a binary where `:ra` internals have never had to handle
+  # one. `Path.basename/1` (used by `ra_cluster_data_dir_test.exs`) and plain
+  # `==` comparison against `:ra_system.fetch(:default)`'s stored config
+  # (used by the test below) both work identically whether this returns a
+  # charlist or a binary, since whatever's returned here is put into the
+  # config verbatim and `:ra_system.fetch/1` returns that config unmodified.
+  @spec data_dir() :: charlist()
   def data_dir do
     base = Application.get_env(:ra, :data_dir, File.cwd!()) |> to_string()
-    Path.join(base, System.get_env("HOSTNAME", "nonode"))
+    Path.join(base, System.get_env("HOSTNAME", "nonode")) |> String.to_charlist()
   end
 
   @spec server_alive?(atom()) :: boolean()

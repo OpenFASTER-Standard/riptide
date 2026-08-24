@@ -42,7 +42,9 @@ defmodule Riptide.RaClusterColdRestartTest do
     # consistency with HOSTNAME-based data directories.
     dir = RaCluster.data_dir()
     File.mkdir_p!(dir)
-    config = :ra_system.default_config()
+
+    config =
+      :ra_system.default_config()
       |> Map.put(:data_dir, dir)
       |> Map.put(:wal_data_dir, dir)
 
