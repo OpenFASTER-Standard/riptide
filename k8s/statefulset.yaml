@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: riptide
+  labels:
+    app: riptide
+spec:
+  serviceName: riptide-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: riptide
+  template:
+    metadata:
+      labels:
+        app: riptide
+    spec:
+      containers:
+        - name: riptide
+          image: ghcr.io/openfaster-standard/riptide:latest
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PHX_SERVER
+              value: "true"
+            - name: PHX_HOST
+              value: "riptide-headless"
+            - name: RELEASE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: riptide-secrets
+                  key: RELEASE_COOKIE
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: riptide-secrets
+                  key: SECRET_KEY_BASE
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

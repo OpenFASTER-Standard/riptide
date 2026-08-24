@@ -1,0 +1,54 @@
+# Deploying Riptide to Kubernetes
+
+Phase 3b's multi-node connectivity manifests: a 3-replica `StatefulSet`, a headless
+`Service` for peer discovery, a regular `Service` for client traffic, and a `Secret`
+template.
+
+## Deploy
+
+1. Copy the secret template and fill in real values:
+
+   ```bash
+   cp secret.example.yaml secret.yaml
+   # RELEASE_COOKIE: openssl rand -base64 48
+   # SECRET_KEY_BASE: mix phx.gen.secret (run from a Riptide checkout)
+   ```
+
+2. Apply everything:
+
+   ```bash
+   kubectl apply -f secret.yaml
+   kubectl apply -f headless-service.yaml
+   kubectl apply -f service.yaml
+   kubectl apply -f statefulset.yaml
+   ```
+
+3. Wait for all 3 pods to become ready:
+
+   ```bash
+   kubectl rollout status statefulset/riptide
+   ```
+
+## Verify nodes are connected
+
+```bash
+kubectl exec -it riptide-0 -- bin/riptide remote
+```
+
+Then, in the remote IEx shell:
+
+```elixir
+Node.list()
+# => [:"riptide@10.x.x.x", :"riptide@10.x.x.x"]  (the other two pods' IPs)
+```
+
+Repeat against `riptide-1`/`riptide-2` to confirm all three see the other two.
+
+## Teardown
+
+```bash
+kubectl delete -f statefulset.yaml -f service.yaml -f headless-service.yaml -f secret.yaml
+```
+
+`secret.yaml` is git-ignored (see the repo's `.gitignore`) — never commit real
+`RELEASE_COOKIE`/`SECRET_KEY_BASE` values.
