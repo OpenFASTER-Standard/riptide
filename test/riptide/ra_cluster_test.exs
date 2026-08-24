@@ -54,29 +54,15 @@ defmodule Riptide.RaClusterTest do
     on_exit(fn -> :ra.force_delete_server(:default, server_id) end)
 
     # Idempotent: another test may already have started the default system.
-    # Must build the same HOSTNAME-keyed config `RaCluster.ensure_system_started/0`
-    # does, rather than calling `:ra_system.start_default/0` (which uses the
-    # OLD node()-derived directory) — `:ra_system.start/1`'s underlying
-    # `ra_systems_sup:start_system/1` unconditionally calls `ra_system:store/1`
-    # to persist whatever config it's given into `persistent_term`, even when
-    # the actual supervisor start subsequently fails as `{:already_started,
-    # _}` (i.e. loses the race to be the system's real, first starter). Two
-    # different callers racing to start `:default` with two different
-    # `data_dir`s therefore doesn't just no-op harmlessly on the loser: it
-    # leaves `:ra_system.fetch(:default)` permanently reporting whichever
-    # config happened to `store/1` *last*, decoupled from whichever config
-    # actually won the real, underlying `ra_system_sup` startup (and thus
-    # from where the registry's DETS file and other already-open state
-    # actually live on disk) — confirmed by direct inspection (`:ra_system.fetch(:default)`
-    # vs. the actual on-disk `names.dets` location) while root-causing a
-    # cross-test-file flaky failure in `ra_cluster_cold_restart_test.exs`.
-    dir = RaCluster.data_dir()
-    File.mkdir_p!(dir)
-
-    config_override =
-      :ra_system.default_config()
-      |> Map.put(:data_dir, dir)
-      |> Map.put(:wal_data_dir, dir)
+    # Must build the exact same config `RaCluster.ensure_system_started/0`
+    # does — via the shared `RaCluster.system_config/0` — rather than calling
+    # `:ra_system.start_default/0` (which uses the OLD node()-derived
+    # directory) or hand-rolling an equivalent-looking config here. See
+    # `RaCluster.system_config/0`'s doc for why even a merely-equivalent
+    # config is unsafe: this was a confirmed cross-test-file flaky failure in
+    # `ra_cluster_cold_restart_test.exs` before all call sites shared this one
+    # function.
+    config_override = RaCluster.system_config()
 
     case :ra_system.start(config_override) do
       {:ok, _} -> :ok

@@ -165,13 +165,7 @@ defmodule Riptide.RaCluster do
   # entry point that needs the system stays self-sufficient.
   @spec ensure_system_started() :: :ok
   defp ensure_system_started do
-    dir = data_dir()
-    File.mkdir_p!(dir)
-
-    config =
-      :ra_system.default_config()
-      |> Map.put(:data_dir, dir)
-      |> Map.put(:wal_data_dir, dir)
+    config = system_config()
 
     case :ra_system.start(config) do
       {:ok, _pid} -> :ok
@@ -179,6 +173,31 @@ defmodule Riptide.RaCluster do
       {:error, {:already_started, _pid}} -> :ok
       {:error, reason} -> raise "Failed to start the default Ra system: #{inspect(reason)}"
     end
+  end
+
+  # Every caller that starts (or restarts) the `:default` Ra system MUST build
+  # this exact config, byte-for-byte — not just "a config pointing at the same
+  # directory". `ra_systems_sup:start_system/1` calls `ra_system:store/1`
+  # unconditionally, even on the losing side of an `{:already_started, _}`
+  # race, which persists whatever config *that* caller passed into
+  # `persistent_term` regardless of which caller actually won the underlying
+  # supervisor start. Two callers racing to start `:default` with
+  # merely-equivalent-but-not-identical configs can therefore leave
+  # `:ra_system.fetch(:default)` permanently reporting a config decoupled from
+  # wherever the system's data (and its DETS-backed server registry) actually
+  # live on disk — this was a real, confirmed-flaky bug before all call sites
+  # (production and the two tests that manually restart `:default`) were
+  # switched to share this single function. Ensures the target directory
+  # exists as a side effect, matching what every call site needs immediately
+  # before calling `:ra_system.start/1`.
+  @spec system_config() :: map()
+  def system_config do
+    dir = data_dir()
+    File.mkdir_p!(dir)
+
+    :ra_system.default_config()
+    |> Map.put(:data_dir, dir)
+    |> Map.put(:wal_data_dir, dir)
   end
 
   # Stable across pod restarts/rescheduling even though Erlang distribution identity

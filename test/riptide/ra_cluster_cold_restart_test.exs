@@ -38,15 +38,11 @@ defmodule Riptide.RaClusterColdRestartTest do
     Application.stop(:ra)
     Application.start(:ra)
 
-    # Use the same config approach as ensure_system_started/0 to maintain
-    # consistency with HOSTNAME-based data directories.
-    dir = RaCluster.data_dir()
-    File.mkdir_p!(dir)
-
-    config =
-      :ra_system.default_config()
-      |> Map.put(:data_dir, dir)
-      |> Map.put(:wal_data_dir, dir)
+    # Use the shared `RaCluster.system_config/0` to build the exact same
+    # config `RaCluster.ensure_system_started/0` does — see that function's
+    # doc for why even a merely-equivalent (not byte-identical) config here
+    # is unsafe.
+    config = RaCluster.system_config()
 
     case :ra_system.start(config) do
       {:ok, _} -> :ok
