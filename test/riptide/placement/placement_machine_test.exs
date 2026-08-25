@@ -45,4 +45,46 @@ defmodule Riptide.Placement.PlacementMachineTest do
   test "get/2 returns nil for an unknown stream" do
     assert PlacementMachine.get(%{}, "unknown") == nil
   end
+
+  test "list/1 returns the full stream_id => nodes map" do
+    state = %{"s1" => [:a, :b, :c], "s2" => [:d, :e, :f]}
+    assert PlacementMachine.list(state) == state
+  end
+
+  test "list/1 returns an empty map when nothing is assigned yet" do
+    assert PlacementMachine.list(PlacementMachine.init(%{})) == %{}
+  end
+
+  test "apply/3 {:replace_member, ...} swaps a dead node for a new one in an existing assignment" do
+    state = %{"s1" => [:a, :b, :c]}
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 1}, {:replace_member, "s1", :b, :z}, state)
+
+    assert new_state == %{"s1" => [:a, :z, :c]}
+    assert reply == [:a, :z, :c]
+    assert effects == []
+  end
+
+  test "apply/3 {:replace_member, ...} is a no-op if the named dead node is no longer present" do
+    state = %{"s1" => [:a, :z, :c]}
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 2}, {:replace_member, "s1", :b, :y}, state)
+
+    assert new_state == %{"s1" => [:a, :z, :c]}
+    assert reply == [:a, :z, :c]
+    assert effects == []
+  end
+
+  test "apply/3 {:replace_member, ...} is a no-op for an unknown stream_id" do
+    state = %{}
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 1}, {:replace_member, "unknown", :a, :b}, state)
+
+    assert new_state == %{}
+    assert reply == nil
+    assert effects == []
+  end
 end
