@@ -787,48 +787,42 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
 
     {_pid, entry_node, _ordinal} = hd(peers)
     stream_id = "stream-placement-cluster-" <> Uniq.UUID.uuid4()
-    machine = {:module, Riptide.Stream.RaMachine, %{retention: :infinity}}
 
-    # Placement.propose_nodes/2's candidate list is Node.list() ++ [node()]
-    # — on a real :peer node this correctly sees its two connected siblings,
-    # so a genuinely new stream with RF=3 and exactly 3 connected peers gets
-    # all 3, deterministically (no randomness needed to reach "take 3 of 3").
-    assert {:ok, server_ids} =
-             :erpc.call(entry_node, Riptide.Stream.Placement, :ensure_started, [
-               stream_id,
-               machine
-             ])
+    # Goes through the real StreamServer entry point (not RaCluster/
+    # Riptide.Stream.Placement directly) — this is the proof that Task 5's
+    # integration, not just the lower-level formation mechanics, works
+    # against real distinct nodes. Placement.propose_nodes/2's candidate
+    # list is Node.list() ++ [node()] — on a real :peer node this correctly
+    # sees its two connected siblings, so a genuinely new stream with RF=3
+    # and exactly 3 connected peers gets all 3, deterministically (no
+    # randomness needed to reach "take 3 of 3").
+    assert {:ok, _pid} =
+             :erpc.call(entry_node, Riptide.Stream.StreamServer, :start_link, [stream_id])
 
+    server_ids = :erpc.call(entry_node, Riptide.Stream.Placement, :server_ids!, [stream_id])
     assert length(server_ids) == 3
     assigned_nodes = Enum.map(server_ids, fn {_name, node} -> node end)
     assert Enum.sort(assigned_nodes) == Enum.sort(nodes)
 
     graph = :erpc.call(entry_node, RDF.Graph, :new, [])
     event = :erpc.call(entry_node, Riptide.Event, :new, [stream_id, :replace, graph])
-    event_wire = :erpc.call(entry_node, Riptide.Event, :encode, [event])
 
-    {_name, writer_node} = hd(server_ids)
-
-    stamped =
-      :erpc.call(writer_node, Riptide.RaCluster, :process_command, [
-        hd(server_ids),
-        {:append, event_wire}
-      ])
-
+    stamped = :erpc.call(entry_node, Riptide.Stream.StreamServer, :append, [stream_id, event])
     assert stamped.sequence == 1
 
     # Read from a *different* peer than the one that wrote — proving real
     # Raft replication through the stream's own multi-member cluster, not
-    # local memory.
+    # local memory. That peer is a legitimate member (one of the 3 assigned
+    # nodes), so its own StreamServer.start_link/1 call rediscovers the
+    # already-running local member via the self-correcting recheck in
+    # RaCluster.start_or_join_replicated/3 (Task 2), not a fresh formation.
     {_pid, reader_node, _ordinal} = Enum.at(peers, 1)
 
-    {:ok, read_back} =
-      :erpc.call(reader_node, Riptide.RaCluster, :consistent_query, [
-        hd(server_ids),
-        &Riptide.Stream.RaMachine.get_since(&1, 0)
-      ])
+    assert {:ok, _pid} =
+             :erpc.call(reader_node, Riptide.Stream.StreamServer, :start_link, [stream_id])
 
-    assert [%{sequence: 1}] = read_back
+    assert {:ok, [%{sequence: 1}]} =
+             :erpc.call(reader_node, Riptide.Stream.StreamServer, :get_since, [stream_id, 0])
 
     _ = resolve_fun
   end
@@ -842,19 +836,22 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     stream_id = "stream-placement-backfill-" <> Uniq.UUID.uuid4()
     machine = {:module, Riptide.Stream.RaMachine, %{retention: :infinity}}
 
-    # Bypass Riptide.Stream.Placement entirely to create real on-disk data on
-    # exactly one node — simulating a stream that already existed before
-    # this phase shipped, before any Placement entry for it ever existed.
+    # Bypass Riptide.Stream.Placement/StreamServer entirely to create real
+    # on-disk data on exactly one node — simulating a stream that already
+    # existed before this phase shipped, before any Placement entry for it
+    # ever existed.
     :erpc.call(origin_node, Riptide.RaCluster, :start_or_restart, [stream_id, machine])
 
     assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id, resolve_fun]) == nil
 
-    assert {:ok, server_ids} =
-             :erpc.call(origin_node, Riptide.Stream.Placement, :ensure_started, [
-               stream_id,
-               machine
-             ])
+    # Goes through the real StreamServer entry point, same as the other
+    # test above, so this proves the backfill path end-to-end through
+    # Task 5's integration too, not just Riptide.Stream.Placement in
+    # isolation.
+    assert {:ok, _pid} =
+             :erpc.call(origin_node, Riptide.Stream.StreamServer, :start_link, [stream_id])
 
+    server_ids = :erpc.call(origin_node, Riptide.Stream.Placement, :server_ids!, [stream_id])
     uid = :erpc.call(origin_node, Riptide.RaCluster, :uid_for, [stream_id])
     assert server_ids == [{String.to_atom(uid), origin_node}]
     assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id, resolve_fun]) == [origin_node]
