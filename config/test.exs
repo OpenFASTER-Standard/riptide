@@ -21,11 +21,13 @@ config :phoenix,
 config :ra, data_dir: ~c"priv/ra_data_test"
 
 # No real headless-service DNS exists in this environment — every ordinal
-# resolves to whichever node is actually asking, which is correct for both
-# the single-node async suite (test_helper.exs bootstraps all 3 fixed
-# ordinals collapsed onto this one node) and real :peer-based multi-node
-# integration tests (every peer that's genuinely a placement-cluster member
-# addresses its own real local member this way — see Phase 3c-ii plan Task
-# 6). Never applies outside MIX_ENV=test — config/runtime.exs (real
-# Kubernetes) is untouched and keeps using real DNS.
+# resolves to whichever node is actually asking, which is correct for the
+# single-node async suite (test_helper.exs bootstraps all 3 fixed ordinals
+# collapsed onto this one, origin BEAM node running `mix test`). Real
+# multi-node :peer-based tests need a *different*, per-node mechanism (see
+# Task 6 in the plan, which sets this same application env key individually
+# on each peer via :erpc with a real per-peer ordinal->node mapping) since
+# :peer nodes don't load this file at all. Never applies outside
+# MIX_ENV=test — config/runtime.exs (real Kubernetes) is untouched and keeps
+# using real DNS.
 config :riptide, ordinal_resolver: fn _ordinal -> node() end
