@@ -260,7 +260,11 @@ defmodule Riptide.RaClusterTest do
       # without needing real distinct nodes — real distinctness is proven
       # separately by the :peer-based integration test (Task 6).
       assert {:ok, server_ids} =
-               RaCluster.start_or_join_replicated(uid, [node(), node(), node()], {:module, EchoMachine, %{}})
+               RaCluster.start_or_join_replicated(
+                 uid,
+                 [node(), node(), node()],
+                 {:module, EchoMachine, %{}}
+               )
 
       assert length(server_ids) == 3
       assert Enum.uniq(server_ids) == [{name, node()}]
@@ -277,7 +281,10 @@ defmodule Riptide.RaClusterTest do
       machine = {:module, EchoMachine, %{}}
 
       assert {:ok, first_ids} = RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
-      assert {:ok, second_ids} = RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+
+      assert {:ok, second_ids} =
+               RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+
       assert first_ids == second_ids
     end
 
@@ -285,7 +292,7 @@ defmodule Riptide.RaClusterTest do
       uid = "sojr-unreachable-" <> Uniq.UUID.uuid4()
       machine = {:module, EchoMachine, %{}}
 
-      assert RaCluster.start_or_join_replicated(uid, [:"nonexistent@nowhere"], machine) ==
+      assert RaCluster.start_or_join_replicated(uid, [:nonexistent@nowhere], machine) ==
                {:error, :cluster_not_formed}
     end
   end

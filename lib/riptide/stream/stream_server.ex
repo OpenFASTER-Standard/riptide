@@ -82,11 +82,15 @@ defmodule Riptide.Stream.StreamServer do
   @spec wait_for_process(term(), non_neg_integer()) :: {:ok, pid()} | :timeout
   defp wait_for_process(name, attempts \\ 100) do
     case Process.whereis(name) do
-      pid when is_pid(pid) -> {:ok, pid}
+      pid when is_pid(pid) ->
+        {:ok, pid}
+
       nil when attempts > 0 ->
         Process.sleep(10)
         wait_for_process(name, attempts - 1)
-      nil -> :timeout
+
+      nil ->
+        :timeout
     end
   end
 end

@@ -30,6 +30,7 @@ defmodule Riptide.Stream.PlacementTest do
       {:ok, server_ids} = StreamPlacement.ensure_started(stream_id, machine)
 
       unreachable_formation_fun = fn _uid, _nodes, _machine -> raise "should never be called" end
+
       assert {:ok, ^server_ids} =
                StreamPlacement.ensure_started(stream_id, machine, unreachable_formation_fun)
     end
@@ -58,7 +59,10 @@ defmodule Riptide.Stream.PlacementTest do
 
       formation_fun = fn uid, nodes, machine ->
         count = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
-        if count < 2, do: {:error, :cluster_not_formed}, else: real_formation_fun.(uid, nodes, machine)
+
+        if count < 2,
+          do: {:error, :cluster_not_formed},
+          else: real_formation_fun.(uid, nodes, machine)
       end
 
       assert {:ok, _server_ids} =
