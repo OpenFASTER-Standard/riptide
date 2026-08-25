@@ -305,16 +305,31 @@ defmodule Riptide.RaCluster do
   end
 
   # A single attempt to form (or rejoin) the placement cluster. Safe to call
-  # redundantly from multiple ordinals concurrently, and safe to call again
-  # on a routine pod restart when the cluster is already running elsewhere —
-  # `:ra.start_cluster/2`'s own per-member `{:error, {:already_started, _}}`
-  # handling (internal to `:ra`, not surfaced here) means an already-running
-  # sibling member is simply not double-started, not an error condition for
-  # this call as a whole. Uses the same deterministic, non-random uid for
-  # every member's config (`@placement_uid`) — each member's data still lives
-  # in a distinct, non-colliding directory because it's nested under that
-  # node's own HOSTNAME-scoped data_dir (see `RaCluster.data_dir/0`), so a
-  # shared uid string across members is correct here, not a collision risk.
+  # redundantly from multiple ordinals concurrently, and safe to call again on
+  # a routine pod restart when the cluster is already running elsewhere — but
+  # NOT because `:ra.start_cluster/2` itself tolerates a redundant call
+  # transparently. It does not: `:ra.start_cluster/3`'s own `Started` list
+  # (confirmed directly against `deps/ra/src/ra.erl:427-465`) tracks only
+  # servers *this call* newly started, not servers that are merely alive —
+  # so once every member is already running (e.g. because an earlier call,
+  # from this same ordinal or another one, already won), every member's
+  # per-server `:ra.start_server/2` attempt returns
+  # `{:error, {:already_started, pid}}` instead of `ok`, `Started` ends up
+  # empty, and `:ra.start_cluster/2` reports the whole call as
+  # `{:error, :cluster_not_formed}` — even though the cluster is completely
+  # healthy. This function is safe anyway because it self-corrects: on that
+  # exact error, it rechecks whether THIS node's own local placement-cluster
+  # member is alive (mirroring `start_new_cluster/4`'s own "recheck locally
+  # after an error, in case someone else already won" pattern below) and
+  # returns `:ok` if so, rather than propagating a false failure. Only a
+  # genuine failure to form (the local member really isn't running) still
+  # surfaces as `{:error, :cluster_not_formed}`.
+  #
+  # Uses the same deterministic, non-random uid for every member's config
+  # (`@placement_uid`) — each member's data still lives in a distinct,
+  # non-colliding directory because it's nested under that node's own
+  # HOSTNAME-scoped data_dir (see `RaCluster.data_dir/0`), so a shared uid
+  # string across members is correct here, not a collision risk.
   #
   # `resolve_fun` (whether the real `default_ordinal_resolver/1`, doing a live
   # DNS lookup, or a caller-supplied stand-in) can legitimately fail to
@@ -348,8 +363,19 @@ defmodule Riptide.RaCluster do
         end)
 
       case :ra.start_cluster(@system, configs) do
-        {:ok, _started, _not_started} -> :ok
-        {:error, :cluster_not_formed} -> {:error, :cluster_not_formed}
+        {:ok, _started, _not_started} ->
+          :ok
+
+        {:error, :cluster_not_formed} ->
+          # See the moduledoc comment above: a redundant call whose members
+          # (including this node's own) are already running also reports
+          # `:cluster_not_formed`, indistinguishable at this point from a
+          # genuine failure to reach quorum unless we check locally.
+          if server_alive?(@placement_cluster_name) do
+            :ok
+          else
+            {:error, :cluster_not_formed}
+          end
       end
     rescue
       MatchError -> {:error, :cluster_not_formed}

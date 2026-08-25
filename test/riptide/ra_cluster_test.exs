@@ -164,6 +164,43 @@ defmodule Riptide.RaClusterTest do
       assert RaCluster.attempt_start_placement_cluster(resolve_fun) ==
                {:error, :cluster_not_formed}
     end
+
+    test "a redundant call after the local member is already fully started returns :ok, not {:error, :cluster_not_formed}" do
+      # Reproduces the confirmed bug (found by a real multi-node `:peer`-based
+      # integration test, see `placement_cluster_test.exs`) with a real
+      # `:ra.start_cluster/2` call, no mocking of `:ra` itself — `:ra` doesn't
+      # require its members to be on distinct physical (or even distinct
+      # Erlang) nodes to exercise this exact bug, since the bug is entirely
+      # about `:ra.start_cluster/3`'s own per-call bookkeeping (its `Started`
+      # list only tracks servers *this call* newly started, not servers that
+      # are merely alive — confirmed directly against
+      # `deps/ra/src/ra.erl:427-465`). A resolver that maps every one of the 3
+      # fixed ordinals to this same test node collapses all 3 configs to the
+      # same real `{:riptide_placement, node()}` id, so the *first* call
+      # genuinely starts one real local member (the other two configs lose
+      # the race for the same id/uid and are reported as not-started, which
+      # is fine — `:ra.start_cluster/2` only needs at least one real `ok`
+      # start to succeed) and returns `:ok`. The *second*, redundant call
+      # replays the exact real-world failure: every one of its (here, 3
+      # identical) per-member `:ra.start_server/2` attempts now hits the
+      # already-running member and returns `{:error, {:already_started,
+      # pid}}`, so `:ra`'s own `Started` list is empty and it reports
+      # `{:error, :cluster_not_formed}` for the whole call — even though the
+      # local member is completely healthy. Without the fix in
+      # `attempt_start_placement_cluster/1`, this second call would surface
+      # that raw `:ra` error instead of self-correcting.
+      resolve_fun = fn _ordinal -> node() end
+
+      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
+
+      assert RaCluster.attempt_start_placement_cluster(resolve_fun) == :ok
+
+      pid = Process.whereis(:riptide_placement)
+      assert is_pid(pid)
+      assert Process.alive?(pid)
+
+      assert RaCluster.attempt_start_placement_cluster(resolve_fun) == :ok
+    end
   end
 
   test "server_id/1 never turns an arbitrary stream_id into an unbounded atom", %{
