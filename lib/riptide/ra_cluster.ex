@@ -33,13 +33,26 @@ defmodule Riptide.RaCluster do
     {@placement_cluster_name, resolve_fun.(ordinal)}
   end
 
-  # Resolves a StatefulSet ordinal to its *current* Erlang node identity via
-  # the headless Service's DNS, mirroring exactly how `Cluster.Strategy.
-  # Kubernetes.DNS` (see `config/runtime.exs`) already resolves peers for
-  # libcluster. Public (not private) so `Riptide.Placement`'s client
-  # functions can reference it as their own default argument value.
+  # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
+  # In production this is always the real DNS-based resolution below
+  # (mirroring exactly how `Cluster.Strategy.Kubernetes.DNS` resolves peers
+  # for libcluster); overridden in `config/test.exs` to an identity resolver
+  # (`fn _ordinal -> node() end`) since there's no real headless-service DNS
+  # in local dev/CI. This is the *default* every `Riptide.Placement`
+  # function falls back to — `Riptide.Stream.Placement`/`StreamServer`
+  # (Phase 3c-ii) deliberately never thread a resolver through their own
+  # public APIs, so making the default itself environment-correct is the
+  # only way their calls work in both places.
   @spec default_ordinal_resolver(String.t()) :: node()
   def default_ordinal_resolver(ordinal) do
+    case Application.get_env(:riptide, :ordinal_resolver) do
+      nil -> dns_ordinal_resolver(ordinal)
+      resolver when is_function(resolver, 1) -> resolver.(ordinal)
+    end
+  end
+
+  @spec dns_ordinal_resolver(String.t()) :: node()
+  defp dns_ordinal_resolver(ordinal) do
     headless_service = System.get_env("RIPTIDE_HEADLESS_SERVICE", "riptide-headless")
     hostname = String.to_charlist("#{ordinal}.#{headless_service}")
 
