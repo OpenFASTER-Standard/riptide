@@ -27,20 +27,24 @@
 **Files:**
 - Modify: `test/test_helper.exs`
 - Modify: `test/riptide/placement_test.exs`
+- Modify: `lib/riptide/ra_cluster.ex`
+- Modify: `config/test.exs`
 
 **Interfaces:**
 - Consumes: `Riptide.RaCluster.attempt_start_placement_cluster/1` (existing, from Phase 3c-i).
-- Produces: a real, running (single-node-collapsed) placement metadata cluster for the entire `mix test` run — every later task's tests that call `Riptide.Placement.assign/2`/`lookup/2` for real depend on this.
+- Produces: a real, running (single-node-collapsed) placement metadata cluster for the entire `mix test` run, AND a working default ordinal resolver in that environment — every later task's tests that call `Riptide.Placement.assign/2`/`lookup/2` for real (directly, or indirectly via `Riptide.Stream.Placement`) depend on both.
 
-Today, `Riptide.Application`'s placement-cluster boot-time bootstrap only runs on pods whose `HOSTNAME` matches one of the 3 fixed ordinals (`riptide-0`/`riptide-1`/`riptide-2`) — never true in local dev or CI. This means `Riptide.Placement.assign/2`/`lookup/2` have never been exercised for real in the regular async `mix test` suite (only in the separate `:peer`-based `placement_cluster_test.exs`, and only in Phase 3c-i's own `ra_cluster_test.exs` regression test, which calls `attempt_start_placement_cluster/1` directly). From this plan onward, `Riptide.Stream.Placement` will call `Riptide.Placement.assign/2`/`lookup/2` for real on every new stream in every `StreamServer` test — so the async suite needs a real, running metadata cluster from the start.
+Today, `Riptide.Application`'s placement-cluster boot-time bootstrap only runs on pods whose `HOSTNAME` matches one of the 3 fixed ordinals (`riptide-0`/`riptide-1`/`riptide-2`) — never true in local dev or CI. This means `Riptide.Placement.assign/2`/`lookup/2` have never been exercised for real in the regular async `mix test` suite (only in the separate `:peer`-based `placement_cluster_test.exs`, and only in Phase 3c-i's own `ra_cluster_test.exs` regression test, which calls `attempt_start_placement_cluster/1` directly). From this plan onward, `Riptide.Stream.Placement` will call `Riptide.Placement.assign/2`/`lookup/2` for real on every new stream in every `StreamServer` test — so the async suite needs both a real, running metadata cluster AND working `Placement.assign/2`/`lookup/2` calls *with their default arguments* (no test can pass an explicit resolver through `Riptide.Stream.Placement`/`StreamServer`'s public API, since neither exposes one — that API stays exactly as clean as Phase 3c-i's own design intended).
 
-- [ ] **Step 1: Write a failing test proving `Placement.assign/lookup` don't work yet in the async suite**
+There's a second problem beyond just starting the cluster: `Riptide.Placement.assign/2`'s and `lookup/2`'s *default* `resolve_fun` argument is `&RaCluster.default_ordinal_resolver/1`, which always does a real DNS lookup (`riptide-0.riptide-headless`) — correct in real Kubernetes, but there is no such DNS record in local dev/CI, so it raises `MatchError` before ever reaching the cluster this task just bootstrapped. Passing an explicit resolver to every individual call site would work for isolated test code, but `Riptide.Stream.Placement` (Task 4) and `Riptide.Stream.StreamServer` (Task 5) call `Placement.assign/2`/`lookup/2` with their *default* argument by design — their own public APIs deliberately don't expose a resolver parameter (Task 5's whole point is "no change to `StreamServer`'s public API"). So the fix has to make the *default* itself work correctly per environment, not patch each call site.
+
+- [ ] **Step 1: Write a failing test proving `Placement.assign/lookup` don't work yet in the async suite, with their default arguments**
 
 Add to `test/riptide/placement_test.exs`:
 
 ```elixir
   describe "assign/2 and lookup/2 against the real metadata cluster" do
-    test "a real assignment round-trips through the real placement cluster" do
+    test "a real assignment round-trips through the real placement cluster, using default arguments" do
       stream_id = "placement-roundtrip-" <> Uniq.UUID.uuid4()
       assigned = Placement.assign(stream_id, [node()])
 
@@ -53,9 +57,62 @@ Add to `test/riptide/placement_test.exs`:
 - [ ] **Step 2: Run it to confirm it fails**
 
 Run: `mix test test/riptide/placement_test.exs --trace`
-Expected: FAIL — the placement server_id (`{:riptide_placement, node()}`) was never started, so `RaCluster.process_command/2`/`consistent_query/2` raise (`Ra command failed`/`Ra consistent query failed`) rather than returning a value.
+Expected: FAIL — `default_ordinal_resolver/1`'s `:inet.gethostbyname/1` call raises `MatchError` (no such DNS record as `riptide-0.riptide-headless` in this environment), before the (not-yet-bootstrapped) placement cluster is even reached.
 
-- [ ] **Step 3: Bootstrap a real placement cluster once for the whole test run**
+- [ ] **Step 3: Make `default_ordinal_resolver/1` environment-configurable**
+
+Modify `lib/riptide/ra_cluster.ex` — replace the existing `default_ordinal_resolver/1` with:
+
+```elixir
+  # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
+  # In production this is always the real DNS-based resolution below
+  # (mirroring exactly how `Cluster.Strategy.Kubernetes.DNS` resolves peers
+  # for libcluster); overridden in `config/test.exs` to an identity resolver
+  # (`fn _ordinal -> node() end`) since there's no real headless-service DNS
+  # in local dev/CI. This is the *default* every `Riptide.Placement`
+  # function falls back to — `Riptide.Stream.Placement`/`StreamServer`
+  # (Phase 3c-ii) deliberately never thread a resolver through their own
+  # public APIs, so making the default itself environment-correct is the
+  # only way their calls work in both places.
+  @spec default_ordinal_resolver(String.t()) :: node()
+  def default_ordinal_resolver(ordinal) do
+    case Application.get_env(:riptide, :ordinal_resolver) do
+      nil -> dns_ordinal_resolver(ordinal)
+      resolver when is_function(resolver, 1) -> resolver.(ordinal)
+    end
+  end
+
+  @spec dns_ordinal_resolver(String.t()) :: node()
+  defp dns_ordinal_resolver(ordinal) do
+    headless_service = System.get_env("RIPTIDE_HEADLESS_SERVICE", "riptide-headless")
+    hostname = String.to_charlist("#{ordinal}.#{headless_service}")
+
+    {:ok, {:hostent, _, _, _, _, [ip | _]}} = :inet.gethostbyname(hostname)
+    ip_string = ip |> :inet.ntoa() |> to_string()
+    String.to_atom("riptide@#{ip_string}")
+  end
+```
+
+Add to `config/test.exs` (anywhere after `import Config`):
+
+```elixir
+# No real headless-service DNS exists in this environment — every ordinal
+# resolves to whichever node is actually asking, which is correct for both
+# the single-node async suite (test_helper.exs bootstraps all 3 fixed
+# ordinals collapsed onto this one node) and real :peer-based multi-node
+# integration tests (every peer that's genuinely a placement-cluster member
+# addresses its own real local member this way — see Phase 3c-ii plan Task
+# 6). Never applies outside MIX_ENV=test — config/runtime.exs (real
+# Kubernetes) is untouched and keeps using real DNS.
+config :riptide, ordinal_resolver: fn _ordinal -> node() end
+```
+
+- [ ] **Step 4: Run the test again — still expected to fail, for a different reason**
+
+Run: `mix test test/riptide/placement_test.exs --trace`
+Expected: FAIL — the resolver now works (no more `MatchError`), but the placement cluster still isn't running, so `RaCluster.process_command/2`/`consistent_query/2` raise (`Ra command failed`/`Ra consistent query failed`).
+
+- [ ] **Step 5: Bootstrap a real placement cluster once for the whole test run**
 
 Modify `test/test_helper.exs`:
 
@@ -63,32 +120,33 @@ Modify `test/test_helper.exs`:
 ExUnit.start()
 
 # Riptide.Application's own placement-cluster bootstrap only runs on pods
-# whose HOSTNAME matches one of the 3 fixed ordinals — never true here. A
-# resolver that maps every ordinal to this same test node collapses all 3
-# configs to the same real {:riptide_placement, node()} id, exactly the
-# pattern already proven safe by ra_cluster_test.exs's own redundant-call
-# regression test (Phase 3c-i) — this gives the whole async suite a real,
-# running (single-node) placement cluster to assign/lookup against, so
-# every test that goes through Riptide.Stream.Placement (Phase 3c-ii) can
-# exercise real Placement.assign/2/lookup/2 calls, not just pure logic.
-:ok = Riptide.RaCluster.attempt_start_placement_cluster(fn _ordinal -> node() end)
+# whose HOSTNAME matches one of the 3 fixed ordinals — never true here. This
+# gives the whole async suite a real, running (single-node-collapsed)
+# placement cluster to assign/lookup against, so every test that goes
+# through Riptide.Stream.Placement (Phase 3c-ii) can exercise real
+# Placement.assign/2/lookup/2 calls, not just pure logic. Uses the same
+# config-driven ordinal_resolver Step 3 just added (config/test.exs), not
+# an explicit resolver here — this must resolve exactly the same way
+# Placement.assign/2/lookup/2's own default argument will later, or the
+# bootstrapped cluster and later calls address different servers.
+:ok = Riptide.RaCluster.attempt_start_placement_cluster()
 ```
 
-- [ ] **Step 4: Run the test again to verify it passes**
+- [ ] **Step 6: Run the test again to verify it passes**
 
 Run: `mix test test/riptide/placement_test.exs --trace`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full suite to confirm nothing else broke**
+- [ ] **Step 7: Run the full suite to confirm nothing else broke**
 
 Run: `mix test`
-Expected: PASS, same pass count as before this change (no new failures — this only ADDS a working capability, it doesn't change any existing behavior).
+Expected: PASS, same pass count as before this change (no new failures — this only ADDS a working capability, it doesn't change any existing behavior). `config/test.exs`'s override never applies outside `MIX_ENV=test`, so production behavior (real DNS resolution) is unchanged.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add test/test_helper.exs test/riptide/placement_test.exs
-git commit -m "Bootstrap a real placement cluster for the async test suite"
+git add test/test_helper.exs test/riptide/placement_test.exs lib/riptide/ra_cluster.ex config/test.exs
+git commit -m "Make default_ordinal_resolver/1 environment-configurable; bootstrap a real placement cluster for the async test suite"
 ```
 
 ---
@@ -896,6 +954,21 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
     ordinal_to_node = Map.new(peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
     resolve_fun = fn ordinal -> Map.fetch!(ordinal_to_node, ordinal) end
+
+    # Riptide.Placement.assign/2's and lookup/2's *default* argument is
+    # RaCluster.default_ordinal_resolver/1, which (since Task 1) consults
+    # Application.get_env(:riptide, :ordinal_resolver) — but :peer-spawned
+    # nodes never load Mix config at all, so config/test.exs's override
+    # (an identity resolver, correct for the collapsed single-node async
+    # suite) never reaches them, and isn't what real distinct peers need
+    # anyway. Riptide.Stream.Placement/StreamServer (called via erpc below)
+    # never pass an explicit resolver — their public APIs deliberately
+    # don't expose one — so each peer needs this set explicitly here, using
+    # the SAME real ordinal->node mapping used for the placement cluster's
+    # own bootstrap immediately below.
+    for {_pid, node, _ordinal} <- peers do
+      :erpc.call(node, Application, :put_env, [:riptide, :ordinal_resolver, resolve_fun])
+    end
 
     for {n1, n2} <- unique_pairs(nodes) do
       assert :erpc.call(n1, :net_kernel, :connect_node, [n2]) == true
