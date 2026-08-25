@@ -42,12 +42,26 @@ defmodule Riptide.RaCluster do
   # through `placement_server_id/2`'s ordinal/DNS resolution, since this is
   # only ever meaningful to call from a node that's itself a placement
   # ordinal already running its own local member.
+  # Wrapped in `try/catch :exit` because `:ra.members/1` doesn't always turn
+  # a bad outcome into an `{:error, _}` tuple: `ra_server_proc`'s own
+  # `gen_statem_safe_call/3` only converts `timeout`/`noproc`/`nodedown`/
+  # `shutdown` exits into a return value — any OTHER exit (e.g. the local
+  # member process crashing for an unrelated reason while this exact call is
+  # in flight) propagates straight out of `gen_statem:call/3` as a genuine
+  # `exit`, which a plain `case` can't catch. `Riptide.Stream.ReplicaHealer`
+  # (Phase 3d-ii) is the first caller to invoke this from a periodic
+  # boot-time timer rather than a one-off request path, so a rare exit here
+  # would otherwise crash that GenServer outright instead of just skipping a
+  # sweep. Any exit is treated as "not the leader" — the same conservative
+  # default this function already returns for a plain `{:error, _}`.
   @spec placement_leader?() :: boolean()
   def placement_leader? do
     case :ra.members({@placement_cluster_name, node()}) do
       {:ok, _members, {@placement_cluster_name, leader_node}} -> leader_node == node()
       _ -> false
     end
+  catch
+    :exit, _ -> false
   end
 
   # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
@@ -548,15 +562,69 @@ defmodule Riptide.RaCluster do
     new_id = {name, new_node}
     cluster_name = uid <> "_cluster"
 
-    with {:ok, _reply, _leader} <-
-           retry_cluster_change(fn -> :ra.add_member(survivor_ids, new_id) end),
-         :ok <- :ra.start_server(@system, cluster_name, new_id, machine, survivor_ids),
+    with :ok <- add_member(survivor_ids, new_id),
+         :ok <- start_joining_server(cluster_name, new_id, machine, survivor_ids),
          {:ok, _reply, _leader} <-
            retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
       :ok
     else
       {:error, reason} -> {:error, reason}
       {:timeout, _} -> {:error, :timeout}
+    end
+  end
+
+  # Self-corrects the exact same "redundant retry after a partial prior
+  # success" shape `start_new_cluster/4` and `attempt_start_placement_cluster/1`
+  # already handle for their own `:ra` calls (see their own docs): if a
+  # previous `replace_member/5` attempt's `add_member` step already landed
+  # (e.g. this node crashed before reaching `remove_member`), `:ra.add_member/2`
+  # now genuinely returns `{:error, :already_member}` for `new_id` — a real,
+  # non-transient error `retry_cluster_change/2` deliberately does NOT retry
+  # (see its own doc). Without this, that error would fail the whole repair
+  # attempt outright on every retry, leaving the stream permanently stuck
+  # (finding 3, Phase 3d-ii final review) instead of proceeding on to
+  # (re-)ensure the joining server itself is started.
+  @spec add_member([:ra.server_id()], :ra.server_id()) ::
+          :ok | {:error, term()} | {:timeout, term()}
+  defp add_member(survivor_ids, new_id) do
+    case retry_cluster_change(fn -> :ra.add_member(survivor_ids, new_id) end) do
+      {:ok, _reply, _leader} -> :ok
+      {:error, :already_member} -> :ok
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} = timeout -> timeout
+    end
+  end
+
+  # Same self-correction idiom as `start_new_cluster/4`'s own "recheck
+  # liveness after an error, in case someone else already won" pattern — but
+  # checking `member_alive?/1` (local-or-remote, since `new_id`'s node is
+  # often a genuinely different physical node than whichever node is running
+  # this repair) rather than pattern-matching a specific error shape like
+  # `{:error, {:already_started, _pid}}`. Confirmed necessary, not just
+  # defensive: `:ra.start_server/5`'s underlying supervisor child-start
+  # failure for an id that's already running can come back wrapped as
+  # `{:error, {:shutdown, {:failed_to_start_child, ChildId, {:already_started,
+  # pid}}}}` rather than the bare tuple (observed via this module's own
+  # collapsed-node test, where `new_node` coincides with an already-running
+  # survivor) — matching only the unwrapped shape silently let that case fall
+  # through as a genuine failure. Checking real liveness instead is robust to
+  # whatever exact wrapping `:ra`/its supervisor happens to produce for "this
+  # id is already running," the same reasoning `start_new_cluster/4` already
+  # established for its own redundant-start races.
+  @spec start_joining_server(String.t(), :ra.server_id(), :ra_machine.machine(), [
+          :ra.server_id()
+        ]) :: :ok | {:error, term()}
+  defp start_joining_server(cluster_name, new_id, machine, survivor_ids) do
+    case :ra.start_server(@system, cluster_name, new_id, machine, survivor_ids) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        if member_alive?(new_id) do
+          :ok
+        else
+          {:error, reason}
+        end
     end
   end
 

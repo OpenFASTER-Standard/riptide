@@ -319,8 +319,16 @@ defmodule Riptide.RaClusterTest do
       # doesn't blow up against a real, already-running single-member
       # cluster — real distinctness is proven separately by Step 5's
       # `:peer`-based test.
+      #
+      # `node()` is already a member here, so `add_member`/`start_server` both
+      # self-correct on their own respective "already there" outcomes (finding
+      # 3, Phase 3d-ii final review — see `RaCluster.add_member/2` and
+      # `start_joining_server/4`'s own docs) and the call proceeds all the way
+      # to `remove_member`, which is where this contrived scenario's real
+      # error surfaces: `:dead@nowhere` was never actually a member of this
+      # single-member cluster to begin with.
       assert RaCluster.replace_member(uid, [node()], :dead@nowhere, node(), machine) ==
-               {:error, :already_member}
+               {:error, :not_member}
     end
   end
 end

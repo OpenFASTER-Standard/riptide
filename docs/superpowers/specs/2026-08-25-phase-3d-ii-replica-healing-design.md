@@ -121,12 +121,15 @@ just "nothing to do yet."
 Given a stream with dead member `D` and chosen replacement `R`, addressed against the stream's
 own `:ra` cluster (a surviving member's server id, entirely separate from the placement cluster):
 
-1. `:ra.start_server/2` on `R`'s node, using the same config shape
+1. `:ra.add_member(survivor_id, new_id)` — registers `R` as a cluster member FIRST, before its
+   local server exists. Verified against `:ra`'s own growing-a-cluster documentation (`ra`'s
+   README, "Dynamically Changing Cluster Membership"): a freshly-started server with no cluster
+   membership entry yet has nothing to catch up from, so the membership entry must exist before
+   step 2 brings the server itself up.
+2. `:ra.start_server/2` on `R`'s node, using the same config shape
    `RaCluster.start_or_join_replicated/3` already builds (`uid`, `cluster_name`,
    `log_init_args`) — but as a server *joining* an existing cluster, not forming a fresh one.
-   Brings up `R`'s local Ra server so it's ready to receive the cluster's replicated log.
-2. `:ra.add_member(survivor_id, new_id)` — registers `R` as a cluster member; it begins catching
-   up via ordinary Raft log replication.
+   Brings up `R`'s local Ra server so it can start catching up via ordinary Raft log replication.
 3. `:ra.remove_member(survivor_id, dead_id)` — evicts `D` from the cluster's membership.
 4. `Riptide.Placement.replace_member(stream_id, D, R)` — updates the durable metadata so future
    lookups (and any node's future cache population) return the corrected node list.

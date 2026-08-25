@@ -18,7 +18,6 @@ defmodule Riptide.Stream.ReplicaHealer do
   alias Riptide.Stream.RaMachine
 
   @sweep_interval_ms 30_000
-  @stream_machine {:module, RaMachine, %{retention: :infinity}}
 
   @spec start_link(term()) :: GenServer.on_start()
   def start_link(_opts) do
@@ -78,40 +77,83 @@ defmodule Riptide.Stream.ReplicaHealer do
         :ok
 
       new_node ->
-        case RaCluster.replace_member(uid, survivor_nodes, dead_node, new_node, @stream_machine) do
-          :ok ->
-            new_nodes = Placement.replace_member(stream_id, dead_node, new_node)
+        case discover_retention(uid, survivor_nodes) do
+          {:ok, retention} ->
+            do_repair(stream_id, uid, survivor_nodes, dead_node, new_node, retention)
 
-            Phoenix.PubSub.broadcast(
-              Riptide.PubSub,
-              "stream_placement_changed",
-              {:stream_placement_changed, stream_id, new_nodes}
-            )
-
-            Logger.info(
-              "ReplicaHealer repaired #{stream_id}: replaced #{inspect(dead_node)} with #{inspect(new_node)}"
-            )
-
-          {:error, reason} ->
+          :error ->
             Logger.warning(
-              "ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}"
+              "ReplicaHealer could not discover #{stream_id}'s current retention from any " <>
+                "survivor (#{inspect(survivor_nodes)}); skipping repair this tick"
             )
         end
     end
   end
 
+  defp do_repair(stream_id, uid, survivor_nodes, dead_node, new_node, retention) do
+    machine = {:module, RaMachine, %{retention: retention}}
+
+    case RaCluster.replace_member(uid, survivor_nodes, dead_node, new_node, machine) do
+      :ok ->
+        new_nodes = Placement.replace_member(stream_id, dead_node, new_node)
+
+        Phoenix.PubSub.broadcast(
+          Riptide.PubSub,
+          "stream_placement_changed",
+          {:stream_placement_changed, stream_id, new_nodes}
+        )
+
+        Logger.info(
+          "ReplicaHealer repaired #{stream_id}: replaced #{inspect(dead_node)} with #{inspect(new_node)}"
+        )
+
+      {:error, reason} ->
+        Logger.warning(
+          "ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}"
+        )
+    end
+  end
+
   @doc """
   Picks a live fleet node to replace a dead member with — a candidate not
-  already among `current_nodes`, chosen the same random-selection way
-  `Riptide.Placement.propose_nodes/2` already picks a new stream's initial
-  replicas. `live_nodes` defaults to `Node.list()` but is overridable for
-  tests, mirroring `propose_nodes/2`'s own `peers \\ Node.list()` pattern.
+  already among `current_nodes`. Deterministic (sorted, first candidate)
+  rather than random, unlike `Riptide.Placement.propose_nodes/2`'s own
+  selection for a brand-new stream: two concurrent or retried repair
+  attempts for the very same `{stream_id, dead_node}` pair always compute
+  the same `current_nodes`/`live_nodes` inputs, so picking deterministically
+  means they always converge on the same replacement node too — turning a
+  redundant second attempt (e.g. after a partial failure, or a leadership
+  handoff mid-sweep — see finding 3, Phase 3d-ii final review) into a safe
+  retry of the same repair instead of a competing one that could leave the
+  stream over-replicated. `live_nodes` defaults to `Node.list()` but is
+  overridable for tests, mirroring `propose_nodes/2`'s own
+  `peers \\ Node.list()` pattern.
   """
   @spec pick_replacement([node()], [node()]) :: node() | nil
   def pick_replacement(current_nodes, live_nodes \\ Node.list()) do
-    case Placement.select_nodes(live_nodes -- current_nodes, 1) do
-      [node] -> node
+    case (live_nodes -- current_nodes) |> Enum.uniq() |> Enum.sort() do
       [] -> nil
+      [node | _rest] -> node
     end
+  end
+
+  # `RaCluster` is the sole module allowed to call `:ra` directly (see its
+  # own moduledoc) — this goes through `RaCluster.consistent_query/2`, the
+  # existing linearizable-read primitive, rather than reaching into `:ra`
+  # itself. Tries every survivor in turn (mirroring `Riptide.Placement`'s own
+  # `with_ordinal_fallback/2` "try the next one on failure" shape) since any
+  # single survivor being briefly unreachable shouldn't block discovering a
+  # value every survivor's machine state agrees on.
+  @spec discover_retention(String.t(), [node()]) :: {:ok, term()} | :error
+  defp discover_retention(uid, survivor_nodes) do
+    name = String.to_atom(uid)
+
+    Enum.find_value(survivor_nodes, :error, fn node ->
+      try do
+        {:ok, RaCluster.consistent_query({name, node}, &Map.get(&1, :retention))}
+      rescue
+        _ -> nil
+      end
+    end)
   end
 end
