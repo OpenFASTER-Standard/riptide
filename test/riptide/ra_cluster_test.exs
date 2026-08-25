@@ -118,6 +118,38 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
+  describe "placement_ordinals/0 and placement_server_id/1,2" do
+    test "placement_ordinals/0 returns exactly the 3 fixed ordinals" do
+      assert RaCluster.placement_ordinals() == ["riptide-0", "riptide-1", "riptide-2"]
+    end
+
+    test "placement_server_id/2 combines the placement cluster name with the resolver's result" do
+      resolve_fun = fn "riptide-1" -> :"riptide@10.0.0.5" end
+
+      assert RaCluster.placement_server_id("riptide-1", resolve_fun) ==
+               {:riptide_placement, :"riptide@10.0.0.5"}
+    end
+  end
+
+  describe "ensure_placement_cluster_started/2" do
+    test "retries the attempt function until it succeeds" do
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      attempt_fun = fn ->
+        count = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
+        if count < 2, do: {:error, :cluster_not_formed}, else: :ok
+      end
+
+      assert RaCluster.ensure_placement_cluster_started(1, attempt_fun) == :ok
+      assert Agent.get(counter, & &1) == 3
+    end
+
+    test "succeeds immediately if the first attempt succeeds" do
+      attempt_fun = fn -> :ok end
+      assert RaCluster.ensure_placement_cluster_started(1, attempt_fun) == :ok
+    end
+  end
+
   test "server_id/1 never turns an arbitrary stream_id into an unbounded atom", %{
     stream_id: stream_id
   } do

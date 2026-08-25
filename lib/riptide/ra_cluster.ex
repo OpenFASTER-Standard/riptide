@@ -18,6 +18,36 @@ defmodule Riptide.RaCluster do
     "riptide_" <> Base.encode16(:crypto.hash(:sha256, stream_id), case: :lower)
   end
 
+  # Fixed, not derived from fleet size — see Phase 3c-i design spec §2/§5. The
+  # metadata cluster stays this exact size regardless of how large the overall
+  # fleet grows.
+  @placement_ordinals ["riptide-0", "riptide-1", "riptide-2"]
+  @placement_cluster_name :riptide_placement
+  @placement_uid "riptide_placement"
+
+  @spec placement_ordinals() :: [String.t()]
+  def placement_ordinals, do: @placement_ordinals
+
+  @spec placement_server_id(String.t(), (String.t() -> node())) :: :ra.server_id()
+  def placement_server_id(ordinal, resolve_fun \\ &default_ordinal_resolver/1) do
+    {@placement_cluster_name, resolve_fun.(ordinal)}
+  end
+
+  # Resolves a StatefulSet ordinal to its *current* Erlang node identity via
+  # the headless Service's DNS, mirroring exactly how `Cluster.Strategy.
+  # Kubernetes.DNS` (see `config/runtime.exs`) already resolves peers for
+  # libcluster. Public (not private) so `Riptide.Placement`'s client
+  # functions can reference it as their own default argument value.
+  @spec default_ordinal_resolver(String.t()) :: node()
+  def default_ordinal_resolver(ordinal) do
+    headless_service = System.get_env("RIPTIDE_HEADLESS_SERVICE", "riptide-headless")
+    hostname = String.to_charlist("#{ordinal}.#{headless_service}")
+
+    {:ok, {:hostent, _, _, _, _, [ip | _]}} = :inet.gethostbyname(hostname)
+    ip_string = ip |> :inet.ntoa() |> to_string()
+    String.to_atom("riptide@#{ip_string}")
+  end
+
   @spec start_or_restart(String.t(), :ra_machine.machine()) :: :ra.server_id()
   def start_or_restart(stream_id, machine) do
     ensure_system_started()
@@ -249,6 +279,64 @@ defmodule Riptide.RaCluster do
     case Process.whereis(name) do
       nil -> false
       pid -> Process.alive?(pid)
+    end
+  end
+
+  # Retries indefinitely until the placement cluster is formed — intended to
+  # be started as a fire-and-forget background task at application boot (see
+  # Task 4), not called synchronously from a request path. StatefulSet pods
+  # start ordinally by default, so early attempts legitimately fail while
+  # sibling ordinals aren't yet reachable; `attempt_fun` returning
+  # `{:error, :cluster_not_formed}` is the expected, retriable outcome during
+  # that startup window, not a bug.
+  @spec ensure_placement_cluster_started(pos_integer(), (-> :ok | {:error, term()})) :: :ok
+  def ensure_placement_cluster_started(
+        retry_interval_ms \\ 1000,
+        attempt_fun \\ &attempt_start_placement_cluster/0
+      ) do
+    case attempt_fun.() do
+      :ok ->
+        :ok
+
+      {:error, _reason} ->
+        Process.sleep(retry_interval_ms)
+        ensure_placement_cluster_started(retry_interval_ms, attempt_fun)
+    end
+  end
+
+  # A single attempt to form (or rejoin) the placement cluster. Safe to call
+  # redundantly from multiple ordinals concurrently, and safe to call again
+  # on a routine pod restart when the cluster is already running elsewhere —
+  # `:ra.start_cluster/2`'s own per-member `{:error, {:already_started, _}}`
+  # handling (internal to `:ra`, not surfaced here) means an already-running
+  # sibling member is simply not double-started, not an error condition for
+  # this call as a whole. Uses the same deterministic, non-random uid for
+  # every member's config (`@placement_uid`) — each member's data still lives
+  # in a distinct, non-colliding directory because it's nested under that
+  # node's own HOSTNAME-scoped data_dir (see `RaCluster.data_dir/0`), so a
+  # shared uid string across members is correct here, not a collision risk.
+  @spec attempt_start_placement_cluster((String.t() -> node())) ::
+          :ok | {:error, :cluster_not_formed}
+  def attempt_start_placement_cluster(resolve_fun \\ &default_ordinal_resolver/1) do
+    ensure_system_started()
+
+    member_ids = Enum.map(@placement_ordinals, &placement_server_id(&1, resolve_fun))
+
+    configs =
+      Enum.map(member_ids, fn id ->
+        %{
+          id: id,
+          uid: @placement_uid,
+          cluster_name: "#{@placement_uid}_cluster",
+          log_init_args: %{uid: @placement_uid},
+          initial_members: member_ids,
+          machine: {:module, Riptide.Placement.PlacementMachine, %{}}
+        }
+      end)
+
+    case :ra.start_cluster(@system, configs) do
+      {:ok, _started, _not_started} -> :ok
+      {:error, :cluster_not_formed} -> {:error, :cluster_not_formed}
     end
   end
 end
