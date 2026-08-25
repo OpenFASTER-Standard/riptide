@@ -226,4 +226,11 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     container_get_conn = :get |> conn(container_path) |> RiptideWeb.Endpoint.call(@opts)
     assert container_get_conn.resp_body =~ "ldp#contains"
   end
+
+  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
+    assert RiptideWeb.LDP.ResourceController.ensure_ready_status(:ok) == :ok
+
+    assert RiptideWeb.LDP.ResourceController.ensure_ready_status({:error, :cluster_not_formed}) ==
+             :error
+  end
 end

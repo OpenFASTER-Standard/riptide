@@ -6,27 +6,35 @@ defmodule RiptideWeb.Realtime.SseController do
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
   def subscribe(conn, %{"stream_id" => stream_id}) do
-    StreamSupervisor.get_or_start(stream_id)
-    Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
+    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      :ok ->
+        Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
+        cursor = last_event_id(conn)
 
-    cursor = last_event_id(conn)
+        case StreamServer.get_since(stream_id, cursor) do
+          {:gap, oldest} ->
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(409, Jason.encode!(%{"oldestAvailable" => oldest}))
 
-    case StreamServer.get_since(stream_id, cursor) do
-      {:gap, oldest} ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(409, Jason.encode!(%{"oldestAvailable" => oldest}))
+          {:ok, backlog} ->
+            conn =
+              conn
+              |> put_resp_content_type("text/event-stream", nil)
+              |> send_chunked(200)
 
-      {:ok, backlog} ->
-        conn =
-          conn
-          |> put_resp_content_type("text/event-stream", nil)
-          |> send_chunked(200)
+            conn = Enum.reduce(backlog, conn, &write_event(&2, &1))
+            loop(conn)
+        end
 
-        conn = Enum.reduce(backlog, conn, &write_event(&2, &1))
-        loop(conn)
+      :error ->
+        send_resp(conn, 503, "")
     end
   end
+
+  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
+  def ensure_ready_status(:ok), do: :ok
+  def ensure_ready_status({:error, _reason}), do: :error
 
   defp loop(conn) do
     receive do

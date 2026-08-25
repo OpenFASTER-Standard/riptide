@@ -17,6 +17,9 @@ defmodule RiptideWeb.LDP.ResourceController do
 
       :not_found ->
         send_resp(conn, 404, "")
+
+      :service_unavailable ->
+        send_resp(conn, 503, "")
     end
   end
 
@@ -26,10 +29,14 @@ defmodule RiptideWeb.LDP.ResourceController do
 
     case TurtleCodec.decode(body) do
       {:ok, graph} ->
-        StreamSupervisor.get_or_start(stream_id)
-        StreamServer.append(stream_id, Event.new(stream_id, :replace, graph))
+        case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+          :ok ->
+            StreamServer.append(stream_id, Event.new(stream_id, :replace, graph))
+            send_resp(conn, 201, "")
 
-        send_resp(conn, 201, "")
+          :error ->
+            send_resp(conn, 503, "")
+        end
 
       {:error, _reason} ->
         send_resp(conn, 400, "")
@@ -39,10 +46,14 @@ defmodule RiptideWeb.LDP.ResourceController do
   def delete(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(path_segments)
 
-    StreamSupervisor.get_or_start(stream_id)
-    StreamServer.append(stream_id, Event.new(stream_id, :delete, RDF.Graph.new()))
+    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      :ok ->
+        StreamServer.append(stream_id, Event.new(stream_id, :delete, RDF.Graph.new()))
+        send_resp(conn, 204, "")
 
-    send_resp(conn, 204, "")
+      :error ->
+        send_resp(conn, 503, "")
+    end
   end
 
   def patch(conn, %{"path" => path_segments} = params) do
@@ -64,10 +75,14 @@ defmodule RiptideWeb.LDP.ResourceController do
         removals: RDF.Graph.triples(removals_graph)
       }
 
-      StreamSupervisor.get_or_start(stream_id)
-      StreamServer.append(stream_id, Event.new(stream_id, :patch, patch))
+      case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+        :ok ->
+          StreamServer.append(stream_id, Event.new(stream_id, :patch, patch))
+          send_resp(conn, 200, "")
 
-      send_resp(conn, 200, "")
+        :error ->
+          send_resp(conn, 503, "")
+      end
     else
       :error -> send_resp(conn, 400, "")
       {:error, _reason} -> send_resp(conn, 400, "")
@@ -83,54 +98,65 @@ defmodule RiptideWeb.LDP.ResourceController do
         child_id = Uniq.UUID.uuid4()
         child_stream_id = container_stream_id <> "/" <> child_id
 
-        StreamSupervisor.get_or_start(child_stream_id)
-        StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
+        with :ok <- child_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status(),
+             :ok <-
+               container_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+          StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
 
-        containment_triple =
-          {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
+          containment_triple =
+            {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
 
-        containment_patch = %Patch{additions: [containment_triple], removals: []}
+          containment_patch = %Patch{additions: [containment_triple], removals: []}
 
-        StreamSupervisor.get_or_start(container_stream_id)
+          StreamServer.append(
+            container_stream_id,
+            Event.new(container_stream_id, :patch, containment_patch)
+          )
 
-        StreamServer.append(
-          container_stream_id,
-          Event.new(container_stream_id, :patch, containment_patch)
-        )
+          location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
 
-        location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
-
-        conn
-        |> put_resp_header("location", location)
-        |> send_resp(201, "")
+          conn
+          |> put_resp_header("location", location)
+          |> send_resp(201, "")
+        else
+          :error -> send_resp(conn, 503, "")
+        end
 
       {:error, _reason} ->
         send_resp(conn, 400, "")
     end
   end
 
+  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
+  def ensure_ready_status(:ok), do: :ok
+  def ensure_ready_status({:error, _reason}), do: :error
+
   defp stream_id_for(path_segments) do
     "https://riptide.example/resources/" <> Enum.join(path_segments, "/")
   end
 
   defp current_state(stream_id) do
-    StreamSupervisor.get_or_start(stream_id)
+    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      :error ->
+        :service_unavailable
 
-    case StreamServer.get_since(stream_id, 0) do
-      {:ok, []} ->
-        :not_found
+      :ok ->
+        case StreamServer.get_since(stream_id, 0) do
+          {:ok, []} ->
+            :not_found
 
-      # LDP streams use `:infinity` retention today, so `get_since/2` from
-      # cursor 0 can't currently return a gap. Handle it defensively anyway:
-      # if a future retention change trims the oldest events, a full-history
-      # fold from 0 can no longer be reconstructed, so the resource can't be
-      # faithfully rendered — treat it as not-found (404) rather than letting
-      # an unmatched `{:gap, _}` crash the request into a 500.
-      {:gap, _} ->
-        :not_found
+          # LDP streams use `:infinity` retention today, so `get_since/2` from
+          # cursor 0 can't currently return a gap. Handle it defensively anyway:
+          # if a future retention change trims the oldest events, a full-history
+          # fold from 0 can no longer be reconstructed, so the resource can't be
+          # faithfully rendered — treat it as not-found (404) rather than letting
+          # an unmatched `{:gap, _}` crash the request into a 500.
+          {:gap, _} ->
+            :not_found
 
-      {:ok, events} ->
-        resolve_state(events)
+          {:ok, events} ->
+            resolve_state(events)
+        end
     end
   end
 

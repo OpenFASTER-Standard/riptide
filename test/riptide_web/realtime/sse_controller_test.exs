@@ -12,7 +12,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   test "subscribing with no Last-Event-ID and then appending pushes one SSE frame" do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
-    StreamSupervisor.get_or_start(stream_id)
+    StreamSupervisor.ensure_ready(stream_id)
 
     task =
       Task.async(fn ->
@@ -54,5 +54,12 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     assert conn.status == 409
     assert Jason.decode!(conn.resp_body) == %{"oldestAvailable" => 2}
+  end
+
+  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
+    assert RiptideWeb.Realtime.SseController.ensure_ready_status(:ok) == :ok
+
+    assert RiptideWeb.Realtime.SseController.ensure_ready_status({:error, :cluster_not_formed}) ==
+             :error
   end
 end
