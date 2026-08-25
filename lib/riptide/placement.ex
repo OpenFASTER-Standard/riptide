@@ -34,12 +34,18 @@ defmodule Riptide.Placement do
 
   @spec assign(String.t(), [node()], (String.t() -> node())) :: [node()]
   def assign(stream_id, proposed_nodes, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    RaCluster.process_command(placement_server_id(resolve_fun), {:assign, stream_id, proposed_nodes})
+    RaCluster.process_command(
+      placement_server_id(resolve_fun),
+      {:assign, stream_id, proposed_nodes}
+    )
   end
 
   @spec lookup(String.t(), (String.t() -> node())) :: [node()] | nil
   def lookup(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    RaCluster.consistent_query(placement_server_id(resolve_fun), &PlacementMachine.get(&1, stream_id))
+    RaCluster.consistent_query(
+      placement_server_id(resolve_fun),
+      &PlacementMachine.get(&1, stream_id)
+    )
   end
 
   defp placement_server_id(resolve_fun) do

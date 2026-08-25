@@ -82,7 +82,11 @@ defmodule Riptide.PlacementClusterTest do
 
     for {_pid, node, _ordinal} <- peers do
       assert {:module, ^module} =
-               :erpc.call(node, :code, :load_binary, [module, ~c"placement_cluster_test.ex", bytecode])
+               :erpc.call(node, :code, :load_binary, [
+                 module,
+                 ~c"placement_cluster_test.ex",
+                 bytecode
+               ])
     end
 
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
@@ -123,7 +127,9 @@ defmodule Riptide.PlacementClusterTest do
     # node attempts cluster formation, so no member is ever "not started yet"
     # when another member's `:ra.start_cluster/2` call tries to reach it.
     for {_pid, node, _ordinal} <- peers do
-      case :erpc.call(node, :ra_system, :start, [:erpc.call(node, Riptide.RaCluster, :system_config, [])]) do
+      case :erpc.call(node, :ra_system, :start, [
+             :erpc.call(node, Riptide.RaCluster, :system_config, [])
+           ]) do
         {:ok, _pid} -> :ok
         {:ok, _pid, _info} -> :ok
         {:error, {:already_started, _pid}} -> :ok
@@ -163,7 +169,9 @@ defmodule Riptide.PlacementClusterTest do
     stream_id = "placement-test-" <> Uniq.UUID.uuid4()
     proposed = Enum.take(nodes, 2)
 
-    assigned = :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed, resolve_fun])
+    assigned =
+      :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed, resolve_fun])
+
     assert Enum.sort(assigned) == Enum.sort(proposed)
 
     # Every member — not just the one that received the assign call — must
@@ -182,7 +190,11 @@ defmodule Riptide.PlacementClusterTest do
     different_proposal = Enum.take(Enum.reverse(nodes), 2)
 
     reassigned =
-      :erpc.call(other_node, Riptide.Placement, :assign, [stream_id, different_proposal, resolve_fun])
+      :erpc.call(other_node, Riptide.Placement, :assign, [
+        stream_id,
+        different_proposal,
+        resolve_fun
+      ])
 
     assert Enum.sort(reassigned) == Enum.sort(proposed)
   end
