@@ -233,10 +233,32 @@ sub-projects 1 and 2 did internally):
     assignment and a real cross-pod read.
 - **Phase 3d — HA proof + operator tooling.** Actually kill a node and prove streams keep
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
-  deferring sophisticated auto-rebalancing. **Not yet designed.**
+  deferring sophisticated auto-rebalancing.
+  - **3d-i — HA proof spike.** Live GKE spike (5-pod StatefulSet, RF=3): force-killed placement-
+    cluster pods and a stream replica pod to observe real failure/recovery behavior. **Investigated
+    and fixed 2026-08-25.** Found and fixed 2 real bugs, corrected a stale design-doc claim:
+    1. A fresh, non-placement-ordinal fleet node could lose a startup race and silently never
+       start its replica of a brand-new stream's cluster — `RaCluster.start_or_join_replicated/3`
+       blindly trusted `:ra.start_cluster/2`'s reply even when its `NotStarted` list was
+       non-empty. Fixed: `Riptide.Application.start/2` now starts every node's local `:ra` system
+       unconditionally at boot (closing the race at its root), and `start_or_join_replicated/3`
+       now treats a genuinely-not-alive `NotStarted` member as a retriable error instead of
+       silent partial success — routing through `Riptide.Stream.Placement`'s existing bounded
+       retry loop.
+    2. `Riptide.Placement.assign/2,3`/`lookup/1,2` hardcoded addressing the metadata cluster via
+       only `riptide-0`, no fallback — a de-facto single point of failure for the whole placement
+       layer on every restart of that one pod, even though the underlying 3-member Raft cluster
+       stayed healthy via its other members. Fixed: both now try each placement ordinal in turn.
+    3. Not a bug: confirmed (live + reproduced via a controlled multi-node test + direct `:ra`
+       source reading) that the placement cluster's own membership self-heals automatically after
+       genuine quorum loss, with zero data loss — contradicting 3c-i's own design spec, which was
+       corrected. This holds structurally as long as the placement cluster never snapshots
+       (`PlacementMachine.apply/3` never emits `release_cursor`); a tripwire regression test
+       (`test/riptide/placement_snapshot_recovery_test.exs`) guards against that assumption
+       silently breaking in the future.
 
-**Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d
-not yet designed.
+**Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d-i (HA
+proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (operator tooling) not yet designed.
 
 ## 4-5. Not yet started
 

@@ -71,10 +71,12 @@ depending on Khepri" exists independently in the BEAM ecosystem (`ex_esdb`, `Ram
 - No general N-of-fleet placement algorithm beyond a simple random-selection helper — the
   actual *use* of a placement decision (starting a real multi-member per-stream Ra cluster)
   is 3c-ii's job, not this phase's.
-- No automatic reconciliation of the metadata cluster's own membership after a member's
-  identity drifts (e.g. after a pod restart under a new IP) — manual-only for now, matching
-  Phase 3d's already-established "manual grow/shrink first, deliberately deferring
-  sophisticated auto-rebalancing" philosophy for the whole sub-project.
+- No *deliberately designed* reconciliation of the metadata cluster's own membership after a
+  member's identity drifts (e.g. after a pod restart under a new IP) — this was originally
+  scoped as manual-only, matching Phase 3d's "manual grow/shrink first, deliberately deferring
+  sophisticated auto-rebalancing" philosophy. **Correction, see §5:** this turns out to
+  self-heal automatically anyway, as a side effect of mechanisms this phase and Phase 3b
+  already ship — not because it was designed to.
 - No reassignment/rebalancing of already-assigned streams, ever, in this design — placement
   is permanent once made, matching RabbitMQ's own explicit, deliberate precedent (their core
   team has repeatedly rejected automatic rebalancing, citing SLA/predictability concerns).
@@ -147,12 +149,36 @@ itself already tolerates partial member availability (confirmed against the pinn
 source: it succeeds once a majority — 2 of 3 — are reachable), so the retry only needs to
 keep calling it until that quorum threshold is met.
 
-Post-restart identity drift (one of the 3 ordinals restarts under a new IP) is **not**
-automatically reconciled by this phase — the cluster keeps functioning on 2-of-3 quorum, but
-restoring the third member to healthy requires a manual operator action (`:ra.remove_member`
-+ `:ra.add_member`, or a small script) for now. Automatic self-healing of the metadata
-cluster's own membership is explicitly Phase 3d's job, not this phase's — consistent with the
-sub-project's established "manual-first" philosophy.
+**Correction (Phase 3d-i HA-proof spike, 2026-08-25):** the paragraph above, as originally
+written, was wrong. Post-restart identity drift (one of the 3 ordinals restarts under a new
+IP, having lost real quorum first) turns out to be reconciled automatically, with zero data
+loss, by mechanisms *already present* in this phase and Phase 3b — no manual operator action
+or Phase 3d tooling required. Confirmed via a live GKE spike (kill 2-of-3 placement-cluster
+pods, observe recovery) and reproduced/root-caused via a controlled `:peer`-based test plus
+direct `:ra`/`ra_server` source reading:
+
+- `RaCluster.data_dir/0`'s directory scheme is keyed by Kubernetes `HOSTNAME` (the stable
+  StatefulSet pod name, e.g. `riptide-0`), not by `node()`/pod IP — so a restarted pod, even
+  under a brand-new IP (and therefore a brand-new `node()` identity), recovers its own prior
+  on-disk `:ra` data via the same PVC mount path.
+- `ra_server:init/1`'s cluster-membership recovery branches on whether a snapshot exists: with
+  no snapshot, it trusts the *freshly passed* `initial_members` config (the restarted pod's
+  new identity); with a snapshot, it trusts the snapshot's own recorded membership instead.
+- `PlacementMachine.apply/3` never emits a `{:release_cursor, ...}` effect, so the placement
+  cluster itself never snapshots — meaning the first branch above always applies today, and a
+  freshly-restarted member's `ensure_placement_cluster_started/0` boot-time retry loop
+  (already shipped, originally written only to handle StatefulSet ordinal startup ordering)
+  ends up reconciling membership to the new identity as a side effect, for free.
+
+This is a **real but load-bearing structural assumption, not a coincidence**: it holds only as
+long as the placement cluster never snapshots. If `PlacementMachine` ever gains a
+`release_cursor` effect (e.g. for compaction/performance), this self-healing property would
+silently stop holding. A regression test (`test/riptide/placement_snapshot_recovery_test.exs`)
+exists specifically as a tripwire for that case — see its own moduledoc for the full mechanism
+and citations. The exact mechanism by which the *fresh* replacement peers' local view
+reconciles with the surviving member's committed log (rather than, e.g., forming an
+independent parallel cluster) is empirically confirmed and consistent with the above, though
+not proven exhaustively for every possible interleaving.
 
 ## 6. Testing
 
