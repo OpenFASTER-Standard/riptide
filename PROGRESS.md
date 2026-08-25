@@ -232,8 +232,16 @@ sub-projects 1 and 2 did internally):
     stream's 3 replicas correctly served both a request that resolved the existing
     assignment and a real cross-pod read.
 - **Phase 3d — HA proof + operator tooling.** Actually kill a node and prove streams keep
-  working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
-  deferring sophisticated auto-rebalancing.
+  working. **Scope correction (2026-08-25, ahead of 3d-ii design):** the placement cluster's own
+  membership is a solved problem (see 3d-i finding 3) — this phase's remaining, still-fully-open
+  job is repairing a *stream's own* replica set after a member's node identity drifts. That drift
+  isn't a rare failure mode: every pod restart (routine deploy included) gets a fresh IP-based
+  `node()` identity (Phase 3b), so it's the normal steady state of running this fleet, not an
+  edge case. Manual/on-demand operator tooling for something this frequent doesn't scale — 3d-ii
+  is scoped as a **fully automatic background self-healing process** (detect drift, pick a
+  replacement, repair — zero operator/human involvement in the steady-state case), not a
+  RabbitMQ-style manual-first CLI tool as originally sketched. This is a deliberate reversal of
+  the sub-project's earlier "manual grow/shrink first" framing for this specific piece.
   - **3d-i — HA proof spike.** Live GKE spike (5-pod StatefulSet, RF=3): force-killed placement-
     cluster pods and a stream replica pod to observe real failure/recovery behavior. **Investigated
     and fixed 2026-08-25.** Found and fixed 2 real bugs, corrected a stale design-doc claim:
