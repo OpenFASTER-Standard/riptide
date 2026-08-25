@@ -30,4 +30,15 @@ defmodule Riptide.PlacementTest do
       assert Placement.propose_nodes(1) == [node()]
     end
   end
+
+  describe "assign/2 and lookup/2 against the real metadata cluster" do
+    test "a real assignment round-trips through the real placement cluster" do
+      stream_id = "placement-roundtrip-" <> Uniq.UUID.uuid4()
+      resolve_fun = fn _ordinal -> node() end
+      assigned = Placement.assign(stream_id, [node()], resolve_fun)
+
+      assert assigned == [node()]
+      assert Placement.lookup(stream_id, resolve_fun) == [node()]
+    end
+  end
 end
