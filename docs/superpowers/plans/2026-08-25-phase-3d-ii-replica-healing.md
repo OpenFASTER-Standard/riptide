@@ -1014,13 +1014,18 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
 
     assert Enum.any?(results, &(&1 == :ok))
 
-    for {_pid, node, _ordinal} <- peers do
-      {:ok, _} = start_unlinked(node, Riptide.Stream.Placement, :start_link, [[]])
-    end
-
+    # PubSub before Placement — Task 5's `Riptide.Stream.Placement.init/1`
+    # now subscribes to a PubSub topic on start (tolerating a not-yet-started
+    # `Riptide.PubSub` via a scoped rescue, but there's no reason to rely on
+    # that here when starting it first is just as easy and matches real
+    # `Riptide.Application.start/2`'s own ordering).
     for {_pid, node, _ordinal} <- peers do
       {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:phoenix_pubsub])
       {:ok, _} = start_unlinked(node, Phoenix.PubSub.Supervisor, :start_link, [[name: Riptide.PubSub]])
+    end
+
+    for {_pid, node, _ordinal} <- peers do
+      {:ok, _} = start_unlinked(node, Riptide.Stream.Placement, :start_link, [[]])
     end
 
     stream_id = "healer-cluster-" <> Uniq.UUID.uuid4()
