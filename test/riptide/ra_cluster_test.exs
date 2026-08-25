@@ -150,6 +150,22 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
+  describe "attempt_start_placement_cluster/1" do
+    test "a resolver that raises (e.g. default_ordinal_resolver/1 on an unresolvable DNS name) yields a retriable error instead of an uncaught exception" do
+      # Mirrors exactly how `default_ordinal_resolver/1` fails for real: a
+      # hard match against `:inet.gethostbyname/1`'s result raises `MatchError`
+      # when a sibling ordinal's DNS record doesn't exist yet (e.g. during
+      # normal StatefulSet startup, before all pods are up).
+      resolve_fun = fn
+        "riptide-1" -> raise MatchError, term: {:error, :nxdomain}
+        ordinal -> String.to_atom("riptide@#{ordinal}")
+      end
+
+      assert RaCluster.attempt_start_placement_cluster(resolve_fun) ==
+               {:error, :cluster_not_formed}
+    end
+  end
+
   test "server_id/1 never turns an arbitrary stream_id into an unbounded atom", %{
     stream_id: stream_id
   } do

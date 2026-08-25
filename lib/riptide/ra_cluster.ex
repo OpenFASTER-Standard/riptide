@@ -315,28 +315,44 @@ defmodule Riptide.RaCluster do
   # in a distinct, non-colliding directory because it's nested under that
   # node's own HOSTNAME-scoped data_dir (see `RaCluster.data_dir/0`), so a
   # shared uid string across members is correct here, not a collision risk.
+  #
+  # `resolve_fun` (whether the real `default_ordinal_resolver/1`, doing a live
+  # DNS lookup, or a caller-supplied stand-in) can legitimately fail to
+  # resolve a sibling ordinal during the normal StatefulSet startup window —
+  # `default_ordinal_resolver/1`'s hard match on `:inet.gethostbyname/1`
+  # raises `MatchError` in that case rather than returning an error tuple, so
+  # we rescue it here and fold it into the same retriable
+  # `{:error, :cluster_not_formed}` outcome `:ra.start_cluster/2` itself
+  # already returns for "couldn't form the cluster yet" — from
+  # `ensure_placement_cluster_started/2`'s point of view, an unresolvable
+  # sibling and a cluster that failed to form are the same "try again later"
+  # signal, not two different error shapes it needs to distinguish.
   @spec attempt_start_placement_cluster((String.t() -> node())) ::
           :ok | {:error, :cluster_not_formed}
   def attempt_start_placement_cluster(resolve_fun \\ &default_ordinal_resolver/1) do
     ensure_system_started()
 
-    member_ids = Enum.map(@placement_ordinals, &placement_server_id(&1, resolve_fun))
+    try do
+      member_ids = Enum.map(@placement_ordinals, &placement_server_id(&1, resolve_fun))
 
-    configs =
-      Enum.map(member_ids, fn id ->
-        %{
-          id: id,
-          uid: @placement_uid,
-          cluster_name: "#{@placement_uid}_cluster",
-          log_init_args: %{uid: @placement_uid},
-          initial_members: member_ids,
-          machine: {:module, Riptide.Placement.PlacementMachine, %{}}
-        }
-      end)
+      configs =
+        Enum.map(member_ids, fn id ->
+          %{
+            id: id,
+            uid: @placement_uid,
+            cluster_name: "#{@placement_uid}_cluster",
+            log_init_args: %{uid: @placement_uid},
+            initial_members: member_ids,
+            machine: {:module, Riptide.Placement.PlacementMachine, %{}}
+          }
+        end)
 
-    case :ra.start_cluster(@system, configs) do
-      {:ok, _started, _not_started} -> :ok
-      {:error, :cluster_not_formed} -> {:error, :cluster_not_formed}
+      case :ra.start_cluster(@system, configs) do
+        {:ok, _started, _not_started} -> :ok
+        {:error, :cluster_not_formed} -> {:error, :cluster_not_formed}
+      end
+    rescue
+      MatchError -> {:error, :cluster_not_formed}
     end
   end
 end
