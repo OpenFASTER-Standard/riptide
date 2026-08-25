@@ -32,7 +32,32 @@ defmodule Riptide.Stream.Placement do
   @impl GenServer
   def init(:ok) do
     :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+
+    # Subscribe to cache invalidation broadcasts, but gracefully handle isolated
+    # test environments where PubSub might not be started.
+    try do
+      Phoenix.PubSub.subscribe(Riptide.PubSub, "stream_placement_changed")
+    rescue
+      ArgumentError -> :ok
+    end
+
     {:ok, %{}}
+  end
+
+  # Corrects this node's cached server ids the moment `Riptide.Stream.ReplicaHealer`
+  # (Phase 3d-ii) repairs a stream elsewhere in the fleet — without this, a
+  # node that already cached the old (now partially dead) server ids would
+  # keep them until it happened to restart, per this module's own
+  # cache-forever design (see moduledoc). Overwrites directly rather than
+  # evicting, since the correct value is already known from the broadcast —
+  # no need to force a re-resolution round-trip through the placement
+  # cluster.
+  @impl GenServer
+  def handle_info({:stream_placement_changed, stream_id, new_nodes}, state) do
+    uid = RaCluster.uid_for(stream_id)
+    server_ids = Enum.map(new_nodes, &{String.to_atom(uid), &1})
+    :ets.insert(@table, {stream_id, server_ids})
+    {:noreply, state}
   end
 
   @doc """
