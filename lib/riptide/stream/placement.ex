@@ -94,7 +94,14 @@ defmodule Riptide.Stream.Placement do
 
     case resolve_nodes(stream_id) do
       {:member, nodes} ->
-        case start_with_retry(uid, nodes, machine, formation_fun, sleep_fun, @max_formation_attempts) do
+        case start_with_retry(
+               uid,
+               nodes,
+               machine,
+               formation_fun,
+               sleep_fun,
+               @max_formation_attempts
+             ) do
           {:ok, server_ids} ->
             :ets.insert(@table, {stream_id, server_ids})
             {:ok, server_ids}
