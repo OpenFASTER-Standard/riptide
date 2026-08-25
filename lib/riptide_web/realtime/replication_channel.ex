@@ -13,16 +13,21 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   @impl true
   def join("replication:" <> stream_id, %{"after" => cursor}, socket) do
-    StreamSupervisor.get_or_start(stream_id)
-    Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
+    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      :ok ->
+        Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
 
-    case StreamServer.get_since(stream_id, cursor) do
-      {:gap, oldest} ->
-        {:error, %{"oldestAvailable" => oldest}}
+        case StreamServer.get_since(stream_id, cursor) do
+          {:gap, oldest} ->
+            {:error, %{"oldestAvailable" => oldest}}
 
-      {:ok, events} ->
-        socket = assign(socket, :stream_id, stream_id)
-        {:ok, %{"backlog" => Enum.map(events, &frame/1)}, socket}
+          {:ok, events} ->
+            socket = assign(socket, :stream_id, stream_id)
+            {:ok, %{"backlog" => Enum.map(events, &frame/1)}, socket}
+        end
+
+      :error ->
+        {:error, %{"reason" => "service_unavailable"}}
     end
   end
 
@@ -31,6 +36,10 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
     push(socket, "replication_frame", frame(event))
     {:noreply, socket}
   end
+
+  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
+  def ensure_ready_status(:ok), do: :ok
+  def ensure_ready_status({:error, _reason}), do: :error
 
   defp frame(%Event{} = event) do
     {:ok, turtle} = TurtleCodec.encode(Event.wire_payload(event))

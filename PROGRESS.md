@@ -221,13 +221,22 @@ sub-projects 1 and 2 did internally):
     `Riptide.Stream.Placement`'s new cache-hit shortcut, and fixed a pre-existing test-suite
     flake in the shared placement cluster's node-identity bootstrap.
   - **3c-iii — Request routing.** Wires the HTTP/SSE/WebSocket layer to consult 3c-i's store
-    and dispatch to the correct node(s). **Not yet designed.**
+    and serve requests correctly regardless of which node they land on. **Shipped 2026-08-25**
+    — see `docs/superpowers/specs/2026-08-25-phase-3c-iii-request-routing-design.md`. No
+    HTTP-level proxy layer needed — leans entirely on `:ra`'s and `Phoenix.PubSub`'s existing
+    location-transparent/cluster-wide semantics. `Riptide.Stream.Placement` gained a
+    member/non-member branch so a non-member node skips cluster formation entirely;
+    `StreamSupervisor.get_or_start/1` was renamed to `ensure_ready/1`, dropping the
+    local-pid contract that never made sense once a node's replicas could live elsewhere.
+    Live-proved against a real 5-pod GKE StatefulSet (RF=3): a pod that wasn't one of a
+    stream's 3 replicas correctly served both a request that resolved the existing
+    assignment and a real cross-pod read.
 - **Phase 3d — HA proof + operator tooling.** Actually kill a node and prove streams keep
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
   deferring sophisticated auto-rebalancing. **Not yet designed.**
 
-**Status**: Phases 3a-3b shipped. Phase 3c-i and 3c-ii shipped. 3c-iii (request routing)
-not yet started.
+**Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d
+not yet designed.
 
 ## 4-5. Not yet started
 

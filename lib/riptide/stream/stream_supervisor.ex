@@ -1,15 +1,21 @@
 defmodule Riptide.Stream.StreamSupervisor do
   @moduledoc """
-  Entry point for "get me this stream's durable log, starting or restarting
-  it from disk if needed." No longer a real OTP supervisor — `Ra` supervises
-  its own server process; this just calls through to it.
+  Entry point for "make sure this stream's real, placement-driven Ra
+  cluster is resolved and ready" — used by every request path (LDP HTTP,
+  SSE, WebSocket replication). Calls `Riptide.Stream.Placement.
+  ensure_started/2` directly rather than through `StreamServer.start_link/1`,
+  since a stream's actual replicas may not include this node (Phase 3c-iii
+  design spec §3) — `start_link/1`'s own "return a local pid" contract only
+  ever made sense when this node was always assumed to be a replica.
   """
 
-  alias Riptide.Stream.StreamServer
+  alias Riptide.Stream.{Placement, RaMachine}
 
-  @spec get_or_start(String.t()) :: pid()
-  def get_or_start(stream_id) do
-    {:ok, pid} = StreamServer.start_link({stream_id, []})
-    pid
+  @spec ensure_ready(String.t()) :: :ok | {:error, term()}
+  def ensure_ready(stream_id) do
+    case Placement.ensure_started(stream_id, {:module, RaMachine, %{retention: :infinity}}) do
+      {:ok, _server_ids} -> :ok
+      {:error, _reason} = error -> error
+    end
   end
 end

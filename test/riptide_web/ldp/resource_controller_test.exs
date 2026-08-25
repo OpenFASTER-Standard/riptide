@@ -2,6 +2,8 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   use ExUnit.Case, async: true
   use Plug.Test
 
+  alias RiptideWeb.LDP.ResourceController
+
   @opts RiptideWeb.Endpoint.init([])
 
   defp unique_path, do: "/resources/test-#{System.unique_integer([:positive])}"
@@ -225,5 +227,12 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
 
     container_get_conn = :get |> conn(container_path) |> RiptideWeb.Endpoint.call(@opts)
     assert container_get_conn.resp_body =~ "ldp#contains"
+  end
+
+  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
+    assert ResourceController.ensure_ready_status(:ok) == :ok
+
+    assert ResourceController.ensure_ready_status({:error, :cluster_not_formed}) ==
+             :error
   end
 end

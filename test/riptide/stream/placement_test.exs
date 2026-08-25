@@ -95,6 +95,42 @@ defmodule Riptide.Stream.PlacementTest do
 
       assert Agent.get(counter, & &1) == 3
     end
+
+    test "a stream already assigned to nodes not including this one skips formation entirely" do
+      stream_id = "stream-placement-remote-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> RaCluster.force_delete(stream_id) end)
+      remote_node = :"other-node@nowhere"
+
+      assert Placement.assign(stream_id, [remote_node]) == [remote_node]
+
+      unreachable_formation_fun = fn _uid, _nodes, _machine -> raise "should never be called" end
+
+      assert {:ok, server_ids} =
+               StreamPlacement.ensure_started(
+                 stream_id,
+                 {:module, EchoMachine, %{}},
+                 unreachable_formation_fun
+               )
+
+      uid = RaCluster.uid_for(stream_id)
+      assert server_ids == [{String.to_atom(uid), remote_node}]
+    end
+
+    test "a stream already assigned to nodes including this one re-forms/rejoins for real" do
+      stream_id = "stream-placement-rejoin-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> RaCluster.force_delete(stream_id) end)
+      machine = {:module, EchoMachine, %{}}
+
+      assert Placement.assign(stream_id, [node()]) == [node()]
+
+      assert {:ok, server_ids} = StreamPlacement.ensure_started(stream_id, machine)
+      uid = RaCluster.uid_for(stream_id)
+      assert server_ids == [{String.to_atom(uid), node()}]
+
+      pid = Process.whereis(String.to_atom(uid))
+      assert is_pid(pid)
+      assert Process.alive?(pid)
+    end
   end
 
   describe "server_ids!/1" do

@@ -14,7 +14,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   test "joining with after: 0 receives no backlog on an empty stream" do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
-    StreamSupervisor.get_or_start(stream_id)
+    StreamSupervisor.ensure_ready(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
 
@@ -27,7 +27,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   test "joining with after: 0 on a non-empty stream replies with the existing backlog" do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
-    StreamSupervisor.get_or_start(stream_id)
+    StreamSupervisor.ensure_ready(stream_id)
     StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     {:ok, socket} = connect(Socket, %{})
@@ -56,7 +56,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   test "new appends after joining are pushed as replication_frame messages" do
     stream_id = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
-    StreamSupervisor.get_or_start(stream_id)
+    StreamSupervisor.ensure_ready(stream_id)
 
     {:ok, socket} = connect(Socket, %{})
 
@@ -121,11 +121,16 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     assert_receive :socket_b_joined, 500
 
-    StreamSupervisor.get_or_start(stream_a)
+    StreamSupervisor.ensure_ready(stream_a)
     StreamServer.append(stream_a, Event.new(stream_a, :replace, RDF.Graph.new()))
 
     assert_push "replication_frame", %{}, 500
 
     Task.await(task_b)
+  end
+
+  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
+    assert ReplicationChannel.ensure_ready_status(:ok) == :ok
+    assert ReplicationChannel.ensure_ready_status({:error, :cluster_not_formed}) == :error
   end
 end
