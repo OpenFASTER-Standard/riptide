@@ -90,23 +90,48 @@ defmodule Riptide.Stream.Placement do
   end
 
   defp resolve_and_start(stream_id, machine, formation_fun, sleep_fun) do
-    nodes = resolve_nodes(stream_id)
     uid = RaCluster.uid_for(stream_id)
 
-    case start_with_retry(uid, nodes, machine, formation_fun, sleep_fun, @max_formation_attempts) do
-      {:ok, server_ids} ->
+    case resolve_nodes(stream_id) do
+      {:member, nodes} ->
+        case start_with_retry(uid, nodes, machine, formation_fun, sleep_fun, @max_formation_attempts) do
+          {:ok, server_ids} ->
+            :ets.insert(@table, {stream_id, server_ids})
+            {:ok, server_ids}
+
+          {:error, _} = error ->
+            error
+        end
+
+      {:remote, nodes} ->
+        server_ids = Enum.map(nodes, &{String.to_atom(uid), &1})
         :ets.insert(@table, {stream_id, server_ids})
         {:ok, server_ids}
-
-      {:error, _} = error ->
-        error
     end
   end
 
+  # Distinguishes "this node needs to form/join the cluster" from "this node
+  # is just resolving an existing assignment it isn't part of." A genuinely
+  # new stream (nil lookup) always lands in {:member, _} — `propose_nodes/2`
+  # (Phase 3c-ii) always puts the local node first, and backfill always
+  # proposes exactly [node()] — so this node always needs to form it.  An
+  # already-assigned stream this node isn't a replica of has nothing to
+  # form or join locally: attempting `formation_fun` there would only ever
+  # fail (`:ra.start_cluster/2` can't succeed for a node whose id was never
+  # in the config), even though the stream is perfectly healthy elsewhere
+  # (Phase 3c-iii design spec §1/§4).
+  @spec resolve_nodes(String.t()) :: {:member, [node()]} | {:remote, [node()]}
   defp resolve_nodes(stream_id) do
     case Placement.lookup(stream_id) do
-      nil -> backfill_or_propose(stream_id)
-      nodes -> nodes
+      nil ->
+        {:member, backfill_or_propose(stream_id)}
+
+      nodes ->
+        if node() in nodes do
+          {:member, nodes}
+        else
+          {:remote, nodes}
+        end
     end
   end
 
