@@ -150,6 +150,12 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
+  describe "placement_leader?/0" do
+    test "returns true for this node's own already-running (collapsed) placement cluster" do
+      assert RaCluster.placement_leader?()
+    end
+  end
+
   describe "attempt_start_placement_cluster/1" do
     test "a resolver that raises (e.g. default_ordinal_resolver/1 on an unresolvable DNS name) yields a retriable error instead of an uncaught exception" do
       # Mirrors exactly how `default_ordinal_resolver/1` fails for real: a

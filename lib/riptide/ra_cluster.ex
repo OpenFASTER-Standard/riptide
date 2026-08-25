@@ -33,6 +33,23 @@ defmodule Riptide.RaCluster do
     {@placement_cluster_name, resolve_fun.(ordinal)}
   end
 
+  # Whether THIS node is currently the placement cluster's Raft leader —
+  # used by `Riptide.Stream.ReplicaHealer` (Phase 3d-ii) to gate stream
+  # replica repair so only one of the 3 placement ordinals ever acts on a
+  # given sweep, reusing the placement cluster's own existing leader
+  # election rather than a new coordination mechanism. Queries the LOCAL
+  # member directly (`{@placement_cluster_name, node()}`) rather than going
+  # through `placement_server_id/2`'s ordinal/DNS resolution, since this is
+  # only ever meaningful to call from a node that's itself a placement
+  # ordinal already running its own local member.
+  @spec placement_leader?() :: boolean()
+  def placement_leader? do
+    case :ra.members({@placement_cluster_name, node()}) do
+      {:ok, _members, {@placement_cluster_name, leader_node}} -> leader_node == node()
+      _ -> false
+    end
+  end
+
   # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
   # In production this is always the real DNS-based resolution below
   # (mirroring exactly how `Cluster.Strategy.Kubernetes.DNS` resolves peers
@@ -301,20 +318,17 @@ defmodule Riptide.RaCluster do
     end
   end
 
-  # Local-or-remote liveness check for a single Ra server id — used to
-  # distinguish, member by member, "genuinely never started" from "already
-  # running, just not *newly* started by this particular
-  # `:ra.start_cluster/2` call" (see `start_or_join_replicated/3`'s
-  # `NotStarted` handling below). A member unreachable over `:erpc` (network
-  # blip, node still booting) is conservatively treated as not-alive, which
-  # only ever causes a spurious retry of an already-fine formation — never a
-  # silently-accepted broken one.
+  # Public (not `defp`) so callers beyond this module — e.g.
+  # `Riptide.Stream.ReplicaHealer` (Phase 3d-ii) — can check a specific
+  # stream replica's real liveness, local or remote, the same way this
+  # module already does internally for `start_or_join_replicated/3`'s own
+  # `NotStarted` handling.
   @spec member_alive?(:ra.server_id()) :: boolean()
-  defp member_alive?({name, node}) when node == node() do
+  def member_alive?({name, node}) when node == node() do
     server_alive?(name)
   end
 
-  defp member_alive?({name, node}) do
+  def member_alive?({name, node}) do
     case :erpc.call(node, __MODULE__, :server_alive?, [name], 5_000) do
       true -> true
       false -> false
