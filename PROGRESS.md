@@ -205,9 +205,12 @@ sub-projects 1 and 2 did internally):
   clusters instead of always-size-1. Decomposed into:
   - **3c-i — Placement metadata store.** A small, dedicated `:ra` cluster (fixed 3 members,
     decoupled from total fleet size) durably recording `stream_id → [replica nodes]`.
-    Foundational — nothing else in 3c can be built without it. **Design approved
-    2026-08-25** — see
-    `docs/superpowers/specs/2026-08-25-phase-3c-i-placement-metadata-design.md`.
+    Foundational — nothing else in 3c can be built without it. **Shipped 2026-08-25** — see
+    `docs/superpowers/specs/2026-08-25-phase-3c-i-placement-metadata-design.md`. Live-proved
+    against a real 3-pod GKE StatefulSet (real assignment written on one pod, correctly
+    replicated to the other two via Raft); that proof also surfaced and fixed a real,
+    pre-existing gap in `k8s/statefulset.yaml` (missing `fsGroup`, which blocked any real
+    `:ra` data persistence to `/data` for the non-root container user).
   - **3c-ii — Real multi-member Ra cluster formation.** Consumes 3c-i's stored assignment to
     actually start an N-member Ra cluster for a stream. **Not yet designed.**
   - **3c-iii — Request routing.** Wires the HTTP/SSE/WebSocket layer to consult 3c-i's store
@@ -216,8 +219,8 @@ sub-projects 1 and 2 did internally):
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
   deferring sophisticated auto-rebalancing. **Not yet designed.**
 
-**Status**: Phases 3a-3b shipped. Phase 3c decomposed into 3c-i/3c-ii/3c-iii; 3c-i's design
-approved, implementation not yet started.
+**Status**: Phases 3a-3b shipped. Phase 3c-i shipped. 3c-ii (multi-member Ra cluster
+formation) not yet started.
 
 ## 4-5. Not yet started
 
