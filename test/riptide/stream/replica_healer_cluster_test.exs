@@ -107,7 +107,9 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # `Riptide.Application.start/2`'s own ordering).
     for {_pid, node, _ordinal} <- peers do
       {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:phoenix_pubsub])
-      {:ok, _} = start_unlinked(node, Phoenix.PubSub.Supervisor, :start_link, [[name: Riptide.PubSub]])
+
+      {:ok, _} =
+        start_unlinked(node, Phoenix.PubSub.Supervisor, :start_link, [[name: Riptide.PubSub]])
     end
 
     for {_pid, node, _ordinal} <- peers do
@@ -121,6 +123,7 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # which peer to kill and which stays as the extra fleet node available
     # as a replacement candidate for pick_replacement/2.
     original_nodes = [node_a, node_b, node_c]
+
     assert Enum.sort(:erpc.call(node_a, Riptide.Placement, :assign, [stream_id, original_nodes])) ==
              Enum.sort(original_nodes)
 
@@ -161,7 +164,10 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # No data loss: the write made before the repair is still there,
     # readable through the fresh replacement.
     assert :ok = :erpc.call(new_node, Riptide.Stream.StreamSupervisor, :ensure_ready, [stream_id])
-    {:ok, read_back} = :erpc.call(new_node, Riptide.Stream.StreamServer, :get_since, [stream_id, 0])
+
+    {:ok, read_back} =
+      :erpc.call(new_node, Riptide.Stream.StreamServer, :get_since, [stream_id, 0])
+
     assert [%{sequence: 1}] = read_back
   end
 
@@ -194,8 +200,12 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
 
   defp eventually(fun, attempts_left \\ 50) do
     cond do
-      fun.() -> true
-      attempts_left <= 1 -> false
+      fun.() ->
+        true
+
+      attempts_left <= 1 ->
+        false
+
       true ->
         Process.sleep(200)
         eventually(fun, attempts_left - 1)

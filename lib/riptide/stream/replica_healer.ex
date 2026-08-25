@@ -42,7 +42,9 @@ defmodule Riptide.Stream.ReplicaHealer do
   end
 
   defp schedule_sweep do
-    interval = Application.get_env(:riptide, :replica_healer_sweep_interval_ms, @sweep_interval_ms)
+    interval =
+      Application.get_env(:riptide, :replica_healer_sweep_interval_ms, @sweep_interval_ms)
+
     Process.send_after(self(), :sweep, interval)
   end
 

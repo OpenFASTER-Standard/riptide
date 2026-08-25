@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-08-25
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -264,9 +264,20 @@ sub-projects 1 and 2 did internally):
        (`PlacementMachine.apply/3` never emits `release_cursor`); a tripwire regression test
        (`test/riptide/placement_snapshot_recovery_test.exs`) guards against that assumption
        silently breaking in the future.
+  - **3d-ii — Automatic stream replica healing.** A stream with exactly one dead replica (of
+    RF=3) is now detected and repaired automatically, with zero operator action — see
+    `docs/superpowers/specs/2026-08-25-phase-3d-ii-replica-healing-design.md`. **Shipped
+    2026-08-25.** `Riptide.Stream.ReplicaHealer` sweeps every known stream on a timer, gated to
+    only the placement cluster's current Raft leader (reusing its existing leader election for
+    single-writer safety, no new coordination mechanism), and on finding a dead member: joins a
+    live replacement into the stream's real `:ra` cluster (`RaCluster.replace_member/5`),
+    updates the durable placement assignment, and broadcasts a PubSub invalidation so no node's
+    cache keeps routing to the dead replica. Live-proved against a real 5-pod GKE StatefulSet
+    (RF=3): a killed replica pod was automatically replaced with no operator action and no data
+    loss.
 
 **Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d-i (HA
-proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (operator tooling) not yet designed.
+proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (automatic stream replica healing) shipped 2026-08-25.
 
 ## 4-5. Not yet started
 

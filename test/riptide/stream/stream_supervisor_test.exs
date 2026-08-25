@@ -2,7 +2,7 @@ defmodule Riptide.Stream.StreamSupervisorTest do
   use ExUnit.Case, async: true
 
   alias Riptide.Event
-  alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias Riptide.Stream.{Placement, StreamServer, StreamSupervisor}
 
   test "ensure_ready/1 returns :ok for an unseen stream id" do
     stream_id = "stream-#{System.unique_integer([:positive])}"
@@ -42,7 +42,7 @@ defmodule Riptide.Stream.StreamSupervisorTest do
 
     assert StreamSupervisor.ensure_ready(stream_id) == :ok
     uid = Riptide.RaCluster.uid_for(stream_id)
-    original_server_ids = Riptide.Stream.Placement.server_ids!(stream_id)
+    original_server_ids = Placement.server_ids!(stream_id)
     assert original_server_ids == [{String.to_atom(uid), node()}]
 
     fake_new_node = :"fake-replacement@nowhere"
@@ -57,7 +57,10 @@ defmodule Riptide.Stream.StreamSupervisorTest do
     # than asserting immediately.
     assert Enum.any?(1..20, fn _ ->
              Process.sleep(10)
-             Riptide.Stream.Placement.server_ids!(stream_id) == [{String.to_atom(uid), fake_new_node}]
+
+             Placement.server_ids!(stream_id) == [
+               {String.to_atom(uid), fake_new_node}
+             ]
            end)
   end
 end

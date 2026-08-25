@@ -84,7 +84,7 @@ defmodule Riptide.PlacementTest do
       stream_id = "placement-replace-member-noop-" <> Uniq.UUID.uuid4()
       Placement.assign(stream_id, [node()])
 
-      result = Placement.replace_member(stream_id, :"never-was-here@nowhere", :"new@nowhere")
+      result = Placement.replace_member(stream_id, :"never-was-here@nowhere", :new@nowhere)
 
       assert result == [node()]
       assert Placement.lookup(stream_id) == [node()]

@@ -319,7 +319,7 @@ defmodule Riptide.RaClusterTest do
       # doesn't blow up against a real, already-running single-member
       # cluster — real distinctness is proven separately by Step 5's
       # `:peer`-based test.
-      assert RaCluster.replace_member(uid, [node()], :"dead@nowhere", node(), machine) ==
+      assert RaCluster.replace_member(uid, [node()], :dead@nowhere, node(), machine) ==
                {:error, :already_member}
     end
   end

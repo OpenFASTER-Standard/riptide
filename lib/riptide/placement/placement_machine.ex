@@ -42,7 +42,7 @@ defmodule Riptide.Placement.PlacementMachine do
     case Map.fetch(state, stream_id) do
       {:ok, nodes} ->
         if dead_node in nodes do
-          new_nodes = Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
+          new_nodes = replace_in_list(nodes, dead_node, new_node)
           new_state = Map.put(state, stream_id, new_nodes)
           {new_state, new_nodes, []}
         else
@@ -52,6 +52,10 @@ defmodule Riptide.Placement.PlacementMachine do
       :error ->
         {state, nil, []}
     end
+  end
+
+  defp replace_in_list(nodes, dead_node, new_node) do
+    Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
   end
 
   @spec get(state(), String.t()) :: [node()] | nil
