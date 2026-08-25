@@ -212,15 +212,22 @@ sub-projects 1 and 2 did internally):
     pre-existing gap in `k8s/statefulset.yaml` (missing `fsGroup`, which blocked any real
     `:ra` data persistence to `/data` for the non-root container user).
   - **3c-ii — Real multi-member Ra cluster formation.** Consumes 3c-i's stored assignment to
-    actually start an N-member Ra cluster for a stream. **Not yet designed.**
+    actually start an N-member Ra cluster for a stream, replacing the old hardcoded
+    single-member `initial_members: [server_id]`. **Shipped 2026-08-25** — see
+    `docs/superpowers/specs/2026-08-25-phase-3c-ii-multi-member-ra-clusters-design.md`.
+    Live-proved against a real 3-pod GKE StatefulSet: a genuinely new stream formed a real
+    3-member cluster spanning all 3 pods, and a write on one pod replicated to the other two.
+    Along the way, closed a real liveness gap in `StreamServer`'s restart path exposed by
+    `Riptide.Stream.Placement`'s new cache-hit shortcut, and fixed a pre-existing test-suite
+    flake in the shared placement cluster's node-identity bootstrap.
   - **3c-iii — Request routing.** Wires the HTTP/SSE/WebSocket layer to consult 3c-i's store
     and dispatch to the correct node(s). **Not yet designed.**
 - **Phase 3d — HA proof + operator tooling.** Actually kill a node and prove streams keep
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
   deferring sophisticated auto-rebalancing. **Not yet designed.**
 
-**Status**: Phases 3a-3b shipped. Phase 3c-i shipped. 3c-ii (multi-member Ra cluster
-formation) not yet started.
+**Status**: Phases 3a-3b shipped. Phase 3c-i and 3c-ii shipped. 3c-iii (request routing)
+not yet started.
 
 ## 4-5. Not yet started
 
