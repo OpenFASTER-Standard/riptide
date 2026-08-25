@@ -130,10 +130,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   end
 
   test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
-    assert RiptideWeb.Realtime.ReplicationChannel.ensure_ready_status(:ok) == :ok
-
-    assert RiptideWeb.Realtime.ReplicationChannel.ensure_ready_status(
-             {:error, :cluster_not_formed}
-           ) == :error
+    assert ReplicationChannel.ensure_ready_status(:ok) == :ok
+    assert ReplicationChannel.ensure_ready_status({:error, :cluster_not_formed}) == :error
   end
 end
