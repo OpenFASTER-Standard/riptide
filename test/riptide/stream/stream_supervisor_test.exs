@@ -4,32 +4,28 @@ defmodule Riptide.Stream.StreamSupervisorTest do
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
-  test "get_or_start/1 starts a new process for an unseen stream id" do
+  test "ensure_ready/1 returns :ok for an unseen stream id" do
     stream_id = "stream-#{System.unique_integer([:positive])}"
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
-    pid = StreamSupervisor.get_or_start(stream_id)
-
-    assert Process.alive?(pid)
+    assert StreamSupervisor.ensure_ready(stream_id) == :ok
   end
 
-  test "get_or_start/1 returns the same pid for the same stream id" do
+  test "ensure_ready/1 is idempotent for the same stream id" do
     stream_id = "stream-#{System.unique_integer([:positive])}"
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
-    first = StreamSupervisor.get_or_start(stream_id)
-    second = StreamSupervisor.get_or_start(stream_id)
-
-    assert first == second
+    assert StreamSupervisor.ensure_ready(stream_id) == :ok
+    assert StreamSupervisor.ensure_ready(stream_id) == :ok
   end
 
-  test "get_or_start/1 isolates state between different streams" do
+  test "ensure_ready/1 isolates state between different streams" do
     stream_a = "stream-#{System.unique_integer([:positive])}"
     stream_b = "stream-#{System.unique_integer([:positive])}"
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_a) end)
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_b) end)
-    StreamSupervisor.get_or_start(stream_a)
-    StreamSupervisor.get_or_start(stream_b)
+    StreamSupervisor.ensure_ready(stream_a)
+    StreamSupervisor.ensure_ready(stream_b)
 
     StreamServer.append(
       stream_a,
