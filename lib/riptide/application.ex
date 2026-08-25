@@ -10,6 +10,7 @@ defmodule Riptide.Application do
     children =
       [
         {Phoenix.PubSub, name: Riptide.PubSub},
+        Riptide.Stream.Placement,
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++

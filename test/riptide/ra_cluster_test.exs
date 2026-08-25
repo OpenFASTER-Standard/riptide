@@ -191,8 +191,32 @@ defmodule Riptide.RaClusterTest do
       # that raw `:ra` error instead of self-correcting.
       resolve_fun = fn _ordinal -> node() end
 
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-
+      # NEW GOTCHA (found empirically during the phase-3c-ii side-fix that
+      # gave test_helper.exs a stable node() identity): deliberately no
+      # `on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement,
+      # node()}) end)` here, even though every other test in this file that
+      # starts a throwaway Ra server cleans it up that way. `{:riptide_placement,
+      # node()}` is NOT a throwaway server this test owns — it's the exact
+      # same address (fixed cluster name + this node's own, now-stable,
+      # identity) as the ONE shared, suite-wide placement cluster
+      # `test_helper.exs` bootstraps once before any test runs, which every
+      # other test touching `Riptide.Placement`/`Riptide.Stream.Placement`
+      # depends on for the rest of the `mix test` process's lifetime. Before
+      # test_helper.exs's node()-identity fix, this collided with `:nonode@nohost`
+      # only when this test happened to run before any `:peer`-based file
+      # flipped node() — easy to miss since the resulting failure looked
+      # identical to that other, more consistently-triggered bug. Now that
+      # node() is stable for the whole suite, this test always collides with
+      # the shared instance, so force-deleting it here would silently take
+      # down every later test that needs it — confirmed empirically: with the
+      # force_delete restored, `mix test test/riptide/ra_cluster_test.exs
+      # test/riptide/stream/stream_server_test.exs --seed 0` fails a later,
+      # unrelated `StreamServerTest` test with "Ra consistent query failed for
+      # {:riptide_placement, :"test_helper_origin@127.0.0.1"}: :noproc" —
+      # removing just this on_exit makes that same run pass. This test's own
+      # assertions never depend on the server being gone afterward, only on
+      # it being alive and correctly responding while the test runs, so
+      # leaving the shared instance alone costs this test nothing.
       assert RaCluster.attempt_start_placement_cluster(resolve_fun) == :ok
 
       pid = Process.whereis(:riptide_placement)
@@ -222,5 +246,54 @@ defmodule Riptide.RaClusterTest do
 
     assert config.data_dir == expected
     assert config.wal_data_dir == expected
+  end
+
+  describe "start_or_join_replicated/3" do
+    test "forms a real cluster and returns one server_id per member_node" do
+      uid = "sojr-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+
+      # A single real node repeated 3x collapses to one real member, exactly
+      # the same "collapsed" pattern Phase 3c-i's own redundant-call
+      # regression test already uses to exercise multi-member config-building
+      # without needing real distinct nodes — real distinctness is proven
+      # separately by the :peer-based integration test (Task 6).
+      assert {:ok, server_ids} =
+               RaCluster.start_or_join_replicated(
+                 uid,
+                 [node(), node(), node()],
+                 {:module, EchoMachine, %{}}
+               )
+
+      assert length(server_ids) == 3
+      assert Enum.uniq(server_ids) == [{name, node()}]
+
+      pid = Process.whereis(name)
+      assert is_pid(pid)
+      assert Process.alive?(pid)
+    end
+
+    test "self-corrects on a redundant call once the local member is already running" do
+      uid = "sojr-redundant-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+      machine = {:module, EchoMachine, %{}}
+
+      assert {:ok, first_ids} = RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+
+      assert {:ok, second_ids} =
+               RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+
+      assert first_ids == second_ids
+    end
+
+    test "returns {:error, :cluster_not_formed} when this node isn't among member_nodes and they're unreachable" do
+      uid = "sojr-unreachable-" <> Uniq.UUID.uuid4()
+      machine = {:module, EchoMachine, %{}}
+
+      assert RaCluster.start_or_join_replicated(uid, [:nonexistent@nowhere], machine) ==
+               {:error, :cluster_not_formed}
+    end
   end
 end
