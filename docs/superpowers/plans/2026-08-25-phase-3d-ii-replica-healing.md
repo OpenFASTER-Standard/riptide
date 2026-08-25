@@ -230,18 +230,11 @@ git commit -m "Add Riptide.Placement.list_all/1 and replace_member/4"
 
 - [ ] **Step 1: Write the failing test for `placement_leader?/0`**
 
-Add to `test/riptide/ra_cluster_test.exs`, in a new `describe` block after the existing `describe "attempt_start_placement_cluster/1"` block:
+Add to `test/riptide/ra_cluster_test.exs`, in a new `describe` block after the existing `describe "attempt_start_placement_cluster/1"` block. Note: `test_helper.exs` always bootstraps a real, running (single-node-collapsed) placement cluster on the test-runner's own node before any test file runs, so there is no honest way to observe a "not running locally" state from within this async suite — only the positive case is tested here; the collapsed cluster's sole member is trivially always its own leader:
 
 ```elixir
   describe "placement_leader?/0" do
-    test "returns false when the placement cluster isn't running locally" do
-      refute RaCluster.placement_leader?()
-    end
-
-    test "returns true once this node forms/joins the placement cluster and becomes its leader" do
-      resolve_fun = fn _ordinal -> node() end
-      :ok = RaCluster.attempt_start_placement_cluster(resolve_fun)
-
+    test "returns true for this node's own already-running (collapsed) placement cluster" do
       assert RaCluster.placement_leader?()
     end
   end
@@ -1050,10 +1043,16 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # Kill node_c for real — the replica being replaced.
     stop_peer_for(peers, node_c)
 
-    # Run the sweep directly from node_a (a placement ordinal) rather than
-    # waiting on the real 30s timer — node_a is also guaranteed to be the
-    # placement cluster's actual leader often enough in a 3-member cluster
-    # that a short retry loop below tolerates the case where it isn't yet.
+    # Run the sweep directly from node_a rather than waiting on the real
+    # 30s timer. `ReplicaHealer.sweep/0` itself performs no leader check —
+    # only the timer-driven `handle_info(:sweep, state)` gates on
+    # `RaCluster.placement_leader?/0` before calling `sweep/0` — so calling
+    # `sweep/0` directly here always attempts the repair regardless of
+    # node_a's actual leadership status; this is a deliberate test-only
+    # bypass of the production gating path, not a claim about node_a being
+    # the leader. The retry loop below exists for a different reason: the
+    # kill in the previous step needs a moment to actually disconnect
+    # before `RaCluster.member_alive?/1` reliably observes it as dead.
     assert eventually(fn ->
              :erpc.call(node_a, Riptide.Stream.ReplicaHealer, :sweep, []) == :ok and
                Enum.sort(:erpc.call(node_a, Riptide.Placement, :lookup, [stream_id])) !=
