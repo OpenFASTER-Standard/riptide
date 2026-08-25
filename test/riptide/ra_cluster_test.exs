@@ -223,4 +223,46 @@ defmodule Riptide.RaClusterTest do
     assert config.data_dir == expected
     assert config.wal_data_dir == expected
   end
+
+  describe "start_or_join_replicated/3" do
+    test "forms a real cluster and returns one server_id per member_node" do
+      uid = "sojr-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+
+      # A single real node repeated 3x collapses to one real member, exactly
+      # the same "collapsed" pattern Phase 3c-i's own redundant-call
+      # regression test already uses to exercise multi-member config-building
+      # without needing real distinct nodes — real distinctness is proven
+      # separately by the :peer-based integration test (Task 6).
+      assert {:ok, server_ids} =
+               RaCluster.start_or_join_replicated(uid, [node(), node(), node()], {:module, EchoMachine, %{}})
+
+      assert length(server_ids) == 3
+      assert Enum.uniq(server_ids) == [{name, node()}]
+
+      pid = Process.whereis(name)
+      assert is_pid(pid)
+      assert Process.alive?(pid)
+    end
+
+    test "self-corrects on a redundant call once the local member is already running" do
+      uid = "sojr-redundant-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+      machine = {:module, EchoMachine, %{}}
+
+      assert {:ok, first_ids} = RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+      assert {:ok, second_ids} = RaCluster.start_or_join_replicated(uid, [node(), node()], machine)
+      assert first_ids == second_ids
+    end
+
+    test "returns {:error, :cluster_not_formed} when this node isn't among member_nodes and they're unreachable" do
+      uid = "sojr-unreachable-" <> Uniq.UUID.uuid4()
+      machine = {:module, EchoMachine, %{}}
+
+      assert RaCluster.start_or_join_replicated(uid, [:"nonexistent@nowhere"], machine) ==
+               {:error, :cluster_not_formed}
+    end
+  end
 end

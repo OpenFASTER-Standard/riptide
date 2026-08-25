@@ -394,4 +394,54 @@ defmodule Riptide.RaCluster do
       MatchError -> {:error, :cluster_not_formed}
     end
   end
+
+  # Generalizes `attempt_start_placement_cluster/1`'s per-member-config +
+  # `:ra.start_cluster/2` pattern beyond the hardcoded 3 placement ordinals
+  # to an arbitrary node list — used by `Riptide.Stream.Placement` (Phase
+  # 3c-ii) to form a real, multi-node cluster for a single stream. Shares
+  # `uid` across every member's config (each member's data still lives in a
+  # distinct, non-colliding directory because it's nested under that node's
+  # own HOSTNAME-scoped data_dir — see `data_dir/0`).
+  #
+  # Self-corrects the same false-failure case documented on
+  # `attempt_start_placement_cluster/1`: a redundant call whose members
+  # (including this node's own, if present) are already running also
+  # reports `{:error, :cluster_not_formed}` from `:ra.start_cluster/2`
+  # itself, since its `Started` list only counts servers *this call* newly
+  # started, not servers merely alive. This rechecks local liveness before
+  # treating that as a genuine failure — but only if this node is actually
+  # one of `member_nodes`; if it isn't, the local liveness check is always
+  # false, and the error correctly propagates (this node has no way to know
+  # whether the *actual* members formed successfully elsewhere).
+  @spec start_or_join_replicated(String.t(), [node()], :ra_machine.machine()) ::
+          {:ok, [:ra.server_id()]} | {:error, :cluster_not_formed}
+  def start_or_join_replicated(uid, member_nodes, machine) do
+    ensure_system_started()
+    name = String.to_atom(uid)
+    member_ids = Enum.map(member_nodes, &{name, &1})
+
+    configs =
+      Enum.map(member_ids, fn id ->
+        %{
+          id: id,
+          uid: uid,
+          cluster_name: uid <> "_cluster",
+          log_init_args: %{uid: uid},
+          initial_members: member_ids,
+          machine: machine
+        }
+      end)
+
+    case :ra.start_cluster(@system, configs) do
+      {:ok, _started, _not_started} ->
+        {:ok, member_ids}
+
+      {:error, :cluster_not_formed} ->
+        if server_alive?(name) do
+          {:ok, member_ids}
+        else
+          {:error, :cluster_not_formed}
+        end
+    end
+  end
 end
