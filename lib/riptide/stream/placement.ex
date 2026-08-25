@@ -32,15 +32,7 @@ defmodule Riptide.Stream.Placement do
   @impl GenServer
   def init(:ok) do
     :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-
-    # Subscribe to cache invalidation broadcasts, but gracefully handle isolated
-    # test environments where PubSub might not be started.
-    try do
-      Phoenix.PubSub.subscribe(Riptide.PubSub, "stream_placement_changed")
-    rescue
-      ArgumentError -> :ok
-    end
-
+    Phoenix.PubSub.subscribe(Riptide.PubSub, "stream_placement_changed")
     {:ok, %{}}
   end
 
