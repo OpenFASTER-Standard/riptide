@@ -521,4 +521,83 @@ defmodule Riptide.RaCluster do
         end
     end
   end
+
+  # Grows a stream's already-running `:ra` cluster by one member (`new_node`)
+  # and evicts a dead one (`dead_node`) — the real repair primitive behind
+  # Phase 3d-ii's automatic replica healing. `survivor_nodes` must be at
+  # least one currently-alive member of the cluster (never `dead_node`
+  # itself); passing every survivor (not just one) lets `:ra` itself pick a
+  # reachable one to route the membership-change commands through, the same
+  # `ra_server_id() | [ra_server_id()]` flexibility `:ra.add_member/2` and
+  # `:ra.remove_member/2` already support directly.
+  #
+  # Order matters and is NOT `start_or_join_replicated/3`'s "form a fresh
+  # cluster" order — verified against `:ra`'s own growing-a-cluster
+  # documentation (`deps/ra/README.md`, "Dynamically Changing Cluster
+  # Membership"): add the member to the existing cluster's configuration
+  # FIRST, then start the joining server itself with `initial_members` set
+  # to just the survivor(s) — reversed, a freshly-started server with no
+  # cluster membership entry yet has nothing to catch up from.
+  @spec replace_member(String.t(), [node()], node(), node(), :ra_machine.machine()) ::
+          :ok | {:error, term()}
+  def replace_member(uid, survivor_nodes, dead_node, new_node, machine) do
+    ensure_system_started()
+    name = String.to_atom(uid)
+    survivor_ids = Enum.map(survivor_nodes, &{name, &1})
+    dead_id = {name, dead_node}
+    new_id = {name, new_node}
+    cluster_name = uid <> "_cluster"
+
+    with {:ok, _reply, _leader} <-
+           retry_cluster_change(fn -> :ra.add_member(survivor_ids, new_id) end),
+         :ok <- :ra.start_server(@system, cluster_name, new_id, machine, survivor_ids),
+         {:ok, _reply, _leader} <-
+           retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} -> {:error, :timeout}
+    end
+  end
+
+  # `:ra.add_member/2` and `:ra.remove_member/2` both return as soon as their
+  # membership-change command is APPENDED to the leader's log
+  # (`after_log_append` reply mode — confirmed directly against
+  # `deps/ra/src/ra.erl`'s `add_member/3`/`remove_member/3`), not once it's
+  # been committed and applied. And `:ra` only permits ONE cluster
+  # membership change in flight at a time: "concurrent changes will be
+  # rejected by design" (`deps/ra/README.md`, "Dynamically Changing Cluster
+  # Membership"). That combination makes `{:error, :cluster_change_not_permitted}`
+  # a genuinely transient condition `replace_member/5` can hit back-to-back
+  # in two different spots, both confirmed empirically against a real
+  # multi-node `:ra` cluster (see `ra_cluster_replace_member_test.exs`):
+  #
+  #   1. `add_member` itself, when `survivor_nodes` was elected leader only
+  #      moments ago (e.g. right after `start_or_join_replicated/3`, or
+  #      right after failing over from a just-killed `dead_node`) — every
+  #      new leader must commit a no-op entry for its own current term
+  #      before ANY membership change is permitted (see the collapsed-node
+  #      test in `ra_cluster_test.exs`).
+  #   2. `remove_member`, racing ahead of THIS SAME CALL's own `add_member`
+  #      change, which hasn't committed+applied yet.
+  #
+  # Retrying the SAME `:ra` call (never the whole `with` chain, and never
+  # more than this one specific error atom) is safe here specifically
+  # because `cluster_change_not_permitted` means the change was REJECTED
+  # outright — nothing was appended, so nothing can be double-applied by
+  # trying again. Any other error (notably a genuine `{:error, :already_member}`
+  # for a `new_node` that's already a distinct, non-transient member — see
+  # the collapsed-node test's own assertion) is NOT retried and propagates
+  # immediately, unchanged.
+  @spec retry_cluster_change((-> term()), pos_integer()) :: term()
+  defp retry_cluster_change(fun, attempts_left \\ 50) do
+    case fun.() do
+      {:error, :cluster_change_not_permitted} when attempts_left > 1 ->
+        Process.sleep(100)
+        retry_cluster_change(fun, attempts_left - 1)
+
+      other ->
+        other
+    end
+  end
 end

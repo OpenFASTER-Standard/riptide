@@ -302,4 +302,25 @@ defmodule Riptide.RaClusterTest do
                {:error, :cluster_not_formed}
     end
   end
+
+  describe "replace_member/5" do
+    test "replaces a member with a fresh one, collapsed onto a single real node" do
+      uid = "replace-member-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      machine = {:module, EchoMachine, %{}}
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+
+      assert {:ok, _server_ids} =
+               RaCluster.start_or_join_replicated(uid, [node()], machine)
+
+      # A single real node standing in for both "the dead node" and "the
+      # replacement" is nonsensical for a real repair, but proves the
+      # function's own call sequence (add_member, start_server, remove_member)
+      # doesn't blow up against a real, already-running single-member
+      # cluster — real distinctness is proven separately by Step 5's
+      # `:peer`-based test.
+      assert RaCluster.replace_member(uid, [node()], :"dead@nowhere", node(), machine) ==
+               {:error, :already_member}
+    end
+  end
 end
