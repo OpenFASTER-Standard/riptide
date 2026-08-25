@@ -63,6 +63,22 @@ defmodule Riptide.Stream.StreamServer do
     RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
   end
 
+  # Bridges a liveness gap that only exists because `Placement.ensure_started/2`
+  # can return via its cache-hit path (Task 4), which is just an ETS lookup —
+  # no fresh `:ra` call at all. The old `RaCluster.start_or_restart/2` this
+  # replaced always made a blocking `:ra.start_cluster`/`:ra.restart_server`
+  # call, which incidentally gave Ra's supervisor time to finish
+  # re-registering a just-killed process's name before returning. Without
+  # that, `start_link/1` on a stream that's cached but whose process was just
+  # killed (e.g. `Process.exit(pid, :kill)` in this file's own tests) can hit
+  # `Process.whereis/1` in the ~1-2ms window after Ra's supervisor notices
+  # the exit but before it re-registers the restarted process under the same
+  # name — confirmed by reproducing the race 30/30 times. This directly
+  # matters for `StreamServerTest`'s "events and sequence numbers survive
+  # killing and restarting the Ra process" and the 100-trial issue #8 test,
+  # both of which kill and immediately restart a stream's process. The 100 x
+  # 10ms = ~1s bound here is generous relative to the observed ~1-2ms gap;
+  # it's a belt-and-suspenders ceiling, not a tuned timeout.
   @spec wait_for_process(term(), non_neg_integer()) :: {:ok, pid()} | :timeout
   defp wait_for_process(name, attempts \\ 100) do
     case Process.whereis(name) do
