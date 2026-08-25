@@ -16,6 +16,7 @@ RUN mix deps.compile
 COPY config config
 COPY lib lib
 COPY priv priv
+COPY rel rel
 
 RUN mix compile
 RUN mix release
@@ -49,18 +50,23 @@ ENV RIPTIDE_RA_DATA_DIR=/data
 ENV PHX_SERVER=true
 ENV PORT=4000
 
-# `:ra` namespaces its on-disk data under a per-node subdirectory keyed by
-# `node()` (see `ra_env:data_dir/0`), so the Erlang node name must be stable
-# across container recreation for the volume-durability guarantee to hold —
-# otherwise a freshly recreated container (new hostname, since `mix
-# release`'s default `sname` distribution derives the node name from the
-# container's hostname) would compute a *different* subdirectory under the
-# same `/data` mount and find it empty. This app is single-node only for
-# now (see `Riptide.RaCluster`'s module doc), so distributed Erlang buys it
-# nothing yet; disabling it entirely makes `node()` the fixed
-# `nonode@nohost` on every boot, which sidesteps the whole hostname problem
-# (and drops the distribution port besides). Revisit if/when the
-# Clustering/HA sub-project needs real multi-node distributed Erlang.
+# Default for the single-node/docker-compose path, where no POD_IP is set:
+# distribution stays fully disabled (node() fixed at `nonode@nohost`, no
+# distribution port). This used to be load-bearing for on-disk data too,
+# back when `:ra` namespaced its data directory by `node()` (`ra_env:data_dir/0`)
+# and an unstable node name across container recreation would silently point
+# at an empty directory. Phase 3b (Clustering/HA) removed that premise:
+# `Riptide.RaCluster.data_dir/0` now keys `:ra`'s data directory off the
+# `HOSTNAME` env var instead of `node()`, so distribution identity and
+# on-disk data location are decoupled.
+#
+# That's what makes it safe for `rel/env.sh.eex` to re-enable real
+# distributed Erlang (RELEASE_DISTRIBUTION=name, RELEASE_NODE=riptide@$POD_IP)
+# on top of this default, but only when POD_IP is present — i.e. only under
+# the Kubernetes StatefulSet deployment path, where each pod's stable
+# HOSTNAME (its pod name) keeps the data directory stable across recreation
+# regardless of what node name distribution uses. See that file and
+# `RaCluster.data_dir/0`'s moduledoc comment for the full picture.
 ENV RELEASE_DISTRIBUTION=none
 
 VOLUME ["/data"]

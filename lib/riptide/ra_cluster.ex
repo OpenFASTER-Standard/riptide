@@ -165,12 +165,83 @@ defmodule Riptide.RaCluster do
   # entry point that needs the system stays self-sufficient.
   @spec ensure_system_started() :: :ok
   defp ensure_system_started do
-    case :ra_system.start_default() do
+    config = system_config()
+
+    case :ra_system.start(config) do
       {:ok, _pid} -> :ok
       {:ok, _pid, _info} -> :ok
       {:error, {:already_started, _pid}} -> :ok
       {:error, reason} -> raise "Failed to start the default Ra system: #{inspect(reason)}"
     end
+  end
+
+  # Every caller that starts (or restarts) the `:default` Ra system MUST build
+  # this exact config, byte-for-byte — not just "a config pointing at the same
+  # directory". `ra_systems_sup:start_system/1` calls `ra_system:store/1`
+  # unconditionally, even on the losing side of an `{:already_started, _}`
+  # race, which persists whatever config *that* caller passed into
+  # `persistent_term` regardless of which caller actually won the underlying
+  # supervisor start. Two callers racing to start `:default` with
+  # merely-equivalent-but-not-identical configs can therefore leave
+  # `:ra_system.fetch(:default)` permanently reporting a config decoupled from
+  # wherever the system's data (and its DETS-backed server registry) actually
+  # live on disk — this was a real, confirmed-flaky bug before all call sites
+  # (production and the two tests that manually restart `:default`) were
+  # switched to share this single function. Ensures the target directory
+  # exists as a side effect, matching what every call site needs immediately
+  # before calling `:ra_system.start/1`.
+  @spec system_config() :: map()
+  def system_config do
+    dir = data_dir()
+    File.mkdir_p!(dir)
+
+    :ra_system.default_config()
+    |> Map.put(:data_dir, dir)
+    |> Map.put(:wal_data_dir, dir)
+  end
+
+  # Stable across pod restarts/rescheduling even though Erlang distribution identity
+  # (node()) is now IP-based and NOT stable — see Phase 3b design spec §1/§3.
+  # Kubernetes sets a StatefulSet pod's HOSTNAME to its stable pod name (e.g.
+  # "riptide-0"); outside Kubernetes (local dev, docker-compose, tests) HOSTNAME
+  # still resolves to something stable per-container/per-host, so this doesn't
+  # regress non-clustered environments. Both `data_dir` and `wal_data_dir` are
+  # pinned here — `:ra`'s own `default_config/0` would otherwise leave
+  # `wal_data_dir` defaulted to the OLD node()-derived directory
+  # (`ra_system.erl`'s `WalDataDir = application:get_env(ra, wal_data_dir,
+  # DataDir)`), silently splitting a stream's WAL from the rest of its data
+  # across two different, inconsistently-keyed directories.
+  #
+  # `to_string/1` on the configured base handles both shapes `:ra, :data_dir`
+  # can arrive in: a plain binary (the `File.cwd!()` fallback) or a charlist
+  # (config/runtime.exs stores `RIPTIDE_RA_DATA_DIR` as a charlist, since it's
+  # passed straight into Erlang code that expects `file:filename()`) — `Path.join/2`
+  # raises on a charlist, unlike Erlang's more permissive `filename:join/2`.
+  #
+  # Returns a charlist, not a `String.t()` binary, despite the `String.t()`
+  # produced by `Path.join/2` being the more idiomatic Elixir shape: `:ra`'s
+  # own config typespec declares `data_dir`/`wal_data_dir` as `file:filename()`
+  # (an Erlang charlist), and — critically — this isn't just a typespec nicety.
+  # `:ra_directory`'s DETS-backed server registry (`ra_directory:init/2`) joins
+  # this path with a literal filename and hands the result straight to
+  # `:dets.open_file/2`; on the OTP/stdlib version pinned here (stdlib 4.2),
+  # that call raises `ArgumentError` (`badarg` from `dets.erl:658`) if given a
+  # binary path — confirmed by isolating the exact call outside of `:ra`
+  # entirely (`:dets.open_file(:x, file: "some/binary/path")` fails the same
+  # way with zero `:ra` code involved). `:ra`'s own `default_config/0` never
+  # hits this because `ra_env:data_dir/0` always produces a charlist (either
+  # from a charlist app-env value or from `file:get_cwd/0`, which itself
+  # returns a charlist) — this function preserves that same invariant instead
+  # of introducing a binary where `:ra` internals have never had to handle
+  # one. `Path.basename/1` (used by `ra_cluster_data_dir_test.exs`) and plain
+  # `==` comparison against `:ra_system.fetch(:default)`'s stored config
+  # (used by the test below) both work identically whether this returns a
+  # charlist or a binary, since whatever's returned here is put into the
+  # config verbatim and `:ra_system.fetch/1` returns that config unmodified.
+  @spec data_dir() :: charlist()
+  def data_dir do
+    base = Application.get_env(:ra, :data_dir, File.cwd!()) |> to_string()
+    Path.join(base, System.get_env("HOSTNAME", "nonode")) |> String.to_charlist()
   end
 
   @spec server_alive?(atom()) :: boolean()

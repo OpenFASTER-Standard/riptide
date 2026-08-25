@@ -28,3 +28,16 @@ riptide-*.tar
 # Ra's on-disk Raft log/data directories.
 priv/ra_data/
 priv/ra_data_test/
+
+# Ra's on-disk data directories for the real-:peer-spawned nodes in
+# multi_node_connectivity_test.exs: those bare peer nodes don't load
+# config/test.exs (no Mix config in a plain `:peer`-started node), so
+# RaCluster.data_dir/0's `Application.get_env(:ra, :data_dir, ...)` falls
+# back to `File.cwd!()` — the repo root — instead of `priv/ra_data_test/`.
+riptide-0/
+riptide-1/
+riptide-2/
+
+# Real Kubernetes Secret values (copied from k8s/secret.example.yaml) —
+# never commit RELEASE_COOKIE/SECRET_KEY_BASE.
+k8s/secret.yaml

@@ -197,7 +197,8 @@ sub-projects 1 and 2 did internally):
 - **Phase 3b — Real multi-node connectivity.** Re-enable distributed Erlang properly (not
   `RELEASE_DISTRIBUTION=none`), solve the stable-node-identity problem for real this time,
   `libcluster` + Kubernetes DNS discovery, prove N nodes actually see and stay connected to each
-  other. Foundational for 3c/3d, testable in isolation. **Not yet designed.**
+  other. Foundational for 3c/3d, testable in isolation. **Shipped 2026-08-24** — see
+  `docs/superpowers/specs/2026-08-24-phase-3b-multi-node-connectivity-design.md`.
 - **Phase 3c — Sharded per-stream placement + real multi-member Ra clusters.** The core
   clustering work: replication factor (almost certainly 3), which subset of the fleet a given
   stream's replicas land on, actually creating multi-member Ra clusters instead of always-size-1.
@@ -206,7 +207,8 @@ sub-projects 1 and 2 did internally):
   working; manual grow/shrink tooling matching RabbitMQ's own manual-first precedent, deliberately
   deferring sophisticated auto-rebalancing. **Not yet designed.**
 
-**Status**: Phase 3a shipped. Phase 3b (real multi-node connectivity) not yet started.
+**Status**: Phases 3a-3b shipped. Phase 3c (sharded per-stream placement + real
+multi-member Ra clusters) not yet started.
 
 ## 4-5. Not yet started
 

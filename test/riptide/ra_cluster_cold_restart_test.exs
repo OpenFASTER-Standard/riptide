@@ -23,7 +23,7 @@ defmodule Riptide.RaClusterColdRestartTest do
     # ETS-backed in memory plus DETS-backed on disk, and a *graceful* OTP
     # application stop cleanly closes that DETS table (`ra_log_ets`'s
     # `terminate/2` calls `ra_directory:deinit/1`), so a subsequent
-    # `:ra_system.start_default/0` reopens it intact and `:ra.restart_server/2`
+    # restart with the same config reopens it intact and `:ra.restart_server/2`
     # succeeds — confirmed empirically while writing this test (see task 1's
     # report). The registry only genuinely loses a server's entry after an
     # *unclean* shutdown (a real `docker rm -f`/SIGKILL, verified separately
@@ -38,7 +38,13 @@ defmodule Riptide.RaClusterColdRestartTest do
     Application.stop(:ra)
     Application.start(:ra)
 
-    case :ra_system.start_default() do
+    # Use the shared `RaCluster.system_config/0` to build the exact same
+    # config `RaCluster.ensure_system_started/0` does — see that function's
+    # doc for why even a merely-equivalent (not byte-identical) config here
+    # is unsafe.
+    config = RaCluster.system_config()
+
+    case :ra_system.start(config) do
       {:ok, _} -> :ok
       {:ok, _, _} -> :ok
       {:error, {:already_started, _}} -> :ok

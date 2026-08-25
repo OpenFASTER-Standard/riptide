@@ -54,7 +54,17 @@ defmodule Riptide.RaClusterTest do
     on_exit(fn -> :ra.force_delete_server(:default, server_id) end)
 
     # Idempotent: another test may already have started the default system.
-    case :ra_system.start_default() do
+    # Must build the exact same config `RaCluster.ensure_system_started/0`
+    # does — via the shared `RaCluster.system_config/0` — rather than calling
+    # `:ra_system.start_default/0` (which uses the OLD node()-derived
+    # directory) or hand-rolling an equivalent-looking config here. See
+    # `RaCluster.system_config/0`'s doc for why even a merely-equivalent
+    # config is unsafe: this was a confirmed cross-test-file flaky failure in
+    # `ra_cluster_cold_restart_test.exs` before all call sites shared this one
+    # function.
+    config_override = RaCluster.system_config()
+
+    case :ra_system.start(config_override) do
       {:ok, _} -> :ok
       {:ok, _, _} -> :ok
       {:error, {:already_started, _}} -> :ok
@@ -115,5 +125,17 @@ defmodule Riptide.RaClusterTest do
     assert is_atom(name)
     assert String.starts_with?(Atom.to_string(name), "riptide_")
     assert RaCluster.server_id(stream_id) == RaCluster.server_id(stream_id)
+  end
+
+  test "the started Ra system's data_dir and wal_data_dir are HOSTNAME-derived, not node()-derived",
+       %{stream_id: stream_id} do
+    machine = {:module, EchoMachine, %{}}
+    RaCluster.start_or_restart(stream_id, machine)
+
+    config = :ra_system.fetch(:default)
+    expected = RaCluster.data_dir()
+
+    assert config.data_dir == expected
+    assert config.wal_data_dir == expected
   end
 end

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: riptide-headless
+  labels:
+    app: riptide
+spec:
+  clusterIP: None
+  selector:
+    app: riptide
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000
