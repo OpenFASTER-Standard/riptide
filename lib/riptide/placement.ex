@@ -5,13 +5,16 @@ defmodule Riptide.Placement do
   `Riptide.Placement.PlacementMachine` via a small, fixed-membership Ra
   cluster (see `Riptide.RaCluster.placement_server_id/1,2`).
 
-  `assign/2,3` and `lookup/1,2` currently always address the metadata cluster
-  via its first fixed ordinal (`RaCluster.placement_ordinals() |> hd()`) —
-  `:ra`'s own leader-redirect means this works whether or not that specific
-  ordinal happens to be the current leader, but if that one ordinal's own pod
-  is unreachable, these calls fail outright rather than falling back to a
-  different ordinal. Acceptable for this phase's narrow scope; revisit if it
-  proves to matter in practice.
+  `assign/2,3` and `lookup/1,2` address the metadata cluster by trying each
+  fixed ordinal in turn (starting from `RaCluster.placement_ordinals()`'s
+  first entry) until one succeeds — `:ra`'s own leader-redirect already
+  means any live member can serve the request whether or not it happens to
+  be the current leader, so falling back to the next ordinal on failure
+  needs no extra coordination. This used to hardcode the first ordinal only,
+  making it a de-facto single point of failure for the entire placement
+  layer on every restart of that one specific pod (confirmed live, Phase
+  3d-i HA-proof spike, finding 2) even though the underlying 3-member Raft
+  cluster stayed healthy via its other members the whole time.
   """
 
   alias Riptide.Placement.PlacementMachine
@@ -38,21 +41,38 @@ defmodule Riptide.Placement do
 
   @spec assign(String.t(), [node()], (String.t() -> node())) :: [node()]
   def assign(stream_id, proposed_nodes, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    RaCluster.process_command(
-      placement_server_id(resolve_fun),
-      {:assign, stream_id, proposed_nodes}
-    )
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:assign, stream_id, proposed_nodes})
+    end)
   end
 
   @spec lookup(String.t(), (String.t() -> node())) :: [node()] | nil
   def lookup(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    RaCluster.consistent_query(
-      placement_server_id(resolve_fun),
-      &PlacementMachine.get(&1, stream_id)
-    )
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.consistent_query(server_id, &PlacementMachine.get(&1, stream_id))
+    end)
   end
 
-  defp placement_server_id(resolve_fun) do
-    RaCluster.placement_server_id(hd(RaCluster.placement_ordinals()), resolve_fun)
+  # Tries each placement ordinal, in `RaCluster.placement_ordinals/0`'s own
+  # fixed order, until one of them answers — `RaCluster.process_command/2`
+  # and `consistent_query/2` both raise on failure/timeout (see their own
+  # moduledoc rationale), so a failing ordinal is caught here and the next
+  # one tried instead of the whole call failing outright. The very last
+  # ordinal's exception is deliberately left to propagate uncaught: if *no*
+  # ordinal in the whole fixed set can serve the request, that's a genuine,
+  # fully-down metadata cluster, not something a caller here can paper over.
+  @spec with_ordinal_fallback((String.t() -> node()), (:ra.server_id() -> term())) :: term()
+  defp with_ordinal_fallback(resolve_fun, fun) do
+    try_ordinals(RaCluster.placement_ordinals(), resolve_fun, fun)
+  end
+
+  defp try_ordinals([ordinal], resolve_fun, fun) do
+    fun.(RaCluster.placement_server_id(ordinal, resolve_fun))
+  end
+
+  defp try_ordinals([ordinal | rest], resolve_fun, fun) do
+    fun.(RaCluster.placement_server_id(ordinal, resolve_fun))
+  rescue
+    _ -> try_ordinals(rest, resolve_fun, fun)
   end
 end

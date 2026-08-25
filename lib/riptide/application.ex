@@ -7,6 +7,18 @@ defmodule Riptide.Application do
 
   @impl true
   def start(_type, _args) do
+    # Every fleet node — not just the 3 placement ordinals — can be picked
+    # as a replica for a brand-new stream's real multi-member Ra cluster
+    # (Phase 3c-ii/3c-iii), and forming that cluster requires this node's
+    # own local `:ra` system to already be running by the time a sibling's
+    # `:ra.start_cluster/2` call reaches it over RPC. Doing this here,
+    # synchronously, before `Cluster.Supervisor`/libcluster even starts
+    # connecting to peers, closes that startup race at its root (see Phase
+    # 3d-i HA-proof spike, finding 1) rather than relying only on each
+    # entry point's own lazy, on-demand call to the same idempotent
+    # function.
+    Riptide.RaCluster.ensure_system_started()
+
     children =
       [
         {Phoenix.PubSub, name: Riptide.PubSub},

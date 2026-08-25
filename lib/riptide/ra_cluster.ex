@@ -202,12 +202,16 @@ defmodule Riptide.RaCluster do
   # tree only brings up `ra_systems_sup`, an *empty* supervisor for
   # dynamically-started systems. Every consuming application is expected to
   # explicitly start (or restart) its Ra system(s) itself; see `ra`'s own
-  # README ("ra:start/0") and `ra_system:start_default/0`. We do it lazily
-  # and idempotently here, rather than in `Riptide.Application.start/2`, so
-  # `RaCluster` remains the sole module that talks to `:ra` at all and every
-  # entry point that needs the system stays self-sufficient.
+  # README ("ra:start/0") and `ra_system:start_default/0`. Idempotent, so
+  # every entry point that needs the system stays self-sufficient by calling
+  # this lazily — but ALSO called unconditionally and synchronously from
+  # `Riptide.Application.start/2` for every fleet node (not just the 3
+  # placement ordinals), closing the startup race where a node picked as a
+  # brand-new stream's replica hadn't started its own local system yet by
+  # the time a sibling's `:ra.start_cluster/2` call tried to reach it over
+  # RPC (see Phase 3d-i HA-proof spike, finding 1).
   @spec ensure_system_started() :: :ok
-  defp ensure_system_started do
+  def ensure_system_started do
     config = system_config()
 
     case :ra_system.start(config) do
@@ -287,12 +291,38 @@ defmodule Riptide.RaCluster do
     Path.join(base, System.get_env("HOSTNAME", "nonode")) |> String.to_charlist()
   end
 
+  # Public (not `defp`) specifically so `member_alive?/1` below can call it
+  # over `:erpc` for a server id on a remote node, not just the local one.
   @spec server_alive?(atom()) :: boolean()
-  defp server_alive?(name) do
+  def server_alive?(name) do
     case Process.whereis(name) do
       nil -> false
       pid -> Process.alive?(pid)
     end
+  end
+
+  # Local-or-remote liveness check for a single Ra server id — used to
+  # distinguish, member by member, "genuinely never started" from "already
+  # running, just not *newly* started by this particular
+  # `:ra.start_cluster/2` call" (see `start_or_join_replicated/3`'s
+  # `NotStarted` handling below). A member unreachable over `:erpc` (network
+  # blip, node still booting) is conservatively treated as not-alive, which
+  # only ever causes a spurious retry of an already-fine formation — never a
+  # silently-accepted broken one.
+  @spec member_alive?(:ra.server_id()) :: boolean()
+  defp member_alive?({name, node}) when node == node() do
+    server_alive?(name)
+  end
+
+  defp member_alive?({name, node}) do
+    case :erpc.call(node, __MODULE__, :server_alive?, [name], 5_000) do
+      true -> true
+      false -> false
+    end
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
   end
 
   # Retries indefinitely until the placement cluster is formed — intended to
@@ -413,6 +443,25 @@ defmodule Riptide.RaCluster do
   # one of `member_nodes`; if it isn't, the local liveness check is always
   # false, and the error correctly propagates (this node has no way to know
   # whether the *actual* members formed successfully elsewhere).
+  #
+  # A non-empty `NotStarted` list on the `{:ok, Started, NotStarted}` branch
+  # is deliberately treated as a retriable failure, not partial success —
+  # `:ra`'s own docs for this return shape say as much ("servers that could
+  # not be started need to be retried periodically"). Blindly returning
+  # `{:ok, member_ids}` regardless of `NotStarted` was a real, already-shipped
+  # bug (Phase 3d-i HA-proof spike, finding 1): a stream whose replica
+  # formation lost a race on one member (e.g. that node's local `:ra` system
+  # genuinely wasn't started yet — closed by the `ensure_system_started/0`
+  # call above being unconditional at application boot now, but this is real
+  # defense in depth against any other reason a member fails to start, e.g.
+  # a momentary network blip) got cached as fully healthy by
+  # `Riptide.Stream.Placement` even though one of its replicas silently never
+  # started — permanently, until an unrelated later request happened to land
+  # on that exact starved node for that exact stream and re-triggered
+  # formation as a side effect. Returning an error here instead routes
+  # through `Riptide.Stream.Placement`'s own existing bounded-retry loop
+  # (`start_with_retry/6`), which already exists precisely to absorb this
+  # kind of transient formation failure.
   @spec start_or_join_replicated(String.t(), [node()], :ra_machine.machine()) ::
           {:ok, [:ra.server_id()]} | {:error, :cluster_not_formed}
   def start_or_join_replicated(uid, member_nodes, machine) do
@@ -433,8 +482,22 @@ defmodule Riptide.RaCluster do
       end)
 
     case :ra.start_cluster(@system, configs) do
-      {:ok, _started, _not_started} ->
+      {:ok, _started, []} ->
         {:ok, member_ids}
+
+      {:ok, _started, [_ | _] = not_started} ->
+        # `NotStarted` also catches members that are already alive but
+        # merely weren't *newly* started by this particular call (e.g. a
+        # concurrent redundant formation attempt from another node already
+        # won for that member) — same false-failure shape as the
+        # `{:error, :cluster_not_formed}` branch below, just per-member
+        # instead of whole-cluster. Only genuinely-dead members should
+        # trigger a retry.
+        if Enum.all?(not_started, &member_alive?/1) do
+          {:ok, member_ids}
+        else
+          {:error, :cluster_not_formed}
+        end
 
       {:error, :cluster_not_formed} ->
         if server_alive?(name) do
