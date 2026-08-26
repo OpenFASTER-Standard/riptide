@@ -28,6 +28,14 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# joken_jwks (Phase 4b) fetches JWKS documents over HTTPS via Tesla. Tesla's
+# own built-in default adapter is already Tesla.Adapter.Httpc (OTP's
+# :inets/:httpc — no extra dependency needed), but joken_jwks's own
+# HttpFetcher hardcodes a *different* fallback (Tesla.Adapter.Hackney) if
+# neither this key nor a per-module override is set. Setting it here
+# explicitly keeps :hackney out of the dependency tree entirely.
+config :tesla, adapter: Tesla.Adapter.Httpc
+
 # `:ra`'s data_dir is env-var-driven (`RIPTIDE_RA_DATA_DIR`, see
 # config/runtime.exs) so it must NOT be set here: config.exs is compile-time
 # config, baked into a `mix release` at build time, so reading the env var

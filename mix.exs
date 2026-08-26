@@ -16,7 +16,7 @@ defmodule Riptide.MixProject do
   def application do
     [
       mod: {Riptide.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :inets, :ssl]
     ]
   end
 
@@ -42,6 +42,16 @@ defmodule Riptide.MixProject do
       {:uniq, "~> 0.6"},
       {:ra, "~> 2.15.0"},
       {:libcluster, "~> 3.3"},
+      # Pinned below joken's own "~> 1.11.10" floor: jose 1.11.11+ uses the
+      # `dynamic()` Erlang type in its typespecs, which only exists as a
+      # built-in type from OTP 27 onward. This project is pinned to OTP 25
+      # (see PROGRESS.md's :ra 2.15.0 rationale), so 1.11.11+ fails to
+      # compile here with "type dynamic() undefined". 1.11.10 predates that
+      # typespec change and satisfies joken's own requirement unchanged.
+      {:jose, "== 1.11.10"},
+      {:joken, "~> 2.6"},
+      {:joken_jwks, "~> 1.7"},
+      {:tesla, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
