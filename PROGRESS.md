@@ -327,10 +327,25 @@ sub-project 3 was decomposed into phases 3a-3d.
   since Phoenix deliberately doesn't expose the raw `Authorization` header to `Socket.connect/3`.
   Live-proved end-to-end against a real, disposable `oidc-provider`-based OIDC issuer. No
   authorization/enforcement yet — that's Phase 4c.
-- **Phase 4c — Authorization (ACP).** Not yet designed.
+- **Phase 4c — Authorization (ACP).** **Shipped 2026-08-26** — see
+  `docs/superpowers/specs/2026-08-26-phase-4c-authorization-design.md`. An ACP-inspired policy
+  model (`Riptide.Authz.Policy`: `effect: :allow | :deny`, `modes: [:read | :write]`, `matcher:
+  :public | :authenticated | {:agent, subject}`), evaluated with container-level inheritance and
+  deny-overrides-allow, enforced across all 3 transports (a new `RiptideWeb.Plugs.Authorize` for
+  LDP HTTP; direct `Riptide.Authz.evaluate/4` calls from SSE and the WebSocket channel after
+  recovering tenant/path from an opaque `stream_id` via a new `parse_stream_id/1`). Default-deny,
+  with an implicit bootstrap: the first authenticated write to a policy-less tenant atomically
+  claims tenant-root ownership (`Riptide.Authz.Store.claim_tenant_if_unclaimed/2`), so no separate
+  tenant registry is needed. Policies persist via the *existing* shared placement Ra cluster
+  (`Riptide.Placement.PlacementMachine` gained `policies` state alongside its original `streams`
+  state) rather than a second Ra cluster to operate. A minimal, tenant-root-only policy management
+  API (`POST`/`GET /tenants/:tenant_id/policies`) lets an owner grant other agents access. Not
+  full Solid ACP compliance — no Access Control Resources as discoverable resources, no
+  client/VC/issuer matchers, no `Control` mode, no policy revocation yet; see the design spec §3
+  for the complete list of deliberate omissions.
 - **Phase 4d — TLS.** Not yet designed.
 
-**Status**: Phases 4a-4b shipped 2026-08-26. Phases 4c-4d not yet designed.
+**Status**: Phases 4a-4c shipped 2026-08-26. Phase 4d not yet designed.
 
 ## 5. Not yet started
 

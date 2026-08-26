@@ -4,15 +4,33 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   `"replication:<stream_id>"` with an `"after"` cursor, replies with a backlog,
   and pushes further events as `"replication_frame"` messages. Mirrors the SSE
   controller's cursor/gap semantics over Phoenix Channels instead of SSE.
+
+  Authorization (Phase 4c) recovers the joining topic's tenant/path via
+  `RiptideWeb.LDP.ResourceController.parse_stream_id/1` and checks it against
+  `socket.assigns.current_subject` (established once at `connect/3` time,
+  per Phase 4b) — a channel `join/3` never re-verifies *identity*, but it
+  does check *authorization* per topic, since one socket can join many
+  different topics over its lifetime and each may have different policies.
   """
   use Phoenix.Channel
 
   alias Riptide.Event
   alias Riptide.RDF.TurtleCodec
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
 
   @impl true
   def join("replication:" <> stream_id, %{"after" => cursor}, socket) do
+    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id),
+         :allow <-
+           Riptide.Authz.evaluate(tenant_id, path_segments, socket.assigns.current_subject, :read) do
+      do_join(stream_id, cursor, socket)
+    else
+      _ -> {:error, %{"reason" => "unauthorized"}}
+    end
+  end
+
+  defp do_join(stream_id, cursor, socket) do
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
       :ok ->
         Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
