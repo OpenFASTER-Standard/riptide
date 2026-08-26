@@ -16,9 +16,41 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     def verify(_token), do: {:error, :invalid_token}
   end
 
-  defp unique_stream_id, do: "sse-test-#{System.unique_integer([:positive])}"
+  # The two top-level tests below (not inside any `describe` block) predate
+  # authorization being enforced and use fixed tenants of their own
+  # (`unique_stream_id/0`'s "sse-test-tenant", and the gap test's
+  # "sse-gap-test-tenant") — seed a `:public`, `[:read]` policy for each so
+  # authorization now being enforced doesn't change their expected statuses,
+  # same pattern as `resource_controller_test.exs`'s Task 5 setup.
+  setup do
+    for tenant_id <- ["sse-test-tenant", "sse-gap-test-tenant"] do
+      Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+    end
 
-  defp unique_auth_stream_id, do: "sse-auth-test-#{System.unique_integer([:positive])}"
+    :ok
+  end
+
+  defp unique_stream_id,
+    do:
+      RiptideWeb.LDP.ResourceController.stream_id_for("sse-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
+
+  # A tenant-resource-shaped stream_id (not just an opaque literal like
+  # `unique_stream_id/0` above), so `SseController.subscribe/2`'s new
+  # authorization check can resolve it to a tenant. Fixed tenant, unique
+  # path segment per call — mirrors `resource_controller_test.exs`'s fixed
+  # "test-tenant" pattern (Task 5), with the matching policy seeded in the
+  # "authentication" describe block's own `setup` below.
+  defp unique_auth_stream_id,
+    do:
+      RiptideWeb.LDP.ResourceController.stream_id_for("sse-auth-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
 
   test "subscribing with no Last-Event-ID and then appending pushes one SSE frame" do
     stream_id = unique_stream_id()
@@ -43,7 +75,11 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   end
 
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
-    stream_id = "sse-gap-test-#{System.unique_integer([:positive])}"
+    stream_id =
+      RiptideWeb.LDP.ResourceController.stream_id_for("sse-gap-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
+
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
     {:ok, _pid} = StreamServer.start_link({stream_id, retention: 1})
 
@@ -75,10 +111,22 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   end
 
   describe "authentication" do
+    # These pre-existing tests exercise *authentication* behavior against a
+    # tenant-shaped stream_id with no bearing on authorization — seed a
+    # `:public`, `[:read]` policy for that fixed tenant (same pattern as
+    # `resource_controller_test.exs`'s Task 5 setup) so authorization now
+    # being enforced doesn't change their expected statuses.
     setup do
       original = Application.get_env(:riptide, :auth_verifier)
       Application.put_env(:riptide, :auth_verifier, StubVerifier)
       on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+
+      Riptide.Authz.Store.Placement.add_policy("sse-auth-test-tenant", [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+
       :ok
     end
 
@@ -87,7 +135,10 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
       StreamSupervisor.ensure_ready(stream_id)
 
-      conn = :get |> conn("/streams/#{stream_id}/subscribe") |> RiptideWeb.Endpoint.call(@opts)
+      conn =
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 200
     end
@@ -99,7 +150,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
       conn =
         :get
-        |> conn("/streams/#{stream_id}/subscribe?token=valid-token")
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe?token=valid-token")
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 200
@@ -110,10 +161,55 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
       conn =
         :get
-        |> conn("/streams/#{stream_id}/subscribe?token=garbage")
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe?token=garbage")
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 401
+    end
+  end
+
+  describe "authorization" do
+    test "subscribing to a stream_id shaped like a tenant resource with no matching policy is denied with 403" do
+      tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
+      stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+
+      conn =
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 403
+    end
+
+    test "subscribing to a stream_id shaped like a tenant resource with a public read policy succeeds" do
+      tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
+      stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      :ok =
+        Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+          effect: :allow,
+          modes: [:read],
+          matcher: :public
+        })
+
+      Riptide.Stream.StreamSupervisor.ensure_ready(stream_id)
+
+      conn =
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "a stream_id not shaped like a tenant resource (e.g. a legacy non-tenant-scoped id) is denied, not crashed" do
+      conn =
+        :get
+        |> conn("/streams/some-legacy-stream-id/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 403
     end
   end
 end
