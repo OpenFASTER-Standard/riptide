@@ -131,4 +131,16 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
   test "rejects a validly-signed token that omits aud entirely", %{signer: signer} do
     assert {:error, _reason} = Verifier.OIDC.verify(token_missing("aud", signer))
   end
+
+  # Regression test: `"exp": null` (present, not omitted) previously passed
+  # Joken's default `exp` validator (`&(&1 > current_time())`) because
+  # `nil > <integer>` evaluates `true` under Erlang/Elixir term ordering,
+  # and the presence check added for the "omits entirely" cases above only
+  # checked `Map.has_key?/2`, which is also `true` for a key present with a
+  # `nil` value.
+  test "rejects a token with an explicit null exp instead of treating it as never-expiring", %{
+    signer: signer
+  } do
+    assert {:error, _reason} = Verifier.OIDC.verify(token(%{"exp" => nil}, signer))
+  end
 end
