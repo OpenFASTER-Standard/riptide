@@ -73,10 +73,6 @@ defmodule Riptide.Placement.PlacementMachine do
     end
   end
 
-  defp replace_in_list(nodes, dead_node, new_node) do
-    Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
-  end
-
   # Same idempotent-by-construction shape as {:assign, ...}: every command is
   # serialized through Raft, so concurrent `add_policy` calls for the same
   # tenant/prefix are safely ordered by the log rather than racing.
@@ -110,6 +106,10 @@ defmodule Riptide.Placement.PlacementMachine do
       new_state = put_in(state, [:policies, tenant_id], %{[] => [owner_policy]})
       {new_state, :claimed, []}
     end
+  end
+
+  defp replace_in_list(nodes, dead_node, new_node) do
+    Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
   end
 
   defp tenant_claimed?(state, tenant_id) do

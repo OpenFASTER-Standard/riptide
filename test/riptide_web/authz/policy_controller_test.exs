@@ -2,6 +2,9 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  alias Riptide.Authz.Store
+  alias RiptideWeb.LDP.ResourceController
+
   @opts RiptideWeb.Endpoint.init([])
 
   defmodule StubVerifier do
@@ -22,7 +25,7 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
   end
 
   defp claim_tenant(tenant_id) do
-    :claimed = Riptide.Authz.Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
   end
 
   test "the owner can add a policy and then list it back" do
@@ -137,7 +140,7 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
 
     on_exit(fn ->
       Riptide.RaTestHelpers.cleanup_stream(
-        RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["shared-doc"])
+        ResourceController.stream_id_for(tenant_id, ["shared-doc"])
       )
     end)
 

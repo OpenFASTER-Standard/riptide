@@ -9,7 +9,7 @@ defmodule RiptideWeb.Authz.PolicyController do
   holds is what's required to manage policies here, since this phase has no
   separate `Control` mode.
   """
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   alias Riptide.Authz.Policy
 

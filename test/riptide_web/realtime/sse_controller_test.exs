@@ -2,8 +2,10 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  alias Riptide.Authz.{Policy, Store}
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
   alias RiptideWeb.Realtime.SseController
 
   @opts RiptideWeb.Endpoint.init([])
@@ -24,7 +26,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   # same pattern as `resource_controller_test.exs`'s Task 5 setup.
   setup do
     for tenant_id <- ["sse-test-tenant", "sse-gap-test-tenant"] do
-      Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+      Store.Placement.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -36,7 +38,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   defp unique_stream_id,
     do:
-      RiptideWeb.LDP.ResourceController.stream_id_for("sse-test-tenant", [
+      ResourceController.stream_id_for("sse-test-tenant", [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -48,7 +50,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   # "authentication" describe block's own `setup` below.
   defp unique_auth_stream_id,
     do:
-      RiptideWeb.LDP.ResourceController.stream_id_for("sse-auth-test-tenant", [
+      ResourceController.stream_id_for("sse-auth-test-tenant", [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -76,7 +78,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
     stream_id =
-      RiptideWeb.LDP.ResourceController.stream_id_for("sse-gap-test-tenant", [
+      ResourceController.stream_id_for("sse-gap-test-tenant", [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -121,7 +123,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       Application.put_env(:riptide, :auth_verifier, StubVerifier)
       on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
 
-      Riptide.Authz.Store.Placement.add_policy("sse-auth-test-tenant", [], %Riptide.Authz.Policy{
+      Store.Placement.add_policy("sse-auth-test-tenant", [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -171,7 +173,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   describe "authorization" do
     test "subscribing to a stream_id shaped like a tenant resource with no matching policy is denied with 403" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
 
       conn =
         :get
@@ -183,17 +185,17 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "subscribing to a stream_id shaped like a tenant resource with a public read policy succeeds" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
       :ok =
-        Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        Store.Placement.add_policy(tenant_id, [], %Policy{
           effect: :allow,
           modes: [:read],
           matcher: :public
         })
 
-      Riptide.Stream.StreamSupervisor.ensure_ready(stream_id)
+      StreamSupervisor.ensure_ready(stream_id)
 
       conn =
         :get

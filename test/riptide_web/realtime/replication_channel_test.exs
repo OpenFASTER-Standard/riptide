@@ -2,9 +2,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   use ExUnit.Case, async: true
   import Phoenix.ChannelTest
 
+  alias Riptide.Authz.{Policy, Store}
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
   alias RiptideWeb.Realtime.{ReplicationChannel, Socket}
 
   @endpoint RiptideWeb.Endpoint
@@ -30,7 +32,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   # authorization now being enforced doesn't change their expected outcomes,
   # same pattern as `sse_controller_test.exs`'s Task 7 setup.
   setup do
-    Riptide.Authz.Store.Placement.add_policy("ws-test-tenant", [], %Riptide.Authz.Policy{
+    Store.Placement.add_policy("ws-test-tenant", [], %Policy{
       effect: :allow,
       modes: [:read],
       matcher: :public
@@ -45,7 +47,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   # call — mirrors `sse_controller_test.exs`'s `unique_stream_id/0`.
   defp unique_stream_id,
     do:
-      RiptideWeb.LDP.ResourceController.stream_id_for("ws-test-tenant", [
+      ResourceController.stream_id_for("ws-test-tenant", [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -188,7 +190,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining a topic shaped like a tenant resource with no matching policy is denied, not crashed" do
     tenant_id = "ws-authz-test-" <> Uniq.UUID.uuid4()
-    stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+    stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
 
     {:ok, socket} = connect(Socket, %{})
 
@@ -200,11 +202,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "joining a topic shaped like a tenant resource with a public read policy succeeds" do
     tenant_id = "ws-authz-test-" <> Uniq.UUID.uuid4()
-    stream_id = RiptideWeb.LDP.ResourceController.stream_id_for(tenant_id, ["doc"])
+    stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
     :ok =
-      Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+      Store.Placement.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public

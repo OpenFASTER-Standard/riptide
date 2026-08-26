@@ -2,6 +2,7 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  alias Riptide.Authz.{Policy, Store}
   alias RiptideWeb.LDP.ResourceController
 
   @opts RiptideWeb.Endpoint.init([])
@@ -16,7 +17,7 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   # their own brand-new, unseeded `authz-e2e-*` tenants instead.
   setup do
     for tenant_id <- ["test-tenant", "tenant-a", "tenant-b"] do
-      Riptide.Authz.Store.Placement.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+      Store.Placement.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read, :write],
         matcher: :public
