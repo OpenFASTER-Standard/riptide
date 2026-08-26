@@ -38,6 +38,26 @@ defmodule Riptide.RaClusterColdRestartTest do
     Application.stop(:ra)
     Application.start(:ra)
 
+    # `:ra` is a single OTP application for the whole BEAM node, so stopping
+    # it above also tears down the shared, suite-wide placement cluster that
+    # `test_helper.exs` bootstraps once before any test runs — not just the
+    # one stream-level server this test is specifically exercising. Every
+    # other test in the suite that touches
+    # `Riptide.Placement`/`Riptide.Stream.Placement` depends on that shared
+    # cluster staying alive for the rest of the `mix test` process's
+    # lifetime. This module being `async: false` only serializes it against
+    # *other* `async: false` modules — it still runs concurrently with the
+    # whole `async: true` pool — so without restoring the shared cluster
+    # here, immediately, whichever test happens to run around this one hits
+    # "Ra consistent query failed for {:riptide_placement, ...}: :noproc"
+    # with no crash log at all (a graceful `Application.stop(:ra)` produces
+    # none). Confirmed as the real root cause, not a guess: instrumenting
+    # both this restart and the exact `consistent_query` failure site with
+    # correlated monotonic timestamps showed `Process.whereis(:riptide_placement)`
+    # already `nil` the instant `:ra` comes back up, tens of seconds before
+    # the failures it caused elsewhere in the suite.
+    :ok = RaCluster.attempt_start_placement_cluster()
+
     # Use the shared `RaCluster.system_config/0` to build the exact same
     # config `RaCluster.ensure_system_started/0` does — see that function's
     # doc for why even a merely-equivalent (not byte-identical) config here
