@@ -8,7 +8,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   @ldp_contains RDF.iri("http://www.w3.org/ns/ldp#contains")
 
   def show(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(path_segments)
+    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
     case current_state(stream_id) do
       {:ok, graph} ->
@@ -24,7 +24,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def replace(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(path_segments)
+    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
 
     case TurtleCodec.decode(body) do
@@ -44,7 +44,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def delete(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(path_segments)
+    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
       :ok ->
@@ -57,7 +57,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def patch(conn, %{"path" => path_segments} = params) do
-    stream_id = stream_id_for(path_segments)
+    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
     # NOTE: the endpoint's `Plug.Parsers` (see Task 6's scaffold) already
     # parses and consumes the request body for `content-type:
@@ -90,7 +90,8 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def create_child(conn, %{"path" => path_segments}) do
-    container_stream_id = stream_id_for(path_segments)
+    tenant_id = conn.assigns.tenant_id
+    container_stream_id = stream_id_for(tenant_id, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
 
     case TurtleCodec.decode(body) do
@@ -113,7 +114,8 @@ defmodule RiptideWeb.LDP.ResourceController do
             Event.new(container_stream_id, :patch, containment_patch)
           )
 
-          location = "/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
+          location =
+            "/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
 
           conn
           |> put_resp_header("location", location)
@@ -131,8 +133,8 @@ defmodule RiptideWeb.LDP.ResourceController do
   def ensure_ready_status(:ok), do: :ok
   def ensure_ready_status({:error, _reason}), do: :error
 
-  defp stream_id_for(path_segments) do
-    "https://riptide.example/resources/" <> Enum.join(path_segments, "/")
+  defp stream_id_for(tenant_id, path_segments) do
+    "https://riptide.example/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/")
   end
 
   defp current_state(stream_id) do
