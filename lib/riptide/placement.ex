@@ -72,6 +72,43 @@ defmodule Riptide.Placement do
     end)
   end
 
+  @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t(), (String.t() -> node())) ::
+          :ok
+  def add_policy(
+        tenant_id,
+        path_prefix,
+        policy,
+        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
+      ) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:add_policy, tenant_id, path_prefix, policy})
+    end)
+  end
+
+  @spec list_policies(String.t(), [String.t()], (String.t() -> node())) :: [
+          Riptide.Authz.Policy.t()
+        ]
+  def list_policies(tenant_id, path_prefix, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.consistent_query(
+        server_id,
+        &PlacementMachine.list_policies(&1, tenant_id, path_prefix)
+      )
+    end)
+  end
+
+  @spec claim_tenant_if_unclaimed(String.t(), String.t(), (String.t() -> node())) ::
+          :claimed | :already_claimed
+  def claim_tenant_if_unclaimed(
+        tenant_id,
+        subject,
+        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
+      ) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:claim_tenant_if_unclaimed, tenant_id, subject})
+    end)
+  end
+
   # Tries each placement ordinal, in `RaCluster.placement_ordinals/0`'s own
   # fixed order, until one of them answers — `RaCluster.process_command/2`
   # and `consistent_query/2` both raise on failure/timeout (see their own

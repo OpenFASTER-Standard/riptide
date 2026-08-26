@@ -88,4 +88,107 @@ defmodule Riptide.Placement.PlacementMachineTest do
     assert reply == nil
     assert effects == []
   end
+
+  test "apply/3 {:add_policy, ...} appends to an empty policy list for a new tenant/prefix" do
+    state = PlacementMachine.init(%{})
+    policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], policy}, state)
+
+    assert new_state == %{streams: %{}, policies: %{"acme" => %{[] => [policy]}}}
+    assert reply == :ok
+    assert effects == []
+  end
+
+  test "apply/3 {:add_policy, ...} appends to an existing policy list rather than replacing it" do
+    state = PlacementMachine.init(%{})
+    first = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+    second = %Riptide.Authz.Policy{effect: :deny, modes: [:write], matcher: :authenticated}
+
+    {state, _, _} = PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], first}, state)
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 2}, {:add_policy, "acme", [], second}, state)
+
+    assert new_state == %{streams: %{}, policies: %{"acme" => %{[] => [first, second]}}}
+    assert reply == :ok
+    assert effects == []
+  end
+
+  test "apply/3 {:add_policy, ...} keeps different path prefixes independent" do
+    state = PlacementMachine.init(%{})
+    root_policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+    child_policy = %Riptide.Authz.Policy{effect: :deny, modes: [:write], matcher: :authenticated}
+
+    {state, _, _} =
+      PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], root_policy}, state)
+
+    {new_state, _, _} =
+      PlacementMachine.apply(%{index: 2}, {:add_policy, "acme", ["secret"], child_policy}, state)
+
+    assert new_state ==
+             %{
+               streams: %{},
+               policies: %{"acme" => %{[] => [root_policy], ["secret"] => [child_policy]}}
+             }
+  end
+
+  test "apply/3 {:claim_tenant_if_unclaimed, ...} creates a tenant-root owner policy when the tenant has zero policies" do
+    state = PlacementMachine.init(%{})
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 1}, {:claim_tenant_if_unclaimed, "acme", "user-1"}, state)
+
+    assert new_state == %{
+             streams: %{},
+             policies: %{
+               "acme" => %{
+                 [] => [
+                   %Riptide.Authz.Policy{
+                     effect: :allow,
+                     modes: [:read, :write],
+                     matcher: {:agent, "user-1"}
+                   }
+                 ]
+               }
+             }
+           }
+
+    assert reply == :claimed
+    assert effects == []
+  end
+
+  test "apply/3 {:claim_tenant_if_unclaimed, ...} is a no-op if the tenant already has any policy at any prefix" do
+    state = PlacementMachine.init(%{})
+    existing = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+
+    {state, _, _} =
+      PlacementMachine.apply(
+        %{index: 1},
+        {:add_policy, "acme", ["some", "path"], existing},
+        state
+      )
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 2}, {:claim_tenant_if_unclaimed, "acme", "user-2"}, state)
+
+    assert new_state == state
+    assert reply == :already_claimed
+    assert effects == []
+  end
+
+  test "list_policies/3 returns an empty list for a tenant/prefix with no policies" do
+    state = PlacementMachine.init(%{})
+    assert PlacementMachine.list_policies(state, "acme", []) == []
+  end
+
+  test "list_policies/3 returns exactly the policies stored at that tenant/prefix" do
+    policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+    state = %{streams: %{}, policies: %{"acme" => %{["docs"] => [policy]}}}
+
+    assert PlacementMachine.list_policies(state, "acme", ["docs"]) == [policy]
+    assert PlacementMachine.list_policies(state, "acme", []) == []
+    assert PlacementMachine.list_policies(state, "other-tenant", ["docs"]) == []
+  end
 end

@@ -77,6 +77,48 @@ defmodule Riptide.Placement.PlacementMachine do
     Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
   end
 
+  # Same idempotent-by-construction shape as {:assign, ...}: every command is
+  # serialized through Raft, so concurrent `add_policy` calls for the same
+  # tenant/prefix are safely ordered by the log rather than racing.
+  @impl :ra_machine
+  def apply(_meta, {:add_policy, tenant_id, path_prefix, policy}, state) do
+    existing = state.policies |> Map.get(tenant_id, %{}) |> Map.get(path_prefix, [])
+
+    new_state =
+      put_in(state, [:policies, Access.key(tenant_id, %{}), path_prefix], existing ++ [policy])
+
+    {new_state, :ok, []}
+  end
+
+  # A tenant is "unclaimed" if it has zero policies at every path prefix —
+  # see the Phase 4c design spec §6. This must be a single Ra command (not a
+  # separate list-then-add pair of calls from the caller) so that two
+  # different agents racing to claim the same brand-new tenant resolve to
+  # exactly one winner, the same way `{:assign, ...}`'s own idempotency
+  # relies on Raft's log ordering rather than a caller-side check-then-act.
+  @impl :ra_machine
+  def apply(_meta, {:claim_tenant_if_unclaimed, tenant_id, subject}, state) do
+    if tenant_claimed?(state, tenant_id) do
+      {state, :already_claimed, []}
+    else
+      owner_policy = %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, subject}
+      }
+
+      new_state = put_in(state, [:policies, tenant_id], %{[] => [owner_policy]})
+      {new_state, :claimed, []}
+    end
+  end
+
+  defp tenant_claimed?(state, tenant_id) do
+    state.policies
+    |> Map.get(tenant_id, %{})
+    |> Map.values()
+    |> Enum.any?(&(&1 != []))
+  end
+
   @spec get(state(), stream_id()) :: [node()] | nil
   def get(state, stream_id) do
     Map.get(state.streams, stream_id)
