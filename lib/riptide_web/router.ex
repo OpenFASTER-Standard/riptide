@@ -37,5 +37,8 @@ defmodule RiptideWeb.Router do
     put "/resources/*path", RiptideWeb.LDP.ResourceController, :replace
     delete "/resources/*path", RiptideWeb.LDP.ResourceController, :delete
     patch "/resources/*path", RiptideWeb.LDP.ResourceController, :patch
+
+    post "/policies", RiptideWeb.Authz.PolicyController, :create
+    get "/policies", RiptideWeb.Authz.PolicyController, :index
   end
 end
