@@ -71,11 +71,11 @@ New `Riptide.Auth` namespace, mirroring Phase 4a's `Riptide.Tenancy` pattern:
   deliberately does not fold authentication into tenant resolution, and deliberately does not fix
   SSE's separate pre-existing gap of sitting outside `:tenant` (see §3) — those are different
   concerns that happen to currently live in the same file.
-- **WebSocket**: `RiptideWeb.Realtime.Socket.connect/3` opts into seeing the request's
-  `Authorization` header (via Phoenix's `connect_info` mechanism — exact syntax confirmed during
-  implementation planning) and performs the same verification once, at connect time, assigning
-  `socket.assigns.current_subject` for the lifetime of the connection. A channel `join/3` never
-  re-verifies — the socket-level identity already applies to every channel joined on it.
+- **WebSocket**: `RiptideWeb.Realtime.Socket.connect/3` verifies a token once, at connect time,
+  assigning `socket.assigns.current_subject` for the lifetime of the connection. A channel
+  `join/3` never re-verifies — the socket-level identity already applies to every channel joined
+  on it. See the correction in §5 for exactly how the token reaches `connect/3` — it is not the
+  raw `Authorization` header.
 
 ## 5. Token extraction per transport
 
@@ -84,9 +84,21 @@ New `Riptide.Auth` namespace, mirroring Phase 4a's `Riptide.Tenancy` pattern:
   `EventSource` API cannot set custom headers, so a query-param fallback is a well-known, accepted
   pattern for this specific transport. If both are somehow present, the header takes precedence,
   to avoid ambiguity about which one is authoritative.
-- **WebSocket**: header on the upgrade request only, extracted once at `connect/3` (see §4) — no
-  query-param fallback, since a WebSocket client (unlike a browser's native `EventSource`) can
-  always set connection headers or explicit connect params if needed.
+- **WebSocket**: **Correction from an earlier draft of this section, caught during implementation
+  planning**: a raw `Authorization` header is NOT readable in `connect/3` — Phoenix deliberately
+  withholds arbitrary request headers from `Phoenix.Socket.connect/3` (documented in
+  `Phoenix.Endpoint`'s own "Where are my headers?" note: a WebSocket handshake is cross-origin, so
+  a malicious page could otherwise ride a victim's browser-managed `Authorization`/cookie headers
+  straight into the socket). The original assumption that "a WebSocket client can always set
+  connection headers" doesn't hold for the same reason browsers' native `EventSource` can't — a
+  browser's native `WebSocket` API can't set arbitrary upgrade-request headers either. Phoenix
+  ships a purpose-built mechanism for exactly this instead: the `socket/3` macro's `auth_token:
+  true` option, which accepts a token from the client via the `Sec-WebSocket-Protocol` header
+  (prefixed `"base64url.bearer.phx."`, standard-base64-decoded server-side — see
+  `deps/phoenix/lib/phoenix/transports/websocket.ex`) and surfaces it to `connect/3` as
+  `connect_info.auth_token`, with no extra `connect_info:` wiring needed (`auth_token: true` alone
+  makes `Phoenix.Socket.Transport.load_config/1` inject it). This is used instead of a
+  query-param fallback.
 
 ## 6. Error handling
 
