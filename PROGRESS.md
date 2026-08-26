@@ -343,9 +343,19 @@ sub-project 3 was decomposed into phases 3a-3d.
   full Solid ACP compliance — no Access Control Resources as discoverable resources, no
   client/VC/issuer matchers, no `Control` mode, no policy revocation yet; see the design spec §3
   for the complete list of deliberate omissions.
-- **Phase 4d — TLS.** Not yet designed.
+- **Phase 4d — TLS.** **Shipped 2026-08-26** — see
+  `docs/superpowers/specs/2026-08-26-phase-4d-tls-design.md`. TLS terminates at the Kubernetes
+  ingress, not in-app — no Elixir changes, confirmed by reading (not assuming) that
+  `config/prod.exs`'s `force_ssl` and `config/runtime.exs`'s `url: [scheme: "https"]` already
+  anticipate this. New example manifests: `k8s/ingress.yaml` (ingress-nginx, with
+  `proxy-buffering: "off"` and a 3600s `proxy-read-timeout` for Riptide's long-lived SSE/WebSocket
+  connections) and `k8s/cluster-issuer.yaml` (Let's Encrypt via ACME HTTP-01, staging + prod).
+  Wildcard/DNS-01 certs for the subdomain tenancy resolver are deliberately out of scope — see the
+  design spec's Out of scope section. Verified via `kubectl apply --dry-run=server` against a
+  scratch namespace on a live cluster (schema-valid), not a live-issued certificate — real ACME
+  issuance needs public DNS + a reachable ingress IP, which this phase does not provision.
 
-**Status**: Phases 4a-4c shipped 2026-08-26. Phase 4d not yet designed.
+**Status**: Phases 4a-4d shipped 2026-08-26. Sub-project 4 (Security & multi-tenancy) complete.
 
 ## 5. Not yet started
 
