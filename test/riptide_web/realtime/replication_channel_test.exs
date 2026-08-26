@@ -9,6 +9,21 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   @endpoint RiptideWeb.Endpoint
 
+  defmodule StubVerifier do
+    @behaviour Riptide.Auth.Verifier
+
+    @impl true
+    def verify("valid-token"), do: {:ok, %{"sub" => "user-1"}}
+    def verify(_token), do: {:error, :invalid_token}
+  end
+
+  setup do
+    original = Application.get_env(:riptide, :auth_verifier)
+    Application.put_env(:riptide, :auth_verifier, StubVerifier)
+    on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+    :ok
+  end
+
   defp unique_stream_id, do: "ws-test-#{System.unique_integer([:positive])}"
 
   test "joining with after: 0 receives no backlog on an empty stream" do
@@ -132,5 +147,19 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
     assert ReplicationChannel.ensure_ready_status(:ok) == :ok
     assert ReplicationChannel.ensure_ready_status({:error, :cluster_not_formed}) == :error
+  end
+
+  test "connecting with no auth_token still succeeds, current_subject is nil" do
+    assert {:ok, socket} = connect(Socket, %{})
+    assert socket.assigns.current_subject == nil
+  end
+
+  test "connecting with a valid auth_token assigns current_subject" do
+    assert {:ok, socket} = connect(Socket, %{}, connect_info: %{auth_token: "valid-token"})
+    assert socket.assigns.current_subject == %{"sub" => "user-1"}
+  end
+
+  test "connecting with an invalid auth_token is refused" do
+    assert {:error, _reason} = connect(Socket, %{}, connect_info: %{auth_token: "garbage"})
   end
 end
