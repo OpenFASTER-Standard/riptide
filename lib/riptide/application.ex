@@ -27,6 +27,7 @@ defmodule Riptide.Application do
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++
         placement_bootstrap_children() ++
+        auth_children() ++
         [
           # Start a worker by calling: Riptide.Worker.start_link(arg)
           # {Riptide.Worker, arg},
@@ -52,6 +53,22 @@ defmodule Riptide.Application do
         {Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
         Riptide.Stream.ReplicaHealer
       ]
+    else
+      []
+    end
+  end
+
+  # Every node that can serve a request needs its own live JWKS signer
+  # cache, unlike placement_bootstrap_children/0's 3-ordinal gating — see
+  # Riptide.Auth.JwksStrategy's own moduledoc for why no leader coordination
+  # is needed here. Conditional on real OIDC config being present at all, so
+  # dev/test boot doesn't require a reachable JWKS endpoint just to start —
+  # config/test.exs deliberately leaves :oidc_jwks_url unset so individual
+  # tests can start their own isolated instance instead (see
+  # test/riptide/auth/verifier/oidc_test.exs).
+  defp auth_children do
+    if Application.get_env(:riptide, :oidc_jwks_url) do
+      [Riptide.Auth.JwksStrategy]
     else
       []
     end

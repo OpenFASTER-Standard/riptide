@@ -59,6 +59,26 @@ if System.get_env("POD_IP") do
     ]
 end
 
+# OIDC config is optional outside :test — Riptide.Application's
+# auth_children/0 only starts Riptide.Auth.JwksStrategy when
+# :oidc_jwks_url is actually set, so a deployment that hasn't configured an
+# identity provider yet still boots (every request's current_subject is
+# simply always nil — no enforcement exists until Phase 4c). :test is
+# excluded entirely: config/test.exs deliberately leaves this unset so the
+# test suite's own app boot never tries to reach a real JWKS endpoint.
+if config_env() != :test do
+  oidc_issuer = System.get_env("RIPTIDE_OIDC_ISSUER")
+  oidc_audience = System.get_env("RIPTIDE_OIDC_AUDIENCE")
+  oidc_jwks_url = System.get_env("RIPTIDE_OIDC_JWKS_URL")
+
+  if oidc_issuer && oidc_audience && oidc_jwks_url do
+    config :riptide,
+      oidc_issuer: oidc_issuer,
+      oidc_audience: oidc_audience,
+      oidc_jwks_url: oidc_jwks_url
+  end
+end
+
 if config_env() == :prod do
   # The secret key base is used to sign/encrypt cookies and other secrets.
   # A default value is used in config/dev.exs and config/test.exs but you

@@ -316,11 +316,21 @@ sub-project 3 was decomposed into phases 3a-3d.
   changes below the web layer. SSE and the WebSocket replication channel needed no changes — they
   already take a fully-qualified, client-supplied `stream_id` directly, never constructing one
   from a path server-side.
-- **Phase 4b — Pluggable authentication.** Not yet designed.
+- **Phase 4b — Pluggable authentication.** **Shipped 2026-08-26** — see
+  `docs/superpowers/specs/2026-08-26-phase-4b-pluggable-authentication-design.md`. A pluggable
+  `Riptide.Auth.Verifier` behaviour (config-selected, defaulting to `Riptide.Auth.Verifier.OIDC` —
+  standard OIDC/JWT via `joken`+`joken_jwks`) feeds a new `RiptideWeb.Plugs.Authenticate` plug,
+  applied to all 3 request transports (LDP HTTP, SSE, WebSocket). Authentication is optional at
+  this layer — no token proceeds as anonymous (`current_subject: nil`); a present-but-invalid
+  token is rejected (`401` for HTTP/SSE, connection refused for WebSocket). WebSocket auth uses
+  Phoenix's purpose-built `auth_token`/`Sec-WebSocket-Protocol` mechanism rather than a header,
+  since Phoenix deliberately doesn't expose the raw `Authorization` header to `Socket.connect/3`.
+  Live-proved end-to-end against a real, disposable `oidc-provider`-based OIDC issuer. No
+  authorization/enforcement yet — that's Phase 4c.
 - **Phase 4c — Authorization (ACP).** Not yet designed.
 - **Phase 4d — TLS.** Not yet designed.
 
-**Status**: Phase 4a shipped 2026-08-26. Phases 4b-4d not yet designed.
+**Status**: Phases 4a-4b shipped 2026-08-26. Phases 4c-4d not yet designed.
 
 ## 5. Not yet started
 
