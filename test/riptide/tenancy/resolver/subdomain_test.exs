@@ -27,4 +27,16 @@ defmodule Riptide.Tenancy.Resolver.SubdomainTest do
 
     assert Subdomain.resolve(conn) == {:ok, "acme"}
   end
+
+  test "returns an error when a bare base domain has a trailing dot (FQDN form)" do
+    conn = %{conn(:get, "/resources/foo") | host: "riptide.example."}
+
+    assert {:error, _reason} = Subdomain.resolve(conn)
+  end
+
+  test "resolves correctly when a tenant host has a trailing dot (FQDN form)" do
+    conn = %{conn(:get, "/resources/foo") | host: "acme.riptide.example."}
+
+    assert Subdomain.resolve(conn) == {:ok, "acme"}
+  end
 end
