@@ -77,6 +77,54 @@ docker compose up
 with `openssl rand -base64 48` or `mix phx.gen.secret`. `PHX_HOST` defaults to `localhost` in the
 compose file — set it to your real hostname for anything beyond local testing.
 
+## Running via Kubernetes
+
+Example manifests live in `k8s/` — a 3-replica `StatefulSet` (`k8s/statefulset.yaml`), a
+`ClusterIP` Service for client traffic (`k8s/service.yaml`), a headless Service for internal Ra/
+Erlang-distribution peer discovery (`k8s/headless-service.yaml`), and a Secret template for the
+two required env vars (`k8s/secret.example.yaml`). These assume a Kubernetes cluster and `kubectl`
+access already exist — copy `k8s/secret.example.yaml` to `secret.yaml` (git-ignored), fill in real
+values per its own comments, then:
+
+```bash
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/headless-service.yaml -f k8s/service.yaml -f k8s/statefulset.yaml
+```
+
+### TLS
+
+`k8s/ingress.yaml` and `k8s/cluster-issuer.yaml` add TLS termination at the ingress, per this
+project's design (see `docs/superpowers/specs/2026-08-26-phase-4d-tls-design.md`) — Riptide itself
+never holds a certificate or speaks TLS directly. This requires
+[ingress-nginx](https://kubernetes.github.io/ingress-nginx/deploy/) and
+[cert-manager](https://cert-manager.io/docs/installation/) already installed on your cluster.
+
+1. Edit `k8s/cluster-issuer.yaml`: replace both `REPLACE_ME@example.com` placeholders with a real
+   email address (Let's Encrypt uses this for expiry/problem notifications, not for
+   authentication), then `kubectl apply -f k8s/cluster-issuer.yaml`.
+2. Edit `k8s/ingress.yaml`: replace both `riptide.example.com` placeholders with your real
+   hostname, then `kubectl apply -f k8s/ingress.yaml`.
+3. Point that hostname's DNS at your ingress controller's external IP
+   (`kubectl get svc -n <ingress-nginx-namespace> ingress-nginx-controller`).
+4. Update `k8s/statefulset.yaml`'s `PHX_HOST` value to the same hostname (see the comment above
+   that field) and re-apply the StatefulSet.
+5. Verify: `kubectl describe certificate riptide-tls` should reach `Ready: True` once cert-manager
+   completes the ACME HTTP-01 challenge. While testing, point `k8s/ingress.yaml`'s
+   `cert-manager.io/cluster-issuer` annotation at `letsencrypt-staging` instead of
+   `letsencrypt-prod` first — Let's Encrypt's production endpoint has strict per-hostname rate
+   limits that a first attempt can easily exceed while debugging DNS/ingress setup. Staging certs
+   aren't trusted by browsers, so switch the annotation to `letsencrypt-prod` and re-apply once
+   staging succeeds.
+
+**Not covered by these manifests:** the subdomain-based tenancy resolver (see
+`docs/superpowers/specs/2026-08-26-phase-4a-multi-tenancy-data-model-design.md`) routes tenants by
+hostname (`tenant.riptide.example.com`), which needs a *wildcard* certificate — HTTP-01 (used
+above) cannot issue wildcards. If you're using that resolver, switch to a DNS-01 solver instead
+(provider-specific; see
+[cert-manager's ACME DNS-01 provider docs](https://cert-manager.io/docs/configuration/acme/dns01/))
+and request `*.riptide.example.com` in `k8s/ingress.yaml`'s `tls.hosts` instead of a single
+hostname.
+
 ## Releasing
 
 Riptide uses plain [semver](https://semver.org/) tags (`vMAJOR.MINOR.PATCH`, optionally with a
