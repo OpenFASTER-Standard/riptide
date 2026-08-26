@@ -237,6 +237,37 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
              :error
   end
 
+  test "a %2F-encoded slash inside the tenant_id path segment is rejected with 400, not silently aliased" do
+    # Regression test for the stream_id collision finding: plug_cowboy's raw
+    # path splitter (deps/plug_cowboy/lib/plug/cowboy/conn.ex) splits on
+    # literal "/" bytes with no decoding, so a raw "%2F" stays embedded
+    # inside a single path_info element. Phoenix's router
+    # (deps/phoenix/lib/phoenix/router.ex) then URI.decodes each already-split
+    # segment individually before route param binding, so the decoded
+    # ":tenant_id" param ends up containing a literal "/". Without
+    # validation, this crafted request would resolve to
+    # tenant_id = "a/resources/foo", path_segments = ["x"], producing the
+    # exact same stream_id as a legitimate, unrelated request to
+    # "/tenants/a/resources/foo/resources/x" for tenant "a" — silently
+    # colliding two different tenants onto one stream.
+    #
+    # Built via Plug.Test.conn/2 (not a hand-constructed conn with tenant_id
+    # injected into params) so the raw, still-percent-encoded path is what
+    # actually flows through URI.parse/split_path/Phoenix's router, exactly
+    # as it would over real HTTP.
+    encoded_path = "/tenants/a%2Fresources%2Ffoo/resources/x"
+
+    on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(
+        "https://riptide.example/tenants/a/resources/foo/resources/x"
+      )
+    end)
+
+    conn = :get |> conn(encoded_path) |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 400
+  end
+
   test "two different tenants requesting the identically-named resource path get fully isolated resources" do
     path_suffix = "shared-name-#{System.unique_integer([:positive])}"
     tenant_a_path = "/tenants/tenant-a/resources/" <> path_suffix

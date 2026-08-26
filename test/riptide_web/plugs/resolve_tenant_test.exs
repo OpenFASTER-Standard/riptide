@@ -47,4 +47,19 @@ defmodule RiptideWeb.Plugs.ResolveTenantTest do
     assert conn.assigns.tenant_id == "acme"
     refute conn.halted
   end
+
+  test "halts with 400 when a resolved tenant_id contains a literal slash" do
+    # Simulates what a resolver would hand back once a `%2F`-encoded slash
+    # in the raw request path has already been decoded by Phoenix's router
+    # (see the moduledoc) — the plug must reject this rather than assign it,
+    # since an unrejected slash would let this tenant_id's stream_id string
+    # collide with a different, legitimate tenant's.
+    conn =
+      %{conn(:get, "/tenants/a/resources/foo") | params: %{"tenant_id" => "a/resources/foo"}}
+      |> ResolveTenant.call(ResolveTenant.init([]))
+
+    assert conn.halted
+    assert conn.status == 400
+    refute Map.has_key?(conn.assigns, :tenant_id)
+  end
 end
