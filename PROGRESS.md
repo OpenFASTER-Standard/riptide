@@ -14,7 +14,7 @@ first place to check for current status, not a historical log.
 | 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | **Shipped** — see below |
 | 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
-| 4 | Security & multi-tenancy (auth, WAC/ACP, TLS) | Not started |
+| 4 | Security & multi-tenancy (auth, ACP, TLS) | **Decomposed into phases 4a-4d** — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | Not started |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
@@ -279,6 +279,49 @@ sub-projects 1 and 2 did internally):
 **Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d-i (HA
 proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (automatic stream replica healing) shipped 2026-08-25.
 
-## 4-5. Not yet started
+## 4. Security & multi-tenancy — decomposed into phases
 
-Will be filled in as each sub-project reaches design.
+**Goal for this sub-project**: authentication (who is making a request), authorization (what can
+they do), multi-tenancy (data isolation between tenants sharing one deployment), and TLS
+(transport security) — bundled under one roadmap line originally, but these are independent
+concerns, each getting its own brainstorm → spec → plan → implementation cycle, the same way
+sub-project 3 was decomposed into phases 3a-3d.
+
+**Key decisions made:**
+
+- **Isolation model**: logical, not physical — tenants share the same fleet and the same kind of
+  `:ra` clusters per stream; isolation is enforced in software (namespacing + authorization), not
+  by giving each tenant dedicated infrastructure. Keeps operating cost from multiplying per tenant.
+- **Authentication**: pluggable from the start, starting with standard OIDC/OAuth2 (not the
+  narrower Solid-ecosystem WebID-OIDC convention the original StreamLD design doc's naming came
+  from) — a request's identity mechanism should be swappable without redesigning the request
+  pipeline, so a Solid-specific or API-key mechanism can be added later without a rewrite.
+- **Authorization**: ACP (Access Control Policy), not WAC (Web Access Control) — ACP is the newer
+  Solid-ecosystem standard, more expressive (policy/condition-based rather than a flat ACL
+  resource), and fixes known WAC expressiveness gaps.
+- **TLS**: terminated at the Kubernetes ingress/load balancer, not in-app — keeps this out of
+  Riptide's own codebase entirely; the phase is mostly infrastructure (Ingress manifest +
+  cert-manager), not Elixir code.
+
+**Phasing:**
+
+- **Phase 4a — Multi-tenancy data model.** Tenant-scoped resource addressing only — no auth or
+  enforcement yet. **Shipped 2026-08-26** — see
+  `docs/superpowers/specs/2026-08-26-phase-4a-multi-tenancy-data-model-design.md`. A pluggable
+  `Riptide.Tenancy.Resolver` behaviour (path-segment and subdomain implementations, config-selected)
+  feeds a new `RiptideWeb.Plugs.ResolveTenant` plug; every LDP resource route now lives under
+  `/tenants/:tenant_id/resources/*path`, and `ResourceController.stream_id_for/2` incorporates
+  `tenant_id` into every stream_id it builds. Since `RaCluster.uid_for/1` already hashes the full
+  stream_id opaquely, this namespaces every stream's underlying `:ra` cluster by tenant with zero
+  changes below the web layer. SSE and the WebSocket replication channel needed no changes — they
+  already take a fully-qualified, client-supplied `stream_id` directly, never constructing one
+  from a path server-side.
+- **Phase 4b — Pluggable authentication.** Not yet designed.
+- **Phase 4c — Authorization (ACP).** Not yet designed.
+- **Phase 4d — TLS.** Not yet designed.
+
+**Status**: Phase 4a shipped 2026-08-26. Phases 4b-4d not yet designed.
+
+## 5. Not yet started
+
+Will be filled in as this sub-project reaches design.
