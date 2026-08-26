@@ -52,3 +52,9 @@ kubectl delete -f statefulset.yaml -f service.yaml -f headless-service.yaml -f s
 
 `secret.yaml` is git-ignored (see the repo's `.gitignore`) — never commit real
 `RELEASE_COOKIE`/`SECRET_KEY_BASE` values.
+
+## TLS
+
+`ingress.yaml` and `cluster-issuer.yaml` (added in Phase 4d) add TLS termination at the ingress —
+see the top-level [`README.md`'s "Running via Kubernetes" § TLS](../README.md#tls) for the full
+setup walkthrough, rather than duplicating it here.

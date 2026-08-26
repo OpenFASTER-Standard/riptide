@@ -99,22 +99,27 @@ never holds a certificate or speaks TLS directly. This requires
 [ingress-nginx](https://kubernetes.github.io/ingress-nginx/deploy/) and
 [cert-manager](https://cert-manager.io/docs/installation/) already installed on your cluster.
 
+Let's Encrypt's production endpoint has strict per-hostname rate limits that a first attempt can
+easily exceed while debugging DNS/ingress setup, so the steps below have you verify against the
+`letsencrypt-staging` issuer first — staging certs aren't trusted by browsers, but they prove the
+HTTP-01 challenge mechanics work before you spend a production issuance attempt on it.
+
 1. Edit `k8s/cluster-issuer.yaml`: replace both `REPLACE_ME@example.com` placeholders with a real
    email address (Let's Encrypt uses this for expiry/problem notifications, not for
    authentication), then `kubectl apply -f k8s/cluster-issuer.yaml`.
 2. Edit `k8s/ingress.yaml`: replace both `riptide.example.com` placeholders with your real
-   hostname, then `kubectl apply -f k8s/ingress.yaml`.
+   hostname, and change the `cert-manager.io/cluster-issuer` annotation from `letsencrypt-prod` to
+   `letsencrypt-staging` — then `kubectl apply -f k8s/ingress.yaml`.
 3. Point that hostname's DNS at your ingress controller's external IP
    (`kubectl get svc -n <ingress-nginx-namespace> ingress-nginx-controller`).
 4. Update `k8s/statefulset.yaml`'s `PHX_HOST` value to the same hostname (see the comment above
    that field) and re-apply the StatefulSet.
-5. Verify: `kubectl describe certificate riptide-tls` should reach `Ready: True` once cert-manager
-   completes the ACME HTTP-01 challenge. While testing, point `k8s/ingress.yaml`'s
-   `cert-manager.io/cluster-issuer` annotation at `letsencrypt-staging` instead of
-   `letsencrypt-prod` first — Let's Encrypt's production endpoint has strict per-hostname rate
-   limits that a first attempt can easily exceed while debugging DNS/ingress setup. Staging certs
-   aren't trusted by browsers, so switch the annotation to `letsencrypt-prod` and re-apply once
-   staging succeeds.
+5. Verify staging works: `kubectl describe certificate riptide-tls` should reach `Ready: True`
+   once cert-manager completes the ACME HTTP-01 challenge against the staging endpoint.
+6. Switch to production: edit `k8s/ingress.yaml` again, changing the annotation from
+   `letsencrypt-staging` to `letsencrypt-prod`, then re-apply and re-check
+   `kubectl describe certificate riptide-tls` for `Ready: True` against the real Let's Encrypt
+   endpoint.
 
 **Not covered by these manifests:** the subdomain-based tenancy resolver (see
 `docs/superpowers/specs/2026-08-26-phase-4a-multi-tenancy-data-model-design.md`) routes tenants by
