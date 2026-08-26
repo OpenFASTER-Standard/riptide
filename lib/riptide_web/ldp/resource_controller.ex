@@ -133,9 +133,33 @@ defmodule RiptideWeb.LDP.ResourceController do
   def ensure_ready_status(:ok), do: :ok
   def ensure_ready_status({:error, _reason}), do: :error
 
-  defp stream_id_for(tenant_id, path_segments) do
-    "https://riptide.example/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/")
+  @stream_id_prefix "https://riptide.example/tenants/"
+  @resources_segment "/resources/"
+
+  @spec stream_id_for(String.t(), [String.t()]) :: String.t()
+  def stream_id_for(tenant_id, path_segments) do
+    @stream_id_prefix <> tenant_id <> @resources_segment <> Enum.join(path_segments, "/")
   end
+
+  # The exact inverse of `stream_id_for/2` — used by Phase 4c's authorization
+  # layer (`RiptideWeb.Realtime.SseController`/`ReplicationChannel`, Tasks 7-8)
+  # to recover which tenant/resource an opaque, client-supplied `stream_id`
+  # addresses, since neither transport constructs one from a path
+  # server-side (see Phase 4a design spec §5, Phase 4c design spec §7).
+  # `stream_id_for/2`'s format is a pure, deterministic, reversible string —
+  # no hashing or randomness — so parsing it back apart needs no new
+  # persisted state, at the cost of staying coupled to this exact format:
+  # the round-trip tests in `resource_controller_test.exs` exist specifically
+  # to catch a future change here breaking that coupling silently.
+  @spec parse_stream_id(String.t()) :: {:ok, String.t(), [String.t()]} | :error
+  def parse_stream_id(@stream_id_prefix <> rest) do
+    case String.split(rest, @resources_segment, parts: 2) do
+      [tenant_id, path] when tenant_id != "" -> {:ok, tenant_id, String.split(path, "/")}
+      _ -> :error
+    end
+  end
+
+  def parse_stream_id(_other), do: :error
 
   defp current_state(stream_id) do
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do

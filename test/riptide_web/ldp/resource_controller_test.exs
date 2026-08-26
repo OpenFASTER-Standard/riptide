@@ -266,6 +266,23 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
              :error
   end
 
+  describe "stream_id_for/2 and parse_stream_id/1" do
+    test "parse_stream_id/1 recovers the exact tenant_id and path_segments stream_id_for/2 was built from" do
+      stream_id = ResourceController.stream_id_for("acme", ["docs", "sub"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["docs", "sub"]}
+    end
+
+    test "parse_stream_id/1 round-trips for a single-segment path" do
+      stream_id = ResourceController.stream_id_for("acme", ["doc"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["doc"]}
+    end
+
+    test "parse_stream_id/1 returns :error for a stream_id not shaped like a tenant resource" do
+      assert ResourceController.parse_stream_id("not-a-real-stream-id") == :error
+      assert ResourceController.parse_stream_id("https://riptide.example/health") == :error
+    end
+  end
+
   test "a %2F-encoded slash inside the tenant_id path segment is rejected with 400, not silently aliased" do
     # Regression test for the stream_id collision finding: plug_cowboy's raw
     # path splitter (deps/plug_cowboy/lib/plug/cowboy/conn.ex) splits on
