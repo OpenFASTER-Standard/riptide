@@ -30,6 +30,12 @@ spec:
                   fieldPath: status.podIP
             - name: PHX_SERVER
               value: "true"
+            # "riptide-headless" (the StatefulSet's own headless Service, k8s/headless-service.yaml)
+            # is correct for internal Erlang clustering with no public TLS configured yet. Once
+            # you apply k8s/ingress.yaml + k8s/cluster-issuer.yaml, change this to the real public
+            # hostname you configured there (e.g. "riptide.example.com") — Socket.check_origin for
+            # the /replication WebSocket validates against this value, and force_ssl's redirect
+            # target depends on it matching what clients actually connect to.
             - name: PHX_HOST
               value: "riptide-headless"
             - name: RELEASE_COOKIE
