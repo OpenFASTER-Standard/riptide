@@ -4,8 +4,19 @@ defmodule RiptideWeb.Realtime.SseController do
   alias Riptide.Event
   alias Riptide.RDF.TurtleCodec
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
 
   def subscribe(conn, %{"stream_id" => stream_id}) do
+    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id),
+         :allow <-
+           Riptide.Authz.evaluate(tenant_id, path_segments, conn.assigns.current_subject, :read) do
+      do_subscribe(conn, stream_id)
+    else
+      _ -> send_resp(conn, 403, "")
+    end
+  end
+
+  defp do_subscribe(conn, stream_id) do
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
       :ok ->
         Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)

@@ -1,10 +1,31 @@
 defmodule RiptideWeb.LDP.ResourceControllerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   use Plug.Test
 
+  alias Riptide.Authz.{Policy, Store}
   alias RiptideWeb.LDP.ResourceController
 
   @opts RiptideWeb.Endpoint.init([])
+
+  # Every pre-existing test below exercises anonymous access against a
+  # policy-less tenant, exactly as it did before `Authorize` was wired into
+  # the router — seed a `:public` allow policy for each fixed tenant_id
+  # those tests' own helpers resolve to (`unique_path/0` always uses
+  # "test-tenant"; the tenant-isolation test below uses "tenant-a" and
+  # "tenant-b" directly) so those tests keep exercising resource behavior,
+  # not authorization. The new `describe "authorization"` tests below use
+  # their own brand-new, unseeded `authz-e2e-*` tenants instead.
+  setup do
+    for tenant_id <- ["test-tenant", "tenant-a", "tenant-b"] do
+      Store.Placement.add_policy(tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: :public
+      })
+    end
+
+    :ok
+  end
 
   defp unique_path,
     do: "/tenants/test-tenant/resources/test-#{System.unique_integer([:positive])}"
@@ -14,6 +35,15 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   defp stream_id_for(path) do
     segments = path |> String.trim_leading("/tenants/test-tenant/resources/") |> String.split("/")
     "https://riptide.example/tenants/test-tenant/resources/" <> Enum.join(segments, "/")
+  end
+
+  # Same as stream_id_for/1, parameterized by tenant_id, for tests that use
+  # a per-test-unique tenant rather than the fixed "test-tenant" literal.
+  defp stream_id_for(tenant_id, path) do
+    segments =
+      path |> String.trim_leading("/tenants/#{tenant_id}/resources/") |> String.split("/")
+
+    "https://riptide.example/tenants/#{tenant_id}/resources/" <> Enum.join(segments, "/")
   end
 
   test "GET on a resource that was never written to returns 404" do
@@ -237,6 +267,23 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
              :error
   end
 
+  describe "stream_id_for/2 and parse_stream_id/1" do
+    test "parse_stream_id/1 recovers the exact tenant_id and path_segments stream_id_for/2 was built from" do
+      stream_id = ResourceController.stream_id_for("acme", ["docs", "sub"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["docs", "sub"]}
+    end
+
+    test "parse_stream_id/1 round-trips for a single-segment path" do
+      stream_id = ResourceController.stream_id_for("acme", ["doc"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["doc"]}
+    end
+
+    test "parse_stream_id/1 returns :error for a stream_id not shaped like a tenant resource" do
+      assert ResourceController.parse_stream_id("not-a-real-stream-id") == :error
+      assert ResourceController.parse_stream_id("https://riptide.example/health") == :error
+    end
+  end
+
   test "a %2F-encoded slash inside the tenant_id path segment is rejected with 400, not silently aliased" do
     # Regression test for the stream_id collision finding: plug_cowboy's raw
     # path splitter (deps/plug_cowboy/lib/plug/cowboy/conn.ex) splits on
@@ -294,5 +341,105 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     get_a_conn = :get |> conn(tenant_a_path) |> RiptideWeb.Endpoint.call(@opts)
     assert get_a_conn.status == 200
     assert get_a_conn.resp_body =~ "\"a\""
+  end
+
+  describe "authorization" do
+    test "an anonymous GET of a never-written resource in a brand-new tenant is denied with 403, not 404" do
+      tenant_id = "authz-e2e-" <> Uniq.UUID.uuid4()
+      path = "/tenants/#{tenant_id}/resources/doc"
+
+      conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 403
+    end
+
+    test "the first authenticated write to a brand-new tenant claims ownership and succeeds" do
+      tenant_id = "authz-e2e-" <> Uniq.UUID.uuid4()
+      path = "/tenants/#{tenant_id}/resources/doc"
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(tenant_id, path)) end)
+
+      owner_claims = %{"sub" => "owner-" <> Uniq.UUID.uuid4()}
+      Application.put_env(:riptide, :authz_test_verifier_claims, owner_claims)
+      on_exit(fn -> Application.delete_env(:riptide, :authz_test_verifier_claims) end)
+
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.LDP.ResourceControllerTest.StubOwnerVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+
+      put_conn =
+        :put
+        |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"z\" .\n")
+        |> put_req_header("content-type", "text/turtle")
+        |> put_req_header("authorization", "Bearer owner-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert put_conn.status == 201
+
+      get_conn =
+        :get
+        |> conn(path)
+        |> put_req_header("authorization", "Bearer owner-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert get_conn.status == 200
+      assert get_conn.resp_body =~ "\"z\""
+    end
+
+    test "a different identity is denied access to an already-claimed tenant's resource" do
+      tenant_id = "authz-e2e-" <> Uniq.UUID.uuid4()
+      path = "/tenants/#{tenant_id}/resources/doc"
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(tenant_id, path)) end)
+
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.LDP.ResourceControllerTest.StubOwnerVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+
+      :put
+      |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"z\" .\n")
+      |> put_req_header("content-type", "text/turtle")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+      other_get_conn =
+        :get
+        |> conn(path)
+        |> put_req_header("authorization", "Bearer someone-else-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert other_get_conn.status == 403
+
+      owner_get_conn =
+        :get
+        |> conn(path)
+        |> put_req_header("authorization", "Bearer owner-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert owner_get_conn.status == 200
+    end
+  end
+
+  # Any bearer token authenticates successfully (so "a different identity"
+  # tests exercise Authorize's identity-based denial, not Authenticate's
+  # invalid-token 401) — only "owner-token" maps to the tenant's actual
+  # owner subject; every other token authenticates as its own distinct,
+  # non-owner subject.
+  defmodule StubOwnerVerifier do
+    @behaviour Riptide.Auth.Verifier
+
+    @impl true
+    def verify("owner-token"), do: {:ok, %{"sub" => "the-owner"}}
+    def verify(token), do: {:ok, %{"sub" => token}}
   end
 end

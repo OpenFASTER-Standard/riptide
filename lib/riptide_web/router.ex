@@ -13,6 +13,10 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.Authenticate
   end
 
+  pipeline :authz do
+    plug RiptideWeb.Plugs.Authorize
+  end
+
   scope "/" do
     pipe_through :api
 
@@ -26,12 +30,15 @@ defmodule RiptideWeb.Router do
   end
 
   scope "/tenants/:tenant_id" do
-    pipe_through [:api, :tenant, :auth]
+    pipe_through [:api, :tenant, :auth, :authz]
 
     get "/resources/*path", RiptideWeb.LDP.ResourceController, :show
     post "/resources/*path", RiptideWeb.LDP.ResourceController, :create_child
     put "/resources/*path", RiptideWeb.LDP.ResourceController, :replace
     delete "/resources/*path", RiptideWeb.LDP.ResourceController, :delete
     patch "/resources/*path", RiptideWeb.LDP.ResourceController, :patch
+
+    post "/policies", RiptideWeb.Authz.PolicyController, :create
+    get "/policies", RiptideWeb.Authz.PolicyController, :index
   end
 end

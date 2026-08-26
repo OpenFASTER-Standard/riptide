@@ -2,9 +2,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   use ExUnit.Case, async: true
   import Phoenix.ChannelTest
 
+  alias Riptide.Authz.{Policy, Store}
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
   alias RiptideWeb.Realtime.{ReplicationChannel, Socket}
 
   @endpoint RiptideWeb.Endpoint
@@ -24,7 +26,30 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     :ok
   end
 
-  defp unique_stream_id, do: "ws-test-#{System.unique_integer([:positive])}"
+  # The pre-existing tests below (predating authorization) use
+  # `unique_stream_id/0`'s fixed tenant ("ws-test-tenant") and no bearing on
+  # authorization itself — seed a `:public`, `[:read]` policy for it so
+  # authorization now being enforced doesn't change their expected outcomes,
+  # same pattern as `sse_controller_test.exs`'s Task 7 setup.
+  setup do
+    Store.Placement.add_policy("ws-test-tenant", [], %Policy{
+      effect: :allow,
+      modes: [:read],
+      matcher: :public
+    })
+
+    :ok
+  end
+
+  # A tenant-resource-shaped stream_id (not an opaque literal like the old
+  # `"ws-test-<n>"` ids), so `ReplicationChannel.join/3`'s authorization
+  # check can resolve it to a tenant. Fixed tenant, unique path segment per
+  # call — mirrors `sse_controller_test.exs`'s `unique_stream_id/0`.
+  defp unique_stream_id,
+    do:
+      ResourceController.stream_id_for("ws-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
 
   test "joining with after: 0 receives no backlog on an empty stream" do
     stream_id = unique_stream_id()
@@ -108,8 +133,8 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   # mailbox, so `refute_push` in the task can only match a push actually
   # delivered to socket B.
   test "an append to stream A is not pushed to a socket joined to stream B" do
-    stream_a = "stream-a-" <> Uniq.UUID.uuid4()
-    stream_b = "stream-b-" <> Uniq.UUID.uuid4()
+    stream_a = unique_stream_id()
+    stream_b = unique_stream_id()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_a) end)
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_b) end)
 
@@ -161,5 +186,51 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   test "connecting with an invalid auth_token is refused" do
     assert {:error, _reason} = connect(Socket, %{}, connect_info: %{auth_token: "garbage"})
+  end
+
+  test "joining a topic shaped like a tenant resource with no matching policy is denied, not crashed" do
+    tenant_id = "ws-authz-test-" <> Uniq.UUID.uuid4()
+    stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+
+    {:ok, socket} = connect(Socket, %{})
+
+    assert {:error, %{"reason" => "unauthorized"}} =
+             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+               "after" => 0
+             })
+  end
+
+  test "joining a topic shaped like a tenant resource with a public read policy succeeds" do
+    tenant_id = "ws-authz-test-" <> Uniq.UUID.uuid4()
+    stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+    :ok =
+      Store.Placement.add_policy(tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+
+    StreamSupervisor.ensure_ready(stream_id)
+
+    {:ok, socket} = connect(Socket, %{})
+
+    {:ok, _reply, _socket} =
+      subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{"after" => 0})
+  end
+
+  test "joining a topic not shaped like a tenant resource is denied, not crashed" do
+    {:ok, socket} = connect(Socket, %{})
+
+    assert {:error, %{"reason" => "unauthorized"}} =
+             subscribe_and_join(
+               socket,
+               ReplicationChannel,
+               "replication:some-legacy-stream-id",
+               %{
+                 "after" => 0
+               }
+             )
   end
 end
