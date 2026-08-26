@@ -101,11 +101,16 @@ Critically, this requires **zero changes** below the web layer: `Riptide.Stream.
 `Riptide.RaCluster`, and `Riptide.Stream.ReplicaHealer` all already treat `stream_id` as an opaque
 string and have no tenant-awareness to add.
 
-`RiptideWeb.Realtime.SseController` and `RiptideWeb.Realtime.ReplicationChannel` resolve
-`tenant_id` the same way (SSE via the same `ResolveTenant` plug on its own route; the WebSocket
-channel via an equivalent resolution step against its own connect params/topic, since channel
-joins don't flow through the same plug pipeline as HTTP requests) and build the matching
-tenant-scoped stream_id before subscribing to or joining a stream.
+**Correction from an earlier draft of this section, caught during implementation planning**:
+`RiptideWeb.Realtime.SseController.subscribe/2` and
+`RiptideWeb.Realtime.ReplicationChannel.join/3` do NOT construct a stream_id from a path the way
+`ResourceController` does — they already take a fully-qualified, opaque `stream_id` directly from
+the client (SSE via its `:stream_id` route param, the WebSocket channel via its own
+`"replication:" <> stream_id` topic string), with no server-side path-to-stream_id translation.
+Tenant-scoping is entirely a property of *how a stream_id is constructed*, which only ever happens
+in `stream_id_for/1` — a client that already knows the correct tenant-scoped stream_id (e.g. from
+a prior LDP response) can subscribe via SSE/WebSocket exactly as it does today, with **no changes
+needed to either module or their routes** for this phase.
 
 ## 6. Testing
 
@@ -116,5 +121,5 @@ tenant-scoped stream_id before subscribing to or joining a stream.
 - `ResourceController` tests confirming two different `tenant_id`s requesting the identically-named
   resource path produce two different `stream_id`s (and, by extension, two fully isolated `:ra`
   clusters) — the core isolation property this phase exists to establish.
-- SSE/WebSocket tests confirming their own tenant resolution produces the same stream_id a
-  matching HTTP request for the same tenant/path would.
+- No SSE/WebSocket test changes needed for this phase — see the correction in §5; neither module's
+  behavior changes.
