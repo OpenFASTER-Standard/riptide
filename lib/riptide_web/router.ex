@@ -9,15 +9,24 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.ResolveTenant
   end
 
+  pipeline :auth do
+    plug RiptideWeb.Plugs.Authenticate
+  end
+
   scope "/" do
     pipe_through :api
 
     get "/health", RiptideWeb.HealthController, :show
+  end
+
+  scope "/" do
+    pipe_through [:api, :auth]
+
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end
 
   scope "/tenants/:tenant_id" do
-    pipe_through [:api, :tenant]
+    pipe_through [:api, :tenant, :auth]
 
     get "/resources/*path", RiptideWeb.LDP.ResourceController, :show
     post "/resources/*path", RiptideWeb.LDP.ResourceController, :create_child

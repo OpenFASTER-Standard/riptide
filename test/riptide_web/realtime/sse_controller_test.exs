@@ -1,5 +1,5 @@
 defmodule RiptideWeb.Realtime.SseControllerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
   use Plug.Test
 
   alias Riptide.Event
@@ -8,7 +8,17 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   @opts RiptideWeb.Endpoint.init([])
 
+  defmodule StubVerifier do
+    @behaviour Riptide.Auth.Verifier
+
+    @impl true
+    def verify("valid-token"), do: {:ok, %{"sub" => "user-1"}}
+    def verify(_token), do: {:error, :invalid_token}
+  end
+
   defp unique_stream_id, do: "sse-test-#{System.unique_integer([:positive])}"
+
+  defp unique_auth_stream_id, do: "sse-auth-test-#{System.unique_integer([:positive])}"
 
   test "subscribing with no Last-Event-ID and then appending pushes one SSE frame" do
     stream_id = unique_stream_id()
@@ -62,5 +72,48 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     assert SseController.ensure_ready_status({:error, :cluster_not_formed}) ==
              :error
+  end
+
+  describe "authentication" do
+    setup do
+      original = Application.get_env(:riptide, :auth_verifier)
+      Application.put_env(:riptide, :auth_verifier, StubVerifier)
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+      :ok
+    end
+
+    test "subscribing with no token still succeeds (optional auth)" do
+      stream_id = unique_auth_stream_id()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+      StreamSupervisor.ensure_ready(stream_id)
+
+      conn = :get |> conn("/streams/#{stream_id}/subscribe") |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "subscribing with a valid ?token= query param succeeds" do
+      stream_id = unique_auth_stream_id()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+      StreamSupervisor.ensure_ready(stream_id)
+
+      conn =
+        :get
+        |> conn("/streams/#{stream_id}/subscribe?token=valid-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "subscribing with an invalid token is rejected with 401 before touching the stream" do
+      stream_id = unique_auth_stream_id()
+
+      conn =
+        :get
+        |> conn("/streams/#{stream_id}/subscribe?token=garbage")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 401
+    end
   end
 end
