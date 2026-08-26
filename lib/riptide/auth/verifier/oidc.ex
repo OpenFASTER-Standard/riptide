@@ -13,7 +13,7 @@ defmodule Riptide.Auth.Verifier.OIDC do
 
   @impl true
   def verify(token) when is_binary(token) do
-    TokenConfig.verify_and_validate(token)
+    TokenConfig.verify_and_validate_required_claims(token)
   rescue
     error -> {:error, error}
   end

@@ -12,7 +12,6 @@ defmodule Riptide.Auth.JwksStrategy do
   """
   use JokenJwks.DefaultStrategyTemplate
 
-  @impl true
   def init_opts(opts) do
     Keyword.put_new(opts, :jwks_url, Application.get_env(:riptide, :oidc_jwks_url))
   end

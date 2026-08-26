@@ -60,6 +60,25 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
     Joken.generate_and_sign!(%{}, Map.merge(default_claims, claims), signer)
   end
 
+  # Builds a validly-signed token that omits `claim_key` entirely (rather than
+  # just overriding its value), to exercise the presence requirement added in
+  # `Riptide.Auth.TokenConfig.verify_and_validate_required_claims/1` — Joken's
+  # own validators only run for claims the token actually includes, so a
+  # token that just doesn't have `exp`/`iss`/`aud` at all would otherwise
+  # skip that claim's check completely.
+  defp token_missing(claim_key, signer) do
+    default_claims = %{
+      "iss" => @issuer,
+      "aud" => @audience,
+      "exp" => System.system_time(:second) + 3600,
+      "sub" => "user-1"
+    }
+
+    default_claims
+    |> Map.delete(claim_key)
+    |> then(&Joken.generate_and_sign!(%{}, &1, signer))
+  end
+
   test "verifies a correctly-signed token with valid claims", %{signer: signer} do
     assert {:ok, claims} = Verifier.OIDC.verify(token(%{"sub" => "user-1"}, signer))
     assert claims["sub"] == "user-1"
@@ -99,5 +118,17 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
 
   test "rejects a malformed token instead of raising" do
     assert {:error, _reason} = Verifier.OIDC.verify("not.a.jwt")
+  end
+
+  test "rejects a validly-signed token that omits exp entirely", %{signer: signer} do
+    assert {:error, _reason} = Verifier.OIDC.verify(token_missing("exp", signer))
+  end
+
+  test "rejects a validly-signed token that omits iss entirely", %{signer: signer} do
+    assert {:error, _reason} = Verifier.OIDC.verify(token_missing("iss", signer))
+  end
+
+  test "rejects a validly-signed token that omits aud entirely", %{signer: signer} do
+    assert {:error, _reason} = Verifier.OIDC.verify(token_missing("aud", signer))
   end
 end
