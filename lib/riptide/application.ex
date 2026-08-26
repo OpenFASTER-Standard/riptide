@@ -48,7 +48,10 @@ defmodule Riptide.Application do
   # of the application (Phoenix Endpoint, etc.) from booting normally.
   defp placement_bootstrap_children do
     if System.get_env("HOSTNAME") in Riptide.RaCluster.placement_ordinals() do
-      [{Task, &Riptide.RaCluster.ensure_placement_cluster_started/0}]
+      [
+        {Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
+        Riptide.Stream.ReplicaHealer
+      ]
     else
       []
     end

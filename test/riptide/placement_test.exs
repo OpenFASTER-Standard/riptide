@@ -61,5 +61,33 @@ defmodule Riptide.PlacementTest do
       assert assigned == [node()]
       assert Placement.lookup(stream_id) == [node()]
     end
+
+    test "list_all/1 includes every real assignment made so far" do
+      stream_id = "placement-list-all-" <> Uniq.UUID.uuid4()
+      Placement.assign(stream_id, [node()])
+
+      assert Placement.list_all()[stream_id] == [node()]
+    end
+
+    test "replace_member/3 swaps a dead node for a new one in a real assignment" do
+      stream_id = "placement-replace-member-" <> Uniq.UUID.uuid4()
+      fake_dead_node = :"fake-dead@nowhere"
+      Placement.assign(stream_id, [node(), fake_dead_node])
+
+      replaced = Placement.replace_member(stream_id, fake_dead_node, :"fake-new@nowhere")
+
+      assert Enum.sort(replaced) == Enum.sort([node(), :"fake-new@nowhere"])
+      assert Enum.sort(Placement.lookup(stream_id)) == Enum.sort([node(), :"fake-new@nowhere"])
+    end
+
+    test "replace_member/3 is a no-op if the dead node named is no longer part of the assignment" do
+      stream_id = "placement-replace-member-noop-" <> Uniq.UUID.uuid4()
+      Placement.assign(stream_id, [node()])
+
+      result = Placement.replace_member(stream_id, :"never-was-here@nowhere", :new@nowhere)
+
+      assert result == [node()]
+      assert Placement.lookup(stream_id) == [node()]
+    end
   end
 end

@@ -110,14 +110,14 @@ defmodule RiptideWeb.RoutingClusterTest do
     assert Enum.any?(results, &(&1 == :ok))
 
     for {_pid, node, _ordinal} <- peers do
-      {:ok, _pid} = start_unlinked(node, Riptide.Stream.Placement, :start_link, [[]])
-    end
-
-    for {_pid, node, _ordinal} <- peers do
       {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:phoenix_pubsub])
 
       {:ok, _pid} =
         start_unlinked(node, Phoenix.PubSub.Supervisor, :start_link, [[name: Riptide.PubSub]])
+    end
+
+    for {_pid, node, _ordinal} <- peers do
+      {:ok, _pid} = start_unlinked(node, Riptide.Stream.Placement, :start_link, [[]])
     end
 
     {_pid, entry_node, _ordinal} = hd(peers)

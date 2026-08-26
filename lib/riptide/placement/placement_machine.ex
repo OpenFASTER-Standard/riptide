@@ -32,8 +32,37 @@ defmodule Riptide.Placement.PlacementMachine do
     end
   end
 
+  # Idempotent the same way {:assign, ...} is: if `dead_node` is no longer
+  # part of `stream_id`'s stored assignment (e.g. a different placement-
+  # cluster leader, from a prior Raft term, already won this exact repair),
+  # this is a no-op that returns the current assignment unchanged rather
+  # than erroring — safe to call redundantly from a racing leader.
+  @impl :ra_machine
+  def apply(_meta, {:replace_member, stream_id, dead_node, new_node}, state) do
+    case Map.fetch(state, stream_id) do
+      {:ok, nodes} ->
+        if dead_node in nodes do
+          new_nodes = replace_in_list(nodes, dead_node, new_node)
+          new_state = Map.put(state, stream_id, new_nodes)
+          {new_state, new_nodes, []}
+        else
+          {state, nodes, []}
+        end
+
+      :error ->
+        {state, nil, []}
+    end
+  end
+
+  defp replace_in_list(nodes, dead_node, new_node) do
+    Enum.map(nodes, fn n -> if n == dead_node, do: new_node, else: n end)
+  end
+
   @spec get(state(), String.t()) :: [node()] | nil
   def get(state, stream_id) do
     Map.get(state, stream_id)
   end
+
+  @spec list(state()) :: state()
+  def list(state), do: state
 end

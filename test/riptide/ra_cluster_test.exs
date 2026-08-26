@@ -150,6 +150,12 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
+  describe "placement_leader?/0" do
+    test "returns true for this node's own already-running (collapsed) placement cluster" do
+      assert RaCluster.placement_leader?()
+    end
+  end
+
   describe "attempt_start_placement_cluster/1" do
     test "a resolver that raises (e.g. default_ordinal_resolver/1 on an unresolvable DNS name) yields a retriable error instead of an uncaught exception" do
       # Mirrors exactly how `default_ordinal_resolver/1` fails for real: a
@@ -294,6 +300,35 @@ defmodule Riptide.RaClusterTest do
 
       assert RaCluster.start_or_join_replicated(uid, [:nonexistent@nowhere], machine) ==
                {:error, :cluster_not_formed}
+    end
+  end
+
+  describe "replace_member/5" do
+    test "replaces a member with a fresh one, collapsed onto a single real node" do
+      uid = "replace-member-" <> Uniq.UUID.uuid4()
+      name = String.to_atom(uid)
+      machine = {:module, EchoMachine, %{}}
+      on_exit(fn -> :ra.force_delete_server(:default, {name, node()}) end)
+
+      assert {:ok, _server_ids} =
+               RaCluster.start_or_join_replicated(uid, [node()], machine)
+
+      # A single real node standing in for both "the dead node" and "the
+      # replacement" is nonsensical for a real repair, but proves the
+      # function's own call sequence (add_member, start_server, remove_member)
+      # doesn't blow up against a real, already-running single-member
+      # cluster — real distinctness is proven separately by Step 5's
+      # `:peer`-based test.
+      #
+      # `node()` is already a member here, so `add_member`/`start_server` both
+      # self-correct on their own respective "already there" outcomes (finding
+      # 3, Phase 3d-ii final review — see `RaCluster.add_member/2` and
+      # `start_joining_server/4`'s own docs) and the call proceeds all the way
+      # to `remove_member`, which is where this contrived scenario's real
+      # error surfaces: `:dead@nowhere` was never actually a member of this
+      # single-member cluster to begin with.
+      assert RaCluster.replace_member(uid, [node()], :dead@nowhere, node(), machine) ==
+               {:error, :not_member}
     end
   end
 end

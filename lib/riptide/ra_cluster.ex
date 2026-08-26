@@ -33,6 +33,37 @@ defmodule Riptide.RaCluster do
     {@placement_cluster_name, resolve_fun.(ordinal)}
   end
 
+  # Whether THIS node is currently the placement cluster's Raft leader —
+  # used by `Riptide.Stream.ReplicaHealer` (Phase 3d-ii) to gate stream
+  # replica repair so only one of the 3 placement ordinals ever acts on a
+  # given sweep, reusing the placement cluster's own existing leader
+  # election rather than a new coordination mechanism. Queries the LOCAL
+  # member directly (`{@placement_cluster_name, node()}`) rather than going
+  # through `placement_server_id/2`'s ordinal/DNS resolution, since this is
+  # only ever meaningful to call from a node that's itself a placement
+  # ordinal already running its own local member.
+  # Wrapped in `try/catch :exit` because `:ra.members/1` doesn't always turn
+  # a bad outcome into an `{:error, _}` tuple: `ra_server_proc`'s own
+  # `gen_statem_safe_call/3` only converts `timeout`/`noproc`/`nodedown`/
+  # `shutdown` exits into a return value — any OTHER exit (e.g. the local
+  # member process crashing for an unrelated reason while this exact call is
+  # in flight) propagates straight out of `gen_statem:call/3` as a genuine
+  # `exit`, which a plain `case` can't catch. `Riptide.Stream.ReplicaHealer`
+  # (Phase 3d-ii) is the first caller to invoke this from a periodic
+  # boot-time timer rather than a one-off request path, so a rare exit here
+  # would otherwise crash that GenServer outright instead of just skipping a
+  # sweep. Any exit is treated as "not the leader" — the same conservative
+  # default this function already returns for a plain `{:error, _}`.
+  @spec placement_leader?() :: boolean()
+  def placement_leader? do
+    case :ra.members({@placement_cluster_name, node()}) do
+      {:ok, _members, {@placement_cluster_name, leader_node}} -> leader_node == node()
+      _ -> false
+    end
+  catch
+    :exit, _ -> false
+  end
+
   # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
   # In production this is always the real DNS-based resolution below
   # (mirroring exactly how `Cluster.Strategy.Kubernetes.DNS` resolves peers
@@ -301,20 +332,17 @@ defmodule Riptide.RaCluster do
     end
   end
 
-  # Local-or-remote liveness check for a single Ra server id — used to
-  # distinguish, member by member, "genuinely never started" from "already
-  # running, just not *newly* started by this particular
-  # `:ra.start_cluster/2` call" (see `start_or_join_replicated/3`'s
-  # `NotStarted` handling below). A member unreachable over `:erpc` (network
-  # blip, node still booting) is conservatively treated as not-alive, which
-  # only ever causes a spurious retry of an already-fine formation — never a
-  # silently-accepted broken one.
+  # Public (not `defp`) so callers beyond this module — e.g.
+  # `Riptide.Stream.ReplicaHealer` (Phase 3d-ii) — can check a specific
+  # stream replica's real liveness, local or remote, the same way this
+  # module already does internally for `start_or_join_replicated/3`'s own
+  # `NotStarted` handling.
   @spec member_alive?(:ra.server_id()) :: boolean()
-  defp member_alive?({name, node}) when node == node() do
+  def member_alive?({name, node}) when node == node() do
     server_alive?(name)
   end
 
-  defp member_alive?({name, node}) do
+  def member_alive?({name, node}) do
     case :erpc.call(node, __MODULE__, :server_alive?, [name], 5_000) do
       true -> true
       false -> false
@@ -505,6 +533,139 @@ defmodule Riptide.RaCluster do
         else
           {:error, :cluster_not_formed}
         end
+    end
+  end
+
+  # Grows a stream's already-running `:ra` cluster by one member (`new_node`)
+  # and evicts a dead one (`dead_node`) — the real repair primitive behind
+  # Phase 3d-ii's automatic replica healing. `survivor_nodes` must be at
+  # least one currently-alive member of the cluster (never `dead_node`
+  # itself); passing every survivor (not just one) lets `:ra` itself pick a
+  # reachable one to route the membership-change commands through, the same
+  # `ra_server_id() | [ra_server_id()]` flexibility `:ra.add_member/2` and
+  # `:ra.remove_member/2` already support directly.
+  #
+  # Order matters and is NOT `start_or_join_replicated/3`'s "form a fresh
+  # cluster" order — verified against `:ra`'s own growing-a-cluster
+  # documentation (`deps/ra/README.md`, "Dynamically Changing Cluster
+  # Membership"): add the member to the existing cluster's configuration
+  # FIRST, then start the joining server itself with `initial_members` set
+  # to just the survivor(s) — reversed, a freshly-started server with no
+  # cluster membership entry yet has nothing to catch up from.
+  @spec replace_member(String.t(), [node()], node(), node(), :ra_machine.machine()) ::
+          :ok | {:error, term()}
+  def replace_member(uid, survivor_nodes, dead_node, new_node, machine) do
+    ensure_system_started()
+    name = String.to_atom(uid)
+    survivor_ids = Enum.map(survivor_nodes, &{name, &1})
+    dead_id = {name, dead_node}
+    new_id = {name, new_node}
+    cluster_name = uid <> "_cluster"
+
+    with :ok <- add_member(survivor_ids, new_id),
+         :ok <- start_joining_server(cluster_name, new_id, machine, survivor_ids),
+         {:ok, _reply, _leader} <-
+           retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} -> {:error, :timeout}
+    end
+  end
+
+  # Self-corrects the exact same "redundant retry after a partial prior
+  # success" shape `start_new_cluster/4` and `attempt_start_placement_cluster/1`
+  # already handle for their own `:ra` calls (see their own docs): if a
+  # previous `replace_member/5` attempt's `add_member` step already landed
+  # (e.g. this node crashed before reaching `remove_member`), `:ra.add_member/2`
+  # now genuinely returns `{:error, :already_member}` for `new_id` — a real,
+  # non-transient error `retry_cluster_change/2` deliberately does NOT retry
+  # (see its own doc). Without this, that error would fail the whole repair
+  # attempt outright on every retry, leaving the stream permanently stuck
+  # (finding 3, Phase 3d-ii final review) instead of proceeding on to
+  # (re-)ensure the joining server itself is started.
+  @spec add_member([:ra.server_id()], :ra.server_id()) ::
+          :ok | {:error, term()} | {:timeout, term()}
+  defp add_member(survivor_ids, new_id) do
+    case retry_cluster_change(fn -> :ra.add_member(survivor_ids, new_id) end) do
+      {:ok, _reply, _leader} -> :ok
+      {:error, :already_member} -> :ok
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} = timeout -> timeout
+    end
+  end
+
+  # Same self-correction idiom as `start_new_cluster/4`'s own "recheck
+  # liveness after an error, in case someone else already won" pattern — but
+  # checking `member_alive?/1` (local-or-remote, since `new_id`'s node is
+  # often a genuinely different physical node than whichever node is running
+  # this repair) rather than pattern-matching a specific error shape like
+  # `{:error, {:already_started, _pid}}`. Confirmed necessary, not just
+  # defensive: `:ra.start_server/5`'s underlying supervisor child-start
+  # failure for an id that's already running can come back wrapped as
+  # `{:error, {:shutdown, {:failed_to_start_child, ChildId, {:already_started,
+  # pid}}}}` rather than the bare tuple (observed via this module's own
+  # collapsed-node test, where `new_node` coincides with an already-running
+  # survivor) — matching only the unwrapped shape silently let that case fall
+  # through as a genuine failure. Checking real liveness instead is robust to
+  # whatever exact wrapping `:ra`/its supervisor happens to produce for "this
+  # id is already running," the same reasoning `start_new_cluster/4` already
+  # established for its own redundant-start races.
+  @spec start_joining_server(String.t(), :ra.server_id(), :ra_machine.machine(), [
+          :ra.server_id()
+        ]) :: :ok | {:error, term()}
+  defp start_joining_server(cluster_name, new_id, machine, survivor_ids) do
+    case :ra.start_server(@system, cluster_name, new_id, machine, survivor_ids) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        if member_alive?(new_id) do
+          :ok
+        else
+          {:error, reason}
+        end
+    end
+  end
+
+  # `:ra.add_member/2` and `:ra.remove_member/2` both return as soon as their
+  # membership-change command is APPENDED to the leader's log
+  # (`after_log_append` reply mode — confirmed directly against
+  # `deps/ra/src/ra.erl`'s `add_member/3`/`remove_member/3`), not once it's
+  # been committed and applied. And `:ra` only permits ONE cluster
+  # membership change in flight at a time: "concurrent changes will be
+  # rejected by design" (`deps/ra/README.md`, "Dynamically Changing Cluster
+  # Membership"). That combination makes `{:error, :cluster_change_not_permitted}`
+  # a genuinely transient condition `replace_member/5` can hit back-to-back
+  # in two different spots, both confirmed empirically against a real
+  # multi-node `:ra` cluster (see `ra_cluster_replace_member_test.exs`):
+  #
+  #   1. `add_member` itself, when `survivor_nodes` was elected leader only
+  #      moments ago (e.g. right after `start_or_join_replicated/3`, or
+  #      right after failing over from a just-killed `dead_node`) — every
+  #      new leader must commit a no-op entry for its own current term
+  #      before ANY membership change is permitted (see the collapsed-node
+  #      test in `ra_cluster_test.exs`).
+  #   2. `remove_member`, racing ahead of THIS SAME CALL's own `add_member`
+  #      change, which hasn't committed+applied yet.
+  #
+  # Retrying the SAME `:ra` call (never the whole `with` chain, and never
+  # more than this one specific error atom) is safe here specifically
+  # because `cluster_change_not_permitted` means the change was REJECTED
+  # outright — nothing was appended, so nothing can be double-applied by
+  # trying again. Any other error (notably a genuine `{:error, :already_member}`
+  # for a `new_node` that's already a distinct, non-transient member — see
+  # the collapsed-node test's own assertion) is NOT retried and propagates
+  # immediately, unchanged.
+  @spec retry_cluster_change((-> term()), pos_integer()) :: term()
+  defp retry_cluster_change(fun, attempts_left \\ 50) do
+    case fun.() do
+      {:error, :cluster_change_not_permitted} when attempts_left > 1 ->
+        Process.sleep(100)
+        retry_cluster_change(fun, attempts_left - 1)
+
+      other ->
+        other
     end
   end
 end

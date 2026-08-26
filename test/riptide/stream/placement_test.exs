@@ -133,6 +133,28 @@ defmodule Riptide.Stream.PlacementTest do
     end
   end
 
+  describe "handle_info/2 - {:stream_placement_changed, ...}" do
+    test "a non-list new_nodes (e.g. a future stream-delete path returning nil) is ignored instead of crashing the shared cache subscriber" do
+      stream_id = "stream-placement-cache-guard-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> RaCluster.force_delete(stream_id) end)
+      machine = {:module, EchoMachine, %{}}
+
+      {:ok, server_ids} = StreamPlacement.ensure_started(stream_id, machine)
+
+      pid = Process.whereis(StreamPlacement)
+      send(pid, {:stream_placement_changed, stream_id, nil})
+
+      # Synchronize: `:sys.get_state/1` blocks until every message enqueued
+      # ahead of it — including the one just sent above — has actually been
+      # handled, so this deterministically observes the post-handling state
+      # rather than racing the GenServer's own mailbox.
+      :sys.get_state(pid)
+
+      assert Process.alive?(pid)
+      assert StreamPlacement.server_ids!(stream_id) == server_ids
+    end
+  end
+
   describe "server_ids!/1" do
     test "raises if ensure_started/2 has never run for this stream on this node" do
       stream_id = "stream-placement-unstarted-" <> Uniq.UUID.uuid4()

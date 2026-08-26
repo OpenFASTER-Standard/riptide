@@ -53,6 +53,25 @@ defmodule Riptide.Placement do
     end)
   end
 
+  @spec list_all((String.t() -> node())) :: %{String.t() => [node()]}
+  def list_all(resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.consistent_query(server_id, &PlacementMachine.list/1)
+    end)
+  end
+
+  @spec replace_member(String.t(), node(), node(), (String.t() -> node())) :: [node()] | nil
+  def replace_member(
+        stream_id,
+        dead_node,
+        new_node,
+        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
+      ) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:replace_member, stream_id, dead_node, new_node})
+    end)
+  end
+
   # Tries each placement ordinal, in `RaCluster.placement_ordinals/0`'s own
   # fixed order, until one of them answers — `RaCluster.process_command/2`
   # and `consistent_query/2` both raise on failure/timeout (see their own

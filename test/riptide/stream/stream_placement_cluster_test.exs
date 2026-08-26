@@ -132,8 +132,8 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     start_ra_application(peers)
     start_ra_systems(peers)
     bootstrap_placement_cluster(peers, resolve_fun)
-    start_placement_server(peers)
     start_pubsub(peers)
+    start_placement_server(peers)
 
     {peers, nodes, resolve_fun}
   end
