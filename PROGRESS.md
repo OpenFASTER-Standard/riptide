@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-25
+**Last updated:** 2026-08-26
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -14,7 +14,7 @@ first place to check for current status, not a historical log.
 | 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | **Shipped** — see below |
 | 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
-| 4 | Security & multi-tenancy (auth, ACP, TLS) | **Decomposed into phases 4a-4d** — see below |
+| 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | Not started |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
