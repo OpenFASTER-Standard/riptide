@@ -8,9 +8,9 @@ from Riptide's own domain concepts:
 
 - `config/config.exs` uses Phoenix's default plain-text formatter
   (`"$time $metadata[$level] $message\n"`, `metadata: [:request_id]`).
-- Only 4 `Logger` call sites exist in `lib/` (`replica_healer.ex` ×3, `placement.ex` ×1), all plain
-  interpolated strings — values like `stream_id`/`dead_node` are baked into the message text, never
-  attached as real `Logger` metadata.
+- Only 4 `Logger` call sites exist in `lib/` (`lib/riptide/stream/replica_healer.ex` ×3,
+  `lib/riptide/stream/placement.ex` ×1), all plain interpolated strings — values like
+  `stream_id`/`dead_node` are baked into the message text, never attached as real `Logger` metadata.
 - Zero explicit `Logger` calls exist anywhere in `lib/riptide_web/`. Phoenix's default request
   logging is nonetheless active — `Phoenix.Logger.install/0` is called automatically by the
   `:phoenix` OTP application itself (confirmed by reading `deps/phoenix/lib/phoenix.ex:26`), not by
@@ -138,9 +138,12 @@ plug-level handling and the same nil-vs-absent reasoning above.
 **`RiptideWeb.Realtime.ReplicationChannel.join/3`** adds `Logger.metadata(tenant_id: tenant_id)`
 right after `parse_stream_id/1` resolves it, mirroring the SSE controller's placement.
 
-**Existing internal `Logger` calls** in `lib/riptide/stream/replica_healer.ex` and
-`lib/riptide/placement.ex` keep their current human-readable messages but move the interpolated
-values into a real metadata keyword list on each call (e.g.
+**Existing internal `Logger` calls** in `lib/riptide/stream/replica_healer.ex` (3 call sites, module
+`Riptide.Stream.ReplicaHealer`) and `lib/riptide/stream/placement.ex` (1 call site, module
+`Riptide.Stream.Placement` — corrected from an earlier draft's wrong path/module name,
+`lib/riptide/placement.ex`/`Riptide.Placement`, a different, unrelated module) keep their current
+human-readable messages but move the interpolated values into a real metadata keyword list on each
+call (e.g.
 `Logger.warning("ReplicaHealer failed to repair stream", stream_id: stream_id, dead_node: dead_node, reason: inspect(reason))`),
 consistent with everything above.
 
