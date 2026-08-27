@@ -2577,6 +2577,7 @@ git commit -m "Add multi-node tests: genesis convergence, grow, dead-member repl
 - Modify: `README.md`
 - Modify: `fly.toml`
 - Modify: `k8s/statefulset.yaml`
+- Modify (found during execution, not in the plan's original file list): `examples/live-story/setup.exs`, `examples/live-story/README.md` — both instructed running the demo with `HOSTNAME=riptide-0`, the same now-removed requirement covered above. Same one-line fix: drop the `HOSTNAME=riptide-0` prefix from the `iex -S mix phx.server` invocation.
 
 - [ ] **Step 1: Update README's "Running locally for development" section**
 
