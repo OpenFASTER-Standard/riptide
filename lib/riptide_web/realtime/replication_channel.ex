@@ -40,6 +40,15 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
       _ ->
         {:error, %{"reason" => "unauthorized"}}
     end
+  rescue
+    _ -> {:error, %{"reason" => "service_unavailable"}}
+  catch
+    # Riptide.Authz.evaluate/4 can raise/exit if the placement cluster
+    # backing the policy store is fully unreachable — this transport calls
+    # it directly rather than through RiptideWeb.Plugs.Authorize (see that
+    # plug's own rescue/catch on this same failure mode), so needs the same
+    # protection here.
+    :exit, _ -> {:error, %{"reason" => "service_unavailable"}}
   end
 
   # Mirrors Authenticate/Socket.connect's own guard: subject stays genuinely

@@ -227,5 +227,25 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       assert conn.status == 403
       assert Logger.metadata()[:tenant_id] == tenant_id
     end
+
+    # Riptide.Authz.evaluate/4 (called directly here, not through
+    # RiptideWeb.Plugs.Authorize) raises when the placement cluster backing
+    # the policy store is totally unreachable — this must surface as a
+    # clean 503 (retry-able), not an uncaught crash / generic 500.
+    test "subscribing when the placement cluster is fully unreachable returns 503, not a crash" do
+      original = Application.get_env(:riptide, :ordinal_resolver)
+      Application.put_env(:riptide, :ordinal_resolver, fn _ordinal -> :nonexistent@nohost end)
+      on_exit(fn -> Application.put_env(:riptide, :ordinal_resolver, original) end)
+
+      tenant_id = "sse-authz-down-test-" <> Uniq.UUID.uuid4()
+      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+
+      conn =
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 503
+    end
   end
 end

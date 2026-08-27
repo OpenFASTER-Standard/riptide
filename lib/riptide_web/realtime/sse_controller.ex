@@ -20,6 +20,15 @@ defmodule RiptideWeb.Realtime.SseController do
       _ ->
         send_resp(conn, 403, "")
     end
+  rescue
+    _ -> send_resp(conn, 503, "")
+  catch
+    # Riptide.Authz.evaluate/4 can raise/exit if the placement cluster
+    # backing the policy store is fully unreachable — this transport calls
+    # it directly rather than through RiptideWeb.Plugs.Authorize (see that
+    # plug's own rescue/catch on this same failure mode), so needs the same
+    # protection here.
+    :exit, _ -> send_resp(conn, 503, "")
   end
 
   defp do_subscribe(conn, stream_id) do
