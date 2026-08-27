@@ -1,0 +1,29 @@
+app = "riptide-live-story"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PHX_HOST = "riptide-live-story.fly.dev"
+  PORT = "4000"
+  HOSTNAME = "riptide-0"
+  RIPTIDE_SINGLE_NODE = "true"
+
+[[mounts]]
+  source = "riptide_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"
+  method = "GET"
+  path = "/health/ready"
