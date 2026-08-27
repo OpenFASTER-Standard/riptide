@@ -52,6 +52,9 @@ defmodule Riptide.MixProject do
       {:joken, "~> 2.6"},
       {:joken_jwks, "~> 1.7"},
       {:tesla, "~> 1.4"},
+      {:telemetry_metrics, "~> 1.0"},
+      {:telemetry_poller, "~> 1.0"},
+      {:telemetry_metrics_prometheus_core, "~> 1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
