@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-26
+**Last updated:** 2026-08-27
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -15,7 +15,7 @@ first place to check for current status, not a historical log.
 | 2 | Docker image + CI/CD | **Shipped** — see below |
 | 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
-| 5 | Observability & operability (metrics, logging, health probes) | Not started |
+| 5 | Observability & operability (metrics, logging, health probes) | **Decomposed into phases 5a-5c** — see below |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -357,6 +357,23 @@ sub-project 3 was decomposed into phases 3a-3d.
 
 **Status**: Phases 4a-4d shipped 2026-08-26. Sub-project 4 (Security & multi-tenancy) complete.
 
-## 5. Not yet started
+## 5. Observability & operability — decomposed into phases
 
-Will be filled in as this sub-project reaches design.
+**Goal for this sub-project**: health/readiness probes, structured logging, and metrics — three
+independent concerns, decomposed into phases the same way sub-projects 3 and 4 were, rather than
+one monolithic spec.
+
+**Phasing:**
+
+- **Phase 5a — Health & readiness probes.** **Shipped 2026-08-27** — see
+  `docs/superpowers/specs/2026-08-27-phase-5a-health-probes-design.md`. The single, always-`200`
+  `/health` route (which checked nothing) is replaced by `/health/live` (unconditional `200`, used
+  for the StatefulSet's `livenessProbe`) and `/health/ready` (a real check — a cheap
+  `Riptide.Placement.lookup/1` call against the shared placement Ra cluster, since every
+  LDP/SSE/WebSocket request needs that cluster reachable to resolve stream placement; used for the
+  `readinessProbe`). A node cut off from placement now stops receiving traffic instead of silently
+  reporting healthy. No supervision-tree changes; the old route was removed outright with no alias.
+- **Phase 5b — Structured logging.** Not yet designed.
+- **Phase 5c — Metrics.** Not yet designed.
+
+**Status**: Phase 5a shipped 2026-08-27. Phases 5b/5c not yet designed.
