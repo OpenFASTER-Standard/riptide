@@ -48,6 +48,22 @@ Riptide exposes that event log through three HTTP/WS surfaces:
   retention window is rejected at join time with `{"oldestAvailable": <seq>}`, matching the SSE
   gap-signal shape.
 
+## Running locally for development
+
+`mix phx.server` needs two things a real Kubernetes deployment gets for free (see "Running via
+Kubernetes" below): a `HOSTNAME` matching one of the 3 fixed placement ordinals, and
+`config/dev.exs`'s own `ordinal_resolver` override (already set) standing in for the real
+headless-service DNS that doesn't exist on a developer's own machine.
+
+```bash
+mix deps.get
+HOSTNAME=riptide-0 mix phx.server
+```
+
+Wait for `curl http://localhost:4000/health/ready` to return `200` (the placement cluster forms in
+the background at boot; this can take a few seconds) before making any LDP request — every read
+and write depends on it being ready.
+
 ## Running via Docker
 
 A published image is available at `ghcr.io/openfaster-standard/riptide` — see the

@@ -69,10 +69,27 @@ defmodule Riptide.Application do
         # pod's lifetime. `ensure_placement_cluster_started/0` is itself
         # documented as safe to call redundantly (self-corrects on
         # `{:error, :cluster_not_formed}` from an already-formed cluster),
-        # so a supervisor-driven restart on `:permanent` is a safe, correct
-        # recovery path with no special-casing needed here.
+        # so a supervisor-driven restart on an ABNORMAL exit is a safe,
+        # correct recovery path with no special-casing needed here — see
+        # the comment on the child_spec itself for why `:transient`, not
+        # `:permanent`, is the right restart strategy.
+        #
+        # `:transient`, not `:permanent` — `ensure_placement_cluster_started/0`
+        # returns `:ok` (a NORMAL exit) once the cluster forms, and
+        # `:permanent` restarts a child on ANY exit, including `:normal`.
+        # That combination is a real, confirmed-live bug: the moment the
+        # cluster forms, this Task exits normally, gets restarted, its
+        # retry loop immediately re-succeeds (self-corrects via
+        # server_alive?/1, since the cluster is already up) and exits
+        # normally again — a tight successful-exit/restart loop that
+        # exceeds the supervisor's default restart intensity and crashes
+        # the entire application, moments after the placement cluster
+        # first forms. `:transient` restarts only on an ABNORMAL exit
+        # (an unanticipated exception — the actual failure mode the
+        # original `:permanent` choice was meant to guard against), and
+        # correctly leaves a `:normal` "job's done" exit alone.
         Supervisor.child_spec({Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
-          restart: :permanent
+          restart: :transient
         ),
         Riptide.Stream.ReplicaHealer
       ]
