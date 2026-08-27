@@ -61,7 +61,6 @@ defmodule Riptide.Stream.Placement do
   # crashing is cheap insurance against a high-blast-radius crash of this
   # shared, fleet-wide cache subscriber.
   def handle_info({:stream_placement_changed, stream_id, new_nodes}, state) do
-    Logger.metadata(stream_id: stream_id, new_nodes: inspect(new_nodes))
     Logger.warning(
       "Riptide.Stream.Placement got a non-list stream_placement_changed broadcast for " <>
         "#{inspect(stream_id)} (#{inspect(new_nodes)}); skipping cache update",
