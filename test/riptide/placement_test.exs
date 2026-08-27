@@ -143,4 +143,44 @@ defmodule Riptide.PlacementTest do
       assert winner in ["racer-1", "racer-2"]
     end
   end
+
+  describe "telemetry instrumentation" do
+    test "lookup/1 emits a riptide.placement.lookup telemetry span" do
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [[:riptide, :placement, :lookup, :stop]])
+
+      Placement.lookup("some-nonexistent-stream-id")
+
+      assert_received {[:riptide, :placement, :lookup, :stop], ^ref, %{duration: duration}, %{}}
+      assert is_integer(duration)
+    end
+
+    test "lookup/1 emits an exception event when every ordinal fails" do
+      failing_resolver = fn _ordinal -> :nonexistent@nohost end
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:riptide, :placement, :lookup, :exception]
+        ])
+
+      assert_raise RuntimeError, fn ->
+        Placement.lookup("some-stream-id", failing_resolver)
+      end
+
+      assert_received {[:riptide, :placement, :lookup, :exception], ^ref, %{duration: _},
+                       %{kind: :error}}
+    end
+
+    test "assign/2 emits a riptide.placement.assign telemetry span" do
+      stream_id = "telemetry-assign-test-" <> Uniq.UUID.uuid4()
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [[:riptide, :placement, :assign, :stop]])
+
+      Placement.assign(stream_id, [node()])
+
+      assert_received {[:riptide, :placement, :assign, :stop], ^ref, %{duration: duration}, %{}}
+      assert is_integer(duration)
+    end
+  end
 end

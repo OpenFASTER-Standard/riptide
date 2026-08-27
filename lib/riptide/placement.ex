@@ -41,15 +41,25 @@ defmodule Riptide.Placement do
 
   @spec assign(String.t(), [node()], (String.t() -> node())) :: [node()]
   def assign(stream_id, proposed_nodes, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
-      RaCluster.process_command(server_id, {:assign, stream_id, proposed_nodes})
+    :telemetry.span([:riptide, :placement, :assign], %{}, fn ->
+      result =
+        with_ordinal_fallback(resolve_fun, fn server_id ->
+          RaCluster.process_command(server_id, {:assign, stream_id, proposed_nodes})
+        end)
+
+      {result, %{}}
     end)
   end
 
   @spec lookup(String.t(), (String.t() -> node())) :: [node()] | nil
   def lookup(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
-      RaCluster.consistent_query(server_id, &PlacementMachine.get(&1, stream_id))
+    :telemetry.span([:riptide, :placement, :lookup], %{}, fn ->
+      result =
+        with_ordinal_fallback(resolve_fun, fn server_id ->
+          RaCluster.consistent_query(server_id, &PlacementMachine.get(&1, stream_id))
+        end)
+
+      {result, %{}}
     end)
   end
 
