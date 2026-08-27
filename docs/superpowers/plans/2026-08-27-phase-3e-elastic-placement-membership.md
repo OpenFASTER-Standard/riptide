@@ -46,6 +46,16 @@
 
 Add to `test/riptide/ra_cluster_test.exs`, replacing the entire `describe "placement_ordinals/0 and placement_server_id/1,2"` block (lines 121-132) and the entire `describe "attempt_start_placement_cluster/1"` block (lines 159-234) with:
 
+**Important — this file is `async: true` and shares one live resource across the entire suite:**
+`test_helper.exs` bootstraps `{:riptide_placement, node()}` once, before any test runs, and every
+`async: true` test anywhere in the suite that touches `Riptide.Placement`/`Riptide.Stream.Placement`
+depends on that ONE shared instance staying alive for the whole `mix test` run (the existing test
+this step replaces already documents this explicitly — "NOT a throwaway server this test owns").
+None of the new tests below may kill that process or `force_delete_server` it — every new test here
+either makes a provably-safe redundant/no-op call against the shared instance, or doesn't touch it
+at all. (`restart_local_placement_member/0`'s own real "kill it and recover" behavior is exercised
+safely instead in Task 2's `placement_membership_test.exs`, which is `async: false`.)
+
 ```elixir
   describe "placement_server_id/1" do
     test "combines the placement cluster name with the given node" do
@@ -54,36 +64,12 @@ Add to `test/riptide/ra_cluster_test.exs`, replacing the entire `describe "place
     end
   end
 
-  describe "restart_local_placement_member/0" do
-    test "recovers a local member that already exists but isn't currently running" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-
-      pid = Process.whereis(:riptide_placement)
-      Process.exit(pid, :kill)
-      :timer.sleep(50)
-      refute RaCluster.server_alive?(:riptide_placement)
-
-      assert RaCluster.restart_local_placement_member() == :ok
-      assert RaCluster.local_placement_members() == {:ok, [node()]}
-    end
-  end
-
   describe "local_placement_members/0 and probe_placement_members/1" do
-    test "local_placement_members/0 returns :error when there is no local member" do
-      assert RaCluster.local_placement_members() == :error
-    end
-
-    test "local_placement_members/0 returns the real membership once a local member exists" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
+    test "local_placement_members/0 returns the real, already-running shared membership" do
       assert RaCluster.local_placement_members() == {:ok, [node()]}
     end
 
-    test "probe_placement_members/1 finds a live member among several unreachable candidates" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-
+    test "probe_placement_members/1 finds the live shared member among unreachable candidates" do
       assert RaCluster.probe_placement_members([
                :nonexistent1@nowhere,
                node(),
@@ -98,36 +84,18 @@ Add to `test/riptide/ra_cluster_test.exs`, replacing the entire `describe "place
   end
 
   describe "start_genesis_placement_cluster/1" do
-    test "forms a fresh placement cluster collapsed onto a single real node" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-
+    test "self-corrects on a redundant call against the already-running shared instance" do
+      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
       assert RaCluster.start_genesis_placement_cluster([node(), node(), node()]) == :ok
-
-      pid = Process.whereis(:riptide_placement)
-      assert is_pid(pid)
-      assert Process.alive?(pid)
-    end
-
-    test "self-corrects on a redundant call once the local member is already running" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
     end
   end
 
   describe "join_placement_cluster/1 and remove_placement_member/2" do
     test "join_placement_cluster/1 is idempotent when this node is already a member" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-
       assert RaCluster.join_placement_cluster([node()]) == :ok
     end
 
     test "remove_placement_member/2 removing a node that was never a member returns an error" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-
       assert {:error, _reason} =
                RaCluster.remove_placement_member([node()], :"riptide@10.0.0.9")
     end
@@ -348,9 +316,8 @@ Insert this new block immediately after `data_dir/0`'s function (after the line 
     machine = {:module, Riptide.Placement.PlacementMachine, %{}}
     cluster_name = "#{@placement_uid}_cluster"
 
-    with :ok <- add_member(existing_ids, my_id),
-         :ok <- start_joining_server(cluster_name, my_id, machine, existing_ids) do
-      :ok
+    with :ok <- add_member(existing_ids, my_id) do
+      start_joining_server(cluster_name, my_id, machine, existing_ids)
     end
   end
 
@@ -414,9 +381,13 @@ defmodule Riptide.PlacementMembershipTest do
   alias Riptide.RaCluster
 
   describe "current_members/0" do
-    test "returns an empty list when nothing has been cached yet" do
-      assert PlacementMembership.current_members() == []
-    end
+    # No "returns [] when nothing has been cached yet" test: once the real
+    # Riptide.PlacementMembership GenServer is wired into the application
+    # supervision tree (Task 4), its cache is populated almost immediately
+    # at boot via its own :bootstrap message — there's no reliably-testable
+    # "genuinely empty" window in a running application to assert against.
+    # (Confirmed empirically: this test failed for exactly this reason once
+    # Task 4 landed.)
 
     test "returns whatever was last cached via a membership-changed broadcast" do
       Phoenix.PubSub.broadcast(
@@ -469,12 +440,18 @@ defmodule Riptide.PlacementMembershipTest do
 
   describe "bootstrap_once/0" do
     test "restarts the local member when this node is discovered as an already-existing member" do
-      on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement, node()}) end)
-      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
-      # Kill the local process (but keep its on-disk data, and this node's
-      # identity is unchanged) — a real member restarting under the SAME
-      # node() identity, discoverable via the fleet probe finding node()
-      # itself already listed in the persisted membership.
+      # No on_exit force_delete_server here: {:riptide_placement, node()} is
+      # NOT a throwaway server this test owns — it's the same shared,
+      # suite-wide placement cluster test_helper.exs bootstraps once before
+      # any test runs, which other tests (e.g. test/riptide_web/health_test.exs)
+      # depend on staying alive and recoverable for the rest of the `mix
+      # test` process's lifetime. Kill the local process (but keep its
+      # on-disk data, and this node's identity is unchanged) — a real member
+      # restarting under the SAME node() identity, discoverable via the
+      # fleet probe finding node() itself already listed in the persisted
+      # membership — then let bootstrap_once/0 recover it, leaving the
+      # shared instance alive and correct when this test finishes, exactly
+      # as every other test that touches it depends on.
       pid = Process.whereis(:riptide_placement)
       Process.exit(pid, :kill)
       :timer.sleep(50)
@@ -683,24 +660,32 @@ defmodule Riptide.PlacementMembership do
         :ok
 
       :error ->
-        candidates = [node() | Node.list()] |> Enum.uniq() |> Enum.sort()
-        genesis_members = Enum.take(candidates, target_size())
+        form_genesis_if_selected()
+    end
+  end
 
-        if node() in genesis_members do
-          case RaCluster.start_genesis_placement_cluster(genesis_members) do
-            :ok ->
-              broadcast_members(genesis_members)
-              :ok
+  defp form_genesis_if_selected do
+    candidates = [node() | Node.list()] |> Enum.uniq() |> Enum.sort()
+    genesis_members = Enum.take(candidates, target_size())
 
-            {:error, :cluster_not_formed} = error ->
-              error
-          end
-        else
-          # Not among the computed genesis members this round — the
-          # reconcile loop's ambient join path picks this node up once the
-          # actual genesis members finish forming.
-          :ok
-        end
+    if node() in genesis_members do
+      do_form_genesis(genesis_members)
+    else
+      # Not among the computed genesis members this round — the reconcile
+      # loop's ambient join path picks this node up once the actual genesis
+      # members finish forming.
+      :ok
+    end
+  end
+
+  defp do_form_genesis(genesis_members) do
+    case RaCluster.start_genesis_placement_cluster(genesis_members) do
+      :ok ->
+        broadcast_members(genesis_members)
+        :ok
+
+      {:error, :cluster_not_formed} = error ->
+        error
     end
   end
 
@@ -724,23 +709,21 @@ defmodule Riptide.PlacementMembership do
     case RaCluster.local_placement_members() do
       {:ok, members} ->
         cache_members(members)
-
-        if RaCluster.placement_leader?() do
-          reconcile_as_leader(members)
-        end
+        if RaCluster.placement_leader?(), do: reconcile_as_leader(members)
 
       :error ->
-        case RaCluster.probe_placement_members([node() | Node.list()]) do
-          {:ok, members} ->
-            cache_members(members)
+        reconcile_as_non_member()
+    end
+  end
 
-            if length(members) < target_size() do
-              try_join(members)
-            end
+  defp reconcile_as_non_member do
+    case RaCluster.probe_placement_members([node() | Node.list()]) do
+      {:ok, members} ->
+        cache_members(members)
+        if length(members) < target_size(), do: try_join(members)
 
-          :error ->
-            attempt_genesis()
-        end
+      :error ->
+        attempt_genesis()
     end
   end
 
@@ -1015,31 +998,31 @@ defmodule Riptide.Placement do
   @spec with_current_members((:ra.server_id() -> term())) :: term()
   defp with_current_members(fun) do
     case Application.get_env(:riptide, :placement_members_override) do
-      nil ->
-        cached = PlacementMembership.current_members()
+      nil -> with_current_members_via_discovery(fun)
+      override_members -> with_current_members_via_list(override_members, fun)
+    end
+  end
 
-        case try_members(cached, fun) do
-          {:ok, result} ->
-            result
+  defp with_current_members_via_discovery(fun) do
+    cached = PlacementMembership.current_members()
 
-          :error ->
-            case RaCluster.probe_placement_members([node() | Node.list()]) do
-              {:ok, members} ->
-                case try_members(members, fun) do
-                  {:ok, result} -> result
-                  :error -> raise "Riptide.Placement: no placement-cluster members could be reached"
-                end
+    case try_members(cached, fun) do
+      {:ok, result} -> result
+      :error -> with_current_members_via_probe(fun)
+    end
+  end
 
-              :error ->
-                raise "Riptide.Placement: no placement-cluster members could be discovered"
-            end
-        end
+  defp with_current_members_via_probe(fun) do
+    case RaCluster.probe_placement_members([node() | Node.list()]) do
+      {:ok, members} -> with_current_members_via_list(members, fun)
+      :error -> raise "Riptide.Placement: no placement-cluster members could be discovered"
+    end
+  end
 
-      override_members ->
-        case try_members(override_members, fun) do
-          {:ok, result} -> result
-          :error -> raise "Riptide.Placement: no placement-cluster members could be reached"
-        end
+  defp with_current_members_via_list(members, fun) do
+    case try_members(members, fun) do
+      {:ok, result} -> result
+      :error -> raise "Riptide.Placement: no placement-cluster members could be reached"
     end
   end
 
