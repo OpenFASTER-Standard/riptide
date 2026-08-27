@@ -19,16 +19,20 @@ from Riptide's own domain concepts:
   metadata at all — it bakes them into two separate plain-text messages ("`GET /path`" and
   "`Sent 200 in 5ms`"). JSON-wrapping that output as-is would still be unqueryable by status or
   duration.
-- `config/config.exs`'s formatter already lists `metadata: [:request_id]`, but `Plug.RequestId` is
-  never actually added to the endpoint — every request today has no correlation ID at all; that
-  metadata key is always empty.
+- **Correction, caught during plan-writing:** an earlier draft of this spec claimed
+  `Plug.RequestId` was never added to the endpoint and that `:request_id` was always empty. That
+  was wrong — `lib/riptide_web/endpoint.ex:36` already has `plug Plug.RequestId` (present since the
+  very first commit of that file, 2026-08-22), and `Plug.RequestId`'s own source
+  (`deps/plug/lib/plug/request_id.ex`) confirms it already calls
+  `Logger.metadata([{:request_id, request_id}])` on every request. Request correlation already
+  works today; this was a research error (an unverified claim), not a real gap. No task in this
+  phase adds `Plug.RequestId` — it's already exactly where it needs to be, ahead of
+  `Plug.Telemetry`.
 
 ## Scope
 
 - A hand-rolled JSON `Logger` formatter (`Jason` is already a dependency; no new dependency added),
   applied only in `config/prod.exs` — dev/test keep today's human-readable plain-text formatter.
-- `Plug.RequestId` added to `RiptideWeb.Endpoint`, fixing the currently-dead `:request_id` metadata
-  key.
 - Phoenix's default two-line, unstructured request logging disabled
   (`plug Plug.Telemetry, ..., log: false`), replaced with one `:telemetry` handler on
   `[:phoenix, :endpoint, :stop]` emitting a single structured log entry per request with real
@@ -85,13 +89,19 @@ from Riptide's own domain concepts:
   keys — `Logger.metadata/1` calls that set a key not in this allowlist are silently dropped by
   Elixir's own `Logger` before formatting ever sees them.
 
-**`RiptideWeb.Endpoint`** gains `plug Plug.RequestId` (placed before `Plug.Telemetry`, matching
-`Plug.RequestId`'s own documented placement recommendation, so the ID is available to the access-log
-handler below) and changes `plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]` to
+**`RiptideWeb.Endpoint`** changes `plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]` to
 `plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: false` — the `log: false` option is
 `Plug.Telemetry`'s own documented mechanism for suppressing `Phoenix.Logger`'s default two-line
 text output per the moduledoc read in `deps/phoenix/lib/phoenix/logger.ex`, without needing to
-touch Phoenix's own code.
+touch Phoenix's own code. `Plug.RequestId` (line 36, already present ahead of `Plug.Telemetry`) is
+untouched — see the Context correction above.
+
+**Wiring the custom formatter** uses `Logger.Formatter`'s documented `{module, function}` tuple
+form (confirmed via `/usr/local/lib/elixir/lib/logger/lib/logger/formatter.ex`'s own moduledoc):
+`config :logger, :default_formatter, format: {Riptide.Logger.JSONFormatter, :format}, metadata: [...]`
+— not a bare module reference. This form still applies `Logger.Formatter`'s own `metadata:`
+allowlist filtering *before* calling the custom function, which is why the metadata keys must be
+listed explicitly (see below) for `Logger.metadata/1`-set keys to ever reach `format/4` at all.
 
 **A new access-log `:telemetry` handler** (`Riptide.Telemetry.AccessLog`, attached once from
 `Riptide.Application.start/2` via `:telemetry.attach/4` on `[:phoenix, :endpoint, :stop]`) reads
