@@ -118,15 +118,9 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
-  describe "placement_ordinals/0 and placement_server_id/1,2" do
-    test "placement_ordinals/0 returns exactly the 3 fixed ordinals" do
-      assert RaCluster.placement_ordinals() == ["riptide-0", "riptide-1", "riptide-2"]
-    end
-
-    test "placement_server_id/2 combines the placement cluster name with the resolver's result" do
-      resolve_fun = fn "riptide-1" -> :"riptide@10.0.0.5" end
-
-      assert RaCluster.placement_server_id("riptide-1", resolve_fun) ==
+  describe "placement_server_id/1" do
+    test "combines the placement cluster name with the given node" do
+      assert RaCluster.placement_server_id(:"riptide@10.0.0.5") ==
                {:riptide_placement, :"riptide@10.0.0.5"}
     end
   end
@@ -156,80 +150,50 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
-  describe "attempt_start_placement_cluster/1" do
-    test "a resolver that raises (e.g. default_ordinal_resolver/1 on an unresolvable DNS name) yields a retriable error instead of an uncaught exception" do
-      # Mirrors exactly how `default_ordinal_resolver/1` fails for real: a
-      # hard match against `:inet.gethostbyname/1`'s result raises `MatchError`
-      # when a sibling ordinal's DNS record doesn't exist yet (e.g. during
-      # normal StatefulSet startup, before all pods are up).
-      resolve_fun = fn
-        "riptide-1" -> raise MatchError, term: {:error, :nxdomain}
-        ordinal -> String.to_atom("riptide@#{ordinal}")
-      end
-
-      assert RaCluster.attempt_start_placement_cluster(resolve_fun) ==
-               {:error, :cluster_not_formed}
+  # This file is async: true and shares one live resource across the whole
+  # suite: test_helper.exs bootstraps {:riptide_placement, node()} once,
+  # before any test runs, and every async: true test anywhere in the suite
+  # that touches Riptide.Placement/Riptide.Stream.Placement depends on that
+  # ONE shared instance staying alive for the whole `mix test` run. None of
+  # the tests below kill that process or force_delete_server it — each one
+  # either makes a provably-safe redundant/no-op call against the shared
+  # instance, or doesn't touch it at all. restart_local_placement_member/0's
+  # own real "kill it and recover" behavior is exercised safely instead in
+  # Task 2's placement_membership_test.exs, which is async: false.
+  describe "local_placement_members/0 and probe_placement_members/1" do
+    test "local_placement_members/0 returns the real, already-running shared membership" do
+      assert RaCluster.local_placement_members() == {:ok, [node()]}
     end
 
-    test "a redundant call after the local member is already fully started returns :ok, not {:error, :cluster_not_formed}" do
-      # Reproduces the confirmed bug (found by a real multi-node `:peer`-based
-      # integration test, see `placement_cluster_test.exs`) with a real
-      # `:ra.start_cluster/2` call, no mocking of `:ra` itself — `:ra` doesn't
-      # require its members to be on distinct physical (or even distinct
-      # Erlang) nodes to exercise this exact bug, since the bug is entirely
-      # about `:ra.start_cluster/3`'s own per-call bookkeeping (its `Started`
-      # list only tracks servers *this call* newly started, not servers that
-      # are merely alive — confirmed directly against
-      # `deps/ra/src/ra.erl:427-465`). A resolver that maps every one of the 3
-      # fixed ordinals to this same test node collapses all 3 configs to the
-      # same real `{:riptide_placement, node()}` id, so the *first* call
-      # genuinely starts one real local member (the other two configs lose
-      # the race for the same id/uid and are reported as not-started, which
-      # is fine — `:ra.start_cluster/2` only needs at least one real `ok`
-      # start to succeed) and returns `:ok`. The *second*, redundant call
-      # replays the exact real-world failure: every one of its (here, 3
-      # identical) per-member `:ra.start_server/2` attempts now hits the
-      # already-running member and returns `{:error, {:already_started,
-      # pid}}`, so `:ra`'s own `Started` list is empty and it reports
-      # `{:error, :cluster_not_formed}` for the whole call — even though the
-      # local member is completely healthy. Without the fix in
-      # `attempt_start_placement_cluster/1`, this second call would surface
-      # that raw `:ra` error instead of self-correcting.
-      resolve_fun = fn _ordinal -> node() end
+    test "probe_placement_members/1 finds the live shared member among unreachable candidates" do
+      assert RaCluster.probe_placement_members([
+               :nonexistent1@nowhere,
+               node(),
+               :nonexistent2@nowhere
+             ]) == {:ok, [node()]}
+    end
 
-      # NEW GOTCHA (found empirically during the phase-3c-ii side-fix that
-      # gave test_helper.exs a stable node() identity): deliberately no
-      # `on_exit(fn -> :ra.force_delete_server(:default, {:riptide_placement,
-      # node()}) end)` here, even though every other test in this file that
-      # starts a throwaway Ra server cleans it up that way. `{:riptide_placement,
-      # node()}` is NOT a throwaway server this test owns — it's the exact
-      # same address (fixed cluster name + this node's own, now-stable,
-      # identity) as the ONE shared, suite-wide placement cluster
-      # `test_helper.exs` bootstraps once before any test runs, which every
-      # other test touching `Riptide.Placement`/`Riptide.Stream.Placement`
-      # depends on for the rest of the `mix test` process's lifetime. Before
-      # test_helper.exs's node()-identity fix, this collided with `:nonode@nohost`
-      # only when this test happened to run before any `:peer`-based file
-      # flipped node() — easy to miss since the resulting failure looked
-      # identical to that other, more consistently-triggered bug. Now that
-      # node() is stable for the whole suite, this test always collides with
-      # the shared instance, so force-deleting it here would silently take
-      # down every later test that needs it — confirmed empirically: with the
-      # force_delete restored, `mix test test/riptide/ra_cluster_test.exs
-      # test/riptide/stream/stream_server_test.exs --seed 0` fails a later,
-      # unrelated `StreamServerTest` test with "Ra consistent query failed for
-      # {:riptide_placement, :"test_helper_origin@127.0.0.1"}: :noproc" —
-      # removing just this on_exit makes that same run pass. This test's own
-      # assertions never depend on the server being gone afterward, only on
-      # it being alive and correctly responding while the test runs, so
-      # leaving the shared instance alone costs this test nothing.
-      assert RaCluster.attempt_start_placement_cluster(resolve_fun) == :ok
+    test "probe_placement_members/1 returns :error when no candidate has a live member" do
+      assert RaCluster.probe_placement_members([:nonexistent1@nowhere, :nonexistent2@nowhere]) ==
+               :error
+    end
+  end
 
-      pid = Process.whereis(:riptide_placement)
-      assert is_pid(pid)
-      assert Process.alive?(pid)
+  describe "start_genesis_placement_cluster/1" do
+    test "self-corrects on a redundant call against the already-running shared instance" do
+      assert RaCluster.start_genesis_placement_cluster([node()]) == :ok
+      assert RaCluster.start_genesis_placement_cluster([node(), node(), node()]) == :ok
+    end
+  end
 
-      assert RaCluster.attempt_start_placement_cluster(resolve_fun) == :ok
+  describe "join_placement_cluster/1 and remove_placement_member/2" do
+    test "join_placement_cluster/1 is idempotent when this node is already a member" do
+      assert RaCluster.join_placement_cluster([node()]) == :ok
+    end
+
+    test "remove_placement_member/2 removing a node that was never a member returns an error" do
+      assert {:error, _reason} =
+               RaCluster.remove_placement_member([node()], :"riptide@10.0.0.9")
     end
   end
 
