@@ -2302,6 +2302,30 @@ defmodule Riptide.PlacementMembershipClusterTest do
       end
     end
 
+    # These bare :peer nodes never boot Riptide.Application, so neither
+    # Phoenix.PubSub (which attempt_genesis/reconcile_as_leader's
+    # broadcast_members/1 needs) nor Riptide.PlacementMembership's own ETS
+    # cache table exist there yet. Bootstrap PubSub explicitly (mirroring
+    # test/riptide/stream/stream_placement_cluster_test.exs's exact pattern
+    # for the same class of problem), then start the REAL
+    # Riptide.PlacementMembership GenServer (unlinked) on every peer — its
+    # own init/1 creates the ETS table and subscribes to PubSub as a side
+    # effect, and having a genuinely running, supervised-shaped process
+    # (not just bare function calls) is what lets the graceful-drain test
+    # below exercise a real terminate/2 via GenServer.stop/3. The tests'
+    # own direct bootstrap_once/0 calls remain safe to make afterward —
+    # they're idempotent, the same operation the GenServer's own :bootstrap
+    # message already performs, just driven synchronously instead of
+    # waiting on that message or the periodic reconcile timer.
+    for {_pid, node} <- peers do
+      {:ok, _} = :erpc.call(node, Application, :ensure_all_started, [:phoenix_pubsub])
+
+      {:ok, _pid} =
+        start_unlinked(node, Phoenix.PubSub.Supervisor, :start_link, [[name: Riptide.PubSub]])
+
+      {:ok, _pid} = start_unlinked(node, Riptide.PlacementMembership, :start_link, [[]])
+    end
+
     {peers, nodes}
   end
 
@@ -2321,6 +2345,32 @@ defmodule Riptide.PlacementMembershipClusterTest do
                  ~c"placement_membership_cluster_test.ex",
                  bytecode
                ])
+    end
+  end
+
+  # Starts `apply(mod, fun, args)` on `node` without linking whatever it
+  # starts to the transient process `:erpc.call/4` uses to dispatch the call
+  # — a direct `:erpc.call` of a `start_link`-shaped function would die the
+  # instant erpc's own dispatch process exits, taking the newly-started
+  # process down with it (confirmed empirically in
+  # test/riptide/stream/stream_placement_cluster_test.exs, Task 9). Mirrors
+  # that same file's `start_unlinked/4` exactly.
+  defp start_unlinked(node, mod, fun, args, timeout \\ 5_000) do
+    parent = self()
+    ref = make_ref()
+
+    :erpc.call(node, Kernel, :spawn, [
+      fn ->
+        result = apply(mod, fun, args)
+        send(parent, {ref, result})
+        Process.sleep(:infinity)
+      end
+    ])
+
+    receive do
+      {^ref, result} -> result
+    after
+      timeout -> {:error, :timeout}
     end
   end
 
