@@ -84,9 +84,3 @@ end
 # :nonode@nohost — see the SIDE-FIX comment above for why that stability is
 # required for this bootstrap to survive the rest of the suite.
 :ok = Riptide.RaCluster.attempt_start_placement_cluster()
-
-# Emit an initial telemetry event to seed the Prometheus registry, so
-# TelemetryMetricsPrometheus.Core.scrape() has metric definitions to expose
-# even before any application traffic occurs in the test (e.g., the metrics
-# endpoint integration test runs in isolation with async: true).
-:telemetry.execute([:riptide, :ra, :placement_leader], %{value: 0}, %{})
