@@ -79,13 +79,14 @@ spec:
             - name: data
               mountPath: /data
           # readinessProbe calls Riptide.Placement.lookup/1, which retries
-          # across all 3 placement ordinals on failure. Each attempt carries
-          # :ra's own 5000ms default query timeout (deps/ra/src/ra.hrl's
-          # DEFAULT_TIMEOUT), so a fully-unreachable placement cluster can
-          # take up to ~15s to resolve to a 503. timeoutSeconds is set to 5s
-          # (one ordinal attempt's worth) rather than k8s's 1s default, which
-          # was already too short even for a single healthy attempt under
-          # any real network latency or in-flight leader election.
+          # across every currently-known placement-cluster member on failure.
+          # Each attempt carries :ra's own 5000ms default query timeout
+          # (deps/ra/src/ra.hrl's DEFAULT_TIMEOUT), so a fully-unreachable
+          # placement cluster can take up to ~15s to resolve to a 503.
+          # timeoutSeconds is set to 5s (one member attempt's worth) rather
+          # than k8s's 1s default, which was already too short even for a
+          # single healthy attempt under any real network latency or
+          # in-flight leader election.
           readinessProbe:
             httpGet:
               path: /health/ready
