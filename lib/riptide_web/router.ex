@@ -20,7 +20,8 @@ defmodule RiptideWeb.Router do
   scope "/" do
     pipe_through :api
 
-    get "/health", RiptideWeb.HealthController, :show
+    get "/health/live", RiptideWeb.HealthController, :live
+    get "/health/ready", RiptideWeb.HealthController, :ready
   end
 
   scope "/" do
