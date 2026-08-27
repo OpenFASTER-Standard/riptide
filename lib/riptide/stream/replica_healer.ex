@@ -64,8 +64,12 @@ defmodule Riptide.Stream.ReplicaHealer do
     dead_nodes = Enum.reject(nodes, &RaCluster.member_alive?({name, &1}))
 
     case dead_nodes do
-      [dead_node] -> repair(stream_id, uid, nodes, dead_node)
-      _ -> :ok
+      [dead_node] ->
+        :telemetry.execute([:riptide, :replica_healer, :dead_replica_detected], %{}, %{})
+        repair(stream_id, uid, nodes, dead_node)
+
+      _ ->
+        :ok
     end
   end
 
@@ -88,6 +92,8 @@ defmodule Riptide.Stream.ReplicaHealer do
               stream_id: stream_id,
               survivor_nodes: inspect(survivor_nodes)
             )
+
+            :telemetry.execute([:riptide, :replica_healer, :repair], %{}, %{result: :error})
         end
     end
   end
@@ -112,6 +118,8 @@ defmodule Riptide.Stream.ReplicaHealer do
           new_node: inspect(new_node)
         )
 
+        :telemetry.execute([:riptide, :replica_healer, :repair], %{}, %{result: :ok})
+
       {:error, reason} ->
         Logger.warning(
           "ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}",
@@ -119,6 +127,8 @@ defmodule Riptide.Stream.ReplicaHealer do
           dead_node: inspect(dead_node),
           reason: inspect(reason)
         )
+
+        :telemetry.execute([:riptide, :replica_healer, :repair], %{}, %{result: :error})
     end
   end
 
