@@ -1,0 +1,140 @@
+:root {
+  --parchment: #f6ecd9;
+  --ink: #3a2e1f;
+  --gold: #b8860b;
+  --line-bg: #fffaf0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--parchment);
+  color: var(--ink);
+  font-family: Georgia, "Times New Roman", serif;
+  display: flex;
+  justify-content: center;
+  padding: 2rem 1rem;
+}
+
+main {
+  width: 100%;
+  max-width: 640px;
+}
+
+h1 {
+  font-size: 2rem;
+  margin-bottom: 0.25rem;
+  border-bottom: 2px solid var(--gold);
+  padding-bottom: 0.5rem;
+}
+
+.subtitle {
+  font-size: 0.95rem;
+  opacity: 0.8;
+  margin-top: 0;
+}
+
+.subtitle a {
+  color: var(--gold);
+}
+
+#story {
+  max-height: 50vh;
+  overflow-y: auto;
+  margin: 1.5rem 0;
+  padding-right: 0.5rem;
+}
+
+.line {
+  background: var(--line-bg);
+  border-left: 3px solid var(--gold);
+  padding: 0.6rem 0.9rem;
+  margin: 0 0 0.6rem 0;
+  border-radius: 0 6px 6px 0;
+  animation: fade-in 0.5s ease-out;
+}
+
+.line-author {
+  display: block;
+  font-size: 0.8rem;
+  opacity: 0.65;
+  margin-top: 0.25rem;
+  font-style: italic;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+#story-form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+#line-input {
+  flex: 1;
+  padding: 0.6rem 0.8rem;
+  font-size: 1rem;
+  font-family: inherit;
+  border: 1px solid var(--gold);
+  border-radius: 6px;
+  background: var(--line-bg);
+  color: var(--ink);
+}
+
+button {
+  font-family: inherit;
+  font-size: 0.95rem;
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  border: 1px solid var(--gold);
+  background: var(--gold);
+  color: var(--line-bg);
+  cursor: pointer;
+}
+
+button:hover {
+  opacity: 0.9;
+}
+
+#toggle-raw {
+  margin-top: 1.5rem;
+  background: transparent;
+  color: var(--ink);
+}
+
+#raw-data-container {
+  display: none;
+  margin-top: 0.75rem;
+}
+
+#raw-data-container.visible {
+  display: block;
+}
+
+.raw-data-label {
+  font-size: 0.85rem;
+  opacity: 0.75;
+}
+
+#raw-data {
+  background: var(--ink);
+  color: var(--parchment);
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: "Courier New", monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}

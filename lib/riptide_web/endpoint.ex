@@ -36,6 +36,18 @@ defmodule RiptideWeb.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: false
 
+  # Riptide has no CORS support otherwise — needed for any browser-based pod
+  # client, which is inherently cross-origin from its pod by design (Solid/
+  # LDP convention). No credentials (Riptide's own auth is a Bearer token in
+  # a header, never a cookie), so a wildcard origin has no credential-leak
+  # implication. Mounted before Plug.Parsers/the router so a preflight
+  # OPTIONS request never reaches (and 404s from) route dispatch.
+  plug CORSPlug,
+    origin: "*",
+    credentials: false,
+    methods: ["GET", "PUT", "PATCH", "DELETE", "POST", "OPTIONS"],
+    headers: ["Authorization", "Content-Type", "Last-Event-ID"]
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],

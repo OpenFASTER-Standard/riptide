@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>The Story So Far — a Riptide example</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <h1>The Story So Far</h1>
+    <p class="subtitle">
+      A story everyone here is writing together, live — powered by
+      <a href="https://github.com/OpenFASTER-Standard/riptide" target="_blank" rel="noopener">Riptide</a>.
+      You are <strong id="guest-name">...</strong>.
+    </p>
+
+    <div id="story" aria-live="polite"></div>
+
+    <form id="story-form">
+      <input
+        id="line-input"
+        type="text"
+        placeholder="Add the next line..."
+        autocomplete="off"
+        maxlength="280"
+        required
+      />
+      <button type="submit">Add line</button>
+    </form>
+
+    <button id="toggle-raw" type="button">Peek at the data</button>
+    <div id="raw-data-container">
+      <p class="raw-data-label">
+        Raw Turtle triples for the most recent line — this is really Linked Data, not a chat log:
+      </p>
+      <pre id="raw-data"></pre>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
