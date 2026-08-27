@@ -105,14 +105,29 @@ listed explicitly (see below) for `Logger.metadata/1`-set keys to ever reach `fo
 
 **A new access-log `:telemetry` handler** (`Riptide.Telemetry.AccessLog`, attached once from
 `Riptide.Application.start/2` via `:telemetry.attach/4` on `[:phoenix, :endpoint, :stop]`) reads
-`conn.method`, `conn.request_path`, `conn.status`, and the event's `duration` measurement
-(native time units, converted to milliseconds via `System.convert_time_unit/3`), then calls
-`Logger.info("request completed", method: ..., path: ..., status: ..., duration_ms: ...)`. Since
-`Logger.metadata/1` is process-scoped and this handler always runs in the same process that handled
-the request (telemetry handlers execute synchronously in the emitting process for
+`conn.method`, `conn.request_path`, `conn.status`, and the event's `duration` measurement (native
+time units, converted to milliseconds via `System.convert_time_unit/3`), then calls
+`Logger.info("#{method} #{path} #{status} (#{duration_ms}ms)", method: ..., path: ..., status: ..., duration_ms: ...)`.
+Since `Logger.metadata/1` is process-scoped and this handler always runs in the same process that
+handled the request (telemetry handlers execute synchronously in the emitting process for
 `:telemetry.execute/3`, confirmed by `:telemetry`'s own documented execution model), the
 already-set `request_id`/`tenant_id`/`subject` metadata is automatically included with zero extra
 plumbing.
+
+**Important correctness detail, caught while working out the exact test mechanics:**
+`Logger.Formatter`'s `metadata:` allowlist filters keys *before* calling either formatter (the
+built-in string one or the custom `{module, function}` one) — so `method`/`path`/`status`/
+`duration_ms` must ALSO be added to `config/prod.exs`'s metadata list (making it
+`[:request_id, :tenant_id, :subject, :method, :path, :status, :duration_ms]`), not just
+`tenant_id`/`subject`/`request_id`, or those fields would silently never reach the JSON formatter
+at all — the same silent-drop behavior already noted above for unlisted keys. `config/config.exs`'s
+shared dev/test list stays `[:request_id]`, unchanged — this is why the access-log message string
+above bakes `method`/`path`/`status`/`duration_ms` directly into the human-readable message itself
+(not metadata-only): dev/test's plain-text formatter always prints `$message` regardless of the
+metadata allowlist, so this is what keeps local `mix phx.server` output at least as useful as
+Phoenix's old two-line default, without needing to also expand dev/test's own metadata list.
+`tenant_id`/`subject` stay metadata-only (no message-string duplication) since their value is
+specifically for production log correlation/querying, not for a human watching a dev console.
 
 **`RiptideWeb.Plugs.ResolveTenant`** adds one line after the existing `assign(conn, :tenant_id,
 tenant_id)`: `Logger.metadata(tenant_id: tenant_id)`.
@@ -152,12 +167,19 @@ consistent with everything above.
 - `Riptide.Logger.JSONFormatter.format/4`: unit tests verifying the output is valid JSON (round-trips
   through `Jason.decode!/1`), contains the expected `timestamp`/`level`/`message` keys, includes
   arbitrary metadata keys passed to it, and correctly stringifies both binary and iodata messages.
-- `Plug.RequestId` + the new access-log handler: an integration test using
-  `ExUnit.CaptureLog.with_log/1` around a real request, asserting the captured output contains
-  exactly one "request completed" line (not Phoenix's old two-line output) and that it mentions the
-  right method/status/a numeric duration — via substring/regex assertions against the captured text,
-  not by switching `config/test.exs` to the JSON formatter (which stays plain-text intentionally, so
-  this test exercises the handler's logging call directly rather than the prod-only formatter).
+- The new access-log handler: an integration test using `ExUnit.CaptureLog.capture_log/1` around a
+  real request, asserting the captured output contains exactly one line (not Phoenix's old two-line
+  output) mentioning the right method/status/a numeric duration — via substring assertions against
+  the captured text, not by switching `config/test.exs` to the JSON formatter (which stays
+  plain-text intentionally, so this test exercises the handler's logging call directly rather than
+  the prod-only formatter). `config/test.exs` sets the global `Logger` level to `:warning`, which
+  would silently suppress this handler's `Logger.info` calls entirely —
+  `ExUnit.CaptureLog`'s own `:level` option does NOT help here (confirmed via its own
+  documentation: it only filters within a capture and explicitly does not override the real
+  `Logger.level/0` if that's already more restrictive), so the test must save `Logger.level()`,
+  call `Logger.configure(level: :info)` before capturing, and restore the original value in
+  `on_exit` — the same global-mutation-with-restore pattern already established for
+  `:ordinal_resolver` (Phase 5a), including `async: false` for the same reason.
 - `ResolveTenant`/`Authenticate`/`SseController`/`Socket`/`ReplicationChannel`: for each, a test
   asserting `Logger.metadata()` contains the expected key/value after the relevant plug or
   connect/join callback runs, using `Logger.metadata/1`'s own getter (`Logger.metadata/0`) rather
