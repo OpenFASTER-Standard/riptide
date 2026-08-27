@@ -19,6 +19,11 @@ defmodule Riptide.Application do
     # function.
     Riptide.RaCluster.ensure_system_started()
 
+    # Attached before the supervision tree (and therefore RiptideWeb.Endpoint)
+    # starts, so no request can possibly arrive before this handler exists
+    # (Phase 5b).
+    Riptide.Telemetry.AccessLog.attach()
+
     children =
       [
         {Phoenix.PubSub, name: Riptide.PubSub},
