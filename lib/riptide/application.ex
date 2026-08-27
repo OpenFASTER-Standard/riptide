@@ -29,6 +29,8 @@ defmodule Riptide.Application do
     children =
       [
         {Phoenix.PubSub, name: Riptide.PubSub},
+        Riptide.Telemetry,
+        {Plug.Cowboy, scheme: :http, plug: RiptideWeb.MetricsEndpoint, options: [port: 9090]},
         Riptide.Stream.Placement,
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
