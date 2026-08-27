@@ -373,7 +373,17 @@ one monolithic spec.
   LDP/SSE/WebSocket request needs that cluster reachable to resolve stream placement; used for the
   `readinessProbe`). A node cut off from placement now stops receiving traffic instead of silently
   reporting healthy. No supervision-tree changes; the old route was removed outright with no alias.
-- **Phase 5b — Structured logging.** Not yet designed.
+- **Phase 5b — Structured logging.** **Shipped 2026-08-27** — see
+  `docs/superpowers/specs/2026-08-27-phase-5b-structured-logging-design.md`. Production logging is
+  now JSON (`Riptide.Logger.JSONFormatter`, `config/prod.exs`-only, `metadata: :all` rather than a
+  hand-enumerated key list). Phoenix's default two-line unstructured request logging is replaced
+  with one structured line per request (`Riptide.Telemetry.AccessLog`, a `:telemetry` handler on
+  `[:phoenix, :endpoint, :stop]`). `tenant_id`/`subject` are attached to `Logger.metadata` once per
+  request/connection across all 3 transports (`ResolveTenant`/`Authenticate` for LDP HTTP,
+  `SseController.subscribe/2` for SSE, `Socket.connect/3`/`ReplicationChannel.join/3` for
+  WebSocket) and then flow automatically into every subsequent log line in that process. `subject`
+  is set only when a token's claims actually include a `sub` (Phase 4b's `TokenConfig` doesn't
+  require one). dev/test keep today's plain-text formatter and narrower metadata list unchanged.
 - **Phase 5c — Metrics.** Not yet designed.
 
-**Status**: Phase 5a shipped 2026-08-27. Phases 5b/5c not yet designed.
+**Status**: Phases 5a-5b shipped 2026-08-27. Phase 5c not yet designed.
