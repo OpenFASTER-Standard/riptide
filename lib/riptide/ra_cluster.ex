@@ -6,6 +6,8 @@ defmodule Riptide.RaCluster do
   differs from what's written here, this is the one place to fix it.
   """
 
+  require Logger
+
   @system :default
 
   @spec server_id(String.t()) :: :ra.server_id()
@@ -173,6 +175,18 @@ defmodule Riptide.RaCluster do
   # multi-node membership, these paths need graceful handling/retry (e.g.
   # redirecting to the current leader on `{:error, {:redirect, _}}` or backing
   # off and retrying a transient `{:timeout, _}`) rather than raising.
+  # Wrapped in `catch :exit` for the same reason `placement_leader?/0` and
+  # `member_alive?/1` already are (see their own docs): `gen_statem_safe_call/3`
+  # only converts `timeout`/`noproc`/`nodedown`/`shutdown` exits into a
+  # return value this `case` can match — any OTHER exit (e.g. the target
+  # `ra_server_proc` crashing for an unrelated reason mid-call) propagates as
+  # a raw `exit` a plain `case` can't catch, which previously meant callers
+  # relying on "this function always raises, never exits" (e.g.
+  # `Riptide.Placement.with_ordinal_fallback/2`'s `rescue`-based ordinal
+  # fallback) could still crash outright on that one failure class. Uniformly
+  # `raise`ing here — whether the underlying failure came back as an
+  # `{:error, _}`/`{:timeout, _}` tuple or a raw `exit` — restores that
+  # "always raises" contract for every caller.
   @spec process_command(:ra.server_id(), term()) :: term()
   def process_command(server_id, command) do
     case :ra.process_command(server_id, command) do
@@ -180,6 +194,8 @@ defmodule Riptide.RaCluster do
       {:error, reason} -> raise "Ra command failed for #{inspect(server_id)}: #{inspect(reason)}"
       {:timeout, _} -> raise "Ra command timed out for #{inspect(server_id)}"
     end
+  catch
+    :exit, reason -> raise "Ra command exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
 
   # A fast, *possibly stale* read of the local server's already-applied
@@ -191,6 +207,7 @@ defmodule Riptide.RaCluster do
   # everything committed so far (e.g. asserting durability right after a
   # crash-restart). Same single-node error-handling caveat as
   # `process_command/2` above applies.
+  # See `process_command/2`'s own `catch :exit` for why this is needed.
   @spec local_query(:ra.server_id(), (term() -> term())) :: term()
   def local_query(server_id, query_fun) do
     case :ra.local_query(server_id, query_fun) do
@@ -198,6 +215,8 @@ defmodule Riptide.RaCluster do
       {:error, reason} -> raise "Ra query failed for #{inspect(server_id)}: #{inspect(reason)}"
       {:timeout, _} -> raise "Ra query timed out for #{inspect(server_id)}"
     end
+  catch
+    :exit, reason -> raise "Ra query exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
 
   # Linearizable read: unlike `local_query/2` this goes through the leader and,
@@ -205,6 +224,7 @@ defmodule Riptide.RaCluster do
   # committed as of the query — so it deterministically observes the fully
   # recovered log even immediately after a restart. Reply shape is
   # `{:ok, Reply, Leader}` (no index/term wrapper, unlike `local_query`).
+  # See `process_command/2`'s own `catch :exit` for why this is needed.
   @spec consistent_query(:ra.server_id(), (term() -> term())) :: term()
   def consistent_query(server_id, query_fun) do
     case :ra.consistent_query(server_id, query_fun) do
@@ -217,6 +237,9 @@ defmodule Riptide.RaCluster do
       {:timeout, _} ->
         raise "Ra consistent query timed out for #{inspect(server_id)}"
     end
+  catch
+    :exit, reason ->
+      raise "Ra consistent query exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
 
   @spec force_delete(String.t()) :: :ok
@@ -365,13 +388,42 @@ defmodule Riptide.RaCluster do
         retry_interval_ms \\ 1000,
         attempt_fun \\ &attempt_start_placement_cluster/0
       ) do
+    do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, 1)
+  end
+
+  # Every failed attempt was previously silent — an operator watching
+  # `/health/ready` = 503 forever had no log line or metric explaining why,
+  # only a real `:ra`-state introspection session to diagnose it. Logs the
+  # first attempt's failure immediately (so the very first sign of trouble
+  # is visible right away) and then only every 30th attempt thereafter (with
+  # the default 1s retry interval, roughly once every 30s) to avoid log-spam
+  # during a startup window where early failures are routine and expected
+  # (sibling ordinals legitimately not resolvable yet). Every attempt still
+  # increments the telemetry counter regardless of whether it logs.
+  @log_every_nth_attempt 30
+  defp do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, attempt) do
     case attempt_fun.() do
       :ok ->
         :ok
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        :telemetry.execute(
+          [:riptide, :ra, :placement_cluster_formation_attempts],
+          %{},
+          %{result: :error}
+        )
+
+        if attempt == 1 or rem(attempt, @log_every_nth_attempt) == 0 do
+          Logger.warning(
+            "Placement cluster not yet formed, still retrying (attempt #{attempt}): " <>
+              inspect(reason),
+            attempt: attempt,
+            reason: inspect(reason)
+          )
+        end
+
         Process.sleep(retry_interval_ms)
-        ensure_placement_cluster_started(retry_interval_ms, attempt_fun)
+        do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, attempt + 1)
     end
   end
 
@@ -564,13 +616,72 @@ defmodule Riptide.RaCluster do
 
     with :ok <- add_member(survivor_ids, new_id),
          :ok <- start_joining_server(cluster_name, new_id, machine, survivor_ids),
-         {:ok, _reply, _leader} <-
-           retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
+         :ok <- remove_member(survivor_ids, dead_id) do
       :ok
     else
       {:error, reason} -> {:error, reason}
       {:timeout, _} -> {:error, :timeout}
     end
+  end
+
+  # Self-corrects the same "redundant retry after a partial prior success"
+  # shape `add_member/2` and `start_joining_server/4` already handle for
+  # their own steps of this same `replace_member/5` pipeline (see their own
+  # docs) — but unlike `:ra.add_member/2`, which has a dedicated
+  # `{:error, :already_member}` atom to self-correct on, `:ra.remove_member/2`
+  # returns the SAME `{:error, :not_member}` for two different situations:
+  # `dead_id` was never a member (a genuine caller bug) and `dead_id` was
+  # ALREADY removed by an earlier, otherwise-successful `replace_member/5`
+  # attempt (e.g. this process/node crashed, or the caller's subsequent
+  # `Riptide.Placement.replace_member/3` metadata update failed/raised,
+  # before this step's own success was ever observed) — confirmed against
+  # `deps/ra/src/ra.erl:618-633` and this module's own
+  # `ra_cluster_test.exs:330-331` assertion of that literal return value.
+  # Without this self-correction, a redundant retry after that exact partial
+  # success permanently fails at this step forever: the real Ra cluster
+  # already has the correct membership, but `Riptide.Stream.ReplicaHealer`'s
+  # caller never reaches the `:ok` branch that updates placement metadata,
+  # so the metadata stays wrongly stuck pointing at the already-evicted
+  # `dead_id` — and any node whose replacement was a *different* replica for
+  # the same repair (e.g. a second concurrent attempt racing this one) can
+  # then never be reconciled either. Disambiguates by checking the surviving
+  # cluster's own real membership via `:ra.members/1` rather than trusting
+  # the ambiguous error atom alone.
+  @spec remove_member([:ra.server_id()], :ra.server_id()) ::
+          :ok | {:error, term()} | {:timeout, term()}
+  defp remove_member(survivor_ids, dead_id) do
+    case retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
+      {:ok, _reply, _leader} -> :ok
+      {:error, :not_member} -> if member_removed?(survivor_ids, dead_id), do: :ok, else: {:error, :not_member}
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} = timeout -> timeout
+    end
+  end
+
+  # Asks each survivor in turn (any single one being briefly unreachable
+  # shouldn't block this check) whether `dead_id` is still in its own
+  # locally-known membership list, and trusts the first one that answers —
+  # Ra membership changes are themselves consensus commands, so any
+  # caught-up member's view of current membership is authoritative, not
+  # merely a hint. Defaults to `false` (i.e. "not confirmed removed," so the
+  # caller keeps the original ambiguous error and the next sweep retries)
+  # if every survivor is unreachable — the safe direction to be wrong in,
+  # since it costs a retry rather than a false "removed" reported swallowing
+  # a genuine failure.
+  @spec member_removed?([:ra.server_id()], :ra.server_id()) :: boolean()
+  defp member_removed?(survivor_ids, dead_id) do
+    Enum.reduce_while(survivor_ids, false, fn survivor_id, _acc ->
+      try do
+        case :ra.members(survivor_id) do
+          {:ok, members, _leader} -> {:halt, dead_id not in members}
+          _ -> {:cont, false}
+        end
+      rescue
+        _ -> {:cont, false}
+      catch
+        :exit, _ -> {:cont, false}
+      end
+    end)
   end
 
   # Self-corrects the exact same "redundant retry after a partial prior

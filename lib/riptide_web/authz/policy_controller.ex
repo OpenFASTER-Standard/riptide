@@ -19,8 +19,10 @@ defmodule RiptideWeb.Authz.PolicyController do
 
     case policy_from_params(params) do
       {:ok, policy} ->
-        :ok = store.add_policy(tenant_id, [], policy)
-        send_resp(conn, 201, "")
+        case store.add_policy(tenant_id, [], policy) do
+          :ok -> send_resp(conn, 201, "")
+          {:error, :too_many_policies} -> send_resp(conn, 429, "")
+        end
 
       :error ->
         send_resp(conn, 400, "")

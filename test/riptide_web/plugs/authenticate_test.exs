@@ -52,13 +52,27 @@ defmodule RiptideWeb.Plugs.AuthenticateTest do
     assert conn.status == 401
   end
 
-  test "falls back to a ?token= query param when no header is present" do
+  test "falls back to a ?token= query param when no header is present and allow_query_param is set" do
     conn =
       :get
       |> conn("/streams/abc/subscribe?token=valid-token")
-      |> Authenticate.call(Authenticate.init([]))
+      |> Authenticate.call(Authenticate.init(allow_query_param: true))
 
     assert conn.assigns.current_subject == %{"sub" => "user-1"}
+    refute conn.halted
+  end
+
+  test "ignores a ?token= query param when allow_query_param is not set (default)" do
+    # A bearer token in a query string is a durable leak risk (proxy/access
+    # logs, browser history, Referer forwarding) — the fallback only applies
+    # when a pipeline explicitly opts in (see RiptideWeb.Router's
+    # :auth_query_param pipeline, used only by the SSE subscribe route).
+    conn =
+      :get
+      |> conn("/resources/foo?token=valid-token")
+      |> Authenticate.call(Authenticate.init([]))
+
+    assert conn.assigns.current_subject == nil
     refute conn.halted
   end
 
@@ -67,7 +81,7 @@ defmodule RiptideWeb.Plugs.AuthenticateTest do
       :get
       |> conn("/streams/abc/subscribe?token=garbage")
       |> put_req_header("authorization", "Bearer valid-token")
-      |> Authenticate.call(Authenticate.init([]))
+      |> Authenticate.call(Authenticate.init(allow_query_param: true))
 
     assert conn.assigns.current_subject == %{"sub" => "user-1"}
     refute conn.halted

@@ -73,17 +73,37 @@ defmodule Riptide.Placement.PlacementMachine do
     end
   end
 
-  # Same idempotent-by-construction shape as {:assign, ...}: every command is
-  # serialized through Raft, so concurrent `add_policy` calls for the same
-  # tenant/prefix are safely ordered by the log rather than racing.
+  # Bounds unbounded growth from a client (malicious, or merely a buggy
+  # retry loop) calling `POST /tenants/:id/policies` with the same or
+  # near-identical body repeatedly: `existing ++ [policy]` with no cap would
+  # otherwise grow this in-memory, Raft-replicated list forever, and every
+  # entry is scanned linearly on every `Riptide.Authz.evaluate/4` call for
+  # that tenant, so unbounded growth here also degrades every authorization
+  # decision's latency. Deduplicating exact-duplicate policies closes the
+  # most common case (identical retries) for free; `@max_policies_per_prefix`
+  # bounds the rest. Same idempotent-by-construction shape as {:assign, ...}
+  # otherwise: every command is serialized through Raft, so concurrent
+  # `add_policy` calls for the same tenant/prefix are safely ordered by the
+  # log rather than racing.
+  @max_policies_per_prefix 1000
+
   @impl :ra_machine
   def apply(_meta, {:add_policy, tenant_id, path_prefix, policy}, state) do
     existing = state.policies |> Map.get(tenant_id, %{}) |> Map.get(path_prefix, [])
 
-    new_state =
-      put_in(state, [:policies, Access.key(tenant_id, %{}), path_prefix], existing ++ [policy])
+    cond do
+      policy in existing ->
+        {state, :ok, []}
 
-    {new_state, :ok, []}
+      length(existing) >= @max_policies_per_prefix ->
+        {state, {:error, :too_many_policies}, []}
+
+      true ->
+        new_state =
+          put_in(state, [:policies, Access.key(tenant_id, %{}), path_prefix], existing ++ [policy])
+
+        {new_state, :ok, []}
+    end
   end
 
   # A tenant is "unclaimed" if it has zero policies at every path prefix —

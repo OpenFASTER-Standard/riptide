@@ -26,11 +26,23 @@ defmodule Riptide.Auth.TokenConfig do
   the *token's own* decoded claims and only runs a claim's validator when
   that claim is actually present — it never enforces that a configured
   claim key show up in the token at all. Left alone, this means a validly
-  signed token that simply omits `exp`, `iss`, or `aud` would skip that
-  claim's check entirely and be accepted. `verify_and_validate_required_claims/1`
-  closes that gap by requiring all three to be present *and non-null*, on
+  signed token that simply omits `exp`, `iss`, `aud`, or `sub` would skip
+  that claim's check entirely and be accepted. `verify_and_validate_required_claims/1`
+  closes that gap by requiring all four to be present *and non-null*, on
   top of whatever `verify_and_validate/1` (Joken.Config's own generated
   function) already checks for claims that are present.
+
+  `sub` is required for a security reason distinct from the other three:
+  `Riptide.Authz`'s `{:agent, subject}` matcher (and the tenant-bootstrap
+  path in `RiptideWeb.Plugs.Authorize.maybe_bootstrap/4` that creates it)
+  compares `current_subject["sub"] == subject`. A token that validly omits
+  `sub` would make `current_subject["sub"]` evaluate to `nil` — and if such
+  a token happened to be the first to write to a brand-new tenant, the
+  stored owner policy would become `{:agent, nil}`, which then matches
+  *any other* authenticated request whose token also lacks `sub`, granting
+  a completely different principal full access to that tenant. Requiring
+  `sub` here closes that off at the token-verification boundary, before it
+  can ever reach the authorization layer.
 
   The non-null part matters on its own: a token with an explicit `"exp":
   null` (present, not omitted) still passes Joken's own default `exp`
@@ -47,7 +59,7 @@ defmodule Riptide.Auth.TokenConfig do
 
   add_hook(JokenJwks, strategy: Riptide.Auth.JwksStrategy)
 
-  @required_claims ~w(exp iss aud)
+  @required_claims ~w(exp iss aud sub)
 
   @impl Joken.Config
   def token_config do

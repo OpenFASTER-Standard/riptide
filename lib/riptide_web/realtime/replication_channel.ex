@@ -54,6 +54,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   defp do_join(stream_id, cursor, socket) do
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
       :ok ->
+        # Same subscribe-before-read ordering (and the same duplicate-delivery
+        # window it opens) as RiptideWeb.Realtime.SseController.do_subscribe/3
+        # — see its own comment. `handle_info/2` below drops any live event
+        # whose sequence isn't strictly greater than the highest one already
+        # sent in the backlog.
         Phoenix.PubSub.subscribe(Riptide.PubSub, "stream:" <> stream_id)
 
         case StreamServer.get_since(stream_id, cursor) do
@@ -61,7 +66,13 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
             {:error, %{"oldestAvailable" => oldest}}
 
           {:ok, events} ->
-            socket = assign(socket, :stream_id, stream_id)
+            last_sequence = events |> List.last() |> then(&(&1 && &1.sequence)) || cursor || 0
+
+            socket =
+              socket
+              |> assign(:stream_id, stream_id)
+              |> assign(:last_sequence, last_sequence)
+
             {:ok, %{"backlog" => Enum.map(events, &frame/1)}, socket}
         end
 
@@ -71,8 +82,14 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   end
 
   @impl true
-  def handle_info({:new_event, %Event{} = event}, socket) do
+  def handle_info({:new_event, %Event{sequence: sequence} = event}, socket)
+      when sequence > socket.assigns.last_sequence do
     push(socket, "replication_frame", frame(event))
+    {:noreply, assign(socket, :last_sequence, sequence)}
+  end
+
+  @impl true
+  def handle_info({:new_event, %Event{}}, socket) do
     {:noreply, socket}
   end
 

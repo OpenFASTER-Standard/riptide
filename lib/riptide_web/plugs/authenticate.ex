@@ -12,6 +12,16 @@ defmodule RiptideWeb.Plugs.Authenticate do
   halts with `401` — a token that can't be checked is never silently treated
   as though it had passed. Nothing yet enforces that `current_subject` be
   non-nil for any route; that's Phase 4c's job.
+
+  The `?token=` query-param fallback (browsers' native `EventSource` API
+  can't set custom request headers, so SSE has no other way to send a
+  bearer token) is opt-in via `allow_query_param: true`, not a blanket
+  behavior of this plug — see `RiptideWeb.Router`'s `:auth_query_param`
+  pipeline, used only by the SSE subscribe route. A bearer token in a query
+  string is a durable leak risk (proxy/access logs, browser history,
+  `Referer` forwarding) that should never be enabled for routes that have a
+  perfectly good `Authorization` header available, which is every route but
+  SSE.
   """
   import Plug.Conn
   require Logger
@@ -22,8 +32,8 @@ defmodule RiptideWeb.Plugs.Authenticate do
   def init(opts), do: opts
 
   @impl true
-  def call(conn, _opts) do
-    case extract_token(conn) do
+  def call(conn, opts) do
+    case extract_token(conn, opts) do
       nil ->
         assign(conn, :current_subject, nil)
 
@@ -35,7 +45,9 @@ defmodule RiptideWeb.Plugs.Authenticate do
             maybe_set_subject_metadata(claims)
             assign(conn, :current_subject, claims)
 
-          {:error, _reason} ->
+          {:error, reason} ->
+            Logger.warning("auth verification failed", reason: inspect(reason))
+
             conn
             |> send_resp(401, "")
             |> halt()
@@ -51,14 +63,12 @@ defmodule RiptideWeb.Plugs.Authenticate do
 
   # Header takes precedence over the query param when both are present, to
   # avoid ambiguity about which one is authoritative (Phase 4b design spec
-  # §5). The query-param fallback exists only for SSE — browsers' native
-  # `EventSource` API can't set custom request headers — but is accepted
-  # here unconditionally rather than gated per-route: an LDP HTTP request
-  # simply never sends a `?token=` param today, so this costs nothing there.
-  defp extract_token(conn) do
+  # §5). The query-param fallback only applies when the pipeline explicitly
+  # opts in via `allow_query_param: true` — see moduledoc.
+  defp extract_token(conn, opts) do
     case get_req_header(conn, "authorization") do
       ["Bearer " <> token] -> token
-      _ -> fallback_token(conn)
+      _ -> if Keyword.get(opts, :allow_query_param, false), do: fallback_token(conn)
     end
   end
 

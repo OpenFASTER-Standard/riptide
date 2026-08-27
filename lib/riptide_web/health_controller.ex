@@ -22,5 +22,13 @@ defmodule RiptideWeb.HealthController do
     send_resp(conn, 200, "ok")
   rescue
     _ -> send_resp(conn, 503, "not ready")
+  catch
+    # Riptide.Placement.lookup/1 can genuinely `exit` (not just `raise`) if
+    # the local placement Ra member crashes mid-query — see
+    # Riptide.RaCluster.process_command/2's own `catch :exit` doc. A plain
+    # `rescue` alone doesn't catch that, which would otherwise surface as an
+    # uncaught exit (a connection reset) instead of the clean 503 this probe
+    # exists to provide.
+    :exit, _ -> send_resp(conn, 503, "not ready")
   end
 end

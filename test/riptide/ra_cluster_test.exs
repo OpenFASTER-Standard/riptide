@@ -323,12 +323,19 @@ defmodule Riptide.RaClusterTest do
       # `node()` is already a member here, so `add_member`/`start_server` both
       # self-correct on their own respective "already there" outcomes (finding
       # 3, Phase 3d-ii final review — see `RaCluster.add_member/2` and
-      # `start_joining_server/4`'s own docs) and the call proceeds all the way
-      # to `remove_member`, which is where this contrived scenario's real
-      # error surfaces: `:dead@nowhere` was never actually a member of this
-      # single-member cluster to begin with.
-      assert RaCluster.replace_member(uid, [node()], :dead@nowhere, node(), machine) ==
-               {:error, :not_member}
+      # `start_joining_server/4`'s own docs), and `remove_member` now
+      # self-corrects too (audit remediation, 2026-08-27 — see
+      # `RaCluster.remove_member/2`'s own doc): `:dead@nowhere` was never
+      # actually a member of this single-member cluster, so
+      # `:ra.remove_member/2` returns `{:error, :not_member}`, but
+      # `member_removed?/2` observes that `:dead@nowhere` is indeed absent
+      # from the cluster's real membership and treats that as the desired
+      # end state already holding, not a distinguishable failure — the same
+      # ambiguity `:ra.remove_member/2` itself has between "never a member"
+      # and "already removed by an earlier attempt," resolved in favor of
+      # the idempotent, self-correcting outcome every other step of this
+      # same pipeline already uses.
+      assert RaCluster.replace_member(uid, [node()], :dead@nowhere, node(), machine) == :ok
     end
   end
 end

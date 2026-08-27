@@ -8,6 +8,8 @@ defmodule Riptide.Stream.RaMachine do
   """
   @behaviour :ra_machine
 
+  require Logger
+
   alias Riptide.Event
 
   # `events` holds each event's *encoded* wire-form map (see `Riptide.Event.encode/1`),
@@ -28,12 +30,45 @@ defmodule Riptide.Stream.RaMachine do
 
   @impl :ra_machine
   def apply(meta, {:append, wire}, state) do
-    event = Event.decode(wire)
-    stamped = Event.with_sequence(event, state.next_sequence)
-    stamped_wire = Event.encode(stamped)
-    {events, trimmed?} = trim(state.events ++ [stamped_wire], state.retention)
-    new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
-    {new_state, stamped, release_cursor_effects(trimmed?, meta, new_state)}
+    case safe_decode(wire) do
+      {:ok, event} ->
+        stamped = Event.with_sequence(event, state.next_sequence)
+        stamped_wire = Event.encode(stamped)
+        {events, trimmed?} = trim(state.events ++ [stamped_wire], state.retention)
+        new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
+        {new_state, stamped, release_cursor_effects(trimmed?, meta, new_state)}
+
+      {:error, reason} ->
+        # This command is already durably committed to this stream's Ra log
+        # — every replica (including ones that join or restart later) will
+        # replay this exact entry forever. Dropping it (state unchanged, no
+        # sequence consumed) rather than crashing is deliberate: an uncaught
+        # exception here would crash `apply/3` on every replica, on every
+        # future replay of this entry, turning one bad command into a
+        # permanently crash-looping stream with no automatic recovery. The
+        # most plausible real trigger is a rolling upgrade: a newer node
+        # commits an event using a future `Riptide.Event` wire version
+        # before every replica has upgraded to understand it.
+        Logger.error(
+          "Riptide.Stream.RaMachine dropped an unparseable committed event " <>
+            "(#{reason}) — state left unchanged rather than crashing this " <>
+            "replica; likely a wire-version mismatch from a rolling upgrade"
+        )
+
+        :telemetry.execute([:riptide, :stream, :poison_command], %{}, %{})
+        {state, {:error, {:undecodable_event, reason}}, []}
+    end
+  end
+
+  # `Event.decode/1` can raise — on an unrecognized wire version explicitly
+  # (`raise("Unknown Event wire version: ...")`) or on any structurally
+  # malformed wire map (e.g. `KeyError`/`FunctionClauseError`). See `apply/3`
+  # above for why that must never propagate out of this callback.
+  @spec safe_decode(map()) :: {:ok, Event.t()} | {:error, String.t()}
+  defp safe_decode(wire) do
+    {:ok, Event.decode(wire)}
+  rescue
+    e -> {:error, Exception.message(e)}
   end
 
   # Ra keeps every applied command on disk in its raft log indefinitely

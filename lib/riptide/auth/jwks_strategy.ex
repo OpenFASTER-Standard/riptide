@@ -12,7 +12,22 @@ defmodule Riptide.Auth.JwksStrategy do
   """
   use JokenJwks.DefaultStrategyTemplate
 
+  # Without an explicit timeout, `Tesla.Adapter.Httpc` (this project's
+  # configured adapter — see config/config.exs) defaults `:httpc`'s own
+  # `timeout`/`connect_timeout` to `:infinity`. `fetch_signers/2` runs
+  # synchronously inside this GenServer's own `handle_info(:check_fetch, ...)`
+  # callback, and the NEXT check is only scheduled after that call returns —
+  # so a JWKS endpoint that accepts the TCP connection but never responds (a
+  # flaky or attacker-influenced IdP) would otherwise wedge this process
+  # forever: no future re-fetch ever fires, and any JWT with a new/rotated
+  # `kid` becomes permanently unverifiable on this node until it restarts.
+  @http_timeout_ms 5_000
+
   def init_opts(opts) do
-    Keyword.put_new(opts, :jwks_url, Application.get_env(:riptide, :oidc_jwks_url))
+    opts
+    |> Keyword.put_new(:jwks_url, Application.get_env(:riptide, :oidc_jwks_url))
+    |> Keyword.put_new(:http_middlewares, [
+      {Tesla.Middleware.Timeout, timeout: @http_timeout_ms}
+    ])
   end
 end

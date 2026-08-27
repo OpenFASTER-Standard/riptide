@@ -5,8 +5,29 @@ defmodule Riptide.RDF.TurtleCodec do
   library's own (bang vs non-bang) function-naming conventions directly.
   """
 
+  # Turtle's grammar allows unbounded nesting of collections `( ( ( ... ) ) )`
+  # and blank-node property lists `[ :p [ :p [ ... ] ] ]`, and the underlying
+  # `rdf` library's decoder recurses once per nesting level with no depth
+  # limit of its own. Confirmed empirically: a ~3MB body containing 1.5M
+  # levels of `(` nesting (well within Plug's default ~8MB body-size cap)
+  # drove ~863MB of heap growth and ~19s of CPU in the decoding process
+  # before this guard existed — a straightforward, request-sized DoS against
+  # any authenticated caller (self-service tenant bootstrap grants any
+  # authenticated principal write access to a fresh tenant).
+  #
+  # `decode/1`'s only callers today (`RiptideWeb.LDP.ResourceController`) run
+  # in a short-lived, per-request Phoenix/Cowboy process, so bounding *that
+  # process's* heap here is safe — it isn't a long-lived process any other
+  # unrelated work shares. 50_000_000 words (~400MB on a 64-bit VM) is
+  # generous relative to any legitimate Turtle body under the same ~8MB
+  # request-size cap, while still well short of exhausting a typical pod's
+  # memory from a single request.
+  @max_heap_size_words 50_000_000
+
   @spec decode(String.t()) :: {:ok, RDF.Graph.t()} | {:error, term()}
   def decode(turtle_string) when is_binary(turtle_string) do
+    Process.flag(:max_heap_size, %{size: @max_heap_size_words, kill: true, error_logger: true})
+
     case RDF.Turtle.read_string(turtle_string) do
       {:ok, graph} -> {:ok, graph}
       {:error, reason} -> {:error, reason}

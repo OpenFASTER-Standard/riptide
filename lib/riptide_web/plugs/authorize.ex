@@ -32,11 +32,18 @@ defmodule RiptideWeb.Plugs.Authorize do
     end
   end
 
-  defp maybe_bootstrap(conn, tenant_id, current_subject, :write)
-       when not is_nil(current_subject) do
+  # Guards against `current_subject["sub"]` being `nil` (bootstrapping the
+  # tenant with an `{:agent, nil}` owner policy that would then match any
+  # other subject-less token — see `Riptide.Authz`'s own guard on this same
+  # shape). `Riptide.Auth.TokenConfig` requires `sub` on every verified
+  # token, so this should not be reachable in practice; kept as defense in
+  # depth rather than trusting that invariant to hold from this call site
+  # alone.
+  defp maybe_bootstrap(conn, tenant_id, %{"sub" => sub}, :write)
+       when not is_nil(sub) do
     store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
 
-    case store.claim_tenant_if_unclaimed(tenant_id, current_subject["sub"]) do
+    case store.claim_tenant_if_unclaimed(tenant_id, sub) do
       :claimed -> conn
       :already_claimed -> reject(conn)
     end

@@ -209,7 +209,18 @@ defmodule Riptide.Stream.Placement do
       {:ok, _server_ids} = ok ->
         ok
 
-      {:error, _} = error when attempts_left <= 1 ->
+      {:error, reason} = error when attempts_left <= 1 ->
+        # Previously silent: a caller (LDP GET/POST, SSE subscribe, WS join)
+        # sees a bare 503 with nothing in Riptide's own logs/metrics
+        # explaining that this specific stream's replica formation is what
+        # failed, as opposed to any other reason a request can 503.
+        Logger.warning(
+          "Stream cluster formation exhausted retries for #{inspect(uid)}: #{inspect(reason)}",
+          uid: uid,
+          reason: inspect(reason)
+        )
+
+        :telemetry.execute([:riptide, :stream, :formation_failure], %{}, %{})
         error
 
       {:error, _} ->

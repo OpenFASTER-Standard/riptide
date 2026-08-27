@@ -59,7 +59,21 @@ defmodule Riptide.Application do
   defp placement_bootstrap_children do
     if System.get_env("HOSTNAME") in Riptide.RaCluster.placement_ordinals() do
       [
-        {Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
+        # `Task`'s own default child_spec restarts as `:temporary` — fine
+        # for `ensure_placement_cluster_started/0`'s own {:error, _} branch,
+        # which already retries forever internally, but NOT fine for any
+        # exception that isn't already anticipated there (e.g. `:ra.start_cluster/2`
+        # exiting instead of returning): a `:temporary` Task that dies from
+        # one of those is never restarted, silently leaving this ordinal
+        # permanently out of the placement cluster for the rest of the
+        # pod's lifetime. `ensure_placement_cluster_started/0` is itself
+        # documented as safe to call redundantly (self-corrects on
+        # `{:error, :cluster_not_formed}` from an already-formed cluster),
+        # so a supervisor-driven restart on `:permanent` is a safe, correct
+        # recovery path with no special-casing needed here.
+        Supervisor.child_spec({Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
+          restart: :permanent
+        ),
         Riptide.Stream.ReplicaHealer
       ]
     else
