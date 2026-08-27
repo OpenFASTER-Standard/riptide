@@ -24,11 +24,22 @@ function guestName() {
 }
 
 function escapeTurtleLiteral(value) {
-  // Triple-quoted Turtle string literals allow any character except an
-  // unescaped backslash or the literal `"""` sequence — both vanishingly
-  // rare in ordinary text, but escaped here for correctness against
-  // arbitrary user input.
-  return value.replace(/\\/g, "\\\\").replace(/"""/g, '\\"\\"\\"');
+  // Mirrors Riptide's own short-form Turtle string escaping exactly
+  // (deps/rdf/lib/rdf/serializations/turtle_trig/encoder.ex's
+  // escape_string/3 with long: false). This demo only ever submits
+  // single-line text (an <input type="text"> can't contain a newline),
+  // so the server always re-serializes it short-form on read anyway —
+  // writing short-form here too keeps escaping symmetric and avoids a
+  // triple-quoted literal whose content ends in an unescaped `"`
+  // colliding with its own closing `"""` (a real, confirmed-live bug:
+  // a submitted line like `He said "run!"` produced `""""` at the end
+  // and the server rejected the PATCH with a 400).
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
 }
 
 function unescapeTurtleLiteral(value) {
@@ -158,8 +169,8 @@ async function submitLine(text) {
   const author = guestName();
   const additions =
     `<${lineId}> <${TYPE_PRED}> <${CREATIVE_WORK}> ;\n` +
-    `  <${TEXT_PRED}> """${escapeTurtleLiteral(text)}""" ;\n` +
-    `  <${AUTHOR_PRED}> """${escapeTurtleLiteral(author)}""" .\n`;
+    `  <${TEXT_PRED}> "${escapeTurtleLiteral(text)}" ;\n` +
+    `  <${AUTHOR_PRED}> "${escapeTurtleLiteral(author)}" .\n`;
 
   const response = await fetch(`${BASE_URL}${STORY_PATH}`, {
     method: "PATCH",

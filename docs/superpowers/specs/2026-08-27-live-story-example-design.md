@@ -17,7 +17,8 @@ it's genuinely Linked Data under the hood — *felt*, not just documented.
   are inherently cross-origin from their pod by design, and Riptide currently supports none of
   this).
 - `examples/live-story/`: a static `index.html` + `app.js` + `style.css` (no build step, no
-  framework) implementing the experience below, plus `setup.exs` (a `mix run` script) and a short
+  framework) implementing the experience below, plus `setup.exs` (loaded into an already-running
+  server via `Code.eval_file/1`) and a short
   `README.md` explaining how to try it.
 - Manual/scripted verification that the live cross-tab experience actually works (two clients, one
   posts a line, the other sees it appear without refreshing).
@@ -30,7 +31,8 @@ it's genuinely Linked Data under the hood — *felt*, not just documented.
   path — but it's not part of this pass.)
 - Running the example against a remote/already-deployed Riptide instance that this repo's checkout
   doesn't control — `setup.exs` seeds the tenant's policy and opening line via Riptide's own Elixir
-  API directly (`mix run`), which requires a local, in-repo checkout. Seeding a remote instance
+  API directly (via `Code.eval_file/1` into an already-running server), which requires a local,
+  in-repo checkout. Seeding a remote instance
   would need an HTTP-based, auth-appropriate bootstrap flow, which is a reasonable future extension
   but adds real complexity this version doesn't need.
 - Deleting/moderating lines, editing the opening line, rate-limiting submissions.
@@ -119,9 +121,9 @@ being closed here, not an example-specific carve-out.
 
 ## Setup script (`examples/live-story/setup.exs`)
 
-A `mix run examples/live-story/setup.exs`, run from a Riptide checkout with `mix phx.server`
-already running (or about to run) against it — the same "talk to Riptide's own Elixir API
-directly, bypassing HTTP" pattern this repo's own `test/bench/*_test.exs` scripts already
+Loaded via `Code.eval_file("examples/live-story/setup.exs")` into an already-running
+`iex -S mix phx.server` process, from a Riptide checkout — the same "talk to Riptide's own Elixir
+API directly, bypassing HTTP" pattern this repo's own `test/bench/*_test.exs` scripts already
 establish. It:
 
 1. Seeds a `:public`, `[:read, :write]` policy for tenant `story-demo` via
