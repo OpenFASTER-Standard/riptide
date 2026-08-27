@@ -12,3 +12,6 @@ spec:
     - name: http
       port: 4000
       targetPort: 4000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
