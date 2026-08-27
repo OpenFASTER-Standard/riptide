@@ -13,6 +13,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   different topics over its lifetime and each may have different policies.
   """
   use Phoenix.Channel
+  require Logger
 
   alias Riptide.Event
   alias Riptide.RDF.TurtleCodec
@@ -21,10 +22,13 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   @impl true
   def join("replication:" <> stream_id, %{"after" => cursor}, socket) do
-    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id),
-         :allow <-
-           Riptide.Authz.evaluate(tenant_id, path_segments, socket.assigns.current_subject, :read) do
-      do_join(stream_id, cursor, socket)
+    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id) do
+      Logger.metadata(tenant_id: tenant_id)
+
+      case Riptide.Authz.evaluate(tenant_id, path_segments, socket.assigns.current_subject, :read) do
+        :allow -> do_join(stream_id, cursor, socket)
+        _ -> {:error, %{"reason" => "unauthorized"}}
+      end
     else
       _ -> {:error, %{"reason" => "unauthorized"}}
     end

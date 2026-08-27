@@ -16,6 +16,7 @@ defmodule RiptideWeb.Realtime.Socket do
   no per-connection session distinguishing one reader from another.
   """
   use Phoenix.Socket
+  require Logger
 
   channel "replication:*", RiptideWeb.Realtime.ReplicationChannel
 
@@ -29,8 +30,15 @@ defmodule RiptideWeb.Realtime.Socket do
         verifier = Application.get_env(:riptide, :auth_verifier, Riptide.Auth.Verifier.OIDC)
 
         case verifier.verify(token) do
-          {:ok, claims} -> {:ok, assign(socket, :current_subject, claims)}
-          {:error, reason} -> {:error, reason}
+          {:ok, claims} ->
+            if sub = claims["sub"] do
+              Logger.metadata(subject: sub)
+            end
+
+            {:ok, assign(socket, :current_subject, claims)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
   end

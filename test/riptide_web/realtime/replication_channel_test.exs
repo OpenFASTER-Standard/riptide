@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   use ExUnit.Case, async: true
   import Phoenix.ChannelTest
+  require Logger
 
   alias Riptide.Authz.{Policy, Store}
   alias Riptide.Event
@@ -232,5 +233,23 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
                  "after" => 0
                }
              )
+  end
+
+  test "sets tenant_id in Logger metadata after a successful join" do
+    stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    StreamSupervisor.ensure_ready(stream_id)
+
+    {:ok, socket} = connect(Socket, %{})
+
+    # Calls join/3 DIRECTLY (not via Phoenix.ChannelTest.join/4 or
+    # subscribe_and_join/4) — those helpers run the channel callback in a
+    # separate, GenServer-spawned process, so Logger.metadata set inside it
+    # would be invisible here. join/3 is a plain exported function; nothing
+    # about its body is channel-process-specific.
+    {:ok, _reply, _socket} =
+      ReplicationChannel.join("replication:" <> stream_id, %{"after" => 0}, socket)
+
+    assert Logger.metadata()[:tenant_id] == "ws-test-tenant"
   end
 end
