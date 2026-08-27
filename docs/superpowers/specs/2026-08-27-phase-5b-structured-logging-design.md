@@ -84,10 +84,21 @@ from Riptide's own domain concepts:
   `String.Chars`) to a plain string via `to_string/1`.
 - Builds a flat map (`timestamp`, `level`, `message`, plus every metadata key present) and
   `Jason.encode!/1`'s it, followed by `"\n"`.
-- `config/prod.exs`'s `:logger, :default_formatter` config's `metadata:` list expands from
-  `[:request_id]` to `[:request_id, :tenant_id, :subject]` so the formatter actually receives these
-  keys — `Logger.metadata/1` calls that set a key not in this allowlist are silently dropped by
-  Elixir's own `Logger` before formatting ever sees them.
+- `config/prod.exs`'s `:logger, :default_formatter` config sets `metadata: :all` (a documented
+  `Logger.Formatter` value — confirmed at
+  `/usr/local/lib/elixir/lib/logger/lib/logger/formatter.ex:122,213` — meaning "pass every metadata
+  key present," not an enumerated list). An explicit list was considered and rejected: it would
+  need a new entry added by hand every time any future `Logger` call anywhere in the app attaches a
+  new custom key, silently dropping anything not kept in sync — the opposite of what structured
+  logging is for. `config/config.exs`'s dev/test list stays the narrower, explicit `[:request_id]`,
+  unchanged — dev/test intentionally keeps today's minimal, deliberate console output.
+- **This makes the `rescue` clause above load-bearing, not just defensive insurance.** With
+  `metadata: :all`, Elixir's own automatically-attached metadata (e.g. `:pid`, `:mfa` — a
+  `{module, function, arity}` tuple, present on log events routed through `:logger`'s standard
+  translators) flows through too, and neither a raw PID nor a bare tuple has a `Jason.Encoder`
+  implementation — `Jason.encode!/1` would raise for such a value. The formatter's `rescue` falls
+  back to an `inspect/1`-based plain-text line in that case, so a JSON-unsafe metadata value
+  degrades a single log line's format rather than crashing the logging pipeline outright.
 
 **`RiptideWeb.Endpoint`** changes `plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]` to
 `plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: false` — the `log: false` option is
@@ -114,20 +125,18 @@ handled the request (telemetry handlers execute synchronously in the emitting pr
 already-set `request_id`/`tenant_id`/`subject` metadata is automatically included with zero extra
 plumbing.
 
-**Important correctness detail, caught while working out the exact test mechanics:**
-`Logger.Formatter`'s `metadata:` allowlist filters keys *before* calling either formatter (the
-built-in string one or the custom `{module, function}` one) — so `method`/`path`/`status`/
-`duration_ms` must ALSO be added to `config/prod.exs`'s metadata list (making it
-`[:request_id, :tenant_id, :subject, :method, :path, :status, :duration_ms]`), not just
-`tenant_id`/`subject`/`request_id`, or those fields would silently never reach the JSON formatter
-at all — the same silent-drop behavior already noted above for unlisted keys. `config/config.exs`'s
-shared dev/test list stays `[:request_id]`, unchanged — this is why the access-log message string
-above bakes `method`/`path`/`status`/`duration_ms` directly into the human-readable message itself
-(not metadata-only): dev/test's plain-text formatter always prints `$message` regardless of the
-metadata allowlist, so this is what keeps local `mix phx.server` output at least as useful as
-Phoenix's old two-line default, without needing to also expand dev/test's own metadata list.
-`tenant_id`/`subject` stay metadata-only (no message-string duplication) since their value is
-specifically for production log correlation/querying, not for a human watching a dev console.
+**Why the access-log message still bakes in `method`/`path`/`status`/`duration_ms` even though prod
+uses `metadata: :all`:** `config/config.exs`'s shared dev/test metadata list stays the narrow,
+explicit `[:request_id]`, unchanged — `metadata: :all` is a prod-only override. Under dev/test's
+plain-text formatter, an unlisted metadata key is still silently dropped from the `$metadata`
+placeholder, so `method`/`path`/`status`/`duration_ms` would otherwise be invisible in a
+developer's own `mix phx.server` console. Baking them into the message string itself (which
+`$message` always prints, regardless of any metadata allowlist) keeps local dev output at least as
+useful as Phoenix's old two-line default. The same reasoning applies to the 4 existing internal
+`Logger` calls below: their interpolated values move into real metadata (for prod's structured
+`:all` output) but ALSO stay in the message text (for dev/test console readability) — unlike
+`tenant_id`/`subject`, which stay metadata-only, since their value is specifically for production
+log correlation/querying across a whole request, not for a human reading one line at a dev console.
 
 **`RiptideWeb.Plugs.ResolveTenant`** adds one line after the existing `assign(conn, :tenant_id,
 tenant_id)`: `Logger.metadata(tenant_id: tenant_id)`.
@@ -157,10 +166,11 @@ right after `parse_stream_id/1` resolves it, mirroring the SSE controller's plac
 `Riptide.Stream.ReplicaHealer`) and `lib/riptide/stream/placement.ex` (1 call site, module
 `Riptide.Stream.Placement` — corrected from an earlier draft's wrong path/module name,
 `lib/riptide/placement.ex`/`Riptide.Placement`, a different, unrelated module) keep their current
-human-readable messages but move the interpolated values into a real metadata keyword list on each
-call (e.g.
-`Logger.warning("ReplicaHealer failed to repair stream", stream_id: stream_id, dead_node: dead_node, reason: inspect(reason))`),
-consistent with everything above.
+human-readable, value-interpolated messages (so dev/test console output is unchanged) but ALSO
+attach the same values as a real metadata keyword list on each call, e.g.
+`Logger.warning("ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}", stream_id: stream_id, dead_node: inspect(dead_node), reason: inspect(reason))`
+— consistent with the access-log handler's own "message keeps the human string, metadata carries
+the same values separately" approach above.
 
 ## Testing
 
@@ -185,8 +195,29 @@ consistent with everything above.
   connect/join callback runs, using `Logger.metadata/1`'s own getter (`Logger.metadata/0`) rather
   than parsing formatted log output — this tests the actual mechanism (metadata being set) directly
   rather than indirectly through string-matching a log line.
-- The 4 converted internal `Logger` calls: existing tests covering `replica_healer.ex`/
-  `placement.ex` behavior are unaffected (the message text and control flow don't change, only the
-  metadata attached) — no new tests required for these beyond confirming (via `ExUnit.CaptureLog`
-  where a relevant existing test already exercises the log call) that the expected metadata keys
-  are present.
+  **`ReplicationChannel.join/3` needs a specific test-construction caveat**, confirmed by reading
+  `deps/phoenix/lib/phoenix/test/channel_test.ex:423`'s own docstring: "the given channel is joined
+  in a **separate process** which is linked to the test process." A test using the normal
+  `Phoenix.ChannelTest.join/4`/`subscribe_and_join/4` helpers would set `Logger.metadata` inside
+  that separate spawned process, invisible to `Logger.metadata()` read back in the test's own
+  process. The metadata test must instead call `ReplicationChannel.join/3` **directly** (it's a
+  plain, exported function — nothing about its body is channel-process-specific) from the test
+  process itself, bypassing the channel-spawning helper for this one assertion. (`Socket.connect/3`
+  does not have this problem: `Phoenix.ChannelTest.connect/3`'s own `__connect__/4`, confirmed by
+  reading the same file's lines 326-347, calls `handler.connect/1` synchronously via a plain `with`
+  in the calling process — no separate process involved.)
+- The 4 converted internal `Logger` calls: `lib/riptide/stream/placement.ex`'s single call site is
+  directly, cheaply testable — `Riptide.Stream.Placement.handle_info/2`'s non-list-broadcast clause
+  is a plain exported function, callable directly with a crafted message
+  (`{:stream_placement_changed, "some-id", "not-a-list"}`) without needing the module's own running
+  GenServer state; wrap the call in `ExUnit.CaptureLog.capture_log/1` (no `Logger.configure`
+  override needed here — `Logger.warning` is already above `config/test.exs`'s `:warning`
+  threshold) and assert the captured text mentions both interpolated values. The 3 call sites in
+  `lib/riptide/stream/replica_healer.ex` are reachable only through `repair/4`'s private,
+  multi-branch call chain (retention discovery, real `RaCluster.replace_member/5` calls), whose
+  setup is already owned by the existing multi-node, `:peer`-based cluster test files
+  (`replica_healer_cluster_test.exs`, `replica_healer_retention_test.exs`,
+  `replica_healer_leadership_gate_test.exs`) — retrofitting `CaptureLog` assertions into those is
+  out of scope for this phase given that setup complexity, and unnecessary for correctness: the
+  message text and control flow are unchanged, only metadata is added, so the full suite passing
+  unchanged is sufficient evidence these 3 call sites didn't regress.
