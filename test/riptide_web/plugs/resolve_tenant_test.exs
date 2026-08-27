@@ -62,4 +62,11 @@ defmodule RiptideWeb.Plugs.ResolveTenantTest do
     assert conn.status == 400
     refute Map.has_key?(conn.assigns, :tenant_id)
   end
+
+  test "sets tenant_id in Logger metadata on success" do
+    %{conn(:get, "/tenants/acme/resources/foo") | params: %{"tenant_id" => "acme"}}
+    |> ResolveTenant.call(ResolveTenant.init([]))
+
+    assert Logger.metadata()[:tenant_id] == "acme"
+  end
 end

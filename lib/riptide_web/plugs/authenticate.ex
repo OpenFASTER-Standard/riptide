@@ -14,6 +14,7 @@ defmodule RiptideWeb.Plugs.Authenticate do
   non-nil for any route; that's Phase 4c's job.
   """
   import Plug.Conn
+  require Logger
 
   @behaviour Plug
 
@@ -31,6 +32,10 @@ defmodule RiptideWeb.Plugs.Authenticate do
 
         case verifier.verify(token) do
           {:ok, claims} ->
+            if sub = claims["sub"] do
+              Logger.metadata(subject: sub)
+            end
+
             assign(conn, :current_subject, claims)
 
           {:error, _reason} ->

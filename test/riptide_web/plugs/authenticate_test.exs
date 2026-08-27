@@ -9,6 +9,7 @@ defmodule RiptideWeb.Plugs.AuthenticateTest do
 
     @impl true
     def verify("valid-token"), do: {:ok, %{"sub" => "user-1"}}
+    def verify("no-sub-token"), do: {:ok, %{"other" => "claim"}}
     def verify(_token), do: {:error, :invalid_token}
   end
 
@@ -81,5 +82,31 @@ defmodule RiptideWeb.Plugs.AuthenticateTest do
 
     assert conn.assigns.current_subject == nil
     refute conn.halted
+  end
+
+  test "sets subject in Logger metadata when a valid token has a sub claim" do
+    :get
+    |> conn("/resources/foo")
+    |> put_req_header("authorization", "Bearer valid-token")
+    |> Authenticate.call(Authenticate.init([]))
+
+    assert Logger.metadata()[:subject] == "user-1"
+  end
+
+  test "does not set subject in Logger metadata for an anonymous request" do
+    :get
+    |> conn("/resources/foo")
+    |> Authenticate.call(Authenticate.init([]))
+
+    refute Keyword.has_key?(Logger.metadata(), :subject)
+  end
+
+  test "does not set subject in Logger metadata when claims lack a sub" do
+    :get
+    |> conn("/resources/foo")
+    |> put_req_header("authorization", "Bearer no-sub-token")
+    |> Authenticate.call(Authenticate.init([]))
+
+    refute Keyword.has_key?(Logger.metadata(), :subject)
   end
 end
