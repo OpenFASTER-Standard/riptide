@@ -147,6 +147,108 @@ metadata:
 Setting up Prometheus itself (and any Grafana dashboards/alerting on top of it) is your own
 deployment's concern — these manifests only expose the metrics, they don't install a scraper.
 
+## Performance
+
+Measured 2026-08-27 against the code at this point in `main`. Every number below is from a real
+run on this exact machine, not an estimate — see [Methodology](#methodology) for exactly how to
+reproduce it and what its limitations are.
+
+### Core primitives (Elixir-level, `Benchee`)
+
+Micro-benchmarks of the operations everything else is built on: RDF/Turtle codec, patch
+application, and the three Ra-backed primitives (stream append, stream read, placement lookup)
+and the in-memory authorization check.
+
+| Operation | Throughput | Mean latency | Median | p99 |
+|---|---:|---:|---:|---:|
+| `Patch.apply/2` (1 addition + 1 removal) | 599.5K/s | 1.67 μs | 1.19 μs | 2.85 μs |
+| `Placement.lookup/1` (cached cluster, hot path) | 179.8K/s | 5.56 μs | 4.68 μs | 12.93 μs |
+| `StreamServer.get_since/2` (10-event history, full read) | 121.7K/s | 8.21 μs | 6.98 μs | 16.58 μs |
+| `TurtleCodec.encode/1` (1 triple) | 112.3K/s | 8.91 μs | 7.82 μs | 31.65 μs |
+| `Authz.evaluate/4` (1 `:public` policy, depth-1 path) | 112.0K/s | 8.93 μs | 7.59 μs | 19.89 μs |
+| `StreamServer.get_since/2` (1000-event history, tail read) | 54.4K/s | 18.37 μs | 17.47 μs | 36.82 μs |
+| `StreamServer.get_since/2` (100-event history, full read) | 29.0K/s | 34.46 μs | 31.06 μs | 59.04 μs |
+| `TurtleCodec.decode/1` (1 triple) | 21.8K/s | 45.92 μs | 43.41 μs | 70.47 μs |
+| `TurtleCodec.encode/1` (50 triples) | 4.8K/s | 207.95 μs | 204.21 μs | 277.24 μs |
+| `StreamServer.get_since/2` (1000-event history, full read) | 3.1K/s | 327.12 μs | 280.63 μs | 523.68 μs |
+| `TurtleCodec.decode/1` (50 triples) | 1.2K/s | 872.37 μs | 847.23 μs | 1141.85 μs |
+| `StreamServer.append/2` (`:replace`, empty graph) | 316/s | 3.16 ms | 3.12 ms | 4.14 ms |
+
+Two things stand out. First, `append/2` is roughly 1000x slower than everything above it in this
+table — that's the cost of a real Raft commit with an fsync'd write-ahead log on every single
+append, not something the implementation is failing to optimize; it's the actual price of the
+durability guarantee this table is really measuring. Second, `get_since/2`'s full-history cost
+grows with the stream's total history size (scanning/decoding every stored event), while its
+tail-read cost (a fresh cursor near the end) stays cheap regardless of history size — read cost is
+about how much of the log a given cursor needs to replay, not how long the stream has existed.
+
+### HTTP (`wrk`, single node)
+
+| Scenario | Concurrency | Throughput | p50 | p90 | p99 |
+|---|---|---:|---:|---:|---:|
+| `GET /health/live` | 4 threads / 32 conns | 19,343 req/s | — | — | — |
+| `GET` LDP resource (10-triple body) | 1 thread / 1 conn | 3,004 req/s | 0.32 ms | 0.40 ms | 0.51 ms |
+| `GET` LDP resource | 4 threads / 32 conns | 9,643 req/s | — | — | — |
+| `GET` LDP resource | 8 threads / 128 conns | 11,094 req/s | 8.4 ms | 36.5 ms | 48.8 ms |
+| `GET` LDP resource | 8 threads / 256 conns | 11,670 req/s | 16.8 ms | 49.4 ms | 61.4 ms |
+| `PUT` (write) same resource repeatedly | 1 thread / 1 conn | 372 req/s | 2.55 ms | 2.90 ms | 11.92 ms |
+| `PUT` same resource repeatedly | 4 threads / 32 conns | 1,293 req/s | 19.5 ms | 69.6 ms | 392.5 ms |
+| `PUT` same resource repeatedly | 8 threads / 128 conns | 764 req/s | 168.5 ms | 242.1 ms | 280.9 ms |
+| `PUT` spread across 500 resources | 4 threads / 32 conns | 3,014 req/s | 6.1 ms | 39.7 ms | 56.0 ms |
+| `PUT` spread across 500 resources | 8 threads / 128 conns | 4,865 req/s | 17.2 ms | 60.8 ms | 68.6 ms |
+
+The `PUT` rows are the most important ones to read carefully, and they tell a real architectural
+story, not just a number: **hammering one resource with concurrent writes doesn't scale, and
+shouldn't** — throughput actually *drops* from 1,293 to 764 req/s going from 32 to 128 connections,
+because every write to the same resource serializes through that resource's own single-writer Ra
+log (by design — see "How the pieces fit together" above). Concurrent writers to the *same*
+resource just queue up and their latency grows; there is no amount of added concurrency that helps
+that case, and this benchmark demonstrates it rather than papering over it. Spreading writes across
+many different resources (the realistic multi-tenant/multi-resource shape) scales the way you'd
+expect instead: 3,014 → 4,865 req/s from 32 to 128 connections, each resource's writes still fully
+serialized and durable, but different resources' Ra clusters make progress independently.
+
+### Methodology
+
+- **Hardware**: 16-core Intel Xeon Platinum 8581C @ 2.10GHz, 62.8 GB RAM. Elixir 1.18.4, Erlang/OTP
+  25.2.3 (JIT enabled).
+- **Single node, not a 3-replica HA cluster.** Every stream (and the placement metadata cluster
+  itself) runs with a real Ra log and a real fsync'd WAL, but with a replication factor of 1 —
+  these numbers do not include cross-node Raft replication latency, which Phase 3's own HA design
+  spec already establishes adds a real, separate cost (a leader must hear back from a quorum of
+  replicas before committing). Benchmarking the 3-replica case needs a real multi-node
+  cluster and is a natural next benchmarking pass, not something this single-machine run
+  attempts to simulate.
+- **Client and server share this same 16-core machine** — `wrk` itself consumes real CPU that
+  would otherwise go to Riptide, so the HTTP throughput numbers above are a lower bound on what a
+  dedicated load-generator-on-a-separate-host setup would show, not an upper bound.
+- **Build**: a `:test`-config build (`mix test`'s own app boot, `code_reloader`/`debug_errors`
+  explicitly disabled), not a full `:prod` release — see `test/bench/http_server_test.exs`'s own
+  comment for exactly why (`force_ssl` is compile-time-locked to `:prod` only, and standing up a
+  real 3-ordinal-DNS-resolved placement cluster just for a single-node benchmark isn't worth a
+  permanent config escape hatch). `:phoenix, :plug_init_mode` also stays `:runtime` (dev/test's
+  faster-recompile setting) rather than `:prod`'s `:compile` — a real production release's plug
+  pipeline has one less layer of per-request overhead than what's measured here.
+- **Not measured in this pass**: SSE/WebSocket live-delivery (append-to-subscriber) latency, and
+  authenticated (OIDC) request overhead (every request above is anonymous, matched against a
+  `:public` policy — real JWT verification adds its own cost on top of `Authz.evaluate/4`'s number
+  above). Both are reasonable candidates for a follow-up benchmarking pass, not silently assumed to
+  be free.
+
+Reproduce it yourself:
+
+```bash
+# Core primitives (Elixir-level Benchee benchmarks)
+mix test test/bench/core_bench_test.exs --include benchmark --trace
+
+# HTTP server for wrk/curl/etc. — run this in one terminal, drive it from another
+mix test test/bench/http_server_test.exs --include benchmark --trace
+wrk -t8 -c128 -d10s --latency http://127.0.0.1:4000/tenants/http-bench-tenant/resources/bench-read-doc
+wrk -t8 -c128 -d10s --latency -s bench/wrk-put-many-resources.lua http://127.0.0.1:4000
+```
+
+See `bench/README.md` for what each script does and why it's structured the way it is.
+
 ## Releasing
 
 Riptide uses plain [semver](https://semver.org/) tags (`vMAJOR.MINOR.PATCH`, optionally with a

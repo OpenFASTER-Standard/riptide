@@ -41,3 +41,7 @@ riptide-2/
 # Real Kubernetes Secret values (copied from k8s/secret.example.yaml) —
 # never commit RELEASE_COOKIE/SECRET_KEY_BASE.
 k8s/secret.yaml
+
+# Written at runtime by test/bench/http_server_test.exs (see bench/README.md)
+# for wrk's PUT benchmarks to read — regenerated every run, not source.
+test/bench/put_body.ttl
