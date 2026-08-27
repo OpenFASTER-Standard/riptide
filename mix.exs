@@ -58,7 +58,8 @@ defmodule Riptide.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       # bench/ only (see bench/README.md) — not needed to build, test, or
       # run Riptide itself.
-      {:benchee, "~> 1.3", only: [:dev, :test], runtime: false}
+      {:benchee, "~> 1.3", only: [:dev, :test], runtime: false},
+      {:cors_plug, "~> 3.0"}
     ]
   end
 end
