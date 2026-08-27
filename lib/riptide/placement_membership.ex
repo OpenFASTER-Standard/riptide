@@ -48,6 +48,14 @@ defmodule Riptide.PlacementMembership do
       [{:members, members}] -> members
       [] -> []
     end
+  rescue
+    # The cache table doesn't exist at all — this node never ran
+    # Riptide.Application.start/2 (e.g. a bare `:peer` node in a test, which
+    # never boots the real supervision tree). Degrading to [] here is
+    # correct, not just defensive: an empty list makes `Riptide.Placement`'s
+    # own fast-path/fallback logic naturally fall through to a live fleet
+    # probe instead, exactly as if the cache were merely stale/unpopulated.
+    ArgumentError -> []
   end
 
   @spec target_size() :: pos_integer()

@@ -95,9 +95,18 @@ safely instead in Task 2's `placement_membership_test.exs`, which is `async: fal
       assert RaCluster.join_placement_cluster([node()]) == :ok
     end
 
-    test "remove_placement_member/2 removing a node that was never a member returns an error" do
-      assert {:error, _reason} =
-               RaCluster.remove_placement_member([node()], :"riptide@10.0.0.9")
+    test "remove_placement_member/2 removing a node that was never a member is a safe no-op" do
+      # Shares remove_member/2's existing disambiguation logic with
+      # replace_member/5 (used for real by ReplicaHealer): "not in the
+      # survivors' current membership" is treated as :ok whether that's
+      # because the node was already removed, or because it was never a
+      # member in the first place — replace_member/5's real callers only
+      # ever pass a genuine prior member, so this ambiguity never manifests
+      # in practice; documented here rather than asserting a stricter
+      # contract the shared helper doesn't actually provide. (Confirmed
+      # empirically: the original stricter assertion here failed for
+      # exactly this reason once the suite actually ran.)
+      assert RaCluster.remove_placement_member([node()], :"riptide@10.0.0.9") == :ok
     end
   end
 ```
@@ -523,6 +532,16 @@ defmodule Riptide.PlacementMembership do
       [{:members, members}] -> members
       [] -> []
     end
+  rescue
+    # The cache table doesn't exist at all — this node never ran
+    # Riptide.Application.start/2 (e.g. a bare `:peer` node in a test, which
+    # never boots the real supervision tree). Degrading to [] here is
+    # correct, not just defensive: an empty list makes `Riptide.Placement`'s
+    # own fast-path/fallback logic naturally fall through to a live fleet
+    # probe instead, exactly as if the cache were merely stale/unpopulated.
+    # (Confirmed necessary empirically once Tasks 8-12's :peer-based tests
+    # actually ran: every bare :peer node in this suite hits this path.)
+    ArgumentError -> []
   end
 
   @spec target_size() :: pos_integer()
@@ -1374,35 +1393,118 @@ git commit -m "Config: remove ordinal_resolver/RIPTIDE_SINGLE_NODE, add RIPTIDE_
 - Modify: `lib/riptide/auth/verifier.ex`
 - Modify: `lib/riptide/tenancy/resolver.ex`
 - Modify: `lib/riptide/placement/placement_machine.ex`
+- Modify: `test/riptide/placement_test.exs` (a genuine plan gap found only once the full
+  test suite ran for real — not caught by the earlier codebase-wide audit)
 
-These 4 files reference `Riptide.RaCluster.default_ordinal_resolver/1` or `placement_server_id/1,2` in prose comments only (no functional code depends on them) — purely doc drift now that Tasks 1-3 removed/changed those functions.
+The first 4 files reference `Riptide.RaCluster.default_ordinal_resolver/1` or
+`placement_server_id/1,2` in prose comments only (no functional code depends on them) —
+purely doc drift now that Tasks 1-3 removed/changed those functions. `test/riptide/
+placement_test.exs` is different: it has one REAL test (not a comment) still calling the
+removed `Placement.lookup/2` (with a `resolve_fun` argument) to simulate "every member
+unreachable" — this file was missed by the original repo-wide audit because that audit's
+searches matched `Riptide.Placement.lookup/2` calls generically but this specific one
+wasn't distinguished from the many legitimate `lookup/1` calls elsewhere in the same file
+until the suite actually ran and failed on it.
 
-- [ ] **Step 1: Fix each stale reference**
+- [ ] **Step 1: Fix the 4 stale doc comments**
 
-Run `grep -n "default_ordinal_resolver\|placement_server_id/1,2" lib/riptide_web/plugs/resolve_tenant.ex lib/riptide/auth/verifier.ex lib/riptide/tenancy/resolver.ex lib/riptide/placement/placement_machine.ex` to find the exact line in each file, then read 5 lines of context around each and update the reference:
+Applied (verified against each file's real surrounding sentence, not just a literal
+function-name swap, so each reads grammatically):
 
-- `lib/riptide_web/plugs/resolve_tenant.ex`: replace `` `Riptide.RaCluster.default_ordinal_resolver/1`'s config-driven resolver `` with `` `Riptide.PlacementMembership`'s config-driven discovery ``.
-- `lib/riptide/auth/verifier.ex`: replace `` `Riptide.RaCluster.default_ordinal_resolver/1` (Phase 3c-i) already use `` with `` `Riptide.PlacementMembership` (Phase 3e) already uses ``.
-- `lib/riptide/tenancy/resolver.ex`: replace `` the same config-driven swap `Riptide.RaCluster.default_ordinal_resolver/1` `` with `` the same config-driven swap `Riptide.PlacementMembership` ``.
-- `lib/riptide/placement/placement_machine.ex`: replace `` fixed-membership Ra cluster (see `Riptide.RaCluster.placement_server_id/1,2`) `` with `` elastic-membership Ra cluster (see `Riptide.PlacementMembership`) ``.
+- `lib/riptide_web/plugs/resolve_tenant.ex`: replaced "mirrors `Riptide.RaCluster.
+  default_ordinal_resolver/1`'s config-driven resolver swap (Phase 3c-i)" with "a
+  config-driven resolver swap (Phase 4a)" — the cross-reference is simply dropped rather
+  than pointed at a new analog, since `Riptide.PlacementMembership` doesn't have an
+  equivalent "swap via config" mechanism anymore (the whole point of Phase 3e is that
+  kind of runtime-swappable resolver is gone, replaced by real discovery).
+- `lib/riptide/auth/verifier.ex`: replaced "the same config-driven swap `Riptide.Tenancy.
+  Resolver` (Phase 4a) and `Riptide.RaCluster.default_ordinal_resolver/1` (Phase 3c-i)
+  already use" with "the same config-driven swap `Riptide.Tenancy.Resolver` (Phase 4a)
+  already uses" — same reasoning, drop rather than repoint.
+- `lib/riptide/tenancy/resolver.ex`: replaced "the same config-driven swap `Riptide.
+  RaCluster.default_ordinal_resolver/1` already uses (Phase 3c-i)" with "a config-driven
+  swap for picking a resolution strategy per deployment" — same reasoning.
+- `lib/riptide/placement/placement_machine.ex`: replaced "a small, fixed-membership Ra
+  cluster (see `Riptide.RaCluster.placement_server_id/1,2`)" with "a small,
+  elastic-membership Ra cluster (see `Riptide.PlacementMembership`)".
 
-Read each file's exact surrounding sentence first (via the grep above) so the replacement reads grammatically — the exact phrasing around each reference may need a small adjustment beyond the literal function-name swap to stay a coherent sentence.
+- [ ] **Step 2: Fix `test/riptide/placement_test.exs`**
 
-- [ ] **Step 2: Run the full test suite**
+Change the module to `async: false` (it has 15 other tests, all fine as `async: true`, but
+the one fix below sets `:placement_members_override`, global Application state every
+other test touching `Riptide.Placement` anywhere in the suite also reads — matching the
+exact reasoning `test/riptide_web/health_test.exs` and `test/riptide_web/realtime/
+sse_controller_test.exs` already use for the identical hazard):
+
+```elixir
+defmodule Riptide.PlacementTest do
+  # async: false — the "emits an exception event when every member fails"
+  # test below sets :placement_members_override, global Application state
+  # every other test touching Riptide.Placement anywhere in the suite also
+  # reads, matching the same reasoning test/riptide_web/health_test.exs and
+  # test/riptide_web/realtime/sse_controller_test.exs already use for the
+  # identical hazard.
+  use ExUnit.Case, async: false
+```
+
+Replace the failing test:
+
+```elixir
+    test "lookup/1 emits an exception event when every ordinal fails" do
+      failing_resolver = fn _ordinal -> :nonexistent@nohost end
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:riptide, :placement, :lookup, :exception]
+        ])
+
+      assert_raise RuntimeError, fn ->
+        Placement.lookup("some-stream-id", failing_resolver)
+      end
+
+      assert_received {[:riptide, :placement, :lookup, :exception], ^ref, %{duration: _},
+                       %{kind: :error}}
+    end
+```
+
+with:
+
+```elixir
+    test "lookup/1 emits an exception event when every member fails" do
+      original = Application.get_env(:riptide, :placement_members_override)
+      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
+      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:riptide, :placement, :lookup, :exception]
+        ])
+
+      assert_raise RuntimeError, fn ->
+        Placement.lookup("some-stream-id")
+      end
+
+      assert_received {[:riptide, :placement, :lookup, :exception], ^ref, %{duration: _},
+                       %{kind: :error}}
+    end
+```
+
+- [ ] **Step 3: Run the full test suite**
 
 Run: `mix test`
-Expected: PASS — these are comment-only changes, no behavior affected.
+Expected: PASS — this closes the last remaining Task-6-scope gap; only Tasks 7-12's own
+`:peer`-based files should still fail after this step.
 
-- [ ] **Step 3: Run format and lint**
+- [ ] **Step 4: Run format and lint**
 
 Run: `mix format && mix credo --strict`
 Expected: clean.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add lib/riptide_web/plugs/resolve_tenant.ex lib/riptide/auth/verifier.ex lib/riptide/tenancy/resolver.ex lib/riptide/placement/placement_machine.ex
-git commit -m "Fix stale doc references to removed ordinal-resolver functions"
+git add lib/riptide_web/plugs/resolve_tenant.ex lib/riptide/auth/verifier.ex lib/riptide/tenancy/resolver.ex lib/riptide/placement/placement_machine.ex test/riptide/placement_test.exs
+git commit -m "Fix stale doc references and a missed old-API test call (test/riptide/placement_test.exs)"
 ```
 
 ---
