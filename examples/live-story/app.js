@@ -39,10 +39,30 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function unescapeShortTurtleLiteral(value) {
+  return value.replace(/\\(.)/g, (_, ch) => {
+    switch (ch) {
+      case "n": return "\n";
+      case "r": return "\r";
+      case "t": return "\t";
+      case "b": return "\b";
+      case "f": return "\f";
+      case '"': return '"';
+      case "\\": return "\\";
+      default: return ch;
+    }
+  });
+}
+
 function extractLiteral(turtle, predicateIri) {
-  const pattern = new RegExp(`<${escapeRegExp(predicateIri)}>\\s+"""([\\s\\S]*?)"""`);
+  const pattern = new RegExp(
+    `<${escapeRegExp(predicateIri)}>\\s+(?:"""([\\s\\S]*?)"""|"((?:[^"\\\\]|\\\\.)*)")`
+  );
   const match = turtle.match(pattern);
-  return match ? unescapeTurtleLiteral(match[1]) : null;
+  if (!match) return null;
+  return match[1] !== undefined
+    ? unescapeTurtleLiteral(match[1])
+    : unescapeShortTurtleLiteral(match[2]);
 }
 
 function renderLine(turtle) {
