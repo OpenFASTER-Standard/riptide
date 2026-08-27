@@ -1,498 +1,529 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, revised after an independent cold review and a targeted
-re-verification pass against primary sources. This is an architecture spec
-covering the full vision and a phased roadmap — not a single implementation
-plan. Each phase gets its own implementation plan (`writing-plans`) when work
-on it starts.
-
-**Revision note:** this replaces an earlier draft of the same spec. The
-revision fixed two factual errors (§4.1, §4.2), one internally contradictory
-concept (§3.4's Generalization), one concept whose stated definition didn't
-actually support its own use (§3.2/§3.3), an overclaimed invariant (§3.5's
-Generalization Fidelity law), a real security gap (Capability was never
-tenant-scoped), and a roadmap that hid its riskiest problem inside a step
-labeled "pure wiring." All of this came from treating the first draft as
-something to stress-test, not something to defend — see §9 for the itemized
-before/after.
+**Status:** Draft, second substantive revision. This is one architecture spec
+defining several sub-projects (§7) — each gets its own implementation plan
+(`writing-plans`) when work on it starts. This revision adds the public
+Pattern Hub and ontology Crosswalk mechanism, corrects a mis-scoped
+institution-theoretic claim caught by dedicated verification, closes a real
+consistency gap between observing external state and the fidelity
+requirement, and folds `administration-commons` in as superseded rather than
+something to reconcile with — see §10 for the itemized changelog.
 
 ## 1. Motivation and vision
 
-Riptide today is an event-sourced fact store (StreamLD's reference
-implementation): an append-only, per-resource log of RDF facts, with one
-hardcoded derivation (replay a stream's events in order to compute current
-state). This spec adds the layer that's structurally missing: a general
-**derivation and execution engine**, so that "answer a question about the
-facts" and "cause an effect in the world" become two interpretations of the
-same declarative object, evaluated by one engine, instead of bespoke
-application code per feature.
+Riptide today is an event-sourced fact store: an append-only, per-resource
+log of RDF facts, with one hardcoded derivation. This spec adds the layer
+that's structurally missing: a general **derivation and execution engine**,
+so that "answer a question about the facts" and "cause an effect in the
+world" become two interpretations of the same declarative object, evaluated
+by one engine.
 
 The organizing idea: **the atomic unit should have a stable identity, and
-everything else — labels, presentations, procedures — should be a *view*
-derived from that identity, never the identity itself.** Riptide's event log
-already does this for facts. This spec extends the same discipline to
-*rules*.
+everything else should be a *view* derived from that identity, never the
+identity itself.** This spec extends that discipline from facts to rules,
+and — new in this revision — to the *vocabularies rules are expressed in*,
+which is what §6 (Pattern Hub) and §6.5 (Crosswalks) are for. The same
+underlying instinct shows up a third time there: when no existing bridge
+covers something (no matching prior Trace, no matching CatalogEntry, no
+matching Crosswalk), a human/direct-origination step fills the gap once, and
+the bridge gets built incrementally from real use — never front-loaded.
+That's not three separate design choices; it's one discipline, applied
+consistently, which is itself evidence the design is coherent rather than a
+pile of individually-plausible ideas.
 
-**What that does and doesn't settle about deployment.** It settles that this
-layer shares Riptide's Fact store, Rule representation, and Signature/Dialect
-definitions as one substrate — no second store, no parallel schema, nothing
-that needs reconciling with Riptide's own facts. It does **not**, by itself,
-settle whether the derivation/execution engine must run in the same OS
-process or release as Riptide's existing LDP surface. That's a real,
-separate engineering question — particularly once §3.3's Capability grants
-are in the picture, which expand the trusted computing base from "evaluates
-RDF queries" to "executes arbitrary sandboxed code." Kept open in §8, not
-asserted here.
+**What's settled about deployment, and what isn't.** Settled: this layer
+shares Riptide's Fact store, Rule representation, and Signature/Dialect
+definitions as one substrate. Not settled, and not asserted here: whether
+the engine runs in the same OS process as Riptide's existing LDP surface —
+genuinely open, see §9.
 
-## 2. Scope and explicit non-goals
+## 2. Scope
 
-**In scope:** the conceptual object model (§3), the grounding for each design
-decision (§4), a worked example (§5), and the phased build order (§7),
-including the concrete, ready-to-plan scope of Phase 1 (§7.1).
+**In scope:** the object model (§3–6), the grounding for each decision (§8),
+two worked examples (§9), and the sub-project breakdown (§7).
 
-**Explicitly out of scope** — flagged as open, not silently assumed:
-- Whether this layer becomes a public `OpenFASTER-Standard` module or stays
-  Riptide-internal.
-- Formal theory for coordinating **concurrent effectful** rule executions
-  (two templates racing on the same Kubernetes namespace). Neither the saga
-  pattern nor CRDTs were found to establish this — CRDT convergence is about
-  merging *data*, not arbitrating *irreversible effects*. This is real,
-  currently-unsolved design surface, not deferred paperwork (see §7, Phase
-  4b).
-- Whether the engine is a separate deployable from Riptide's LDP surface
-  (§1).
-- Detailed UI design — reuse `graphsheet`'s SHACL-driven pattern for the
-  review/discovery/monitoring surfaces this layer needs; screens aren't
-  designed here.
-- The final human-facing name for a Riptide tenant. Shortlist: **Polity**,
-  Enclave, Civitas, Demesne. This document uses **Tenant** as a placeholder.
-- Observability and testing strategy for the engine itself, beyond what
-  §4.9 requires as a precondition for later phases — Riptide's own
-  PROGRESS.md already treats observability (sub-project 5) and
-  schema-versioning risk as first-class, ongoing concerns; this layer
-  should be planned against that existing discipline when Phase 2 starts,
-  not invent a separate one here.
+**`administration-commons` note.** An earlier local project used the term
+"pattern" for a similar idea and sketched its own kernel (content-addressed
+store, Merkle log, WASI executor). It's superseded by this work, not
+something this spec reconciles with — noted here once so a future reader
+finding that repo isn't confused about which is current.
 
-## 3. Core concepts (the T-box)
+**Explicitly still open** (§9 for the full list): concurrent-effectful-
+execution coordination; whether this engine is a separate deployable from
+Riptide's LDP surface; formal versioning/supersedes theory for rules (a
+pragmatic git-like model is adopted instead); the final Tenant name; and,
+new in this revision, automated detection of ontology overlap (deliberately
+out of scope *by design*, not by gap — see §6.5).
+
+## 3. Core concepts — facts and rules
 
 ### 3.1 Fact, Event, Tenant
 
-- **Fact** — an atomic RDF(-star) assertion in the EDB. Carries a
-  *TransactionTime* (free, from Riptide's sequence number) and optionally a
-  *ValidTime* interval, RDF-star-annotated (§4.4). Produced by one **Event**.
-- **Tenant** *(name TBD, §2)* — an isolated administrative/institutional
-  space. **Facts, Rules, CatalogEntries, and Capabilities are all
-  tenant-partitioned** — Capability is added to this list in this revision;
-  its absence in the first draft was a real gap (§9, item 6). A Capability
-  grant issued inside one Tenant must never be exercisable by a Rule running
-  in another. This has to compose with Riptide's already-shipped Phase 4c
-  ACP-based authorization, not duplicate it — Capability is *scoped by* the
-  existing tenant/grant model, not a second, parallel permission system.
+- **Fact** — an atomic RDF(-star) assertion in the EDB. Carries
+  *TransactionTime* (from Riptide's sequence number) and optionally a
+  *ValidTime* interval (RDF-star-annotated, §8.4). Produced by one **Event**.
+- **Tenant** *(name TBD — shortlist: Polity, Enclave, Civitas, Demesne)* —
+  an isolated administrative/institutional space. Facts, Rules,
+  CatalogEntries, and Capabilities are all tenant-partitioned. A Capability
+  grant in one Tenant is never exercisable by a Rule in another; this
+  composes with Riptide's existing Phase 4c ACP authorization, not a
+  parallel system.
+- **A Tenant's vocabulary is observed, not declared.** No separate
+  "ontology preference" object. Whichever Signature a Tenant's own Facts
+  happen to already use *is* their working vocabulary for that area — it
+  falls out of usage. A brand-new Tenant installing its first Pattern simply
+  adopts that Pattern's native Signature; there's nothing to translate yet.
+  This removes a concept ("domain area," "ontology preference") that isn't
+  actually needed once Crosswalk resolution (§6.5) is field-level, not
+  whole-ontology: two Signatures with zero overlapping predicates simply
+  coexist, and Crosswalk resolution only engages where fields genuinely
+  overlap.
 
 ### 3.2 Signature, Dialect, Rule
 
-- **Signature** — the typed interface of a Rule: its parameters, and which
-  predicates it reads/produces. Reuses DOL's `Sign` precisely.
+- **Signature** — a Rule's typed interface: its parameters and which
+  predicates it reads/produces. Institution-theoretically, this is DOL's
+  `Sign`, reused precisely — an arrow in one institution's `Sign` category
+  (confirmed against Goguen & Burstall's own definition; see §8.1).
 - **Dialect** — which concrete rule language a Rule is expressed in. Two
-  candidate targets are being tracked, not one: **SPARQL-RL** and **SHACL
-  1.2 Rules** are both live W3C Working Drafts on the Recommendation track
-  as of this writing, developed in parallel by the Data Shapes Working
-  Group — the first draft of this spec incorrectly described SPARQL-RL as
-  SHACL 1.2 Rules' successor; that relationship isn't documented anywhere
-  and both documents are actively progressing. Track both; adopt whichever
-  reaches sufficient maturity/tooling support first, or both if they serve
-  different needs. Reference engine for actual evaluation: Soufflé's
-  extended Datalog.
+  candidates tracked in parallel, not one succeeding the other: **SPARQL-RL**
+  and **SHACL 1.2 Rules**, both live W3C Working Drafts on the
+  Recommendation track, developed in parallel by the Data Shapes Working
+  Group. Reference evaluation engine: Soufflé's extended Datalog.
 - **Rule** — a declarative IDB definition over a Signature: given a Body,
-  conclude a Head. A Body is a conjunction of literals over two kinds:
-  ordinary **Fact-pattern literals** (matched against the EDB, as in
-  classical Datalog) and, where applicable, a distinguished
-  **capability-reference literal** — a reference to a Capability that
-  ExecuteInterpretation may invoke. This second literal kind is what closes
-  the gap the first draft left open: NativeTemplate's capability-invoking
-  behavior is now part of Rule's own definition, not asserted about Rule
-  from the outside. QueryInterpretation treats a capability-reference
-  literal as inert (unevaluable, contributing nothing to derived facts);
-  ExecuteInterpretation is what actually invokes it.
+  conclude a Head. A Body is a conjunction of three literal kinds:
+  - **Fact-pattern literals** — matched against the EDB, classical Datalog.
+  - **Capability-reference literals** — a reference to a Capability (§4)
+    that ExecuteInterpretation may invoke.
+  - **Rule-reference literals** — a call to another Rule, with argument
+    bindings. **Added in this revision, closing a real bug**: the previous
+    version of this document restricted Body to the first two kinds, which
+    made Rule composability — a Template calling other Templates, the whole
+    point of the design — inexpressible. Caught by tracing a real scenario
+    through the model (§9), not by re-reading the document.
 
-### 3.3 Capability, NativeTemplate, Template
+## 4. Capability, NativeTemplate, Template
 
-- **Capability** — an explicit, tenant-scoped, grantable permission (spawn a
-  process, read a path, reach a host). Backed by WASI Preview 2 (no ambient
-  authority, no subprocess spawning by design) plus WASIX where subprocess
-  spawning is specifically granted (§4.3). Composes with Riptide's Phase 4c
-  ACP model per §3.1 — not a parallel system.
+- **Capability** — an explicit, tenant-scoped, grantable permission. Split
+  into two kinds, **new in this revision**, because collapsing them created
+  a real inconsistency (§8.5, §9):
+  - **EffectCapability** — changes something in the world (deploy a
+    service). Fidelity replay-testing (§5) actually re-invokes it,
+    sandboxed, and compares against the recorded Trace.
+  - **ObserveCapability** — reads external state and asserts the result as
+    new Facts, changing nothing external (check whether a filing already
+    exists). Fidelity replay-testing does *not* re-invoke the real external
+    system — the world isn't expected to be frozen between runs. It replays
+    the response recorded in Provenance instead, and checks that downstream
+    Rule logic behaves consistently given that recorded response. This
+    means an ObserveCapability's Provenance must record the actual observed
+    data, not just which capability was called with which parameters.
+  - Both kinds carry a **StabilityClass** — `documented` (a stable, versioned
+    public interface) or `undocumented` (a reverse-engineered or otherwise
+    unversioned interface, liable to silent breakage). This doesn't solve
+    fragility; it makes it visible and queryable. Discovery (§6) uses it as
+    a ranking input alongside recency/specificity when multiple
+    CatalogEntries could satisfy the same Task — this is not a new
+    selection mechanism, it's one more input to the mechanism §6 already
+    has.
+  - Backed by WASI Preview 2 (no ambient authority, no subprocess spawning
+    by design) plus WASIX where subprocess spawning is specifically
+    granted (§8.3).
 - **NativeTemplate** — a Rule whose Body is exactly one capability-reference
-  literal and nothing else: the base case, backed by a real,
-  capability-scoped WASI component. **Sequencing note, fixing a real
-  ordering ambiguity in the first draft:** Phase 2 (§7) builds the
-  capability-scoped WASI *execution substrate* standalone, with no Rule
-  representation involved at all — it does not yet produce NativeTemplate
-  instances, because NativeTemplate is a Rule, and Rule's own representation
-  isn't built until Phase 3. Phase 4 is what wraps the Phase 2 substrate as
-  actual NativeTemplate Rule instances. "NativeTemplate is the base case of
-  Rule" describes the finished system, not the build order.
+  literal. The base case, backed by a real, capability-scoped WASI
+  component. Sequencing note: Sub-project 2 (§7) builds the WASI execution
+  substrate standalone, with no Rule representation involved — it doesn't
+  produce NativeTemplate instances yet, since NativeTemplate is a Rule and
+  Rule's representation isn't built until Sub-project 3. Sub-project 4 is
+  what wraps Sub-project 2's substrate as actual NativeTemplate instances.
 - **Template** — `Template ⊑ Rule ⊓ (∃ a reachable step whose
-  ExecuteInterpretation invokes a Capability)`. This *is* a structural
-  predicate (graph reachability over the Rule's own Body/composition
-  structure) — the first draft's claim that Template membership involves
-  "no structural difference" from Rule was imprecise and is dropped here.
-  The real point, stated correctly: Template is not a *separate primitive*
-  requiring its own representation — it's a checkable property of the one
-  Rule representation everything already shares.
+  ExecuteInterpretation invokes a Capability)`. A structural (graph-
+  reachability) predicate over the one Rule representation everything
+  shares — not a separate primitive.
 
-### 3.4 Trace, Generalization, Provenance
+## 5. Trace, Generalization, Interpretation, Provenance
 
-- **Trace ⊑ Rule.** Revised from the first draft, which typed Trace as an
-  unrelated primitive and then couldn't consistently type Generalization
-  around it (§9, item 2). A Trace is simply a Rule whose Signature has no
-  free parameters — every value is already ground, from one concrete run
-  (a Rule's ExecuteInterpretation with specific bindings, or an ad hoc
-  LLMFallback episode). This makes Trace a degenerate case of Rule, not a
-  different kind of thing.
+- **Trace ⊑ Rule** — a Rule whose Signature has no free parameters; every
+  value already ground, from one concrete run.
 - **Generalization — uniformly `Rule × Rule → Rule`.** Anti-unification
-  (Plotkin 1970) computes the least-general-generalization of any two Rules
-  — whether both are ground (two Traces), one is ground and one already has
-  free parameters (a new Trace against an existing candidate), or neither is
-  ground (DedupGate anti-unifying a candidate against a CatalogEntry). One
-  operation, one type signature, used identically everywhere it appears in
-  §3.6's pipeline. Always accompanied by the substitutions recovering each
-  input and by mandatory **Provenance** — the dependency edge back to what
-  was generalized, which is what keeps a generalized Rule from becoming an
+  (Plotkin 1970) computes the least-general-generalization of any two
+  Rules, whether both ground, one ground and one not, or neither. One
+  operation, one type signature, used identically wherever it appears in
+  §6's pipeline. Always accompanied by the recovering substitutions and by
+  mandatory **Provenance**.
+- **Admission consequence**: a Rule generalized from only one Trace (still
+  ground, zero free parameters) is not admissible anywhere — a
+  zero-parameter "template" isn't reusable. Admission (§6) requires at
+  least one real Generalization step.
+- **Interpretation** — `(Rule, Bindings, EDB-state) → Outcome`. At least
+  **QueryInterpretation** (pure, Outcome ⊑ new Facts, capability-reference
+  literals inert) and **ExecuteInterpretation** (capability-reference
+  literals actually invoked; Outcome may include both effects and, for
+  ObserveCapability steps, newly-observed Facts — the same shape
+  QueryInterpretation produces, just externally sourced). More modes
+  expected later (dry-run, cost-estimate, explain/audit). Algebraic
+  effects/handler theory is the closest established formalism for this
+  shape; neither it nor tagless-final is a proof this specific design is
+  correct — real inspiration, not borrowed authority (re-verified in an
+  earlier pass of this process, not this revision's final one).
+- **Generalization Fidelity — an engineering requirement, not an inherited
+  proof.** Anti-unification proves syntactic recoverability of term
+  structure, not semantic reproduction of real-world effects. The actual
+  requirement: for a Generalization `g` from Traces `t₁, t₂` with
+  substitutions `σ₁, σ₂`, `ExecuteInterpretation(g, σᵢ)` should reproduce
+  `tᵢ`'s effects, verified by sandboxed replay-testing — with the kind-
+  specific replay semantics from §4 (EffectCapability re-invoked and
+  compared; ObserveCapability replayed from its recorded response, never
+  re-queried live). Capabilities that can't be safely replay-tested at all
+  (destructive, non-idempotent) may need to stay ungeneralized, or require
+  the human reviewer (§6) to certify fidelity manually. Real engineering,
+  scoped to Sub-project 5, not resolved here.
+- **Provenance** — the dependency edge back to what a Rule was generalized
+  or installed from (§6.5). What keeps a derived Rule from becoming an
   ungoverned second source of truth.
-- **Consequence for admission, stated explicitly because the first draft
-  left it implicit and inconsistent:** a Rule generalized from only one
-  Trace (i.e., still ground, zero free parameters) is not admissible as a
-  CatalogEntry — a zero-parameter "template" isn't reusable by definition.
-  DedupGate's `Admit` path requires at least one real Generalization step
-  (at least two distinct Traces or an existing Rule contributing to it).
-  Single, unrepeated Traces stay Traces; they don't get promoted to the
-  catalog on their own.
 
-### 3.5 Interpretation
+## 6. Catalog, DedupGate, Discovery, Task, LLMFallback, Pattern
 
-A function `(Rule, Bindings, EDB-state) → Outcome`. At least two disjoint
-kinds — **QueryInterpretation** (pure, Outcome ⊑ new Facts, treats
-capability-reference literals as inert) and **ExecuteInterpretation** (the
-same Rule, but capability-reference literals are actually invoked) — with
-more expected later (dry-run, cost-estimate, explain/audit). Algebraic
-effects/handler theory (Plotkin & Power; Plotkin & Pretnar) is the closest
-established formalism for this shape, and tagless-final the closest
-established technique for adding interpreters without touching existing code
-— both real, well-grounded inspiration, neither a proof this specific design
-is correct. (These two citations were re-verified in an earlier pass of this
-design process, not in the final re-verification pass behind this revision —
-carried forward, not re-checked here.)
+**Catalog is parameterized by scope: `Tenant` or `Hub`.** This is new in
+this revision and replaces an earlier, unresolved question about whether
+the public hub needed its own separate curation mechanism — it doesn't. One
+mechanism, two scopes:
 
-**On the Generalization Fidelity requirement — reframed, not just renamed,
-from the first draft's "law."** The first draft asserted, as if it followed
-from anti-unification's proven properties, that
-`ExecuteInterpretation(g, σ₁)` must reproduce a source Trace's effects
-exactly. That doesn't follow from anything cited: Plotkin's proof is about
-syntactic recoverability of term structure via substitution, not about
-semantic reproduction of real-world, potentially non-idempotent effects.
-Asserting it as inherited rigor was the exact overclaiming failure mode this
-document is otherwise careful to avoid, applied to itself.
-
-The honest version: **fidelity is a requirement this system has to be
-engineered to satisfy, not a property that falls out of the math for free.**
-Concretely, it needs:
-- A defined notion of what "reproduce effects" means per Capability — some
-  effects are naturally idempotent (a `kubectl apply` of the same manifest),
-  many are not (anything that appends, increments, or has external
-  side-state).
-- A replay-testing mechanism — running `ExecuteInterpretation(g, σᵢ)` in a
-  sandboxed/simulated mode and comparing against the recorded Trace it was
-  generalized from — as an actual test oracle for DedupGate's `Merge`
-  decisions, not an assumption they satisfy automatically.
-- Explicit handling for Capabilities that can't be safely replay-tested at
-  all (destructive, non-idempotent operations) — these may need to stay
-  ungeneralized, or require the human review step (§3.6) to certify fidelity
-  manually rather than mechanically.
-
-This is real, non-trivial engineering scoped to Phase 5 (§7), not resolved
-here.
-
-### 3.6 DedupGate, CatalogEntry, Discovery, Task, LLMFallback
-
-- **DedupGate** — anti-unifies a freshly-generalized candidate against the
-  Catalog and yields `Reject`, `Merge`, or `Admit`. Both `Admit` and `Merge`
-  require human review before the result is live — `Admit` because that's
-  `scratch-command-bar`'s and administration-commons' existing precedent
-  (review before any commons entry, not scoped to merges); `Merge`
-  additionally because graph three-way merge is provably weaker than git's
-  line-based merge: RDF's unordered-set structure lets adds/removes combine
-  mechanically without ever raising a syntactic conflict, which can silently
-  produce a semantically wrong result (Quit Store and Touch Merge's academic
-  treatment of exactly this failure mode; re-verified in an earlier pass of
-  this process, not the final one). `Reject` skips review — nothing changes.
+- **DedupGate** — anti-unifies a freshly-generalized candidate against its
+  Catalog (whichever scope) and yields `Reject`, `Merge`, or `Admit`. Both
+  `Admit` and `Merge` require human review before the result is live —
+  `Admit` because review-before-entry is the working precedent this whole
+  process already established (`scratch-command-bar`'s propose/review
+  loop); `Merge` additionally because graph three-way merge is provably
+  weaker than git's — RDF's unordered-set structure lets adds/removes
+  combine mechanically without ever raising a syntactic conflict, silently
+  producing a semantically wrong result. `Reject` skips review.
 - **CatalogEntry** — `⊑ Rule`, admitted or merged by DedupGate, subject to
-  §3.4's admission consequence (no zero-parameter entries). Carries a
-  Description for Discovery.
-- **Discovery** — search over CatalogEntry only. Two sub-capabilities with
-  different readiness timelines (§7): exact/keyword lookup by name (viable
+  §5's admission consequence.
+- **Pattern is not a separate type.** It's the name for a CatalogEntry at
+  **Hub** scope — a published, human-validated, publicly-installable unit.
+  Everything else about it (Signature, Dialect, Body, Provenance) is
+  ordinary CatalogEntry structure. Reusing "Pattern" as a name (not a new
+  formal type) matters for a concrete reason: this generalizes to *any*
+  computer-doable action — "extract page 2 of this PDF" is as much a
+  Pattern as a tax-form submission is — and giving it a second, narrower
+  formal type would misrepresent that scope.
+- **Discovery** — search over CatalogEntry (either scope). Two
+  sub-capabilities with different readiness: exact/keyword lookup (viable
   as soon as any CatalogEntry exists) and hybrid keyword+embedding
-  progressive disclosure (only useful once there's a catalog large enough to
-  need it). Conflict resolution when multiple entries match: recency first,
-  specificity as tiebreaker (CLIPS's LEX strategy; re-verified in an earlier
-  pass, not the final one).
-- **Task** — the entry point. Triggers Discovery; a confident match invokes
-  that CatalogEntry's ExecuteInterpretation directly; no match triggers
-  **LLMFallback**, whose resulting Trace feeds Generalization → DedupGate →
-  possibly a new CatalogEntry, subject to the admission consequence above.
+  progressive disclosure (once the catalog is large). Conflict resolution
+  when multiple entries match: recency, then StabilityClass (§4), then
+  specificity as final tiebreaker — extending, not replacing, CLIPS's LEX
+  precedent (recency before specificity) with the one new ranking input
+  this revision added.
+- **Task** — the entry point. Triggers Discovery against the Tenant's own
+  Catalog; a confident match invokes that CatalogEntry directly; no match
+  triggers **LLMFallback**, whose resulting Trace feeds Generalization →
+  DedupGate (Tenant scope) → possibly a new local CatalogEntry.
+- **Install** — `CatalogEntry(Hub) × Tenant → CatalogEntry(Tenant)`, the
+  operation for adopting a public Pattern (§6.5 covers the mechanism in
+  full). Its result goes through the same DedupGate as any other candidate
+  entering the Tenant's local Catalog — review scope is narrower than a
+  fresh `Admit` (confirming the specific field bindings are correct for
+  this Tenant, not re-reviewing content the Hub already curated), but it's
+  the same gate, not a separate mechanism.
 
-## 4. Grounding
+### 6.5 Crosswalk — corrected from an earlier draft's overreach
 
-**4.1 Rule dialects — corrected.** Institution theory covers Horn Clause
-Logic as a genuine sub-institution of first-order logic (Diaconescu 2006,
-re-verified against the primary source in this revision's final pass) —
-that's real and precise. What's *not* established, and wasn't hedged
-carefully enough in the first draft: Soufflé's extended Datalog (aggregation,
-stratified negation) and both SPARQL-RL and SHACL 1.2 Rules go beyond pure
-Horn Clause Logic. The institution-theoretic grounding for Dialect covers the
-Horn-clause *core* of what these dialects express, not their full extent —
-stated honestly here, matching the hedging discipline §4.2 already applied
-to the anti-unification/institution-theory question. Soufflé's hard
-requirement that user-defined functors stay pure and reentrant (re-verified
-against Soufflé's own docs in this revision's final pass — a genuine "must,"
-execution guarantees void otherwise) remains real, independent validation
-that effects belong in a separate interpreter, never a live call inside the
-pure evaluator.
+Installing a Hub Pattern against a Tenant whose own vocabulary differs
+requires translating some of the Pattern's Signature fields. What that
+translation actually *is*, formally, was mis-scoped in an earlier version
+of this document and has now been checked properly rather than asserted:
 
-**4.2 Anti-unification — corrected, with a real design consequence.**
-Plotkin/Reynolds (1970) is correctly the source for flat first-order
-syntactic anti-unification, proven unitary (a unique lgg always exists).
-It is **not** the source for term-graph anti-unification, and the first
-draft's citation was wrong. The actual term-graph result (Baumgartner,
-Kutsia, Levy & Villaret, FSCD 2018) proves the *general* term-graph case is
-only **finitary** — a finite, minimal, but not necessarily singleton set of
-incomparable generalizations can exist. Unitarity (one unique lgg) is proven
-only for the narrower special case of **bisimilar term-graphs**.
+- **When the Pattern and the Tenant's existing vocabulary share a Dialect**
+  (both SPARQL-RL, say), the correct formal tool is a **signature
+  morphism** — an arrow within one institution's `Sign` category. This is
+  established, textbook institution theory (confirmed against Goguen &
+  Burstall's own definition), and it is *already in this document's own
+  vocabulary* — it's the same kind of thing Signature itself already is.
+  No new borrowed machinery needed. If a signature morphism's soundness
+  needs checking, the literature's own vocabulary for that is model-
+  conservativeness / Mod-strictness / Sen-maximality — not the
+  sublogic/embedding/faithful/exact scale, which is documented specifically
+  for the next case, not this one.
+- **When the Pattern and the Tenant's vocabulary are in *different*
+  Dialects** (one SPARQL-RL, one SHACL 1.2 Rules), the correct tool is a
+  full **comorphism** — categorically heavier (a functor between the two
+  Dialects' `Sign` categories plus natural transformations translating
+  their sentences and models), and *this* is where the
+  sublogic/embedding/faithful/(weakly) exact fidelity scale actually
+  applies, per DOL's own worked practice.
+- **An earlier draft of this document proposed modeling all Crosswalks as
+  comorphisms and borrowing that fidelity scale universally. Checked
+  directly against the primary institution-theory literature: that's
+  wrong** for the (more common) same-Dialect case, and the correction
+  matters — it's the difference between reaching for machinery that's
+  already sitting in this document (a signature morphism, essentially a
+  second Signature with a translation) versus machinery that's
+  categorically heavier and was never actually needed for most Crosswalks.
+- **The human-facing representation, regardless of which formal case
+  applies, is SSSOM** — `exact_match`/`close_match`/`broad_match`/
+  `narrow_match`/`related_match`, each with a curator's confidence. This is
+  the right layer for the actual working mechanism, and it composes
+  cleanly with the formal distinction above rather than competing with it:
+  SSSOM's own specification is explicit that these are practical,
+  curatorial judgments calibrated to "fitness for purpose," *not* claims of
+  model-theoretic equivalence — checked directly against SSSOM's own paper,
+  which discusses DOL by name in its related work and never once invokes
+  institution theory, confirming the two are genuinely separate layers, not
+  one dressed as the other. A human curating an `exact_match` is making a
+  practical judgment call, available for later, optional strengthening
+  into a formally-checked signature morphism or comorphism if anyone
+  wants that — never a prerequisite for using the mapping.
+- **Detection of overlap is human-only, by design, for now** — not a gap to
+  fill later with automated ontology-alignment matching, a deliberate
+  scoping decision. A curator proposes a Crosswalk entry (an SSSOM mapping
+  row); it goes through the same Hub-scope DedupGate as any other Hub
+  content.
+- **Crosswalks are Hub-scope content** (a mapping between two named
+  standards is a general, reusable fact, not tenant-specific); which
+  vocabulary a given Tenant has actually settled into, per §3.1, is the one
+  genuinely tenant-local fact.
+- **Installation with partial coverage** — the actual mechanism, precisely:
+  for each field in the Pattern's Signature, look up an existing Crosswalk
+  entry against the Tenant's own established vocabulary. Matched fields
+  bind through the Crosswalk. **Unmatched fields — no Crosswalk entry
+  exists yet — the Tenant is prompted to supply those Facts directly**, in
+  the Pattern's own native vocabulary, since there's nothing to translate
+  from. This is recorded as manually-originated Provenance, not a
+  translation. Crosswalks grow incrementally from real installation
+  friction — the same anti-Xanadu discipline ("the graph should grow from
+  real transactions, not an a priori exhaustive ontology") already applied
+  to Traces (§5) and Tasks (§6), applied a third time here. For a Pattern
+  with a thin, largely-uncontested Signature (page-extraction-shaped
+  actions), this degrades to zero friction — most fields hit exact matches,
+  nothing left to fill in by hand. It only gets elaborate where a domain
+  genuinely has competing standards, which is a property of the domain, not
+  a cost the mechanism imposes uniformly.
 
-This has a real consequence the first draft's overclaim was hiding: **the
-Rule representation needs to be restricted to the bisimilar-graph fragment
-specifically**, not just "the term-graph fragment" generally, if DedupGate is
-to assume a single canonical generalization rather than needing to arbitrate
-among several incomparable ones. Whether the workflow-graph shape this
-system needs (typed steps, branch/loop/call) can be constrained to stay
-inside that narrower fragment, or whether DedupGate genuinely needs to
-handle a finite set of candidates and let human review pick among them, is
-now an explicit open question (§8) rather than a settled fact. Minimizing
-generalization variables remains NP-complete in the closest scalable
-formalism (Yernaux & Vanhoof 2022, unordered goals — re-verified precisely
-in this revision's final pass, confirmed as NP-complete, a stronger result
-than the "NP-hard" the first draft stated) — accept a bounded/greedy
-generalization regardless of which fragment is chosen.
+## 7. Sub-projects
 
-**4.3 Execution kernel.** WASI Preview 2 excludes fork/exec/subprocess
+Each of these becomes its own spec → plan → implementation cycle when work
+on it starts; this document defines their scope and dependencies, not their
+detailed plans.
+
+1. **Bitemporal fact shape.** RDF-star `validFrom`/`validTo`, a defined
+   OWL-Time Allen-relation subset, ValidTime defaulting to TransactionTime.
+   Applies to Riptide's existing LDP write path. Depends on nothing but
+   Riptide as it exists today. Detailed scope: §9.1... *(unchanged from the
+   prior revision; kept minimal here since it's already fully specified and
+   nothing in this revision touches it)*. Deferred to Sub-project 3+:
+   making ValidTime queryable/joinable in rule logic.
+2. **Execution substrate.** WASI component execution, WASIX capability
+   grant, **tenant-scoped and split into EffectCapability/ObserveCapability
+   from the start** (§4) — new requirement in this revision. Must produce
+   the integration point with Riptide's Phase 4c ACP model as an exit
+   criterion, not a follow-up. Tested with no Rule representation involved.
+3. **Pure derivation engine.** Cross-stream joins, recursion, aggregation,
+   query interpretation only. Depends on Sub-project 1.
+4. **Wiring**, split by risk:
+   - **4a — mechanical wiring.** Execute interpreter, real NativeTemplate
+     instances, `call_template` against a small hand-authored set. Low
+     risk.
+   - **4b — concurrent-effects design spike.** No established theory
+     answers coordinating concurrent ExecuteInterpretations over
+     overlapping, irreversible resources (checked: neither sagas nor CRDTs
+     establish this). Real, open design work, not a checklist item inside
+     4a.
+5. **Generalization and DedupGate**, including replay-testing fidelity with
+   the kind-specific (Effect vs. Observe) semantics from §4. Depends on 4a.
+6. **LLM fallback loop.** OAuth ported to Elixir by hand (no ecosystem to
+   lean on — `lambdaclass/datalog` dead, `fogfish/datalog` real but
+   dormant since 2019). Needs Sub-project 5's gate to have somewhere to put
+   its output.
+7. **Discovery**, split by readiness:
+   - **7a — exact/keyword lookup**, viable as soon as any CatalogEntry
+     exists (as early as Sub-project 5) — a real walking skeleton well
+     before the rest of the roadmap ships.
+   - **7b — hybrid keyword+embedding progressive disclosure**, deferred
+     until the catalog is large enough to need it.
+8. **Pattern Hub.** **New in this revision.** Stand up Hub-scope Catalog
+   (§6) as a distinct, publicly-reachable deployment of the same DedupGate
+   mechanism Sub-project 5 already builds — genuinely low new-mechanism
+   risk, since it reuses rather than duplicates. Depends on Sub-project 5.
+9. **Ontology Crosswalks and Installation.** **New in this revision.**
+   SSSOM-shaped Hub-scope Crosswalk content, the Install operation (§6.5),
+   and the human-curation workflow for proposing Crosswalk entries. Depends
+   on Sub-project 8. The signature-morphism/comorphism distinction (§6.5)
+   only needs to inform how Crosswalk correctness is *reasoned about* when
+   questioned — the day-to-day mechanism is SSSOM curation plus DedupGate,
+   which Sub-project 8 already provides.
+
+**Ongoing, not sequential:** LinkML authoring applied to each new schema as
+created (§8.6).
+
+## 8. Grounding
+
+**8.1 Rule dialects.** Institution theory covers Horn Clause Logic as a
+genuine sub-institution of first-order logic (Diaconescu 2006). Soufflé's
+extended Datalog and both target Dialects go beyond pure Horn Clause Logic —
+the institution-theoretic grounding covers their Horn-clause core, not
+their full extent; stated honestly rather than left implicit. Soufflé's
+hard requirement that user-defined functors stay pure and reentrant remains
+real, independent validation that effects belong in a separate interpreter.
+
+**8.2 Anti-unification.** Plotkin/Reynolds (1970): flat first-order
+syntactic anti-unification, proven unitary. Term-graph anti-unification is
+a *different* result (Baumgartner, Kutsia, Levy & Villaret, FSCD 2018),
+proving the general case only **finitary** (a finite, possibly-plural set
+of incomparable generalizations), with unitarity proven only for the
+narrower bisimilar-term-graph case. Open question this creates, unresolved:
+whether the Rule/workflow-graph representation can be constrained to that
+narrower fragment, or whether DedupGate genuinely needs to arbitrate among
+several incomparable candidates. Minimizing generalization variables is
+NP-complete in the closest scalable formalism (Yernaux & Vanhoof 2022) —
+accept bounded/greedy generalization regardless.
+
+**8.3 Execution kernel.** WASI Preview 2 excludes fork/exec/subprocess
 spawning by design; WASIX is the separate superset restoring it. Kernel
-primitive: "execute a capability-scoped WASM component," subprocess
-spawning one optional grantable Capability among others. (Re-verified in an
-earlier pass, not this revision's final one.)
+primitive: execute a capability-scoped WASM component; subprocess spawning
+one optional grantable capability among others.
 
-**4.4 Bitemporal facts.** Datomic is unitemporal; XTDB's two-axis model
+**8.4 Bitemporal facts.** Datomic is unitemporal; XTDB's two-axis model
 (system transaction-time, user-assigned valid-time) is the target shape,
 via RDF-star + OWL-Time. Valid-time must be duplicated into ordinary
-queryable fact form for the derivation layer to reason over it — XTDB's
-indexing alone only controls which document version a query sees. (Re-verified
-in an earlier pass, not this revision's final one.)
+queryable fact form for the derivation layer to reason over it.
 
-**4.5 Versioning.** TerminusDB and Fluree implement git's model over graph
-data; graph three-way merge is weaker than git's (see §3.6). (Re-verified in
-an earlier pass, not this revision's final one — maintenance-status claims
-about both projects specifically should be treated as time-sensitive and
-worth a fresh check before Phase 6 planning starts, not assumed current
-indefinitely.)
+**8.5 Capability kinds — new grounding this revision.** The
+EffectCapability/ObserveCapability split wasn't researched against external
+literature; it fell directly out of tracing a real scenario (§9.2) through
+the model and finding that "replay this to check fidelity" means two
+different things depending on whether the capability changes the world or
+just reads it — re-querying a live external system during a fidelity check
+would fail spuriously whenever that system's real state has simply moved on
+since the original Trace, which isn't a fidelity failure at all. This is
+this document's own synthesis, not a citation, and is presented as such.
 
-**4.6 Parallelism — fully re-confirmed in this revision's final pass, with
-more precision than the first draft had.** Soufflé compiles `par...endpar`
-blocks to OpenMP-annotated C++ (GCC's OpenMP runtime, threads pinned to
-cores) implementing semi-naive evaluation — not runtime interpretation.
-Backed by two purpose-built concurrent structures: a concurrent B-tree
-(optimistic fine-grained locking extending seqlocks, plus a traversal-reuse
-"hints" mechanism) and Brie, a concurrent trie hybridizing trie/B-tree design
-with lock-free insertion. This is the adoptable answer for
-QueryInterpretation. ExecuteInterpretation concurrency has no equivalent
-answer and stays explicitly open (§2, §7 Phase 4b).
+**8.6 Authoring.** LinkML adopted for Sub-project 3's rule schema and
+Sub-project 8/9's Pattern and Crosswalk schemas specifically —
+`linkml-datalog` (real, alpha, dormant since Feb 2024 at last check, worth
+a fresh liveness check before depending on it) already demonstrates
+"author in LinkML, generate a working Soufflé Datalog program" as a working
+pattern, not a hypothesis.
 
-**4.7 Conflict resolution.** CLIPS's LEX strategy: recency checked before
-specificity, specificity only the final tiebreaker. (Re-verified in an
-earlier pass, not this revision's final one.)
+**8.7 Versioning.** TerminusDB and Fluree implement git's model over graph
+data; graph three-way merge is weaker than git's (§6's DedupGate `Merge`
+rule). Maintenance-status claims about both projects are time-sensitive and
+worth a fresh check before Sub-project 6 planning.
 
-**4.8 Authoring.** LinkML isn't a replacement for StreamLD's shipped SHACL
-schemas — a safely-deferrable representation choice. Adopted now for the
-*new* Phase 3 rule schema specifically: `linkml-datalog` (real, alpha,
-dormant since Feb 2024 as of the last check) already demonstrates "author in
-LinkML, generate a working Soufflé Datalog program" as a working pattern.
-(Re-verified in an earlier pass, not this revision's final one — worth a
-fresh liveness check before depending on it in Phase 3 planning, given how
-long "dormant since Feb 2024" has now been true.)
+**8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
+C++ implementing semi-naive evaluation, backed by a concurrent B-tree and
+Brie (a concurrent trie). Adoptable for QueryInterpretation.
+ExecuteInterpretation concurrency has no equivalent answer (§7, Sub-project
+4b).
 
-**4.9 Human review, UI, and repo integration.** External research on
+**8.9 Signature morphisms vs. comorphisms — the correction driving §6.5.**
+Confirmed directly against Goguen & Burstall's own definitions and
+follow-on literature (Diaconescu; the 2-institutions literature): a
+signature morphism is an arrow within one institution's `Sign` category — a
+translation within one Dialect. A comorphism is a categorically heavier
+triple (a functor between two institutions' `Sign` categories, plus natural
+transformations translating their sentences and models) — needed only when
+crossing between genuinely different Dialects. The
+sublogic/embedding/faithful/(weakly) exact fidelity scale is documented
+specifically for comorphisms; same-institution signature-morphism quality
+uses different, unrelated vocabulary (model-conservativeness,
+Mod-strictness, Sen-maximality) in the literature that actually works
+within one institution. SSSOM's own specification frames its match
+predicates as practical/curatorial ("fitness for purpose," explicitly not
+correctness), and no citable work connects SSSOM/SKOS mappings to
+institution-theoretic morphisms of either kind — confirmed by a direct
+search of SSSOM's own paper, which discusses DOL by name in its related
+work without ever invoking institution theory.
+
+**8.10 Conflict resolution.** CLIPS's LEX strategy: recency checked before
+specificity, specificity the final tiebreaker. StabilityClass (§4) is a new
+ranking input this revision adds ahead of specificity, not documented CLIPS
+behavior — this document's own extension, stated as such.
+
+**8.11 Human review, UI, repo integration.** External research on
 review-gate placement and generic-shape-driven UI came back empty twice —
-treated as a real signal, not bad luck. Uses local precedent instead:
-`scratch-command-bar`'s working propose/review loop, administration-commons'
-stated review principle, `graphsheet`'s shipped SHACL-driven UI. **Added in
-this revision:** this layer is not yet reflected in Riptide's own
-PROGRESS.md sub-project table, which the repo treats as the canonical
-current-status reference — that should happen no later than Phase 2 start,
-not as an afterthought once the whole roadmap is further along.
+a real signal, not bad luck. Local precedent used instead:
+`scratch-command-bar`'s propose/review loop, `graphsheet`'s shipped
+SHACL-driven UI. This layer should be reflected in Riptide's own
+PROGRESS.md sub-project table no later than Sub-project 2's start.
 
-**4.10 Elixir OAuth.** No Elixir Datalog ecosystem to lean on
-(`lambdaclass/datalog` dead stub; `fogfish/datalog` real, dormant since
-2019). OAuth needs hand-porting to Elixir, the same scoped cost
-`sovereign-ops` already identified for its own agent loop. (Re-verified in
-an earlier pass, not this revision's final one.)
+## 9. Worked examples
 
-## 5. Worked example
+**9.1 — the clean case (unchanged from the prior revision).** Task "deploy
+the billing service" → no CatalogEntry match → LLMFallback produces a
+ground Trace → not admitted alone (§5) → weeks later, a second, similar
+Task's Trace anti-unifies against the first, producing a genuinely
+parameterized candidate → DedupGate `Admit` with human review, including
+sandboxed-replay fidelity evidence → becomes CatalogEntry
+`deploy-service-to-prod` → a third occurrence hits Discovery's exact lookup
+directly, zero LLM calls.
 
-Added in this revision — the first draft had none, and the cold review
-correctly flagged that as a real source of the ambiguities it found.
+**9.2 — the case that found real gaps: a German tax filing, walked through
+deliberately, not as a domain this spec builds.** A fresh Tenant, Task
+"file my tax return." Discovery finds nothing (empty Catalog). LLMFallback
+doesn't decompose this into one Trace — it needs, in order:
 
-1. **Task**: "deploy the billing service." Discovery finds no matching
-   CatalogEntry (first time this kind of task has occurred). LLMFallback
-   runs: the LLM issues concrete tool calls, producing a ground
-   **Trace** — a zero-parameter Rule whose Body is a specific sequence of
-   capability-reference literals with concrete arguments
-   (`kubectl(apply, "billing.yaml", "prod")`, `kubectl(rollout-status,
-   "billing", "prod")`).
-2. Per §3.4's admission consequence, this single Trace is **not** admitted —
-   it's stored as a Trace with Provenance pointing at nothing (it's the
-   first occurrence), and the Task completes by running it directly under
-   ExecuteInterpretation.
-3. **Weeks later**, a second Task: "deploy the auth service." Discovery again
-   finds no CatalogEntry, but this time a Trace-similarity check (a cheap
-   prefilter, not full anti-unification, over the stored Trace log) surfaces
-   the billing-deploy Trace as a candidate. LLMFallback's new Trace and the
-   old Trace go through **Generalization**: anti-unification finds they
-   agree on `kubectl(apply, ?, "prod")` and `kubectl(rollout-status, ?,
-   "prod")`, diverging only on the manifest/service name — producing a
-   genuinely parameterized Rule with one free parameter, plus the
-   substitutions recovering each original Trace.
-4. This candidate goes to **DedupGate**. The Catalog is empty, so there's
-   nothing to anti-unify against for dedup purposes — it's a novel,
-   admissible candidate (it has a real parameter, satisfying §3.4). Per §3.6,
-   `Admit` requires human review regardless: a reviewer sees the proposed
-   Rule, its Description, and — per §3.5's fidelity requirement — evidence
-   from a sandboxed replay that specializing it back to each original Trace's
-   bindings reproduces each original run.
-5. Reviewer approves. It becomes a **CatalogEntry**: `deploy-service-to-prod`,
-   one parameter (`service`).
-6. **Third occurrence**: Task "deploy the auth service" (again, or a
-   different service) now hits Discovery's exact/keyword lookup, finds the
-   CatalogEntry directly, and runs `ExecuteInterpretation` with the bound
-   parameter — zero LLM calls.
+1. **An ObserveCapability check**: has this year's filing already been
+   submitted? Queries the external tax authority, asserts the answer as a
+   new Fact with its own ValidTime (per §8.4, distinct from when Riptide
+   learned it). This Fact's Provenance records the actual response, so a
+   later fidelity replay of any Rule built from this Trace replays that
+   recorded answer rather than re-querying — the real external system
+   isn't expected to still say the same thing days or months later, and
+   that's not a fidelity failure (§4, §8.5).
+2. **Gathering the actual facts to file** — no existing Signature in this
+   ecosystem covers personal income tax; the Tenant supplies them via the
+   same extraction-and-review loop `scratch-command-bar` already uses. This
+   is real content-layer work this spec doesn't provide, correctly out of
+   scope (§2) — but the example is worth keeping precisely because it shows
+   *how much* has to exist before "file my tax return" can complete on a
+   fresh instance, which the simpler §9.1 example doesn't reveal.
+3. **An EffectCapability submission.** Two independently-viable
+   implementations exist in principle for the same real-world outcome — a
+   documented official interface and a reverse-engineered one — exactly
+   the shape Discovery's own multi-match resolution (§6) already handles:
+   eligibility differences show up as Signature preconditions (a documented
+   path's CatalogEntry requires a Fact this Tenant may or may not have),
+   and StabilityClass (§4) correctly ranks the documented path over the
+   reverse-engineered one when both apply. No new mechanism needed —
+   genuine validation that §6's existing machinery covers this, not a gap.
+4. Composability (§3.2's rule-reference literals, fixed in this revision)
+   is what lets a `file-annual-return` Rule call a `submit-return` Rule
+   that calls a lower-level submission NativeTemplate — the bug this
+   example caught when it was still missing.
 
-## 6. Diagram
+Nothing about German tax law is proposed as part of this spec's own
+deliverables; this example exists to stress-test the object model against
+something with real regulatory weight, external system fragility, and
+composability requirements a purely infrastructural example wouldn't
+surface.
 
-```
-  Content / domain           (lattice, MiKaDiv, KaFE — unaffected)
-  Extraction / population    (scratch-command-bar's pattern — LLMFallback + review)
-  ── new in this spec, abstraction layers — NOT call order; see §5 for call order ──
-  Discovery
-  Anti-unification / DedupGate
-  Interpretation             (Query / Execute)
-  Rule (IDB)                 (SPARQL-RL / SHACL 1.2 Rules-targeted, Soufflé-referenced)
-  ── existing, unchanged ───────────────────────────────────────
-  Execution kernel           (WASI + WASIX capability, tenant-scoped)
-  Fact / Event (EDB)         (Riptide today, extended with valid-time)
-```
+## 10. Changelog
 
-## 7. Phased build order
+**This revision (second):**
+- Rule's Body gained a rule-reference literal kind — composability was
+  inexpressible without it, caught by §9.2.
+- Capability split into EffectCapability/ObserveCapability with distinct
+  fidelity-replay semantics — caught by the same trace.
+- StabilityClass added, feeding Discovery's existing conflict resolution.
+- Catalog generalized to Tenant/Hub scope; Pattern defined as a name for
+  Hub-scope CatalogEntry, not a new type.
+- Crosswalk mechanism added: SSSOM as the working representation;
+  signature morphisms for same-Dialect translation (corrected from an
+  earlier, wrong instinct to model all of this as comorphisms); comorphisms
+  reserved for genuinely cross-Dialect translation, with the
+  sublogic/embedding/faithful/exact scale now correctly scoped to that case
+  only.
+- Sub-projects 8 and 9 added; the whole document restructured as one spec
+  defining many sub-projects rather than a single phased roadmap.
+- `administration-commons` reframed as superseded, not something to
+  reconcile with.
 
-1. **Bitemporal fact shape.** Changes what a fact looks like; must land
-   before anything reads/writes facts downstream. Depends on nothing but
-   Riptide as it exists today. Scope detailed in §7.1.
-2. **Execution substrate in isolation.** WASI component execution, the
-   WASIX capability grant, **tenant-scoped from the start** (§3.1) — tested
-   with no Rule representation involved. This phase must also produce the
-   integration point with Riptide's Phase 4c ACP model; shipping a
-   capability-grant mechanism that doesn't yet compose with existing
-   authorization is not acceptable exit criteria for this phase. Add this
-   layer's own entry to PROGRESS.md's sub-project table here, not later
-   (§4.9).
-3. **Pure derivation engine.** Cross-stream joins, recursion, aggregation,
-   query interpretation only. Depends on Phase 1.
-4. **Wiring — split into two sub-phases, correcting the first draft's single
-   "pure wiring" phase that actually hid its hardest problem.**
-   - **4a — mechanical wiring.** Connect Phase 2's substrate and Phase 3's
-     engine: add the execute interpreter, NativeTemplate instances become
-     real (§3.3), `call_template` works for the first time against a small,
-     hand-authored set of NativeTemplates. Genuinely low-risk, no open
-     research questions.
-   - **4b — concurrent-effects design spike.** The problem named in §2 and
-     §4.6: no established theory answers how two concurrent
-     ExecuteInterpretations should be coordinated when they touch
-     overlapping, irreversible resources. This is real, open design work,
-     scoped and staffed as such — not a checklist item inside 4a.
-5. **Anti-unification: Generalization and DedupGate**, including the
-   replay-testing fidelity mechanism from §3.5. Depends on 4a.
-6. **LLM fallback loop.** Last among the "core" phases — needs 5's gate to
-   have somewhere to put its output.
-7. **Discovery — split by readiness, correcting the first draft's
-   single-phase, catalog-must-already-be-large framing.**
-   - **7a — exact/keyword lookup.** Viable as soon as any CatalogEntry
-     exists (as early as Phase 5), giving a real, working walking skeleton
-     (§5's example, end to end) well before the full roadmap ships — the
-     first draft had no demonstrable milestone before the very last phase.
-   - **7b — hybrid keyword+embedding progressive disclosure.** Deferred
-     until the catalog is large enough to need it.
-
-**Ongoing, not sequential:** LinkML authoring (§4.8) applied to each new
-schema as created.
-
-### 7.1 Phase 1 — ready to plan
-
-- RDF-star `validFrom`/`validTo` annotation convention on individual facts.
-- A defined OWL-Time Allen-relation subset for interval comparisons.
-- ValidTime defaults to TransactionTime when unspecified (XTDB's default).
-- Applies to all new writes in Riptide's existing LDP write path — no new
-  engine, no behavior change beyond the annotation.
-- Deferred to Phase 3+: making ValidTime queryable/joinable in rule logic.
-
-## 8. Open questions
-
-- OpenFASTER-Standard public governance status.
-- Whether this engine is operationally a separate deployable from Riptide's
-  LDP surface, given Capability grants expand the trusted computing base
-  (§1) — genuinely unresolved, not just undecided by omission.
-- Concurrent-effectful-execution coordination — no established answer;
-  Phase 4b's actual subject matter, not a footnote.
-- Whether the Rule/workflow-graph representation can be constrained to the
-  bisimilar-term-graph fragment where anti-unification is proven unitary, or
-  whether DedupGate must handle a finite set of incomparable generalizations
-  (§4.2) — newly surfaced by this revision, not resolved.
-- Formal versioning/supersedes theory for declarative rules — none found;
-  pragmatic git/TerminusDB model adopted instead.
-- Final Tenant name.
-- Fresh liveness checks needed before depending on them operationally:
-  `linkml-datalog` (dormant since Feb 2024 at last check) and
-  TerminusDB/Fluree's current maintenance status (§4.5, §4.8).
-
-## 9. What changed in this revision, and why
-
-For anyone comparing against the first draft: this is not a copyedit.
-- §3.2/§3.3/§3.4: Rule's definition now actually accommodates
-  NativeTemplate; Trace is now `⊑ Rule` instead of an incompatible sibling
-  type; Generalization has one consistent type signature (`Rule × Rule →
-  Rule`) instead of three incompatible ones used in different places.
-- §3.5: the Generalization Fidelity "law" is reframed from an inherited
-  proof to an engineering requirement this system has to earn, with a
-  concrete mechanism (replay-testing) instead of an assumption.
-- §4.1: SPARQL-RL is no longer described as succeeding SHACL 1.2 Rules —
-  they're two parallel, currently-live drafts. Institution-theoretic
-  grounding for Dialect is now scoped to the Horn-clause core, not the full
-  extent of the actual target dialects.
-- §4.2: anti-unification's term-graph unitarity claim is correctly
-  attributed (Baumgartner et al. 2018, not Plotkin/Reynolds) and correctly
-  scoped (finitary in general, unitary only for bisimilar graphs) — with a
-  real, newly-surfaced open question this creates for DedupGate.
-- §3.1: Capability is now tenant-scoped and required to compose with
-  Riptide's existing ACP model — a real security gap in the first draft.
-- §7: Phase 4 is split into a genuinely-low-risk wiring step and an
-  honestly-scoped open-research step, instead of one phase mischaracterized
-  as both. Phase 7 is split so a real walking skeleton exists many phases
-  before the end of the roadmap, instead of no working demonstration until
-  everything ships.
-- §5 (worked example) and §1's deployment-scope narrowing are new; both were
-  gaps a cold reader flagged, not refinements of something already there.
+**Prior revision:** fixed Rule's definition to accommodate NativeTemplate,
+made Trace `⊑ Rule` with one consistent Generalization type signature,
+reframed the Generalization Fidelity requirement from an inherited proof to
+an engineering obligation, corrected the SPARQL-RL/SHACL 1.2 Rules
+relationship, corrected the term-graph anti-unification citation and scope,
+added tenant-scoping to Capability, split the wiring phase by risk, and
+added a walking-skeleton milestone before the end of the roadmap.
