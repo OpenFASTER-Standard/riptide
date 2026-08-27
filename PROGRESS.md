@@ -383,7 +383,11 @@ one monolithic spec.
   `SseController.subscribe/2` for SSE, `Socket.connect/3`/`ReplicationChannel.join/3` for
   WebSocket) and then flow automatically into every subsequent log line in that process. `subject`
   is set only when a token's claims actually include a `sub` (Phase 4b's `TokenConfig` doesn't
-  require one). dev/test keep today's plain-text formatter and narrower metadata list unchanged.
+  require one). dev/test keep today's plain-text formatter; `config/config.exs`'s shared
+  `metadata: :all` (widened from `[:request_id]` during CI fix-up, since `mix credo --strict`'s
+  `Warning.MissingLoggerMetadataKeys` check flags any custom key not declared in *some* env's
+  Logger config, and `:all` costs nothing extra on lines that don't set those keys) means any of
+  the new metadata keys also show at the dev console when present, not just in prod's JSON output.
 - **Phase 5c — Metrics.** Not yet designed.
 
 **Status**: Phases 5a-5b shipped 2026-08-27. Phase 5c not yet designed.

@@ -5,6 +5,8 @@ defmodule Riptide.Application do
 
   use Application
 
+  alias Riptide.Telemetry.AccessLog
+
   @impl true
   def start(_type, _args) do
     # Every fleet node — not just the 3 placement ordinals — can be picked
@@ -22,7 +24,7 @@ defmodule Riptide.Application do
     # Attached before the supervision tree (and therefore RiptideWeb.Endpoint)
     # starts, so no request can possibly arrive before this handler exists
     # (Phase 5b).
-    Riptide.Telemetry.AccessLog.attach()
+    AccessLog.attach()
 
     children =
       [

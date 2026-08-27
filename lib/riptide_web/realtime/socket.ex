@@ -31,10 +31,7 @@ defmodule RiptideWeb.Realtime.Socket do
 
         case verifier.verify(token) do
           {:ok, claims} ->
-            if sub = claims["sub"] do
-              Logger.metadata(subject: sub)
-            end
-
+            maybe_set_subject_metadata(claims)
             {:ok, assign(socket, :current_subject, claims)}
 
           {:error, reason} ->
@@ -45,4 +42,10 @@ defmodule RiptideWeb.Realtime.Socket do
 
   @impl true
   def id(_socket), do: nil
+
+  # subject stays genuinely absent from metadata (not present-but-nil) when
+  # claims lack a `sub` — Phase 4b's TokenConfig doesn't require one.
+  defp maybe_set_subject_metadata(claims) do
+    if sub = claims["sub"], do: Logger.metadata(subject: sub)
+  end
 end

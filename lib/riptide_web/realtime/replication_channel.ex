@@ -22,21 +22,33 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   @impl true
   def join("replication:" <> stream_id, %{"after" => cursor}, socket) do
-    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id) do
-      Logger.metadata(tenant_id: tenant_id)
+    case ResourceController.parse_stream_id(stream_id) do
+      {:ok, tenant_id, path_segments} ->
+        Logger.metadata(tenant_id: tenant_id)
+        maybe_set_subject_metadata(socket.assigns.current_subject)
 
-      case socket.assigns.current_subject do
-        nil -> :ok
-        claims -> if sub = claims["sub"], do: Logger.metadata(subject: sub)
-      end
+        case Riptide.Authz.evaluate(
+               tenant_id,
+               path_segments,
+               socket.assigns.current_subject,
+               :read
+             ) do
+          :allow -> do_join(stream_id, cursor, socket)
+          _ -> {:error, %{"reason" => "unauthorized"}}
+        end
 
-      case Riptide.Authz.evaluate(tenant_id, path_segments, socket.assigns.current_subject, :read) do
-        :allow -> do_join(stream_id, cursor, socket)
-        _ -> {:error, %{"reason" => "unauthorized"}}
-      end
-    else
-      _ -> {:error, %{"reason" => "unauthorized"}}
+      _ ->
+        {:error, %{"reason" => "unauthorized"}}
     end
+  end
+
+  # Mirrors Authenticate/Socket.connect's own guard: subject stays genuinely
+  # absent from metadata (not present-but-nil) for an anonymous socket or a
+  # token whose claims lack `sub`.
+  defp maybe_set_subject_metadata(nil), do: :ok
+
+  defp maybe_set_subject_metadata(claims) do
+    if sub = claims["sub"], do: Logger.metadata(subject: sub)
   end
 
   defp do_join(stream_id, cursor, socket) do

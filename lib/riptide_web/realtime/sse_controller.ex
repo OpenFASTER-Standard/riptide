@@ -8,15 +8,17 @@ defmodule RiptideWeb.Realtime.SseController do
   alias RiptideWeb.LDP.ResourceController
 
   def subscribe(conn, %{"stream_id" => stream_id}) do
-    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id) do
-      Logger.metadata(tenant_id: tenant_id)
+    case ResourceController.parse_stream_id(stream_id) do
+      {:ok, tenant_id, path_segments} ->
+        Logger.metadata(tenant_id: tenant_id)
 
-      case Riptide.Authz.evaluate(tenant_id, path_segments, conn.assigns.current_subject, :read) do
-        :allow -> do_subscribe(conn, stream_id)
-        _ -> send_resp(conn, 403, "")
-      end
-    else
-      _ -> send_resp(conn, 403, "")
+        case Riptide.Authz.evaluate(tenant_id, path_segments, conn.assigns.current_subject, :read) do
+          :allow -> do_subscribe(conn, stream_id)
+          _ -> send_resp(conn, 403, "")
+        end
+
+      _ ->
+        send_resp(conn, 403, "")
     end
   end
 
