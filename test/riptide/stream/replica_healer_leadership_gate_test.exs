@@ -74,12 +74,8 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
     end
 
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
-    ordinal_to_node = Map.new(peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
-    resolve_fun = fn ordinal -> Map.fetch!(ordinal_to_node, ordinal) end
 
     for {_pid, node, _ordinal} <- peers do
-      :erpc.call(node, Application, :put_env, [:riptide, :ordinal_resolver, resolve_fun])
-
       # Prevent each node's own real 30s sweep timer from firing mid-test and
       # confusing which send/handle_info actually caused a given repair —
       # this test drives every sweep explicitly.
@@ -111,9 +107,11 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
     [{_pid_a, node_a, _}, {_pid_b, node_b, _}, {_pid_c, node_c, _}, {_pid_d, _node_d, _}] = peers
     placement_peers = Enum.take(peers, 3)
 
+    placement_nodes = Enum.map(placement_peers, fn {_pid, node, _ordinal} -> node end)
+
     results =
       Enum.map(placement_peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [resolve_fun])
+        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [placement_nodes])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
