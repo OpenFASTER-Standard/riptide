@@ -2337,12 +2337,32 @@ defmodule Riptide.PlacementMembershipClusterTest do
     {survivor_pid, survivor_node} = hd(survivors)
     :erpc.call(survivor_node, Riptide.PlacementMembership, :bootstrap_once, [])
 
-    members = wait_for_stable_membership([survivor_node, spare_node], 3, 10_000)
+    # A plain size-3 check isn't enough to detect real convergence here:
+    # the ORIGINAL cluster (with the now-dead node still counted) is already
+    # size 3 the instant it forms, and stays exactly size 3 in the steady
+    # state too (dead node removed, spare node joined) — so a poll that only
+    # checks length would report "converged" on its very first read, before
+    # any repair has actually happened. Require the dead node's absence too.
+    members =
+      poll_until(
+        fn ->
+          case :erpc.call(survivor_node, Riptide.RaCluster, :probe_placement_members, [
+                 [survivor_node, spare_node]
+               ]) do
+            {:ok, members} ->
+              if length(members) == 3 and dead_node not in members, do: members
+
+            _ ->
+              nil
+          end
+        end,
+        20_000
+      )
 
     assert length(members) == 3
     refute dead_node in members
-    assert survivor_pid == survivor_pid
-    assert spare_pid == spare_pid
+    assert Process.alive?(survivor_pid)
+    assert Process.alive?(spare_pid)
   end
 
   defp spawn_and_connect(count) do
@@ -2358,12 +2378,16 @@ defmodule Riptide.PlacementMembershipClusterTest do
       end
 
     on_exit(fn ->
-      Enum.each(peers, fn {pid, _node} ->
-        if Process.alive?(pid), do: safe_stop_peer(pid)
-      end)
+      Enum.each(peers, fn {pid, _node} -> stop_alive_peer(pid) end)
 
-      Enum.each(specs, fn {alive_name, _host} ->
-        File.rm_rf!(Path.join(File.cwd!(), Atom.to_string(alive_name)))
+      # Keyed on the full node name, not `alive_name` — `RaCluster.data_dir/0`
+      # derives its on-disk directory from `HOSTNAME`, which is set below to
+      # `Atom.to_string(node)` (e.g. "pm0@127.0.0.20"), not the bare peer
+      # alias ("pm0"). Cleaning up the wrong directory leaves real Ra data on
+      # disk for the next test in this file to collide with, since @peers'
+      # names/hosts are reused across every test in this module.
+      Enum.each(peers, fn {_pid, node} ->
+        File.rm_rf!(Path.join(File.cwd!(), Atom.to_string(node)))
       end)
     end)
 
@@ -2412,6 +2436,10 @@ defmodule Riptide.PlacementMembershipClusterTest do
     end
 
     {peers, nodes}
+  end
+
+  defp stop_alive_peer(pid) do
+    if Process.alive?(pid), do: safe_stop_peer(pid)
   end
 
   defp safe_stop_peer(pid) do
@@ -2518,6 +2546,11 @@ end
 
 Run: `mix test test/riptide/placement_membership_cluster_test.exs`
 Expected: PASS. If genesis convergence is flaky (multiple nodes racing to form genesis under real network timing), increase `@genesis_settle_ms` in `lib/riptide/placement_membership.ex` (Task 2) from 3000 to a larger value (e.g. 5000) and re-run — this is a real tuning parameter, not a correctness bug, per the spec's own accepted-risk note on genesis timing.
+
+**Found during execution (fixed in the code block above, not a re-run-with-bigger-timeout situation):**
+1. `spawn_and_connect/1`'s original `on_exit` cleaned up `Path.join(File.cwd!(), Atom.to_string(alive_name))` (e.g. `"pm0"`), but `RaCluster.data_dir/0` actually keys its on-disk directory off `HOSTNAME`, set earlier in the same function to `Atom.to_string(node)` (e.g. `"pm0@127.0.0.20"`). The mismatch meant cleanup silently deleted the wrong (nonexistent) directory and left real `:ra` on-disk data behind for the next test in this file to collide with — since `@peers`' names/hosts are reused identically across all 5 tests. This surfaced as 3 of the 5 tests failing with wrong member counts or `{:error, :cluster_not_formed}` depending on run order, never reproducible when a failing test was re-run in isolation (fresh, uncollided directories). Fixed by keying cleanup off the real node name.
+2. The "dead-member replacement" test's original `wait_for_stable_membership(candidates, 3, ...)` call falsely reports convergence instantly: the *original* 3-member cluster (dead node still counted) already satisfies `length(members) == 3` the moment it forms, and stays exactly size 3 in the healthy end state too (dead node removed, spare node joined) — a bare size check can't tell "stale 3, unrepaired" from "healthy 3, repaired" apart. Fixed by polling for size 3 *and* the dead node's absence together, with a longer 20s timeout (two ambient `@reconcile_interval_ms` ticks — one to remove the dead member, one for the spare to join — plus leader-election time after the kill).
+3. The test's own closing assertions were tautologies (`assert survivor_pid == survivor_pid`, `assert spare_pid == spare_pid` — always true, caught by `mix credo --strict`). Replaced with `assert Process.alive?(survivor_pid)` / `assert Process.alive?(spare_pid)`, confirming only the deliberately-killed peer actually died.
 
 - [ ] **Step 3: Run the full suite to confirm no regressions**
 
