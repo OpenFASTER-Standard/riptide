@@ -65,29 +65,18 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
       assert :erpc.call(n1, :net_kernel, :connect_node, [n2]) == true
     end
 
-    original_resolver =
-      Map.new(original_peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
-
-    original_resolve_fun = fn ordinal -> Map.fetch!(original_resolver, ordinal) end
-
     bootstrap_ra(original_peers)
-    form_placement_cluster(original_peers, original_resolve_fun)
+    form_placement_cluster(original_peers, nodes)
 
     [{pid_a, node_a, _}, {pid_b, _node_b, _}, {_pid_c, node_c, _}] = original_peers
 
     stream_id = "snapshot-recovery-" <> Uniq.UUID.uuid4()
 
-    assigned =
-      :erpc.call(node_a, Riptide.Placement, :assign, [
-        stream_id,
-        [node_a],
-        original_resolve_fun
-      ])
+    assigned = :erpc.call(node_a, Riptide.Placement, :assign, [stream_id, [node_a]])
 
     assert assigned == [node_a]
 
-    assert :erpc.call(node_c, Riptide.Placement, :lookup, [stream_id, original_resolve_fun]) ==
-             [node_a]
+    assert :erpc.call(node_c, Riptide.Placement, :lookup, [stream_id]) == [node_a]
 
     # Kill 2-of-3 — genuine quorum loss, not a graceful shutdown.
     stop_peer(pid_a)
@@ -113,20 +102,18 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
 
     bootstrap_ra(replacement_peers)
 
-    fresh_resolver =
-      Map.new([{"riptide-0", node_a2}, {"riptide-1", node_b2}, {"riptide-2", node_c}])
-
-    fresh_resolve_fun = fn ordinal -> Map.fetch!(fresh_resolver, ordinal) end
+    fresh_nodes = [node_a2, node_b2, node_c]
 
     # Both fresh replacements attempt to (re)form the placement cluster —
-    # exactly what `RaCluster.ensure_placement_cluster_started/0`'s
-    # boot-time infinite-retry loop already does on every real pod boot,
-    # with no new code needed for this to work.
+    # exactly what `Riptide.PlacementMembership`'s own reconcile loop does
+    # on every real pod boot (Phase 3e), just driven directly here instead
+    # of waiting on that loop's timer, so this test proves the underlying
+    # `:ra` recovery mechanism itself (`RaCluster.start_genesis_placement_
+    # cluster/1`'s internal `:ra.start_cluster/2` call trusting the fresh
+    # member list when no snapshot exists — see this file's own moduledoc)
+    # independent of the higher-level controller's timing.
     for {_pid, node, _ordinal} <- replacement_peers do
-      _ =
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [
-          fresh_resolve_fun
-        ])
+      _ = :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [fresh_nodes])
     end
 
     # Membership reconciles to the fresh identities, queried from the one
@@ -143,10 +130,8 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
            end)
 
     # No data loss: the original assignment, made before the quorum loss,
-    # is still there — queried through the fresh resolver, against the
-    # reconciled cluster.
-    assert :erpc.call(node_c, Riptide.Placement, :lookup, [stream_id, fresh_resolve_fun]) ==
-             [node_a]
+    # is still there — queried against the reconciled cluster.
+    assert :erpc.call(node_c, Riptide.Placement, :lookup, [stream_id]) == [node_a]
   end
 
   defp start_peers(peer_specs, pa_args) do
@@ -191,10 +176,10 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
     end
   end
 
-  defp form_placement_cluster(peers, resolve_fun) do
+  defp form_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [resolve_fun])
+        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.all?(results, &(&1 in [:ok, {:error, :cluster_not_formed}]))
@@ -214,7 +199,7 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
   end
 
   # Membership reconciliation isn't instantaneous — it happens as a side
-  # effect of `attempt_start_placement_cluster/1`'s own election/replication
+  # effect of `start_genesis_placement_cluster/1`'s own election/replication
   # machinery settling, not synchronously within a single call.
   defp eventually(fun, attempts_left \\ 50) do
     cond do
