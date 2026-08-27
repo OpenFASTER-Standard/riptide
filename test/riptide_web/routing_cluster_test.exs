@@ -68,12 +68,6 @@ defmodule RiptideWeb.RoutingClusterTest do
     end
 
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
-    ordinal_to_node = Map.new(peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
-    resolve_fun = fn ordinal -> Map.fetch!(ordinal_to_node, ordinal) end
-
-    for {_pid, node, _ordinal} <- peers do
-      :erpc.call(node, Application, :put_env, [:riptide, :ordinal_resolver, resolve_fun])
-    end
 
     for {n1, n2} <- unique_pairs(nodes) do
       assert :erpc.call(n1, :net_kernel, :connect_node, [n2]) == true
@@ -93,18 +87,18 @@ defmodule RiptideWeb.RoutingClusterTest do
       end
     end
 
-    # Only the first 3 :peer_specs are real placement-cluster ordinals
-    # ("riptide-0/1/2", matching RaCluster.placement_ordinals/0) — the 4th
-    # peer is deliberately extra fleet capacity, exactly like a real node
-    # joining a growing cluster that ISN'T one of the 3 fixed placement
-    # ordinals. It still needs :ra/PubSub bootstrapped (below) since it's a
-    # real node any stream request could land on, just not a placement
-    # metadata cluster member.
+    # Only the first 3 peers form the placement cluster (a fixed genesis
+    # target size of 3, independent of total fleet size) — the 4th peer is
+    # deliberately extra fleet capacity, exactly like a real node joining a
+    # growing cluster that isn't a placement-cluster member. It still needs
+    # :ra/PubSub bootstrapped (below) since it's a real node any stream
+    # request could land on, just not a placement metadata cluster member.
     placement_peers = Enum.take(peers, 3)
+    placement_nodes = Enum.map(placement_peers, fn {_pid, node, _ordinal} -> node end)
 
     results =
       Enum.map(placement_peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [resolve_fun])
+        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [placement_nodes])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
