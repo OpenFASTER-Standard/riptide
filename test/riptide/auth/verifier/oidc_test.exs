@@ -54,7 +54,8 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
     default_claims = %{
       "iss" => @issuer,
       "aud" => @audience,
-      "exp" => System.system_time(:second) + 3600
+      "exp" => System.system_time(:second) + 3600,
+      "sub" => "user-1"
     }
 
     Joken.generate_and_sign!(%{}, Map.merge(default_claims, claims), signer)
@@ -130,6 +131,17 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
 
   test "rejects a validly-signed token that omits aud entirely", %{signer: signer} do
     assert {:error, _reason} = Verifier.OIDC.verify(token_missing("aud", signer))
+  end
+
+  # A validly-signed token that omits `sub` would otherwise pass verification
+  # with `current_subject["sub"] == nil` — if such a token were the first
+  # write to a brand-new tenant, the stored owner policy would become
+  # `{:agent, nil}`, matching any OTHER subject-less token too (see
+  # Riptide.Auth.TokenConfig's own moduledoc). Requiring `sub` here closes
+  # that off before it can ever reach the authorization layer.
+  test "rejects a validly-signed token that omits sub entirely", %{signer: signer} do
+    assert {:error, {:missing_claims, ["sub"]}} =
+             Verifier.OIDC.verify(token_missing("sub", signer))
   end
 
   # Regression test: `"exp": null` (present, not omitted) previously passed

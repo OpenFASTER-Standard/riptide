@@ -164,4 +164,68 @@ defmodule Riptide.Stream.StreamServerTest do
 
     assert_received {[:riptide, :stream, :get_since, :gap], ^ref, %{}, %{}}
   end
+
+  describe "replica fallback (audit remediation, 2026-08-27)" do
+    # append/2 and get_since/2 previously always addressed only
+    # `hd(Placement.server_ids!(stream_id))` — a de-facto single point of
+    # failure for the whole stream even if its other replicas were healthy.
+    # This directly manipulates Riptide.Stream.Placement's own cache (a
+    # public, named ETS table — see its moduledoc) to inject an unreachable
+    # server id ahead of the real, already-running one, mirroring the same
+    # "collapsed/synthetic multi-member" testing pattern already used
+    # elsewhere in this codebase (e.g. RaClusterTest's own collapsed-node
+    # test) rather than standing up a real multi-node :peer cluster just to
+    # prove this fallback logic.
+    test "append/2 falls back to the next replica when the first is unreachable" do
+      stream_id = "stream-fallback-append-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      {:ok, _pid} = StreamServer.start_link(stream_id)
+      real_server_id = hd(:ets.lookup_element(:riptide_stream_placement_cache, stream_id, 2))
+      uid = Riptide.RaCluster.uid_for(stream_id)
+      unreachable_server_id = {String.to_atom(uid), :nonexistent@nohost}
+
+      :ets.insert(
+        :riptide_stream_placement_cache,
+        {stream_id, [unreachable_server_id, real_server_id]}
+      )
+
+      appended =
+        StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+      assert appended.sequence == 1
+    end
+
+    test "get_since/2 falls back to the next replica when the first is unreachable" do
+      stream_id = "stream-fallback-get-since-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      {:ok, _pid} = StreamServer.start_link(stream_id)
+      StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+      real_server_id = hd(:ets.lookup_element(:riptide_stream_placement_cache, stream_id, 2))
+      uid = Riptide.RaCluster.uid_for(stream_id)
+      unreachable_server_id = {String.to_atom(uid), :nonexistent@nohost}
+
+      :ets.insert(
+        :riptide_stream_placement_cache,
+        {stream_id, [unreachable_server_id, real_server_id]}
+      )
+
+      assert {:ok, [%{sequence: 1}]} = StreamServer.get_since(stream_id, 0)
+    end
+
+    test "append/2 raises when every replica is unreachable" do
+      stream_id = "stream-fallback-total-failure-" <> Uniq.UUID.uuid4()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      uid = Riptide.RaCluster.uid_for(stream_id)
+      unreachable_server_id = {String.to_atom(uid), :nonexistent@nohost}
+      :ets.insert(:riptide_stream_placement_cache, {stream_id, [unreachable_server_id]})
+
+      assert_raise RuntimeError, fn ->
+        StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+      end
+    end
+  end
 end

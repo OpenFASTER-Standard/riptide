@@ -1,5 +1,6 @@
 defmodule RiptideWeb.LDP.ResourceController do
   use Phoenix.Controller
+  require Logger
 
   alias Riptide.Event
   alias Riptide.RDF.{Patch, TurtleCodec}
@@ -96,42 +97,91 @@ defmodule RiptideWeb.LDP.ResourceController do
 
     case TurtleCodec.decode(body) do
       {:ok, child_graph} ->
-        child_id = Uniq.UUID.uuid4()
-        child_stream_id = container_stream_id <> "/" <> child_id
-
-        with :ok <- child_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status(),
-             :ok <-
-               container_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
-          StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
-
-          containment_triple =
-            {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
-
-          containment_patch = %Patch{additions: [containment_triple], removals: []}
-
-          StreamServer.append(
-            container_stream_id,
-            Event.new(container_stream_id, :patch, containment_patch)
-          )
-
-          location =
-            "/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
-
-          conn
-          |> put_resp_header("location", location)
-          |> send_resp(201, "")
-        else
-          :error -> send_resp(conn, 503, "")
-        end
+        finish_create_child(conn, tenant_id, path_segments, container_stream_id, child_graph)
 
       {:error, _reason} ->
         send_resp(conn, 400, "")
     end
   end
 
+  defp finish_create_child(conn, tenant_id, path_segments, container_stream_id, child_graph) do
+    child_id = Uniq.UUID.uuid4()
+    child_stream_id = container_stream_id <> "/" <> child_id
+
+    with :ok <- child_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status(),
+         :ok <-
+           container_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
+
+      containment_triple =
+        {RDF.iri(container_stream_id), @ldp_contains, RDF.iri(child_stream_id)}
+
+      containment_patch = %Patch{additions: [containment_triple], removals: []}
+
+      case append_containment_patch(container_stream_id, containment_patch) do
+        :ok ->
+          location =
+            "/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/") <> "/" <> child_id
+
+          conn
+          |> put_resp_header("location", location)
+          |> send_resp(201, "")
+
+        :error ->
+          cleanup_orphaned_child(child_stream_id)
+          send_resp(conn, 503, "")
+      end
+    else
+      :error -> send_resp(conn, 503, "")
+    end
+  end
+
   @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
   def ensure_ready_status(:ok), do: :ok
   def ensure_ready_status({:error, _reason}), do: :error
+
+  # StreamServer.append/2 can raise if the container's own replicas are all
+  # unreachable at this exact moment (e.g. a transient partition after the
+  # child's own append already succeeded) — without catching it here, an
+  # uncaught exception would leave the child resource durably created and
+  # independently readable, but permanently un-referenced by its
+  # container's `ldp:contains` listing, with no retry or cleanup.
+  @spec append_containment_patch(String.t(), Patch.t()) :: :ok | :error
+  defp append_containment_patch(container_stream_id, patch) do
+    StreamServer.append(container_stream_id, Event.new(container_stream_id, :patch, patch))
+    :ok
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
+
+  # Best-effort: append a :delete event for the just-created, now-orphaned
+  # child so it stops being independently readable even though it was never
+  # linked from its container. If THIS also fails (the child's own replicas
+  # are unreachable too), there is no automated reconciliation path today —
+  # log loudly so an operator can find and clean it up manually rather than
+  # it silently persisting forever.
+  @spec cleanup_orphaned_child(String.t()) :: :ok
+  defp cleanup_orphaned_child(child_stream_id) do
+    StreamServer.append(child_stream_id, Event.new(child_stream_id, :delete, RDF.Graph.new()))
+    :ok
+  rescue
+    e -> log_orphaned_child_cleanup_failure(child_stream_id, Exception.message(e))
+  catch
+    :exit, reason -> log_orphaned_child_cleanup_failure(child_stream_id, inspect(reason))
+  end
+
+  defp log_orphaned_child_cleanup_failure(child_stream_id, reason) do
+    Logger.error(
+      "create_child: container patch failed AND cleanup of orphaned child " <>
+        "#{child_stream_id} also failed (#{reason}) — manual cleanup needed",
+      child_stream_id: child_stream_id,
+      reason: reason
+    )
+
+    :ok
+  end
 
   @stream_id_prefix "https://riptide.example/tenants/"
   @resources_segment "/resources/"

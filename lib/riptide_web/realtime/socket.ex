@@ -35,6 +35,7 @@ defmodule RiptideWeb.Realtime.Socket do
             {:ok, assign(socket, :current_subject, claims)}
 
           {:error, reason} ->
+            Logger.warning("auth verification failed", reason: inspect(reason))
             {:error, reason}
         end
     end

@@ -17,6 +17,8 @@ defmodule Riptide.Placement do
   cluster stayed healthy via its other members the whole time.
   """
 
+  require Logger
+
   alias Riptide.Placement.PlacementMachine
   alias Riptide.RaCluster
 
@@ -82,8 +84,33 @@ defmodule Riptide.Placement do
     end)
   end
 
+  # See Riptide.Placement.PlacementMachine's own moduledoc ("Repair claims")
+  # for the full rationale: fences Riptide.Stream.ReplicaHealer's repair
+  # against two placement ordinals both believing they're the leader at
+  # once. `now_ts` is computed here (the caller), not inside `apply/3` —
+  # reading the wall clock inside a Ra machine callback would break replica
+  # determinism.
+  @spec claim_repair(String.t(), node(), (String.t() -> node())) :: :claimed | :already_claimed
+  def claim_repair(stream_id, dead_node, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    now_ts = System.system_time(:second)
+
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(
+        server_id,
+        {:claim_repair, stream_id, dead_node, node(), now_ts}
+      )
+    end)
+  end
+
+  @spec release_repair(String.t(), (String.t() -> node())) :: :ok
+  def release_repair(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:release_repair, stream_id, node()})
+    end)
+  end
+
   @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t(), (String.t() -> node())) ::
-          :ok
+          :ok | {:error, :too_many_policies}
   def add_policy(
         tenant_id,
         path_prefix,
@@ -139,6 +166,35 @@ defmodule Riptide.Placement do
   defp try_ordinals([ordinal | rest], resolve_fun, fun) do
     fun.(RaCluster.placement_server_id(ordinal, resolve_fun))
   rescue
-    _ -> try_ordinals(rest, resolve_fun, fun)
+    e ->
+      log_ordinal_fallback(ordinal, Exception.message(e))
+      try_ordinals(rest, resolve_fun, fun)
+  catch
+    # `RaCluster.process_command/2`/`consistent_query/2` now always raise
+    # rather than exit (see their own `catch :exit` doc) — this remains as
+    # defense in depth for any other failure this call chain could
+    # eventually surface as a raw exit, so a single ordinal's failure keeps
+    # falling through to the next one instead of defeating the whole point
+    # of this fallback.
+    :exit, reason ->
+      log_ordinal_fallback(ordinal, inspect(reason))
+      try_ordinals(rest, resolve_fun, fun)
+  end
+
+  # A single ordinal failing over is expected/routine during a rolling
+  # restart or a transient network blip — this is intentionally a warning,
+  # not swallowed silently, so a *persistently* unreachable ordinal (one
+  # that fails on every call for an extended period) is at least visible in
+  # logs even though only total failure (all 3 ordinals down) is reflected
+  # in the `riptide.placement.lookup/assign.errors` metrics.
+  defp log_ordinal_fallback(ordinal, reason) do
+    Logger.warning(
+      "Riptide.Placement: ordinal #{inspect(ordinal)} failed, falling back to the next one " <>
+        "(#{reason})",
+      ordinal: ordinal,
+      reason: reason
+    )
+
+    :telemetry.execute([:riptide, :placement, :ordinal_fallback], %{}, %{})
   end
 end

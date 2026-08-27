@@ -13,6 +13,13 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.Authenticate
   end
 
+  # SSE-only: browsers' native EventSource API can't set custom request
+  # headers, so this is the only route allowed to accept a bearer token via
+  # `?token=` — see RiptideWeb.Plugs.Authenticate's own moduledoc.
+  pipeline :auth_query_param do
+    plug RiptideWeb.Plugs.Authenticate, allow_query_param: true
+  end
+
   pipeline :authz do
     plug RiptideWeb.Plugs.Authorize
   end
@@ -25,7 +32,7 @@ defmodule RiptideWeb.Router do
   end
 
   scope "/" do
-    pipe_through [:api, :auth]
+    pipe_through [:api, :auth_query_param]
 
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end

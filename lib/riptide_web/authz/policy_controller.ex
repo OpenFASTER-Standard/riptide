@@ -19,12 +19,22 @@ defmodule RiptideWeb.Authz.PolicyController do
 
     case policy_from_params(params) do
       {:ok, policy} ->
-        :ok = store.add_policy(tenant_id, [], policy)
-        send_resp(conn, 201, "")
+        case store.add_policy(tenant_id, [], policy) do
+          :ok -> send_resp(conn, 201, "")
+          {:error, :too_many_policies} -> send_resp(conn, 429, "")
+        end
 
       :error ->
         send_resp(conn, 400, "")
     end
+  rescue
+    _ -> send_resp(conn, 503, "")
+  catch
+    # store.add_policy/3 (and list_policies/2 below) can raise/exit if the
+    # placement cluster is fully unreachable — see RiptideWeb.Plugs.
+    # Authorize's own rescue/catch on this same failure mode, immediately
+    # upstream of this same route.
+    :exit, _ -> send_resp(conn, 503, "")
   end
 
   def index(conn, _params) do
@@ -35,6 +45,10 @@ defmodule RiptideWeb.Authz.PolicyController do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(200, Jason.encode!(Enum.map(policies, &policy_to_map/1)))
+  rescue
+    _ -> send_resp(conn, 503, "")
+  catch
+    :exit, _ -> send_resp(conn, 503, "")
   end
 
   defp policy_from_params(%{"effect" => effect, "modes" => modes, "matcher" => matcher})

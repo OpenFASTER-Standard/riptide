@@ -10,7 +10,8 @@ defmodule Riptide.Authz.Store do
   alias Riptide.Authz.Policy
 
   @callback list_policies(tenant_id :: String.t(), path_prefix :: [String.t()]) :: [Policy.t()]
-  @callback add_policy(tenant_id :: String.t(), path_prefix :: [String.t()], Policy.t()) :: :ok
+  @callback add_policy(tenant_id :: String.t(), path_prefix :: [String.t()], Policy.t()) ::
+              :ok | {:error, :too_many_policies}
   @callback claim_tenant_if_unclaimed(tenant_id :: String.t(), subject :: String.t()) ::
               :claimed | :already_claimed
 end

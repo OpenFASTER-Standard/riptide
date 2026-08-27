@@ -21,11 +21,24 @@ defmodule Riptide.Authz do
       |> Enum.flat_map(&store.list_policies(tenant_id, &1))
       |> Enum.filter(&applies?(&1, current_subject, mode))
 
-    cond do
-      Enum.any?(matching_policies, &(&1.effect == :deny)) -> :deny
-      Enum.any?(matching_policies, &(&1.effect == :allow)) -> :allow
-      true -> :deny
-    end
+    effect =
+      cond do
+        Enum.any?(matching_policies, &(&1.effect == :deny)) -> :deny
+        Enum.any?(matching_policies, &(&1.effect == :allow)) -> :allow
+        true -> :deny
+      end
+
+    # `effect`/`mode` are both small, fixed sets (2 values each) — safe to
+    # tag without violating the cardinality constraint every other metric in
+    # this codebase follows (see Riptide.Telemetry's own moduledoc). Without
+    # this, a systemic authz failure (e.g. the policy store starts returning
+    # empty for an unrelated reason, so `evaluate/4`'s own default-deny
+    # kicks in for every request) is invisible on any dashboard — the only
+    # signal would be an HTTP 403-rate bump on the LDP routes, and SSE/WS
+    # authorization denials have no equivalent status-coded metric at all.
+    :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: effect, mode: mode})
+
+    effect
   end
 
   # Every prefix of path_segments, including the empty one (the tenant
@@ -41,6 +54,17 @@ defmodule Riptide.Authz do
 
   defp matches?(:public, _current_subject), do: true
   defp matches?(:authenticated, current_subject), do: not is_nil(current_subject)
+
+  # `subject: nil` never matches, even against a `current_subject` that also
+  # lacks a `sub` claim — an `{:agent, nil}` policy would otherwise mean "any
+  # authenticated request whose token happens to omit `sub`," which defeats
+  # the whole point of an agent-scoped policy (one specific principal, not a
+  # class of them). `Riptide.Auth.TokenConfig` now requires `sub` on every
+  # verified token, so a `nil` matcher subject should never be created going
+  # forward — this guard is defense in depth for any policy that predates
+  # that requirement or is inserted through a path other than token-based
+  # bootstrap.
+  defp matches?({:agent, nil}, _current_subject), do: false
 
   defp matches?({:agent, subject}, current_subject),
     do: not is_nil(current_subject) and current_subject["sub"] == subject

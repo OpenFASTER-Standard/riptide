@@ -14,12 +14,37 @@ spec:
     metadata:
       labels:
         app: riptide
+      annotations:
+        # No-op unless a Prometheus configured for annotation-based scrape
+        # discovery is present in the cluster — see README.md's "Metrics"
+        # section. Shipped on by default rather than left as a README-only
+        # step an operator has to remember to add themselves.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
     spec:
       securityContext:
         fsGroup: 1000
       containers:
         - name: riptide
           image: ghcr.io/openfaster-standard/riptide:latest
+          securityContext:
+            # Matches the Dockerfile's own `USER riptide` (uid/gid 1000) —
+            # defense in depth, not a bypass: the image already never runs
+            # as root, this just makes Kubernetes enforce the same thing
+            # even if a future image change regresses that.
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
           ports:
             - name: http
               containerPort: 4000
