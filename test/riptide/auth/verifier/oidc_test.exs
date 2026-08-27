@@ -140,7 +140,8 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
   # Riptide.Auth.TokenConfig's own moduledoc). Requiring `sub` here closes
   # that off before it can ever reach the authorization layer.
   test "rejects a validly-signed token that omits sub entirely", %{signer: signer} do
-    assert {:error, {:missing_claims, ["sub"]}} = Verifier.OIDC.verify(token_missing("sub", signer))
+    assert {:error, {:missing_claims, ["sub"]}} =
+             Verifier.OIDC.verify(token_missing("sub", signer))
   end
 
   # Regression test: `"exp": null` (present, not omitted) previously passed

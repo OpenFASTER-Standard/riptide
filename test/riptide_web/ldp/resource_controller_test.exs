@@ -2,6 +2,8 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  import ExUnit.CaptureLog
+
   alias Riptide.Authz.{Policy, Store}
   alias RiptideWeb.LDP.ResourceController
 
@@ -258,6 +260,42 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
 
     container_get_conn = :get |> conn(container_path) |> RiptideWeb.Endpoint.call(@opts)
     assert container_get_conn.resp_body =~ "ldp#contains"
+  end
+
+  test "POST to a container whose containment patch fails cleans up the orphaned child instead of leaving it dangling" do
+    container_path = unique_path()
+    container_stream_id = stream_id_for(container_path)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(container_stream_id) end)
+
+    # Pre-seeds the container's placement cache with an unreachable server
+    # id — Riptide.Stream.Placement.ensure_started/2's cache-hit path trusts
+    # the cache without re-validating reachability, so StreamSupervisor.
+    # ensure_ready/1 still reports :ok for the container (the child's own
+    # stream is a fresh, real, non-seeded one and succeeds normally), but
+    # the container's own StreamServer.append/2 — the containment patch —
+    # then genuinely fails against that unreachable address.
+    uid = Riptide.RaCluster.uid_for(container_stream_id)
+    unreachable_server_id = {String.to_atom(uid), :nonexistent@nohost}
+    :ets.insert(:riptide_stream_placement_cache, {container_stream_id, [unreachable_server_id]})
+
+    child_turtle = "<https://pod.example/a> <https://pod.example/b> \"c\" .\n"
+
+    log =
+      capture_log(fn ->
+        post_conn =
+          :post
+          |> conn(container_path, child_turtle)
+          |> put_req_header("content-type", "text/turtle")
+          |> RiptideWeb.Endpoint.call(@opts)
+
+        assert post_conn.status == 503
+      end)
+
+    # If cleanup of the orphaned child had ALSO failed, that failure logs
+    # loudly (see ResourceController.log_orphaned_child_cleanup_failure/2) —
+    # its absence here means the child's own :delete append succeeded, i.e.
+    # the orphan was actually cleaned up rather than left dangling.
+    refute log =~ "manual cleanup needed"
   end
 
   test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do

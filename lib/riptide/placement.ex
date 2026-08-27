@@ -84,6 +84,31 @@ defmodule Riptide.Placement do
     end)
   end
 
+  # See Riptide.Placement.PlacementMachine's own moduledoc ("Repair claims")
+  # for the full rationale: fences Riptide.Stream.ReplicaHealer's repair
+  # against two placement ordinals both believing they're the leader at
+  # once. `now_ts` is computed here (the caller), not inside `apply/3` —
+  # reading the wall clock inside a Ra machine callback would break replica
+  # determinism.
+  @spec claim_repair(String.t(), node(), (String.t() -> node())) :: :claimed | :already_claimed
+  def claim_repair(stream_id, dead_node, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    now_ts = System.system_time(:second)
+
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(
+        server_id,
+        {:claim_repair, stream_id, dead_node, node(), now_ts}
+      )
+    end)
+  end
+
+  @spec release_repair(String.t(), (String.t() -> node())) :: :ok
+  def release_repair(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+    with_ordinal_fallback(resolve_fun, fn server_id ->
+      RaCluster.process_command(server_id, {:release_repair, stream_id, node()})
+    end)
+  end
+
   @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t(), (String.t() -> node())) ::
           :ok | {:error, :too_many_policies}
   def add_policy(

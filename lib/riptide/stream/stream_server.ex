@@ -44,8 +44,11 @@ defmodule Riptide.Stream.StreamServer do
   @spec append(String.t(), Event.t()) :: Event.t()
   def append(stream_id, %Event{} = event) do
     :telemetry.span([:riptide, :stream, :append], %{}, fn ->
-      server_id = hd(Placement.server_ids!(stream_id))
-      stamped = RaCluster.process_command(server_id, {:append, Event.encode(event)})
+      stamped =
+        try_replicas(stream_id, fn server_id ->
+          RaCluster.process_command(server_id, {:append, Event.encode(event)})
+        end)
+
       Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> stream_id, {:new_event, stamped})
       {stamped, %{}}
     end)
@@ -62,8 +65,10 @@ defmodule Riptide.Stream.StreamServer do
           {:ok, [Event.t()]} | {:gap, pos_integer() | nil}
   def get_since(stream_id, cursor) do
     :telemetry.span([:riptide, :stream, :get_since], %{}, fn ->
-      server_id = hd(Placement.server_ids!(stream_id))
-      result = RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
+      result =
+        try_replicas(stream_id, fn server_id ->
+          RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
+        end)
 
       case result do
         {:gap, _oldest} -> :telemetry.execute([:riptide, :stream, :get_since, :gap], %{}, %{})
@@ -72,6 +77,34 @@ defmodule Riptide.Stream.StreamServer do
 
       {result, %{}}
     end)
+  end
+
+  # Mirrors Riptide.Placement.with_ordinal_fallback/2's own "try each
+  # member in turn" shape (see its own moduledoc for the SPOF finding this
+  # pattern originally fixed for the placement cluster): a stream's replica
+  # list is fixed once assigned, and any one of them being briefly
+  # unreachable or mid-restart shouldn't fail the whole operation while the
+  # other replicas are healthy — previously `append/2`/`get_since/2` always
+  # addressed only `hd(Placement.server_ids!(stream_id))`, making that one
+  # replica a de-facto single point of failure for the entire stream even
+  # though its underlying multi-member Ra cluster stayed healthy. The very
+  # last replica's exception is deliberately left to propagate uncaught: if
+  # none of a stream's own replicas can serve the request, that's a
+  # genuine, fully-down stream cluster, not something a caller here can
+  # paper over.
+  @spec try_replicas(String.t(), (:ra.server_id() -> term())) :: term()
+  defp try_replicas(stream_id, fun) do
+    try_server_ids(Placement.server_ids!(stream_id), fun)
+  end
+
+  defp try_server_ids([server_id], fun), do: fun.(server_id)
+
+  defp try_server_ids([server_id | rest], fun) do
+    fun.(server_id)
+  rescue
+    _ -> try_server_ids(rest, fun)
+  catch
+    :exit, _ -> try_server_ids(rest, fun)
   end
 
   # Bridges a liveness gap that only exists because `Placement.ensure_started/2`

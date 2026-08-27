@@ -98,7 +98,32 @@ defmodule Riptide.Stream.ReplicaHealer do
     end
   end
 
+  # Fences this repair through the placement Ra cluster's own consensus
+  # (see Riptide.Placement.PlacementMachine's moduledoc, "Repair claims")
+  # rather than trusting `RaCluster.placement_leader?/0`'s unfenced,
+  # point-in-time belief alone — closes a dual-leader race where two
+  # placement ordinals both briefly believing they're the leader during a
+  # handoff/partition could each fully commit a *different* replacement
+  # node for the same dead replica, leaving an untracked, over-replicated
+  # extra member with no cleanup path. `release_repair/1` always runs (even
+  # if the repair itself raises/fails) so a crash mid-repair doesn't
+  # permanently wedge this stream's repair path any longer than the claim's
+  # own TTL.
   defp repair(stream_id, uid, nodes, dead_node) do
+    case Placement.claim_repair(stream_id, dead_node) do
+      :already_claimed ->
+        :ok
+
+      :claimed ->
+        try do
+          do_claimed_repair(stream_id, uid, nodes, dead_node)
+        after
+          Placement.release_repair(stream_id)
+        end
+    end
+  end
+
+  defp do_claimed_repair(stream_id, uid, nodes, dead_node) do
     survivor_nodes = nodes -- [dead_node]
 
     case pick_replacement(nodes) do

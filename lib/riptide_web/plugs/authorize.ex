@@ -30,6 +30,19 @@ defmodule RiptideWeb.Plugs.Authorize do
       :allow -> conn
       :deny -> maybe_bootstrap(conn, tenant_id, current_subject, mode)
     end
+  rescue
+    _ -> service_unavailable(conn)
+  catch
+    # Riptide.Authz.evaluate/4 (and claim_tenant_if_unclaimed/2 below) can
+    # raise/exit if the placement cluster backing the policy store is fully
+    # unreachable (Riptide.Placement's own documented raise-on-total-failure
+    # behavior) — every authenticated LDP/policy route goes through this
+    # plug, so left uncaught this surfaces as a generic Phoenix 500 with no
+    # way for a caller/load-balancer to tell "genuinely forbidden" apart
+    # from "transient, back off and retry," the same distinction
+    # RiptideWeb.HealthController's /health/ready already makes for this
+    # exact failure mode.
+    :exit, _ -> service_unavailable(conn)
   end
 
   # Guards against `current_subject["sub"]` being `nil` (bootstrapping the
@@ -57,6 +70,12 @@ defmodule RiptideWeb.Plugs.Authorize do
   defp reject(conn) do
     conn
     |> send_resp(403, "")
+    |> halt()
+  end
+
+  defp service_unavailable(conn) do
+    conn
+    |> send_resp(503, "")
     |> halt()
   end
 end

@@ -651,10 +651,17 @@ defmodule Riptide.RaCluster do
           :ok | {:error, term()} | {:timeout, term()}
   defp remove_member(survivor_ids, dead_id) do
     case retry_cluster_change(fn -> :ra.remove_member(survivor_ids, dead_id) end) do
-      {:ok, _reply, _leader} -> :ok
-      {:error, :not_member} -> if member_removed?(survivor_ids, dead_id), do: :ok, else: {:error, :not_member}
-      {:error, reason} -> {:error, reason}
-      {:timeout, _} = timeout -> timeout
+      {:ok, _reply, _leader} ->
+        :ok
+
+      {:error, :not_member} ->
+        if member_removed?(survivor_ids, dead_id), do: :ok, else: {:error, :not_member}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:timeout, _} = timeout ->
+        timeout
     end
   end
 

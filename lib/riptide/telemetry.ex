@@ -187,6 +187,13 @@ defmodule Riptide.Telemetry do
         event_name: [:riptide, :stream, :poison_command]
       ),
 
+      # A tenant hit its per-tenant live-stream quota — see
+      # Riptide.Stream.Placement's own comment on the resource-exhaustion
+      # this bounds.
+      counter("riptide.stream.quota_exceeded",
+        event_name: [:riptide, :stream, :quota_exceeded]
+      ),
+
       # Authorization decisions — :effect/:mode are both small, fixed sets
       # (2 values each), safe to tag. Without this, a systemic authz failure
       # (e.g. the policy store starts returning empty for an unrelated
