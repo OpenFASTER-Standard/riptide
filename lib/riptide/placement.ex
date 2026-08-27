@@ -2,24 +2,23 @@ defmodule Riptide.Placement do
   @moduledoc """
   Client API for Riptide's placement metadata cluster — the durable
   `stream_id -> [replica nodes]` mapping maintained by
-  `Riptide.Placement.PlacementMachine` via a small, fixed-membership Ra
-  cluster (see `Riptide.RaCluster.placement_server_id/1,2`).
+  `Riptide.Placement.PlacementMachine` via a small, elastic-membership Ra
+  cluster (see `Riptide.PlacementMembership`).
 
-  `assign/2,3` and `lookup/1,2` address the metadata cluster by trying each
-  fixed ordinal in turn (starting from `RaCluster.placement_ordinals()`'s
-  first entry) until one succeeds — `:ra`'s own leader-redirect already
-  means any live member can serve the request whether or not it happens to
-  be the current leader, so falling back to the next ordinal on failure
-  needs no extra coordination. This used to hardcode the first ordinal only,
-  making it a de-facto single point of failure for the entire placement
-  layer on every restart of that one specific pod (confirmed live, Phase
-  3d-i HA-proof spike, finding 2) even though the underlying 3-member Raft
-  cluster stayed healthy via its other members the whole time.
+  Every function here addresses the metadata cluster by trying each
+  currently-known member in turn (fast path: `Riptide.PlacementMembership`'s
+  broadcast-maintained cache; fallback: a live fleet-wide probe when the
+  cache is empty or exhausted) until one succeeds — `:ra`'s own
+  leader-redirect already means any live member can serve the request
+  whether or not it happens to be the current leader. See Phase 3e design
+  spec for the full discovery rationale (this replaces the old fixed-3-
+  ordinal fallback).
   """
 
   require Logger
 
   alias Riptide.Placement.PlacementMachine
+  alias Riptide.PlacementMembership
   alias Riptide.RaCluster
 
   @replication_factor 3
@@ -41,11 +40,11 @@ defmodule Riptide.Placement do
     |> Enum.take(count)
   end
 
-  @spec assign(String.t(), [node()], (String.t() -> node())) :: [node()]
-  def assign(stream_id, proposed_nodes, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+  @spec assign(String.t(), [node()]) :: [node()]
+  def assign(stream_id, proposed_nodes) do
     :telemetry.span([:riptide, :placement, :assign], %{}, fn ->
       result =
-        with_ordinal_fallback(resolve_fun, fn server_id ->
+        with_current_members(fn server_id ->
           RaCluster.process_command(server_id, {:assign, stream_id, proposed_nodes})
         end)
 
@@ -53,11 +52,11 @@ defmodule Riptide.Placement do
     end)
   end
 
-  @spec lookup(String.t(), (String.t() -> node())) :: [node()] | nil
-  def lookup(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+  @spec lookup(String.t()) :: [node()] | nil
+  def lookup(stream_id) do
     :telemetry.span([:riptide, :placement, :lookup], %{}, fn ->
       result =
-        with_ordinal_fallback(resolve_fun, fn server_id ->
+        with_current_members(fn server_id ->
           RaCluster.consistent_query(server_id, &PlacementMachine.get(&1, stream_id))
         end)
 
@@ -65,36 +64,30 @@ defmodule Riptide.Placement do
     end)
   end
 
-  @spec list_all((String.t() -> node())) :: %{String.t() => [node()]}
-  def list_all(resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  @spec list_all() :: %{String.t() => [node()]}
+  def list_all do
+    with_current_members(fn server_id ->
       RaCluster.consistent_query(server_id, &PlacementMachine.list/1)
     end)
   end
 
-  @spec replace_member(String.t(), node(), node(), (String.t() -> node())) :: [node()] | nil
-  def replace_member(
-        stream_id,
-        dead_node,
-        new_node,
-        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
-      ) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  @spec replace_member(String.t(), node(), node()) :: [node()] | nil
+  def replace_member(stream_id, dead_node, new_node) do
+    with_current_members(fn server_id ->
       RaCluster.process_command(server_id, {:replace_member, stream_id, dead_node, new_node})
     end)
   end
 
   # See Riptide.Placement.PlacementMachine's own moduledoc ("Repair claims")
   # for the full rationale: fences Riptide.Stream.ReplicaHealer's repair
-  # against two placement ordinals both believing they're the leader at
-  # once. `now_ts` is computed here (the caller), not inside `apply/3` —
-  # reading the wall clock inside a Ra machine callback would break replica
-  # determinism.
-  @spec claim_repair(String.t(), node(), (String.t() -> node())) :: :claimed | :already_claimed
-  def claim_repair(stream_id, dead_node, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
+  # against two nodes both believing they're the leader at once. `now_ts` is
+  # computed here (the caller), not inside `apply/3` — reading the wall
+  # clock inside a Ra machine callback would break replica determinism.
+  @spec claim_repair(String.t(), node()) :: :claimed | :already_claimed
+  def claim_repair(stream_id, dead_node) do
     now_ts = System.system_time(:second)
 
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+    with_current_members(fn server_id ->
       RaCluster.process_command(
         server_id,
         {:claim_repair, stream_id, dead_node, node(), now_ts}
@@ -102,31 +95,24 @@ defmodule Riptide.Placement do
     end)
   end
 
-  @spec release_repair(String.t(), (String.t() -> node())) :: :ok
-  def release_repair(stream_id, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  @spec release_repair(String.t()) :: :ok
+  def release_repair(stream_id) do
+    with_current_members(fn server_id ->
       RaCluster.process_command(server_id, {:release_repair, stream_id, node()})
     end)
   end
 
-  @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t(), (String.t() -> node())) ::
+  @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t()) ::
           :ok | {:error, :too_many_policies}
-  def add_policy(
-        tenant_id,
-        path_prefix,
-        policy,
-        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
-      ) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  def add_policy(tenant_id, path_prefix, policy) do
+    with_current_members(fn server_id ->
       RaCluster.process_command(server_id, {:add_policy, tenant_id, path_prefix, policy})
     end)
   end
 
-  @spec list_policies(String.t(), [String.t()], (String.t() -> node())) :: [
-          Riptide.Authz.Policy.t()
-        ]
-  def list_policies(tenant_id, path_prefix, resolve_fun \\ &RaCluster.default_ordinal_resolver/1) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  @spec list_policies(String.t(), [String.t()]) :: [Riptide.Authz.Policy.t()]
+  def list_policies(tenant_id, path_prefix) do
+    with_current_members(fn server_id ->
       RaCluster.consistent_query(
         server_id,
         &PlacementMachine.list_policies(&1, tenant_id, path_prefix)
@@ -134,67 +120,85 @@ defmodule Riptide.Placement do
     end)
   end
 
-  @spec claim_tenant_if_unclaimed(String.t(), String.t(), (String.t() -> node())) ::
-          :claimed | :already_claimed
-  def claim_tenant_if_unclaimed(
-        tenant_id,
-        subject,
-        resolve_fun \\ &RaCluster.default_ordinal_resolver/1
-      ) do
-    with_ordinal_fallback(resolve_fun, fn server_id ->
+  @spec claim_tenant_if_unclaimed(String.t(), String.t()) :: :claimed | :already_claimed
+  def claim_tenant_if_unclaimed(tenant_id, subject) do
+    with_current_members(fn server_id ->
       RaCluster.process_command(server_id, {:claim_tenant_if_unclaimed, tenant_id, subject})
     end)
   end
 
-  # Tries each placement ordinal, in `RaCluster.placement_ordinals/0`'s own
-  # fixed order, until one of them answers — `RaCluster.process_command/2`
-  # and `consistent_query/2` both raise on failure/timeout (see their own
-  # moduledoc rationale), so a failing ordinal is caught here and the next
-  # one tried instead of the whole call failing outright. The very last
-  # ordinal's exception is deliberately left to propagate uncaught: if *no*
-  # ordinal in the whole fixed set can serve the request, that's a genuine,
-  # fully-down metadata cluster, not something a caller here can paper over.
-  @spec with_ordinal_fallback((String.t() -> node()), (:ra.server_id() -> term())) :: term()
-  defp with_ordinal_fallback(resolve_fun, fun) do
-    try_ordinals(RaCluster.placement_ordinals(), resolve_fun, fun)
+  # Tries each currently-known member, in order, until one answers —
+  # `RaCluster.process_command/2` and `consistent_query/2` both raise on
+  # failure/timeout, so a failing member is caught here and the next one
+  # tried instead of the whole call failing outright. If every member from
+  # the fast-path cache fails, falls back to a live fleet-wide probe
+  # (`RaCluster.probe_placement_members/1`) before finally raising — a
+  # totally unreachable metadata cluster is a genuine, fully-down failure no
+  # caller here can paper over.
+  #
+  # `:placement_members_override` is a narrow, test-only escape hatch (never
+  # read outside `mix test`) letting a test simulate "no reachable member"
+  # without tearing down the real shared suite-wide placement cluster other
+  # tests depend on — see `test/riptide_web/health_test.exs` and
+  # `test/riptide_web/realtime/sse_controller_test.exs`.
+  @spec with_current_members((:ra.server_id() -> term())) :: term()
+  defp with_current_members(fun) do
+    case Application.get_env(:riptide, :placement_members_override) do
+      nil -> with_current_members_via_discovery(fun)
+      override_members -> with_current_members_via_list(override_members, fun)
+    end
   end
 
-  defp try_ordinals([ordinal], resolve_fun, fun) do
-    fun.(RaCluster.placement_server_id(ordinal, resolve_fun))
+  defp with_current_members_via_discovery(fun) do
+    cached = PlacementMembership.current_members()
+
+    case try_members(cached, fun) do
+      {:ok, result} -> result
+      :error -> with_current_members_via_probe(fun)
+    end
   end
 
-  defp try_ordinals([ordinal | rest], resolve_fun, fun) do
-    fun.(RaCluster.placement_server_id(ordinal, resolve_fun))
+  defp with_current_members_via_probe(fun) do
+    case RaCluster.probe_placement_members([node() | Node.list()]) do
+      {:ok, members} -> with_current_members_via_list(members, fun)
+      :error -> raise "Riptide.Placement: no placement-cluster members could be discovered"
+    end
+  end
+
+  defp with_current_members_via_list(members, fun) do
+    case try_members(members, fun) do
+      {:ok, result} -> result
+      :error -> raise "Riptide.Placement: no placement-cluster members could be reached"
+    end
+  end
+
+  defp try_members([], _fun), do: :error
+
+  defp try_members([node | rest], fun) do
+    {:ok, fun.(RaCluster.placement_server_id(node))}
   rescue
     e ->
-      log_ordinal_fallback(ordinal, Exception.message(e))
-      try_ordinals(rest, resolve_fun, fun)
+      log_member_fallback(node, Exception.message(e))
+      try_members(rest, fun)
   catch
-    # `RaCluster.process_command/2`/`consistent_query/2` now always raise
-    # rather than exit (see their own `catch :exit` doc) — this remains as
-    # defense in depth for any other failure this call chain could
-    # eventually surface as a raw exit, so a single ordinal's failure keeps
-    # falling through to the next one instead of defeating the whole point
-    # of this fallback.
     :exit, reason ->
-      log_ordinal_fallback(ordinal, inspect(reason))
-      try_ordinals(rest, resolve_fun, fun)
+      log_member_fallback(node, inspect(reason))
+      try_members(rest, fun)
   end
 
-  # A single ordinal failing over is expected/routine during a rolling
+  # A single member failing over is expected/routine during a rolling
   # restart or a transient network blip — this is intentionally a warning,
-  # not swallowed silently, so a *persistently* unreachable ordinal (one
-  # that fails on every call for an extended period) is at least visible in
-  # logs even though only total failure (all 3 ordinals down) is reflected
-  # in the `riptide.placement.lookup/assign.errors` metrics.
-  defp log_ordinal_fallback(ordinal, reason) do
+  # not swallowed silently, so a *persistently* unreachable member is at
+  # least visible in logs even though only total failure is reflected in
+  # the `riptide.placement.lookup/assign.errors` metrics.
+  defp log_member_fallback(node, reason) do
     Logger.warning(
-      "Riptide.Placement: ordinal #{inspect(ordinal)} failed, falling back to the next one " <>
+      "Riptide.Placement: member #{inspect(node)} failed, falling back to the next one " <>
         "(#{reason})",
-      ordinal: ordinal,
+      node: node,
       reason: reason
     )
 
-    :telemetry.execute([:riptide, :placement, :ordinal_fallback], %{}, %{})
+    :telemetry.execute([:riptide, :placement, :member_fallback], %{}, %{})
   end
 end

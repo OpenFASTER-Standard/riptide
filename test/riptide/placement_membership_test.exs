@@ -5,9 +5,11 @@ defmodule Riptide.PlacementMembershipTest do
   alias Riptide.RaCluster
 
   describe "current_members/0" do
-    test "returns an empty list when nothing has been cached yet" do
-      assert PlacementMembership.current_members() == []
-    end
+    # No "returns [] when nothing has been cached yet" test: once the real
+    # Riptide.PlacementMembership GenServer is wired into the application
+    # supervision tree (Task 4), its cache is populated almost immediately
+    # at boot via its own :bootstrap message — there's no reliably-testable
+    # "genuinely empty" window in a running application to assert against.
 
     test "returns whatever was last cached via a membership-changed broadcast" do
       Phoenix.PubSub.broadcast(
@@ -78,6 +80,26 @@ defmodule Riptide.PlacementMembershipTest do
 
       assert PlacementMembership.bootstrap_once() == :ok
       assert RaCluster.local_placement_members() == {:ok, [node()]}
+    end
+  end
+
+  describe "Riptide.Placement addressing (via PlacementMembership discovery)" do
+    test "assign/2 and lookup/1 work against the real, currently-running placement cluster" do
+      stream_id = "placement-membership-" <> Uniq.UUID.uuid4()
+      proposed = [node()]
+
+      assert Riptide.Placement.assign(stream_id, proposed) == proposed
+      assert Riptide.Placement.lookup(stream_id) == proposed
+    end
+
+    test "falls back to a live fleet probe and raises when no member is reachable at all" do
+      original = Application.get_env(:riptide, :placement_members_override)
+      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
+      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+
+      assert_raise RuntimeError, ~r/no placement-cluster members could be/, fn ->
+        Riptide.Placement.lookup("irrelevant-stream-id")
+      end
     end
   end
 end

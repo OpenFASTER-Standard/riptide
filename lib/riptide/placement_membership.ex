@@ -185,24 +185,32 @@ defmodule Riptide.PlacementMembership do
         :ok
 
       :error ->
-        candidates = [node() | Node.list()] |> Enum.uniq() |> Enum.sort()
-        genesis_members = Enum.take(candidates, target_size())
+        form_genesis_if_selected()
+    end
+  end
 
-        if node() in genesis_members do
-          case RaCluster.start_genesis_placement_cluster(genesis_members) do
-            :ok ->
-              broadcast_members(genesis_members)
-              :ok
+  defp form_genesis_if_selected do
+    candidates = [node() | Node.list()] |> Enum.uniq() |> Enum.sort()
+    genesis_members = Enum.take(candidates, target_size())
 
-            {:error, :cluster_not_formed} = error ->
-              error
-          end
-        else
-          # Not among the computed genesis members this round — the
-          # reconcile loop's ambient join path picks this node up once the
-          # actual genesis members finish forming.
-          :ok
-        end
+    if node() in genesis_members do
+      do_form_genesis(genesis_members)
+    else
+      # Not among the computed genesis members this round — the reconcile
+      # loop's ambient join path picks this node up once the actual genesis
+      # members finish forming.
+      :ok
+    end
+  end
+
+  defp do_form_genesis(genesis_members) do
+    case RaCluster.start_genesis_placement_cluster(genesis_members) do
+      :ok ->
+        broadcast_members(genesis_members)
+        :ok
+
+      {:error, :cluster_not_formed} = error ->
+        error
     end
   end
 
@@ -226,23 +234,21 @@ defmodule Riptide.PlacementMembership do
     case RaCluster.local_placement_members() do
       {:ok, members} ->
         cache_members(members)
-
-        if RaCluster.placement_leader?() do
-          reconcile_as_leader(members)
-        end
+        if RaCluster.placement_leader?(), do: reconcile_as_leader(members)
 
       :error ->
-        case RaCluster.probe_placement_members([node() | Node.list()]) do
-          {:ok, members} ->
-            cache_members(members)
+        reconcile_as_non_member()
+    end
+  end
 
-            if length(members) < target_size() do
-              try_join(members)
-            end
+  defp reconcile_as_non_member do
+    case RaCluster.probe_placement_members([node() | Node.list()]) do
+      {:ok, members} ->
+        cache_members(members)
+        if length(members) < target_size(), do: try_join(members)
 
-          :error ->
-            attempt_genesis()
-        end
+      :error ->
+        attempt_genesis()
     end
   end
 

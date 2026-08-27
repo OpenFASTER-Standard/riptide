@@ -233,9 +233,9 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     # the policy store is totally unreachable — this must surface as a
     # clean 503 (retry-able), not an uncaught crash / generic 500.
     test "subscribing when the placement cluster is fully unreachable returns 503, not a crash" do
-      original = Application.get_env(:riptide, :ordinal_resolver)
-      Application.put_env(:riptide, :ordinal_resolver, fn _ordinal -> :nonexistent@nohost end)
-      on_exit(fn -> Application.put_env(:riptide, :ordinal_resolver, original) end)
+      original = Application.get_env(:riptide, :placement_members_override)
+      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
+      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
 
       tenant_id = "sse-authz-down-test-" <> Uniq.UUID.uuid4()
       stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
