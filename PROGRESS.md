@@ -15,7 +15,7 @@ first place to check for current status, not a historical log.
 | 2 | Docker image + CI/CD | **Shipped** — see below |
 | 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
-| 5 | Observability & operability (metrics, logging, health probes) | **Decomposed into phases 5a-5c** — see below |
+| 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -388,6 +388,18 @@ one monolithic spec.
   `Warning.MissingLoggerMetadataKeys` check flags any custom key not declared in *some* env's
   Logger config, and `:all` costs nothing extra on lines that don't set those keys) means any of
   the new metadata keys also show at the dev console when present, not just in prod's JSON output.
-- **Phase 5c — Metrics.** Not yet designed.
+- **Phase 5c — Metrics.** **Shipped 2026-08-27** — see
+  `docs/superpowers/specs/2026-08-27-phase-5c-metrics-design.md`. A Prometheus scrape endpoint
+  (`GET /metrics` on port 9090, `RiptideWeb.MetricsEndpoint` — a separate, ClusterIP-only port
+  never routed through Phase 4d's Ingress) exposes both HTTP/WebSocket metrics (attached directly
+  to Phoenix's own existing telemetry events, e.g. `[:phoenix, :router_dispatch, :stop]`'s `route`
+  metadata — the literal router-DSL pattern string, not the resolved per-request path, to avoid
+  unbounded cardinality) and new domain instrumentation added to `Riptide.Stream.StreamServer`
+  (append/read latency, gap-signal rate), `Riptide.Placement` (lookup/assign latency and error
+  counts), and `Riptide.Stream.ReplicaHealer` (repair outcomes, dead-replica detection), plus a
+  `:telemetry_poller`-driven gauge for Ra placement-cluster leadership. No metric tags by
+  `stream_id`/`tenant_id` — see the design spec's Cardinality section. This closes sub-project 5
+  (Observability & operability) and completes Riptide's entire production-readiness roadmap.
 
-**Status**: Phases 5a-5b shipped 2026-08-27. Phase 5c not yet designed.
+**Status**: Phases 5a-5c shipped 2026-08-27. Sub-project 5 (Observability & operability) complete.
+Production-readiness roadmap complete.

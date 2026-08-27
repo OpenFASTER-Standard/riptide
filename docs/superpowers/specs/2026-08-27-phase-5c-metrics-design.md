@@ -100,10 +100,13 @@ single local instance for development still benefits from being able to curl its
 **Metric definitions** (`Riptide.Telemetry.metrics/0`):
 
 HTTP/WS (attached to existing Phoenix events, zero new instrumentation):
-- `phoenix.endpoint.stop.duration` — distribution (ms), tags: `[:route, :method, :status]` (via
-  `Telemetry.Metrics.distribution/2`, reading `conn.request_path`/`conn.method`/`conn.status` from
-  `[:phoenix, :endpoint, :stop]`'s existing `%{conn: conn}` metadata — the same metadata Phase 5b's
-  `AccessLog` already reads from the same event).
+- `phoenix.router_dispatch.duration` — distribution (ms), tags: `[:route, :method, :status]` (via
+  `Telemetry.Metrics.distribution/2`, reading `route`/`conn.method`/`conn.status` from
+  `[:phoenix, :router_dispatch, :stop]`'s metadata — `route` is the literal, compile-time
+  router-DSL pattern string (e.g. `"/tenants/:tenant_id/resources/*path"`), a small fixed set;
+  `conn.request_path` (the resolved, per-request path) is never used as a tag, since that would
+  violate the Cardinality constraint below. This event only fires for requests that actually match
+  a defined route; a request that matches no route simply never emits it, so it isn't counted).
 - `phoenix.socket_connected.duration` — distribution (ms), from `[:phoenix, :socket_connected]`.
 - `phoenix.channel_joined.duration` — distribution (ms), from `[:phoenix, :channel_joined]`.
 

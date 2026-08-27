@@ -43,10 +43,12 @@ defmodule Riptide.Stream.StreamServer do
 
   @spec append(String.t(), Event.t()) :: Event.t()
   def append(stream_id, %Event{} = event) do
-    server_id = hd(Placement.server_ids!(stream_id))
-    stamped = RaCluster.process_command(server_id, {:append, Event.encode(event)})
-    Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> stream_id, {:new_event, stamped})
-    stamped
+    :telemetry.span([:riptide, :stream, :append], %{}, fn ->
+      server_id = hd(Placement.server_ids!(stream_id))
+      stamped = RaCluster.process_command(server_id, {:append, Event.encode(event)})
+      Phoenix.PubSub.broadcast(Riptide.PubSub, "stream:" <> stream_id, {:new_event, stamped})
+      {stamped, %{}}
+    end)
   end
 
   # Uses `consistent_query/2`, not `local_query/2` — see issue #8. Reads
@@ -59,8 +61,17 @@ defmodule Riptide.Stream.StreamServer do
   @spec get_since(String.t(), non_neg_integer() | nil) ::
           {:ok, [Event.t()]} | {:gap, pos_integer() | nil}
   def get_since(stream_id, cursor) do
-    server_id = hd(Placement.server_ids!(stream_id))
-    RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
+    :telemetry.span([:riptide, :stream, :get_since], %{}, fn ->
+      server_id = hd(Placement.server_ids!(stream_id))
+      result = RaCluster.consistent_query(server_id, &RaMachine.get_since(&1, cursor))
+
+      case result do
+        {:gap, _oldest} -> :telemetry.execute([:riptide, :stream, :get_since, :gap], %{}, %{})
+        _ -> :ok
+      end
+
+      {result, %{}}
+    end)
   end
 
   # Bridges a liveness gap that only exists because `Placement.ensure_started/2`

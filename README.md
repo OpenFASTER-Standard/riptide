@@ -130,6 +130,23 @@ above) cannot issue wildcards. If you're using that resolver, switch to a DNS-01
 and request `*.riptide.example.com` in `k8s/ingress.yaml`'s `tls.hosts` instead of a single
 hostname.
 
+### Metrics
+
+Riptide exposes Prometheus metrics on port 9090 (`GET /metrics`) — a separate port from the main
+application (4000), reachable only from inside the cluster; `k8s/ingress.yaml` never routes to it.
+If you run a Prometheus that auto-discovers scrape targets via pod annotations, add these to
+`k8s/statefulset.yaml`'s pod template:
+
+```yaml
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+```
+
+Setting up Prometheus itself (and any Grafana dashboards/alerting on top of it) is your own
+deployment's concern — these manifests only expose the metrics, they don't install a scraper.
+
 ## Releasing
 
 Riptide uses plain [semver](https://semver.org/) tags (`vMAJOR.MINOR.PATCH`, optionally with a

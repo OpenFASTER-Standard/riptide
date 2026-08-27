@@ -147,11 +147,21 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # the leader. The retry loop below exists for a different reason: the
     # kill in the previous step needs a moment to actually disconnect
     # before `RaCluster.member_alive?/1` reliably observes it as dead.
+    {:ok, _} = :erpc.call(node_a, Application, :ensure_all_started, [:telemetry])
+
+    telemetry_ref =
+      :erpc.call(node_a, :telemetry_test, :attach_event_handlers, [
+        self(),
+        [[:riptide, :replica_healer, :repair]]
+      ])
+
     assert eventually(fn ->
              :erpc.call(node_a, Riptide.Stream.ReplicaHealer, :sweep, []) == :ok and
                Enum.sort(:erpc.call(node_a, Riptide.Placement, :lookup, [stream_id])) !=
                  Enum.sort(original_nodes)
            end)
+
+    assert_received {[:riptide, :replica_healer, :repair], ^telemetry_ref, %{}, %{result: :ok}}
 
     repaired_nodes = :erpc.call(node_a, Riptide.Placement, :lookup, [stream_id])
     assert length(repaired_nodes) == 3
