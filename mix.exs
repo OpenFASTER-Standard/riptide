@@ -55,7 +55,10 @@ defmodule Riptide.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:telemetry_metrics_prometheus_core, "~> 1.0"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      # bench/ only (see bench/README.md) — not needed to build, test, or
+      # run Riptide itself.
+      {:benchee, "~> 1.3", only: [:dev, :test], runtime: false}
     ]
   end
 end

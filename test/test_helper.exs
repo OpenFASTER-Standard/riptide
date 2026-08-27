@@ -1,5 +1,15 @@
 ExUnit.start()
 
+# test/bench/*_test.exs (Benchee micro-benchmarks + a long-running HTTP
+# server for external load-testing — see bench/README.md and the top-level
+# README's "Performance" section) are real ExUnit.Case modules so they can
+# reuse this same file's app/Ra-cluster bootstrap below, but must never run
+# as part of a normal `mix test`/CI invocation — one is a multi-second
+# Benchee run, the other blocks forever on purpose. `:benchmark`-tagged
+# tests are excluded by default; run them explicitly with
+# `mix test test/bench/some_test.exs --include benchmark`.
+ExUnit.configure(exclude: [:benchmark])
+
 # SIDE-FIX (2026-08-25): give the test-runner BEAM a stable, real distributed
 # identity ONCE, here, before the placement-cluster bootstrap below ever
 # calls node(). Without this, node() is :nonode@nohost at bootstrap time (the
