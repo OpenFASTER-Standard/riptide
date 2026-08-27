@@ -117,4 +117,51 @@ defmodule Riptide.Stream.StreamServerTest do
       assert {:ok, [%{sequence: 1}, %{sequence: 2}]} = StreamServer.get_since(stream_id, 0)
     end
   end
+
+  test "append/2 emits a riptide.stream.append telemetry span" do
+    stream_id = "stream-#{System.unique_integer([:positive])}"
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    {:ok, _pid} = StreamServer.start_link(stream_id)
+
+    ref =
+      :telemetry_test.attach_event_handlers(self(), [
+        [:riptide, :stream, :append, :start],
+        [:riptide, :stream, :append, :stop]
+      ])
+
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+    assert_received {[:riptide, :stream, :append, :start], ^ref, %{monotonic_time: _}, %{}}
+    assert_received {[:riptide, :stream, :append, :stop], ^ref, %{duration: duration}, %{}}
+    assert is_integer(duration)
+  end
+
+  test "get_since/2 emits a riptide.stream.get_since telemetry span" do
+    stream_id = "stream-#{System.unique_integer([:positive])}"
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    {:ok, _pid} = StreamServer.start_link(stream_id)
+
+    ref =
+      :telemetry_test.attach_event_handlers(self(), [[:riptide, :stream, :get_since, :stop]])
+
+    StreamServer.get_since(stream_id, nil)
+
+    assert_received {[:riptide, :stream, :get_since, :stop], ^ref, %{duration: duration}, %{}}
+    assert is_integer(duration)
+  end
+
+  test "get_since/2 emits a gap event when the cursor has fallen out of retention" do
+    stream_id = "stream-#{System.unique_integer([:positive])}"
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    {:ok, _pid} = StreamServer.start_link({stream_id, retention: 1})
+
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+    ref = :telemetry_test.attach_event_handlers(self(), [[:riptide, :stream, :get_since, :gap]])
+
+    assert {:gap, _oldest} = StreamServer.get_since(stream_id, 0)
+
+    assert_received {[:riptide, :stream, :get_since, :gap], ^ref, %{}, %{}}
+  end
 end
