@@ -20,10 +20,18 @@ config :riptide, RiptideWeb.Endpoint,
   ],
   pubsub_server: Riptide.PubSub
 
-# Configure Elixir's Logger
+# Configure Elixir's Logger. metadata: :all (not an explicit key list) means
+# every Logger.metadata/1-set or per-call key that's actually present on a
+# given log line gets printed — Credo's own Warning.MissingLoggerMetadataKeys
+# check (mix credo --strict) flags any custom metadata key used anywhere in
+# the app that isn't declared here, and an explicit list would need updating
+# every time a new key is introduced. Values the default text formatter
+# can't render (e.g. tuples like :mfa) are already silently excluded by
+# Logger.Formatter's own printable-type filter, so :all doesn't clutter dev
+# console output with unprintable noise.
 config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
-  metadata: [:request_id]
+  metadata: :all
 
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason

@@ -1,5 +1,6 @@
 defmodule RiptideWeb.Realtime.SseController do
   use Phoenix.Controller
+  require Logger
 
   alias Riptide.Event
   alias Riptide.RDF.TurtleCodec
@@ -7,12 +8,17 @@ defmodule RiptideWeb.Realtime.SseController do
   alias RiptideWeb.LDP.ResourceController
 
   def subscribe(conn, %{"stream_id" => stream_id}) do
-    with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id),
-         :allow <-
-           Riptide.Authz.evaluate(tenant_id, path_segments, conn.assigns.current_subject, :read) do
-      do_subscribe(conn, stream_id)
-    else
-      _ -> send_resp(conn, 403, "")
+    case ResourceController.parse_stream_id(stream_id) do
+      {:ok, tenant_id, path_segments} ->
+        Logger.metadata(tenant_id: tenant_id)
+
+        case Riptide.Authz.evaluate(tenant_id, path_segments, conn.assigns.current_subject, :read) do
+          :allow -> do_subscribe(conn, stream_id)
+          _ -> send_resp(conn, 403, "")
+        end
+
+      _ ->
+        send_resp(conn, 403, "")
     end
   end
 

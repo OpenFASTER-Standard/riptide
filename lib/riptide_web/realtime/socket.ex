@@ -16,6 +16,7 @@ defmodule RiptideWeb.Realtime.Socket do
   no per-connection session distinguishing one reader from another.
   """
   use Phoenix.Socket
+  require Logger
 
   channel "replication:*", RiptideWeb.Realtime.ReplicationChannel
 
@@ -29,12 +30,22 @@ defmodule RiptideWeb.Realtime.Socket do
         verifier = Application.get_env(:riptide, :auth_verifier, Riptide.Auth.Verifier.OIDC)
 
         case verifier.verify(token) do
-          {:ok, claims} -> {:ok, assign(socket, :current_subject, claims)}
-          {:error, reason} -> {:error, reason}
+          {:ok, claims} ->
+            maybe_set_subject_metadata(claims)
+            {:ok, assign(socket, :current_subject, claims)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
   end
 
   @impl true
   def id(_socket), do: nil
+
+  # subject stays genuinely absent from metadata (not present-but-nil) when
+  # claims lack a `sub` — Phase 4b's TokenConfig doesn't require one.
+  defp maybe_set_subject_metadata(claims) do
+    if sub = claims["sub"], do: Logger.metadata(subject: sub)
+  end
 end

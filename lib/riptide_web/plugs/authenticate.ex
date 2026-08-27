@@ -14,6 +14,7 @@ defmodule RiptideWeb.Plugs.Authenticate do
   non-nil for any route; that's Phase 4c's job.
   """
   import Plug.Conn
+  require Logger
 
   @behaviour Plug
 
@@ -31,6 +32,7 @@ defmodule RiptideWeb.Plugs.Authenticate do
 
         case verifier.verify(token) do
           {:ok, claims} ->
+            maybe_set_subject_metadata(claims)
             assign(conn, :current_subject, claims)
 
           {:error, _reason} ->
@@ -39,6 +41,12 @@ defmodule RiptideWeb.Plugs.Authenticate do
             |> halt()
         end
     end
+  end
+
+  # subject stays genuinely absent from metadata (not present-but-nil) when
+  # claims lack a `sub` — Phase 4b's TokenConfig doesn't require one.
+  defp maybe_set_subject_metadata(claims) do
+    if sub = claims["sub"], do: Logger.metadata(subject: sub)
   end
 
   # Header takes precedence over the query param when both are present, to

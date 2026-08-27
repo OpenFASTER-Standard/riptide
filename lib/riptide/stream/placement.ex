@@ -63,7 +63,9 @@ defmodule Riptide.Stream.Placement do
   def handle_info({:stream_placement_changed, stream_id, new_nodes}, state) do
     Logger.warning(
       "Riptide.Stream.Placement got a non-list stream_placement_changed broadcast for " <>
-        "#{inspect(stream_id)} (#{inspect(new_nodes)}); skipping cache update"
+        "#{inspect(stream_id)} (#{inspect(new_nodes)}); skipping cache update",
+      stream_id: stream_id,
+      new_nodes: inspect(new_nodes)
     )
 
     {:noreply, state}

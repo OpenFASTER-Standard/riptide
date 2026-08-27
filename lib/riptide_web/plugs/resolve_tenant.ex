@@ -24,6 +24,7 @@ defmodule RiptideWeb.Plugs.ResolveTenant do
   one: halt with `400`.
   """
   import Plug.Conn
+  require Logger
 
   @behaviour Plug
 
@@ -40,6 +41,7 @@ defmodule RiptideWeb.Plugs.ResolveTenant do
     case resolver.resolve(conn) do
       {:ok, tenant_id} ->
         if Regex.match?(@safe_tenant_id, tenant_id) do
+          Logger.metadata(tenant_id: tenant_id)
           assign(conn, :tenant_id, tenant_id)
         else
           reject(conn)

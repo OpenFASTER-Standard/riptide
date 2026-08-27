@@ -153,6 +153,22 @@ defmodule Riptide.Stream.PlacementTest do
       assert Process.alive?(pid)
       assert StreamPlacement.server_ids!(stream_id) == server_ids
     end
+
+    test "attaches stream_id and new_nodes as Logger metadata when a broadcast value isn't a list" do
+      import ExUnit.CaptureLog
+
+      log =
+        capture_log([metadata: [:stream_id, :new_nodes]], fn ->
+          Riptide.Stream.Placement.handle_info(
+            {:stream_placement_changed, "some-stream", "not-a-list"},
+            %{}
+          )
+        end)
+
+      assert log =~ "stream_id=some-stream"
+      assert log =~ "new_nodes="
+      assert log =~ "not-a-list"
+    end
   end
 
   describe "server_ids!/1" do

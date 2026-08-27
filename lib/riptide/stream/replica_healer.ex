@@ -84,7 +84,9 @@ defmodule Riptide.Stream.ReplicaHealer do
           :error ->
             Logger.warning(
               "ReplicaHealer could not discover #{stream_id}'s current retention from any " <>
-                "survivor (#{inspect(survivor_nodes)}); skipping repair this tick"
+                "survivor (#{inspect(survivor_nodes)}); skipping repair this tick",
+              stream_id: stream_id,
+              survivor_nodes: inspect(survivor_nodes)
             )
         end
     end
@@ -104,12 +106,18 @@ defmodule Riptide.Stream.ReplicaHealer do
         )
 
         Logger.info(
-          "ReplicaHealer repaired #{stream_id}: replaced #{inspect(dead_node)} with #{inspect(new_node)}"
+          "ReplicaHealer repaired #{stream_id}: replaced #{inspect(dead_node)} with #{inspect(new_node)}",
+          stream_id: stream_id,
+          dead_node: inspect(dead_node),
+          new_node: inspect(new_node)
         )
 
       {:error, reason} ->
         Logger.warning(
-          "ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}"
+          "ReplicaHealer failed to repair #{stream_id} (dead: #{inspect(dead_node)}): #{inspect(reason)}",
+          stream_id: stream_id,
+          dead_node: inspect(dead_node),
+          reason: inspect(reason)
         )
     end
   end

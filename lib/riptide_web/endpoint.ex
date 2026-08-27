@@ -34,7 +34,7 @@ defmodule RiptideWeb.Endpoint do
   end
 
   plug Plug.RequestId
-  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
+  plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint], log: false
 
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],

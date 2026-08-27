@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Realtime.SseControllerTest do
   use ExUnit.Case, async: false
   use Plug.Test
+  require Logger
 
   alias Riptide.Authz.{Policy, Store}
   alias Riptide.Event
@@ -212,6 +213,19 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 403
+    end
+
+    test "sets tenant_id in Logger metadata even when authorization denies the request" do
+      tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
+      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+
+      conn =
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 403
+      assert Logger.metadata()[:tenant_id] == tenant_id
     end
   end
 end
