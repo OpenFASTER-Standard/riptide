@@ -182,25 +182,25 @@ defmodule Riptide.PlacementClusterTest do
   end
 
   # `:ra` must be started as an OTP application on EVERY member before ANY
-  # of them attempts to form the cluster — `attempt_start_placement_cluster/1`
+  # of them attempts to form the cluster — `start_genesis_placement_cluster/1`
   # calls `:ra.start_cluster/2`, which reaches out over RPC to start the
   # *other* members too, not just the local one. Confirmed empirically:
   # interleaving "start :ra, then immediately attempt to form" per node (as
   # a single combined loop) races the still-not-started siblings and fails
   # with `{:error, :system_not_started}` on every remote member the caller
   # gets to before its own turn comes up — surfacing as
-  # `{:error, :cluster_not_formed}` from `attempt_start_placement_cluster/1`
+  # `{:error, :cluster_not_formed}` from `start_genesis_placement_cluster/1`
   # itself. Splitting into two passes avoids the race.
   #
-  # `attempt_start_placement_cluster/1` only starts the *local* `:default`
+  # `start_genesis_placement_cluster/1` only starts the *local* `:default`
   # Ra system (via its own private `ensure_system_started/0`) on whichever
   # node calls it — but internally it calls `:ra.start_cluster/2`, which
   # tries to start EVERY member's server, including the ones on the *other*
   # two nodes, over RPC. Confirmed empirically: without this, calling
-  # `attempt_start_placement_cluster/1` on each node in turn fails with
+  # `start_genesis_placement_cluster/1` on each node in turn fails with
   # `{:error, :cluster_not_formed}` every time — `:ra`'s own logs show
   # `{:error, :system_not_started}` for whichever sibling members haven't
-  # yet run `attempt_start_placement_cluster/1` themselves (so never
+  # yet run `start_genesis_placement_cluster/1` themselves (so never
   # started their own local system), which is every sibling except
   # whichever one is on its own turn. Pre-start every node's local
   # `:default` system directly (mirroring `RaCluster`'s own private
@@ -228,7 +228,7 @@ defmodule Riptide.PlacementClusterTest do
   end
 
   # NEW GOTCHA (found empirically while implementing this test, beyond the
-  # brief's own list): `attempt_start_placement_cluster/1`'s moduledoc
+  # brief's own list): `start_genesis_placement_cluster/1`'s moduledoc
   # comment in `ra_cluster.ex` claims it's "safe to call redundantly from
   # multiple ordinals concurrently" because `:ra.start_cluster/2` tolerates
   # `{:error, {:already_started, _pid}}` per member internally — but that
