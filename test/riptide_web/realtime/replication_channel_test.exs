@@ -252,4 +252,17 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     assert Logger.metadata()[:tenant_id] == "ws-test-tenant"
   end
+
+  test "sets subject in Logger metadata after a successful join when the socket has a subject" do
+    stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    StreamSupervisor.ensure_ready(stream_id)
+
+    {:ok, socket} = connect(Socket, %{}, connect_info: %{auth_token: "valid-token"})
+
+    {:ok, _reply, _socket} =
+      ReplicationChannel.join("replication:" <> stream_id, %{"after" => 0}, socket)
+
+    assert Logger.metadata()[:subject] == "user-1"
+  end
 end

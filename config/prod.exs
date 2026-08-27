@@ -27,6 +27,13 @@ config :logger, :default_formatter,
   format: {Riptide.Logger.JSONFormatter, :format},
   metadata: :all
 
+# Ensures Riptide.Logger.JSONFormatter's "Z" (UTC) timestamp suffix is always
+# honest — Logger's own utc_log defaults to false (local time), and was never
+# set anywhere before this, meaning the "Z" suffix only happened to be
+# correct because this environment's system timezone is UTC, not because
+# anything actually enforced it.
+config :logger, utc_log: true
+
 # Do not print debug messages in production
 config :logger, level: :info
 

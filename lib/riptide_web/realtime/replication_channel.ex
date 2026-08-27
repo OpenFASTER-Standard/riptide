@@ -25,6 +25,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
     with {:ok, tenant_id, path_segments} <- ResourceController.parse_stream_id(stream_id) do
       Logger.metadata(tenant_id: tenant_id)
 
+      case socket.assigns.current_subject do
+        nil -> :ok
+        claims -> if sub = claims["sub"], do: Logger.metadata(subject: sub)
+      end
+
       case Riptide.Authz.evaluate(tenant_id, path_segments, socket.assigns.current_subject, :read) do
         :allow -> do_join(stream_id, cursor, socket)
         _ -> {:error, %{"reason" => "unauthorized"}}
