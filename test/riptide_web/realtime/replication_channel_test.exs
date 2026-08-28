@@ -1,5 +1,10 @@
 defmodule RiptideWeb.Realtime.ReplicationChannelTest do
-  use ExUnit.Case, async: true
+  # :auth_verifier is global Application state (mutated in setup/0 below) —
+  # every other consumer of it (authenticate_test.exs, policy_controller_test.exs,
+  # sse_controller_test.exs, authz_test.exs, ldp/resource_controller_test.exs)
+  # is async: false for the same reason; this file matches that convention
+  # rather than risking another async test transiently observing StubVerifier.
+  use ExUnit.Case, async: false
   import Phoenix.ChannelTest
   require Logger
 

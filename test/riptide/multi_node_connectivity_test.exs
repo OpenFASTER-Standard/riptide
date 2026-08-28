@@ -59,6 +59,14 @@ defmodule Riptide.MultiNodeConnectivityTest do
           end
         end
       end)
+
+      # Each peer's Ra data directory (keyed on HOSTNAME, per the assertion
+      # below) is real, on-disk state — @peers' hostnames ("riptide-0/1/2")
+      # are reused by several other :peer-based test files, so leaving this
+      # behind lets a later test collide with it.
+      Enum.each(@peers, fn {_alive_name, hostname} ->
+        File.rm_rf!(Path.join(File.cwd!(), hostname))
+      end)
     end)
 
     nodes = Enum.map(peers, fn {_pid, node, _hostname} -> node end)
