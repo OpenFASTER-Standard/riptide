@@ -18,8 +18,8 @@ defmodule Riptide.Derivation.Matcher do
   `bindings/2`/`evaluate/2` call, never persisted.
   """
 
-  alias Riptide.Derivation.{Rule, Var}
   alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{Rule, Var}
 
   @max_variables 64
   @var_pool Enum.map(1..@max_variables, &String.to_atom("$riptide_derivation_var_#{&1}"))
@@ -54,7 +54,9 @@ defmodule Riptide.Derivation.Matcher do
   @spec evaluate(Rule.t(), RDF.Graph.t()) ::
           {:ok, [RDF.Triple.t()]}
           | {:error,
-             :too_many_variables | {:unsupported_literal, Rule.literal()} | {:unsafe_rule, Var.t()}}
+             :too_many_variables
+             | {:unsupported_literal, Rule.literal()}
+             | {:unsafe_rule, Var.t()}}
   def evaluate(%Rule{head: head} = rule, %RDF.Graph{} = graph) do
     with :ok <- check_safety(head, rule.body),
          {:ok, results} <- bindings(rule, graph) do

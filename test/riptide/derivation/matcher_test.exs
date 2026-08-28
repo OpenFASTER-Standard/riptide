@@ -1,8 +1,8 @@
 defmodule Riptide.Derivation.MatcherTest do
   use ExUnit.Case, async: true
 
-  alias Riptide.Derivation.{Matcher, Parser, Rule, Signature, Var}
   alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{Matcher, Parser, Rule, Signature, Var}
 
   defp t(name), do: RDF.iri("urn:test:" <> name)
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
