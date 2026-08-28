@@ -42,8 +42,6 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   @riptide_result RDF.iri("urn:riptide:vocab:result")
   @riptide_name RDF.iri("urn:riptide:vocab:name")
   @riptide_parameters RDF.iri("urn:riptide:vocab:parameters")
-  @riptide_reads RDF.iri("urn:riptide:vocab:reads")
-  @riptide_produces RDF.iri("urn:riptide:vocab:produces")
 
   @doc "See moduledoc. Returns the Rule's own (blank) node plus the graph fragment reifying it."
   @spec to_rdf(Rule.t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
@@ -66,6 +64,14 @@ defmodule Riptide.Derivation.RuleRDFCodec do
     {node, graph}
   end
 
+  # `reads`/`produces` are deliberately NOT written to the RDF graph — they're
+  # fully derivable from `head`/`produces` and `body`/`reads` (same computation
+  # as `Riptide.Derivation.Parser.build_signature/2`), and storing them as flat
+  # triples would be lossy: `RDF.Description.get/3` does not preserve insertion
+  # order, so a multi-fact-pattern-body rule's `reads` would silently come back
+  # re-sorted into the `rdf` library's own internal ordering instead of the
+  # original body order. `from_rdf/2` re-derives both from the decoded
+  # head/body instead of reading them back from the graph.
   defp encode_signature(%Signature{} = sig) do
     node = RDF.BlankNode.new()
     {param_terms, params_graph} = encode_terms(sig.parameters)
@@ -77,8 +83,6 @@ defmodule Riptide.Derivation.RuleRDFCodec do
       |> RDF.Graph.add(params_list.graph)
       |> RDF.Graph.add({node, @riptide_name, sig.name})
       |> RDF.Graph.add({node, @riptide_parameters, params_list.head})
-      |> RDF.Graph.add(Enum.map(sig.reads, &{node, @riptide_reads, &1}))
-      |> RDF.Graph.add(Enum.map(sig.produces, &{node, @riptide_produces, &1}))
 
     {node, graph}
   end
@@ -147,9 +151,12 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   end
 
   defp encode_triple_pattern_literal(%FactPattern{args: args}, _type_iri) do
+    # Generic on purpose: this path is shared by both the Head (sp:TripleTemplate)
+    # and Body (sp:TriplePattern) encoders — see `@sp_triple_template` above for
+    # why they're distinct types reified through this same helper.
     raise ArgumentError,
           "fact-pattern literals must have exactly 2 args (subject, object) to reify as an " <>
-            "sp:TriplePattern — got #{length(args)}"
+            "sp:TriplePattern/sp:TripleTemplate — got #{length(args)}"
   end
 
   defp encode_call_literal(target, args, result, type_iri, target_predicate) do
@@ -188,7 +195,15 @@ defmodule Riptide.Derivation.RuleRDFCodec do
 
   defp encode_term(term), do: {term, RDF.Graph.new()}
 
-  @doc "See moduledoc. The inverse of `to_rdf/1`."
+  @doc """
+  See moduledoc. The inverse of `to_rdf/1`.
+
+  Requires the Rule's own node to already be known/held by the caller (e.g.
+  the same blank node `to_rdf/1` returned). Discovering a Rule's node
+  identity from a graph with no such handle — e.g. querying for `?n
+  rdf:type riptide:Rule` — is not provided by this module and is left to a
+  future phase.
+  """
   @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: Rule.t()
   def from_rdf(node, graph) do
     description = RDF.Graph.get(graph, node)
@@ -196,19 +211,33 @@ defmodule Riptide.Derivation.RuleRDFCodec do
     head_node = RDF.Description.first(description, @riptide_head)
     body_head = RDF.Description.first(description, @riptide_body)
 
+    head = decode_literal(head_node, graph)
+
+    body =
+      RDF.List.new(body_head, graph)
+      |> RDF.List.values()
+      |> Enum.map(&decode_literal(&1, graph))
+
     %Rule{
-      signature: decode_signature(sig_node, graph),
-      head: decode_literal(head_node, graph),
-      body:
-        RDF.List.new(body_head, graph)
-        |> RDF.List.values()
-        |> Enum.map(&decode_literal(&1, graph))
+      signature: decode_signature(sig_node, graph, head, body),
+      head: head,
+      body: body
     }
   end
 
-  defp decode_signature(node, graph) do
+  # `reads`/`produces` are re-derived from the already-decoded `head`/`body`
+  # rather than read back from the graph — see the comment on
+  # `encode_signature/1` for why, and `Riptide.Derivation.Parser.build_signature/2`
+  # for the matching derivation on the parse side, which this mirrors exactly.
+  defp decode_signature(node, graph, %FactPattern{} = head, body) do
     description = RDF.Graph.get(graph, node)
     params_head = RDF.Description.first(description, @riptide_parameters)
+
+    reads =
+      body
+      |> Enum.filter(&match?(%FactPattern{}, &1))
+      |> Enum.map(& &1.predicate)
+      |> Enum.uniq()
 
     %Signature{
       name: RDF.Description.first(description, @riptide_name),
@@ -216,8 +245,8 @@ defmodule Riptide.Derivation.RuleRDFCodec do
         RDF.List.new(params_head, graph)
         |> RDF.List.values()
         |> Enum.map(&decode_term(&1, graph)),
-      reads: RDF.Description.get(description, @riptide_reads, []),
-      produces: RDF.Description.get(description, @riptide_produces, [])
+      reads: reads,
+      produces: [head.predicate]
     }
   end
 

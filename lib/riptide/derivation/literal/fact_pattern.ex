@@ -1,8 +1,9 @@
 defmodule Riptide.Derivation.Literal.FactPattern do
   @moduledoc """
   A fact-pattern literal — matched against the EDB, classical Datalog.
-  Reifies as an `sp:TriplePattern` (design spec §5), which requires
-  exactly 2 args (subject, object).
+  Reifies as an `sp:TriplePattern` when it's a Body literal, or an
+  `sp:TripleTemplate` when it's a Rule's Head (design spec §5) — both
+  require exactly 2 args (subject, object).
   """
 
   alias Riptide.Derivation.Var

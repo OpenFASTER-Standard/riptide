@@ -174,5 +174,36 @@ defmodule Riptide.Derivation.RuleRDFCodecTest do
 
       assert RuleRDFCodec.from_rdf(node, graph) == rule
     end
+
+    test "round-trips a rule with a bracketed-IRI constant argument" do
+      {:ok, rule} =
+        Parser.decode(
+          ~s|status(Svc, <http://example.org/Healthy>) :- pendingDeploy(Svc, Result).|
+        )
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips signature.reads in the ORIGINAL body order, not re-sorted" do
+      # "zebra" then "apple" is not alphabetically sorted — this catches
+      # `RDF.Description.get/3`'s own (non-insertion-order) ordering being
+      # used to decode `reads`, which would silently re-sort to
+      # [apple, zebra].
+      {:ok, rule} = Parser.decode("h(A, B) :- zebra(A, X), apple(X, B).")
+
+      assert rule.signature.reads == [
+               RDF.iri("urn:riptide:relation:zebra"),
+               RDF.iri("urn:riptide:relation:apple")
+             ]
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      decoded = RuleRDFCodec.from_rdf(node, graph)
+
+      assert decoded.signature.reads == rule.signature.reads
+      assert decoded == rule
+    end
   end
 end

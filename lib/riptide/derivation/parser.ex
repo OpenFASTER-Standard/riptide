@@ -128,11 +128,31 @@ defmodule Riptide.Derivation.Parser do
   Parses Datalog-clause text into a `Riptide.Derivation.Rule.t()`. Applies
   a per-process heap cap first (design spec §8) since this parses
   untrusted/LLM-authored text.
+
+  Unlike `Riptide.RDF.TurtleCodec.decode/1` (which sets the same kind of
+  cap directly on the calling process, safe only because its own callers are
+  short-lived per-request processes), this module has no callers yet and
+  exists specifically so future long-lived evaluation processes (design spec
+  consumers: 6c-i-b, 6d-i, 6e-i) can call it. Setting `:max_heap_size`
+  directly on `self()` here would permanently pin *whatever process calls
+  this* at `@max_heap_size_words` for the rest of its lifetime — fine for a
+  Cowboy request process that dies right after, but silently dangerous for a
+  GenServer that later needs more heap for unrelated work and gets killed by
+  the BEAM far from this call site. Instead, the parse (and the heap flag
+  bounding it) is isolated inside a short-lived `Task`, so the cap applies
+  only to that throwaway process and the caller's own heap is never touched.
   """
   @spec decode(String.t()) :: {:ok, Rule.t()} | {:error, term()}
   def decode(text) when is_binary(text) do
-    Process.flag(:max_heap_size, %{size: @max_heap_size_words, kill: true, error_logger: true})
+    fn ->
+      Process.flag(:max_heap_size, %{size: @max_heap_size_words, kill: true, error_logger: true})
+      do_decode(text)
+    end
+    |> Task.async()
+    |> Task.await()
+  end
 
+  defp do_decode(text) do
     case do_parse(text) do
       {:ok, [head, body], "", _, _, _} -> {:ok, build_rule(head, body)}
       {:error, reason, rest, _, _, _} -> {:error, {reason, rest}}

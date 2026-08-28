@@ -66,6 +66,19 @@ defmodule Riptide.Derivation.ParserTest do
       assert {:error, _reason} = Parser.decode("this is not a rule")
     end
 
+    test "decode/1 does not permanently mutate the calling process's own heap cap" do
+      # Regression test: decode/1 used to call `Process.flag(:max_heap_size, ...)`
+      # directly on the calling process, which stuck for that process's entire
+      # remaining lifetime. It now isolates the cap inside a throwaway Task, so
+      # the caller's own flag must be unchanged after a call, win or lose.
+      {:max_heap_size, before} = Process.info(self(), :max_heap_size)
+
+      assert {:ok, _rule} = Parser.decode("deployed(Svc, Result) :- pendingDeploy(Svc, Result).")
+      assert {:error, _reason} = Parser.decode("this is not a rule")
+
+      assert {:max_heap_size, ^before} = Process.info(self(), :max_heap_size)
+    end
+
     test "the derived Signature reflects the head and body" do
       text = "deployed(Svc, Result) :- pendingDeploy(Svc, Target), other(Target, Result)."
 
