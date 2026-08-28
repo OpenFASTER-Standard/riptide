@@ -1,6 +1,8 @@
 defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   # Design spec §9's own testing requirement, never previously implemented
@@ -244,12 +246,5 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
       found ->
         found
     end
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end

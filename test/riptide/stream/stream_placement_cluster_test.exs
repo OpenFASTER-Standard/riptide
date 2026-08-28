@@ -1,6 +1,8 @@
 defmodule Riptide.Stream.StreamPlacementClusterTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   @new_stream_peers [
@@ -410,12 +412,5 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     Enum.each(peer_specs, fn {_alive_name, ordinal, _host} ->
       File.rm_rf!(Path.join(File.cwd!(), ordinal))
     end)
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end
