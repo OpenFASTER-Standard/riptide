@@ -16,6 +16,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   require Logger
 
   alias Riptide.Event
+  alias Riptide.{NewStreamRateLimit, Placement}
   alias Riptide.RDF.TurtleCodec
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
@@ -33,7 +34,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
                socket.assigns.current_subject,
                :read
              ) do
-          :allow -> do_join(stream_id, cursor, socket)
+          :allow -> check_new_stream_rate_limit(stream_id, cursor, socket)
           _ -> {:error, %{"reason" => "unauthorized"}}
         end
 
@@ -58,6 +59,36 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   defp maybe_set_subject_metadata(claims) do
     if sub = claims["sub"], do: Logger.metadata(subject: sub)
+  end
+
+  # Joining before a stream's first write is intentional (a client watching
+  # for a soon-to-be-created resource), so — unlike RiptideWeb.LDP.
+  # ResourceController's read path — creation can't simply be refused here.
+  # Cap the RATE of new-stream creation instead: each one permanently mints
+  # a BEAM atom (RaCluster.uid_for/server_id) that's never freed, so this
+  # is the mitigation for the one entry point that must keep allowing it.
+  # An already-existing stream (the common case) is never rate-limited —
+  # only genuinely brand-new ones consume the quota. Mirrors
+  # RiptideWeb.Realtime.SseController.do_subscribe/3's own identical guard.
+  defp check_new_stream_rate_limit(stream_id, cursor, socket) do
+    case Placement.lookup(stream_id) do
+      nil -> check_new_stream_rate_limit_for_new_stream(stream_id, cursor, socket)
+      _nodes -> do_join(stream_id, cursor, socket)
+    end
+  end
+
+  defp check_new_stream_rate_limit_for_new_stream(stream_id, cursor, socket) do
+    case NewStreamRateLimit.check_new_stream(rate_limit_subject(socket)) do
+      :allow -> do_join(stream_id, cursor, socket)
+      :deny -> {:error, %{"reason" => "rate_limited"}}
+    end
+  end
+
+  defp rate_limit_subject(socket) do
+    case socket.assigns.current_subject do
+      %{"sub" => sub} -> sub
+      _ -> "anonymous"
+    end
   end
 
   defp do_join(stream_id, cursor, socket) do

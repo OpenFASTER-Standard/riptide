@@ -265,4 +265,107 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     assert Logger.metadata()[:subject] == "user-1"
   end
+
+  describe "new-stream rate limiting (atom-exhaustion guard)" do
+    setup do
+      original_limit = Application.get_env(:riptide, :new_stream_rate_limit)
+      Application.put_env(:riptide, :new_stream_rate_limit, 2)
+      on_exit(fn -> Application.put_env(:riptide, :new_stream_rate_limit, original_limit) end)
+
+      Store.Placement.add_policy("ws-ratelimit-test-tenant", [], %Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+
+      :ok
+    end
+
+    defp new_ratelimit_stream_id do
+      ResourceController.stream_id_for("ws-ratelimit-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
+    end
+
+    test "joining more distinct brand-new streams than the configured limit is rejected" do
+      subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.Realtime.ReplicationChannelTest.FixedSubjectVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+      Application.put_env(:riptide, :ratelimit_test_subject, subject)
+      on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
+
+      {:ok, socket} = connect(Socket, %{}, connect_info: %{auth_token: "any-token"})
+
+      stream_ids = for _ <- 1..3, do: new_ratelimit_stream_id()
+
+      for stream_id <- stream_ids,
+          do: on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      outcomes =
+        for stream_id <- stream_ids do
+          case subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+                 "after" => 0
+               }) do
+            {:ok, _reply, _socket} -> :ok
+            {:error, %{"reason" => "rate_limited"}} -> :rate_limited
+          end
+        end
+
+      assert outcomes == [:ok, :ok, :rate_limited]
+    end
+
+    test "joining an already-existing stream is never rate-limited, regardless of volume" do
+      subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.Realtime.ReplicationChannelTest.FixedSubjectVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+      Application.put_env(:riptide, :ratelimit_test_subject, subject)
+      on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
+
+      stream_id = new_ratelimit_stream_id()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+      StreamSupervisor.ensure_ready(stream_id)
+
+      # 3 joins to the SAME already-existing stream — one more than the
+      # limit of 2 configured above — must all succeed, since only creating
+      # a BRAND NEW stream is rate-limited, never reading an existing one.
+      # Each join needs its own socket: a channel process can only join a
+      # given topic once per socket.
+      results =
+        for _ <- 1..3 do
+          {:ok, socket} = connect(Socket, %{}, connect_info: %{auth_token: "any-token"})
+
+          subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+            "after" => 0
+          })
+        end
+
+      assert Enum.all?(results, &match?({:ok, _reply, _socket}, &1))
+    end
+  end
+
+  # Every token authenticates as the SAME configured test subject, regardless
+  # of the token's actual value — lets the rate-limiting tests above drive
+  # every join as one consistent subject without needing a real JWT.
+  defmodule FixedSubjectVerifier do
+    @behaviour Riptide.Auth.Verifier
+
+    @impl true
+    def verify(_token) do
+      {:ok, %{"sub" => Application.fetch_env!(:riptide, :ratelimit_test_subject)}}
+    end
+  end
 end
