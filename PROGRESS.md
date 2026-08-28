@@ -387,6 +387,16 @@ sub-project 3 was decomposed into phases 3a-3d.
   write," so creation there is instead rate-limited per subject (`Riptide.NewStreamRateLimit`,
   Hammer-backed) rather than refused outright.
 
+  **Known flake, confirmed 2026-08-28**: `SseControllerTest`'s "subscribing to more distinct
+  brand-new streams than the configured limit is rejected with 429" test occasionally observes
+  `[200, 200, 200]` instead of the expected `[200, 200, 429]` — Hammer's ETS-backed fixed window
+  can roll over between the 2nd and 3rd request under CI runner scheduling variance, letting the
+  3rd request land in a fresh window instead of tripping the limit. Confirmed transient: an
+  unrelated PR's CI failed on this exact assertion, then passed cleanly on an immediate rerun with
+  no code changes. Not a regression in the rate limiter itself — a real request only 30/min apart
+  should never legitimately land in a new window this fast; the flake is specific to test-suite
+  timing, not documented as blocking here because a rerun already demonstrates it.
+
 **Status**: Phases 4a-4d shipped 2026-08-26. Sub-project 4 (Security & multi-tenancy) complete.
 Post-4d hardening fix shipped 2026-08-28.
 
