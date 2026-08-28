@@ -1,14 +1,13 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, sixth revision — a second dedicated research pass on
-formal versioning/supersedes theory (§8.7.2), chasing this document's own
-prior leads (view update problem, schema mapping evolution, 2023–2026
-advances) rather than a fresh generic sweep. This is one architecture
+**Status:** Draft, seventh revision — resolved the bisimilar-term-graph
+question (§8.2, §6): Rule expressiveness stays unconstrained, DedupGate
+owns arbitrating incomparable generalizations. This is one architecture
 spec defining a single new top-level Riptide sub-project, **Sub-project
 6**, decomposed into phases 6a–6i, the same way Riptide's own sub-projects
 3, 4, and 5 are already decomposed. Each phase gets its own implementation
 plan (`writing-plans`) when work on it starts. See §11 for the itemized
-changelog across all six revisions.
+changelog across all seven revisions.
 
 ## 1. Motivation and vision
 
@@ -56,10 +55,10 @@ this work, not something this spec reconciles with.
 
 **Explicitly still open** (§10 for the full list): concurrent-effectful-
 execution coordination (confirmed this revision as real design work owed
-here, not a literature gap to close by more research); the bisimilar-
-term-graph constraint question; formal versioning/supersedes theory for
-rules; large-object/persistent-capability engineering details (§3.3, §4,
-§8.12 — the formal grounding is now confirmed, the concrete
+here, not a literature gap to close by more research); formal
+versioning/supersedes theory for rules; large-object/persistent-capability
+engineering details (§3.3, §4, §8.12 — the formal grounding is now
+confirmed, the concrete
 representation isn't); automated detection of ontology overlap (out of
 scope *by design*, §6.5).
 
@@ -287,7 +286,12 @@ two scopes:
   `Merge` require human review before the result is live — `Admit` per
   `scratch-command-bar`'s existing propose/review precedent; `Merge`
   additionally because graph three-way merge is provably weaker than
-  git's. `Reject` skips review.
+  git's. `Reject` skips review. **Must also handle multiple candidates**:
+  per §8.2's resolved decision not to constrain Rule expressiveness to the
+  bisimilar-term-graph fragment, anti-unifying two Rules can yield several
+  mutually-incomparable generalizations rather than one canonical answer —
+  DedupGate's arbitration mechanism for that case is Sub-project 6e's own
+  design work, not specified here.
 - **CatalogEntry** — `⊑ Rule`, admitted or merged by DedupGate, subject to
   §5's admission consequence.
 - **Pattern is not a separate type.** It's the name for a CatalogEntry at
@@ -403,10 +407,20 @@ belong in a separate interpreter.
 syntactic anti-unification, proven unitary. Term-graph anti-unification
 (Baumgartner, Kutsia, Levy & Villaret, FSCD 2018) proves the general case
 only **finitary**, with unitarity proven only for the narrower
-bisimilar-term-graph case — open question (§10) whether the Rule
-representation can be constrained there. Minimizing generalization
-variables is NP-complete in the closest scalable formalism (Yernaux &
-Vanhoof 2022).
+bisimilar-term-graph case. Minimizing generalization variables is
+NP-complete in the closest scalable formalism (Yernaux & Vanhoof 2022).
+
+**Resolved this revision: Rule expressiveness is not constrained to the
+bisimilar-term-graph fragment.** A Rule's Body may express arbitrary
+cross-referencing between rule-reference literals (real composability,
+e.g. one sub-Rule's output feeding another's input, matters more than
+guaranteed-unique anti-unification). The consequence is accepted
+explicitly: DedupGate (§6) must handle the case where anti-unifying two
+Rules yields several mutually-incomparable candidate generalizations, not
+assume there's always exactly one. The concrete arbitration mechanism
+(present all candidates for human review; some ranking heuristic; some
+other approach) is not designed here — Sub-project 6e's job, once a real
+Rule representation exists to test it against.
 
 **8.3 Execution kernel.** WASI Preview 2 excludes fork/exec/subprocess
 spawning by design; WASIX is the separate superset restoring it.
@@ -672,14 +686,17 @@ deleted silently — see §11's changelog for the full reasoning):
   **Riptide-internal for now**, not public/OpenFASTER-Standard governance.
 - ~~Whether this engine is a separate deployable from Riptide's LDP
   surface~~ — resolved: **same OS process**, one deployable (§1).
+- ~~Whether the Rule/workflow-graph representation can be constrained to
+  the bisimilar-term-graph fragment~~ — resolved: **no constraint**; full
+  expressiveness is kept, and DedupGate must arbitrate a finite set of
+  incomparable generalizations when anti-unification isn't unitary (§8.2,
+  §6). The concrete arbitration mechanism is Sub-project 6e's own design
+  work, not resolved here.
 
 **Still open:**
 - Concurrent-effectful-execution coordination (6d-ii's actual subject
   matter) — confirmed this revision as real design work owed directly by
   this project, not a literature gap a further research pass would close.
-- Whether the Rule/workflow-graph representation can be constrained to the
-  bisimilar-term-graph fragment, or whether DedupGate must arbitrate a
-  finite set of incomparable generalizations (§8.2).
 - Formal versioning/supersedes theory for declarative rules — two
   dedicated passes now (§8.7.1, §8.7.2): AGM/KM logic-program update and
   TGD conservative-extension are real candidate anchors, view update
@@ -704,7 +721,18 @@ deleted silently — see §11's changelog for the full reasoning):
 
 ## 11. Changelog
 
-**This revision (sixth) — second research pass on formal
+**This revision (seventh) — resolved the bisimilar-term-graph question:**
+- §8.2/§6: Rule expressiveness is **not** constrained to the
+  bisimilar-term-graph fragment. Real composability (rule-reference
+  literals sharing values across calls) wins over guaranteed-unique
+  anti-unification. DedupGate must arbitrate incomparable generalizations
+  when they arise; the concrete mechanism is left to Sub-project 6e, not
+  designed here.
+- Moved this item from §10's "still open" list to "resolved," matching
+  the pattern already used for the Tenant/governance/deployability
+  decisions.
+
+**Sixth revision — second research pass on formal
 versioning/supersedes theory, requested explicitly rather than accepting
 the prior "not found" result:**
 - Added §8.7.2, chasing §8.7.1's own named leads directly (view update
