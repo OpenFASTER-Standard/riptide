@@ -3,6 +3,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   require Logger
 
   alias Riptide.Event
+  alias Riptide.Placement
   alias Riptide.RDF.{Patch, TurtleCodec}
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
@@ -211,7 +212,21 @@ defmodule RiptideWeb.LDP.ResourceController do
 
   def parse_stream_id(_other), do: :error
 
+  # A read must never create anything: StreamSupervisor.ensure_ready/1 mints
+  # a permanent BEAM atom and a real Ra cluster for any stream_id it's asked
+  # about, so it must only ever run for a stream that's genuinely known.
+  # Placement.lookup/1 is a cheap, atom-free existence check against the
+  # small fixed placement-metadata cluster — nil means this stream_id has
+  # never been assigned, i.e. nobody has ever written to it, so it's a
+  # plain 404 with no side effects at all.
   defp current_state(stream_id) do
+    case Placement.lookup(stream_id) do
+      nil -> :not_found
+      _nodes -> current_state_for_existing(stream_id)
+    end
+  end
+
+  defp current_state_for_existing(stream_id) do
     case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
       :error ->
         :service_unavailable
