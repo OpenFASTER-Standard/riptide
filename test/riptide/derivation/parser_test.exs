@@ -142,5 +142,17 @@ defmodule Riptide.Derivation.ParserTest do
       assert {:ok, rule} = Parser.decode(text)
       assert rule.signature.reads == [RDF.iri("urn:riptide:relation:pendingDeploy")]
     end
+
+    test "a capability literal with no arguments at all (missing the mandatory result) is a clean parse error" do
+      text = "x(A, B) :- capability(deployService)."
+
+      assert {:error, _reason} = Parser.decode(text)
+    end
+
+    test "a rule literal with no arguments at all (missing the mandatory result) is a clean parse error" do
+      text = "x(A, B) :- rule(notifyTeam)."
+
+      assert {:error, _reason} = Parser.decode(text)
+    end
   end
 end

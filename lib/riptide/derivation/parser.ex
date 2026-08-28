@@ -1,3 +1,13 @@
+defmodule Riptide.Derivation.Parser.MissingResultError do
+  @moduledoc """
+  Raised internally by `Riptide.Derivation.Parser`'s builder functions when a
+  `capability(...)`/`rule(...)` literal has no arguments at all (not even the
+  mandatory `result` binding). `decode/1` rescues this and converts it to a clean
+  `{:error, _}` tuple — this exception should never escape `decode/1`.
+  """
+  defexception message: "capability/rule literal requires at least a result argument"
+end
+
 defmodule Riptide.Derivation.Parser do
   @moduledoc """
   Parses the Soufflé-shaped Datalog-clause concrete syntax (design spec
@@ -127,6 +137,8 @@ defmodule Riptide.Derivation.Parser do
       {:ok, [head, body], "", _, _, _} -> {:ok, build_rule(head, body)}
       {:error, reason, rest, _, _, _} -> {:error, {reason, rest}}
     end
+  rescue
+    e in Riptide.Derivation.Parser.MissingResultError -> {:error, Exception.message(e)}
   end
 
   @doc false
@@ -146,14 +158,30 @@ defmodule Riptide.Derivation.Parser do
 
   @doc false
   def build_capability_reference([name | rest]) do
-    {args, [result]} = Enum.split(rest, length(rest) - 1)
+    {args, result} = split_args_and_result!(rest)
     %CapabilityReference{capability: RDF.iri(@capability_ns <> name), args: args, result: result}
   end
 
   @doc false
   def build_rule_reference([name | rest]) do
-    {args, [result]} = Enum.split(rest, length(rest) - 1)
+    {args, result} = split_args_and_result!(rest)
     %RuleReference{rule: RDF.iri(@rule_ns <> name), args: args, result: result}
+  end
+
+  # A capability/rule literal's last positional argument is always the mandatory
+  # `result` binding (design spec §3) — `rest` must therefore have at least one
+  # element. `Enum.split(rest, length(rest) - 1)` would otherwise be called with a
+  # negative count when `rest` is empty (e.g. `capability(deployService)` with no
+  # args and no result), silently returning `{[], []}` instead of raising, which
+  # previously crashed the caller with an uncaught `MatchError` on `{args, [result]}`.
+  defp split_args_and_result!([]) do
+    raise Riptide.Derivation.Parser.MissingResultError,
+          "capability/rule literal requires at least a result argument"
+  end
+
+  defp split_args_and_result!(rest) do
+    {args, [result]} = Enum.split(rest, length(rest) - 1)
+    {args, result}
   end
 
   defp build_rule(%FactPattern{} = head, body) do
