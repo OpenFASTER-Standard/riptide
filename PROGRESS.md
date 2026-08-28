@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **Design drafted, decomposed into 21 phases** (one shared foundation, one primary spine, three parallel tracks — after a full pairwise dependency/leverage review) — see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a shipped** (Rule/Signature representation and parser) — 20 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -485,3 +485,34 @@ one monolithic spec.
 **Status**: Phases 5a-5c shipped 2026-08-27. Sub-project 5 (Observability & operability) complete.
 Production-readiness roadmap complete as of 2026-08-27 — see sub-projects 3 and 4 above for
 hardening work (Phase 3e, the post-4d atom-exhaustion fix) that continued to land afterward.
+
+## 6. Derivation and execution layer — decomposed into phases
+
+**Goal for this sub-project**: the first thing built on top of sub-projects 1-5's now-complete
+foundation, not a parallel effort — see
+`docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` §1. Riptide today is
+an event-sourced fact store with one hardcoded derivation; this sub-project adds a general
+derivation and execution engine so that "answer a question about the facts" and "cause an effect
+in the world" become two interpretations of the same declarative object, evaluated by one engine,
+sharing Riptide's Fact store and running in the same OS process as its existing LDP surface.
+Decomposed into 21 phases (one shared foundation, one primary spine, three parallel tracks, after
+a full pairwise dependency/leverage review) — see the design spec's §7 for the full breakdown.
+
+### 6c-i-a — Rule/Signature representation and parser
+
+Foundation-track phase (§7 of the design spec), the single highest-leverage phase in the
+Sub-project 6 roadmap. **Shipped 2026-08-28** — see
+`docs/superpowers/specs/2026-08-28-rule-signature-representation-design.md`.
+
+`Riptide.Derivation.Rule`/`Signature`/`Var`/`Literal.{FactPattern,CapabilityReference,RuleReference}`
+represent a parsed Rule; `Riptide.Derivation.Parser.decode/1` parses the Soufflé-shaped Datalog-
+clause concrete syntax into that structure (NimbleParsec, with the same untrusted-input heap-cap
+guard `Riptide.RDF.TurtleCodec.decode/1` already carries). `Riptide.Derivation.RuleRDFCodec.
+to_rdf/1`/`from_rdf/2` reify a Rule as RDF triples ("Rules are Facts" — SPIN's `sp:` vocabulary for
+fact-pattern literals, new `urn:riptide:vocab:` terms for capability-reference/rule-reference
+literals) and read it back, asserted through the existing `Event`/`StreamServer` mechanism with no
+new persistence path. `linkml-datalog` re-checked 2026-08-28: still dormant (last pushed
+2024-02-14) — unchanged from the design spec's prior checks.
+
+**Status**: Phase 6c-i-a shipped 2026-08-28. 20 phases remaining across the primary spine and the
+three parallel tracks — see the design spec's §7 for the full roadmap.
