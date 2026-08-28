@@ -1,20 +1,26 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, ninth revision (2026-08-28 restructuring). This is one
-architecture spec defining a single new top-level Riptide sub-project,
-**Sub-project 6**, decomposed into phases 6a–6j, the same way Riptide's
-own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
-own implementation plan (`writing-plans`) when work on it starts.
+**Status:** Draft, tenth revision (2026-08-28, second restructuring same
+day). This is one architecture spec defining a single new top-level
+Riptide sub-project, **Sub-project 6**, decomposed into 21 phases across
+one shared foundation and four tracks (§7) — grown from an initial 14
+phases after a full pairwise dependency/leverage review (§11). Each phase
+gets its own implementation plan (`writing-plans`) when work on it
+starts.
 
-This revision followed an independent cold-context architecture review
-(the review found real, previously-undetected defects — see §11) and
-restructured the document itself: the detailed research trail (three
-versioning-research passes, the blob/persistent-capability research) and
-the full revision-by-revision changelog through revision eight now live
-in a companion file,
+The ninth revision followed an independent cold-context architecture
+review (found real, previously-undetected defects) and restructured the
+document itself: the detailed research trail (three versioning-research
+passes, the blob/persistent-capability research) and the full
+revision-by-revision changelog through revision eight now live in a
+companion file,
 [`2026-08-27-derivation-and-execution-layer-research-log.md`](2026-08-27-derivation-and-execution-layer-research-log.md)
-("the research log" below). This document states current decisions and
-open questions plainly, without re-narrating "resolved this revision" /
+("the research log" below). This tenth revision applied a second,
+independent review method to the same content — pairwise comparison of
+every phase against every other, not just re-checking the existing DAG —
+and found the phase breakdown itself (§7) needed restructuring, not just
+the grounding sections. This document states current decisions and open
+questions plainly, without re-narrating "resolved this revision" /
 "corrected this revision" framing for facts that are now simply true —
 that framing is preserved, once, in the research log's own history.
 
@@ -95,7 +101,7 @@ Pattern Hub's public surface; automated detection of ontology overlap
   remediation (auth/authz correctness, Ra error handling, resource limits,
   concurrency/resilience fixes, observability), not only the narrower
   atom-exhaustion fix `PROGRESS.md` currently documents for it (tracked as
-  a `PROGRESS.md` update, §8.11). Sub-project 6b's integration point
+  a `PROGRESS.md` update, §8.11). Sub-project 6b-i's integration point
   should target this full, current ACP surface directly.
 - **A Tenant's vocabulary is observed, not declared.** No separate
   "ontology preference" object. Whichever Signature a Tenant's own Facts
@@ -113,7 +119,7 @@ Pattern Hub's public surface; automated detection of ontology overlap
 - **Dialect: SPARQL-RL**, tracked as one document. (The separate "SHACL
   1.2 Rules" draft this spec originally tracked in parallel has been
   consolidated by the Data Shapes Working Group into the SPARQL-RL
-  document — confirm this hasn't changed again before Sub-project 6c-i
+  document — confirm this hasn't changed again before Sub-project 6c-i-a
   locks in a concrete grammar, since it's a live Working Draft, not a
   finished Recommendation.) Reference evaluation engine: Soufflé's
   extended Datalog.
@@ -165,8 +171,9 @@ should be built as one privileged, built-in instance of that same
 supervised-process lifecycle pattern (a GenServer/supervision-tree-managed
 chunk store, hash-pointer metadata replicated via Ra) — **not** by routing
 blob storage through the general-purpose, tenant-facing, WASI-sandboxed
-Capability path meant for untrusted third-party code. Sub-project 6j
-(§7) is where this gets built.
+Capability path meant for untrusted third-party code. Sub-project 6b-ii
+(§7) builds the shared primitive; 6j (§7) builds the blob store itself on
+top of it.
 
 **Still genuinely open** (§10): a concrete garbage-collection/reference-
 counting scheme for the case this document's own EDB actually creates —
@@ -202,7 +209,7 @@ persistent/resumable component instance that could simplify this.
     ~3MB deeply-nested Turtle body driving ~863MB/~19s in the decoding
     process (both fixed in PR #32; the second is not yet reflected in
     `PROGRESS.md`, §8.11). A Capability is exactly this risk shape again —
-    tenant-scoped, but running arbitrary WASI component code — so 6b
+    tenant-scoped, but running arbitrary WASI component code — so 6b-i
     (§7) must enforce fuel and memory limits from its first exit
     criterion, not add them after a third incident. `wasmex` (the Elixir
     WASM host this stack would use) has verified, real APIs for both:
@@ -234,11 +241,11 @@ persistent/resumable component instance that could simplify this.
     settled, the concrete representation isn't.
 - **NativeTemplate** — a Rule whose Body is exactly one capability-reference
   literal. The base case, backed by a real, capability-scoped WASI
-  component. Sequencing note: Sub-project 6b (§7) builds the WASI execution
-  substrate standalone, with no Rule representation involved — it doesn't
-  produce NativeTemplate instances yet, since Rule's representation isn't
-  built until 6c. 6d is what wraps 6b's substrate as actual NativeTemplate
-  instances.
+  component. Sequencing note: Sub-project 6b-i (§7) builds the WASI
+  execution substrate standalone, with no Rule representation involved —
+  it doesn't produce NativeTemplate instances yet, since Rule's
+  representation isn't built until 6c-i-a. 6d-i is what wraps 6b-i's
+  substrate as actual NativeTemplate instances.
 - **Template** — `Template ⊑ Rule ⊓ (∃ a reachable step whose
   ExecuteInterpretation invokes a Capability)`. A structural predicate over
   the one Rule representation everything shares — not a separate primitive.
@@ -266,7 +273,7 @@ persistent/resumable component instance that could simplify this.
   verified by sandboxed replay-testing with the kind-specific semantics
   from §4. Capabilities that can't be safely replay-tested may need to
   stay ungeneralized, or require human certification (§6). Real
-  engineering, scoped to Sub-project 6e.
+  engineering, scoped to Sub-project 6e-ii.
 - **Provenance** — the dependency edge back to what a Rule was generalized
   or installed from (§6.5).
 
@@ -284,7 +291,7 @@ two scopes:
   Rule expressiveness is not constrained to the bisimilar-term-graph
   fragment (§8.2), so anti-unifying two Rules can yield several
   mutually-incomparable generalizations rather than one canonical answer —
-  DedupGate's arbitration mechanism for that case is Sub-project 6e's own
+  DedupGate's arbitration mechanism for that case is Sub-project 6e-i's own
   design work, not specified here. One concrete, well-precedented tool
   worth trying first: bottom-clause-style bounding (Muggleton's inverse
   entailment), applied per anti-unification call, which recovers a
@@ -347,33 +354,50 @@ Each phase becomes its own spec → plan → implementation cycle. Every
 phase below states its dependencies (normalized as **Depends on:**) and
 one falsifiable exit criterion.
 
-### Walking skeleton
+**Structure, after a full pairwise dependency/leverage review (see §11's
+latest revision).** The flat 6a–6j letter sequence looks like one serial
+chain; it isn't. A full pairwise pass across every phase — checking each
+against every other for a hidden dependency, not just re-deriving the
+already-known DAG — found that the roadmap is actually **one small shared
+foundation feeding one primary spine plus three genuinely independent
+side-tracks**, and several phases were bundling two different kinds of
+work under one name. That review split 14 phases into 21, all listed
+below under their track. Two general findings drove the splits: (1) a
+phase's *leverage* (how much depends on it) and its *readiness* (whether
+it's blocked) are different axes — several always-blocked-nothing phases
+turned out to have very different downstream weight; (2) wherever a
+phase's own text carried a hedge ("...but *additionally* depends on X for
+part of its scope," "...but Y must happen before Z starts") that hedge
+was a sign of two phases pretending to be one.
 
-The minimal phase subset that proves the whole design end-to-end, ahead
-of the full roadmap: **6b → 6c-i → 6d-i → 6e → 6f → 6g-i**. Exit
-criterion, concretely: a Task with no Catalog match runs through
-LLMFallback twice, and the resulting CatalogEntry is admitted; a third,
-similar Task hits Discovery's exact/keyword lookup directly, with **zero**
-LLM calls (this is §9.1's own worked example, made falsifiable). Getting
-here doesn't require 6a, 6c-ii/6c-iii, 6d-ii, 6g-ii, 6h, 6i, or 6j — those
-extend the skeleton, they don't gate it.
+### Foundation
 
-### Phases
+Start immediately; nothing here depends on anything else in Sub-project 6.
 
-- **6a — Bitemporal fact shape.** RDF-star `validFrom`/`validTo`, a defined
-  OWL-Time Allen-relation subset, ValidTime defaulting to TransactionTime.
-  Applies to Riptide's existing LDP write path, building on the
-  already-shipped Phase 3a schema-versioning envelope (`PROGRESS.md` §3,
-  shipped 2026-08-24) rather than treating the `Event`/`Patch` shape
-  change as a fresh, unaddressed risk.
+- **6c-i-a — Rule/Signature representation and parser.** The Rule/Body/
+  Head/Signature data representation and a SPARQL-RL-subset parser (§3.2).
+  **The highest-leverage phase in the roadmap**: nothing that touches
+  "Rule" — 6c-i-b's evaluation, 6c-ii, 6c-iii, 6d-i's NativeTemplate,
+  6e-i's anti-unification, 6f's Trace, or the LinkML rule schema (§8.6)
+  — can start until this shape is fixed. Previously bundled into "6c-i"
+  together with join evaluation; split out because it has an order of
+  magnitude more downstream consumers than the evaluation logic does, and
+  splitting it off lets those consumers start sooner instead of waiting
+  for the join engine too.
   **Depends on:** nothing.
-  **Exit criterion:** a Fact can carry a ValidTime interval distinct from
-  its TransactionTime, round-trips through the existing LDP write/read
-  path unchanged for Facts that don't set one, and is covered by a
-  migration test against the Phase 3a envelope.
-- **6b — Execution substrate.** WASI component execution, WASIX capability
-  grant, tenant-scoped and split into EffectCapability/ObserveCapability
-  from the start. Tested with no Rule representation involved.
+  **Exit criterion:** the Rule/Signature representation and its SPARQL-RL
+  parser round-trip a hand-written set of representative Rules (all three
+  literal kinds from §3.2), and `linkml-datalog`'s liveness (§8.6) has
+  been re-checked immediately before this phase starts, not assumed from
+  spec-writing time — this is the schema `linkml-datalog` would target,
+  if used.
+- **6b-i — WASI execution substrate.** WASI component execution, WASIX
+  capability grant, tenant-scoped and split into EffectCapability/
+  ObserveCapability from the start, with resource metering as a hard
+  requirement (§4). Tested with no Rule representation involved.
+  (Previously plain "6b"; renamed to distinguish it from 6b-ii below,
+  since both were being called "6b" and only one of them is what 6j
+  actually needs.)
   **Depends on:** nothing.
   **Exit criterion:** a tenant-scoped WASI component can be invoked as an
   EffectCapability or ObserveCapability against Riptide's current ACP
@@ -381,107 +405,251 @@ extend the skeleton, they don't gate it.
   limit (§4's `wasmex` APIs) traps deterministically instead of degrading
   the host, exercised by a test analogous to the Turtle-parsing and
   atom-exhaustion incidents already fixed in PR #32.
-- **6c — Pure derivation engine**, split by concern (following the
-  established Phase 3c-i/ii/iii precedent for splitting an oversized
-  phase):
-  - **6c-i — Fact-pattern matching and joins.**
-    **Depends on:** nothing beyond Riptide's fact store as it exists
-    today (bitemporal joins are 6c-iii's concern, not this one's).
-    **Exit criterion:** a Rule with only fact-pattern literals in its Body
-    evaluates correctly against multi-stream joins in the EDB, verified
-    against a hand-written suite of representative join queries.
-  - **6c-ii — Recursion and fixpoint evaluation.**
-    **Depends on:** 6c-i.
-    **Exit criterion:** a recursive Rule (e.g. transitive closure) reaches
-    a correct fixpoint over the EDB, with a documented stratification/
-    termination discipline.
-  - **6c-iii — Aggregation and full QueryInterpretation.**
-    **Depends on:** 6c-ii. ValidTime-aware querying additionally depends
-    on 6a — that dependency is scoped to this sub-phase, not to 6c as a
-    whole, so 6a and 6c-i/6c-ii can proceed in parallel.
-    **Exit criterion:** QueryInterpretation supports aggregation and, for
-    Facts carrying a ValidTime interval, can filter/join on it.
-    `linkml-datalog`'s liveness (§8.6) must be re-checked immediately
-    before this phase starts, not assumed from spec-writing time.
-- **6d — Wiring**, split by risk:
-  - **6d-i — Mechanical wiring.** Execute interpreter, real NativeTemplate
-    instances, `call_template` against a small hand-authored set.
-    **Depends on:** 6b (execution substrate) and 6c-i (fact-pattern
-    matching — the minimum Rule representation NativeTemplate needs;
-    6c-ii/6c-iii are not required here).
-    **Exit criterion:** a hand-authored set of NativeTemplate instances is
-    invoked end-to-end through ExecuteInterpretation via `call_template`,
-    exercising 6b's substrate and 6c-i's matching together.
-  - **6d-ii — Concurrent-effects design spike.** No established theory
-    answers coordinating concurrent ExecuteInterpretations over
-    overlapping, irreversible resources (checked: neither sagas nor CRDTs
-    establish this). Real, open design work.
-    **Depends on:** 6b (needs EffectCapability semantics to design
-    coordination for); benefits from 6d-i's concrete wiring as a
-    prototyping substrate but isn't blocked on it.
-    **Exit criterion:** a written design decision (not a test) for how
-    concurrent, overlapping EffectCapability invocations are coordinated.
-- **6e — Generalization and DedupGate**, including replay-testing fidelity
-  with the kind-specific semantics from §4.
-  **Depends on:** 6d-i.
-  **Exit criterion:** two independently-produced Traces anti-unify into a
-  single Generalization, pass DedupGate's `Admit` path with sandboxed
-  replay-testing evidence, and become a live CatalogEntry.
-- **6f — LLM fallback loop.** OAuth ported to Elixir by hand (no ecosystem
-  to lean on — `lambdaclass/datalog` dead, `fogfish/datalog` real but
-  dormant since 2019; full Datalog-library liveness tracking lives in
-  §8.6/6c-iii, not here, since this phase's own subject is the LLM
-  fallback loop, not Datalog tooling).
-  **Depends on:** 6e.
+- **6a — Bitemporal fact shape.** RDF-star `validFrom`/`validTo`, a defined
+  OWL-Time Allen-relation subset, ValidTime defaulting to TransactionTime.
+  Applies to Riptide's existing LDP write path, building on the
+  already-shipped Phase 3a schema-versioning envelope (`PROGRESS.md` §3,
+  shipped 2026-08-24). **Scheduled in the foundation despite low
+  downstream leverage** (only 6c-iii-b needs it, and not until well into
+  Track B) **because it's the first real exercise of Phase 3a's
+  schema-versioning envelope**, which has shipped but never been used for
+  an actual shape change — retiring that integration risk now, while
+  little else depends on the current Fact shape, is cheap; retiring it
+  after Track A/B are built on the current shape would not be.
+  **Depends on:** nothing.
+  **Exit criterion:** a Fact can carry a ValidTime interval distinct from
+  its TransactionTime, round-trips through the existing LDP write/read
+  path unchanged for Facts that don't set one, and is covered by a
+  migration test against the Phase 3a envelope.
+- **6b-ii — Supervised long-running process primitive.** An OTP
+  supervision-tree-managed process lifecycle, typed for the
+  revocable/restartable adaptation-safety property from session types
+  with runtime adaptation (§4, §8.12, research log Part 2) — the
+  primitive both a privileged blob store (6j) and any future persistent
+  Capability grant would be built from. **Newly split out**: prior
+  revisions had 6j claim a dependency on "6b" for this, but 6b as scoped
+  (now 6b-i) never actually built it — that dependency was fictional
+  until this phase existed to satisfy it. Scoped to just the reusable
+  primitive, not the open question of how a general persistent Capability
+  would be represented (§10) — that stays open; this phase doesn't need
+  it resolved.
+  **Depends on:** nothing (not even 6b-i — it's Riptide-native, privileged,
+  and never goes through the WASI sandbox).
+  **Exit criterion:** a supervised OTP process can be started, can be
+  cleanly restarted/replaced without corrupting an in-flight session, and
+  refuses a restart/revoke request that arrives mid-session, per the
+  adaptation-safety property the grounding research requires.
+- **6h-i — Pattern Hub threat model.** The auth/rate-limit spec for the
+  Pattern Hub's network-public surface (§7's 6h-ii below). **Newly split
+  out of "6h"**: 6h's own text already said this must be written before
+  6h-ii's implementation starts — a hedge that was really two phases. This
+  one is pure spec-writing against an already-designed API surface (§6,
+  §6.5); it doesn't need 6e-iii or anything else in this document to be
+  *implemented* first, only designed, which it already is.
+  **Depends on:** nothing.
+  **Exit criterion:** a written auth/rate-limit threat model for the Hub's
+  network surface exists and is reviewed, before 6h-ii starts.
+
+### Track A — value-delivery spine (walking skeleton and beyond)
+
+The chain that proves the whole design end-to-end and then extends it to
+Discovery, the Hub, and Crosswalks.
+
+- **6c-i-b — Fact-pattern matching and joins.** The join-evaluation engine
+  over 6c-i-a's representation (multi-stream joins, classical Datalog
+  matching). (Considered splitting further into "single-pattern
+  matching" for 6d-i's minimal needs vs. "multi-stream joins" for
+  everything else — rejected: in a real Datalog engine a 1-pattern match
+  is a trivial corner case of the N-pattern join algorithm, not a
+  separate implementation effort, so there's nothing to gain by
+  splitting it.)
+  **Depends on:** 6c-i-a.
+  **Exit criterion:** a Rule with only fact-pattern literals in its Body
+  evaluates correctly against multi-stream joins in the EDB, verified
+  against a hand-written suite of representative join queries.
+- **6d-i — Mechanical wiring.** Execute interpreter, real NativeTemplate
+  instances, `call_template` against a small hand-authored set.
+  **Depends on:** 6b-i (execution substrate), 6c-i-a (Rule
+  representation), and 6c-i-b (fact-pattern matching — the minimum
+  derivation-engine slice NativeTemplate needs; 6c-ii/6c-iii, Track B, are
+  not required here).
+  **Exit criterion:** a hand-authored set of NativeTemplate instances is
+  invoked end-to-end through ExecuteInterpretation via `call_template`,
+  exercising 6b-i's substrate and 6c-i-b's matching together.
+- **6e-i — Anti-unification algorithm.** `Rule × Rule → Rule`
+  least-general-generalization (Plotkin 1970) over 6c-i-a's
+  representation, including arbitration when anti-unification yields
+  several mutually-incomparable candidates (§8.2's decision not to
+  constrain Rule expressiveness) via bottom-clause-style bounding
+  (research log Part 1, Pass 3). **Newly split out of "6e"**: this is a
+  pure, syntactic algorithm that only needs 6c-i-a to exist — it was
+  previously stuck waiting on 6d-i for no real reason, since it can be
+  built and unit-tested against synthetic/hand-constructed Traces well
+  before any real Capability or NativeTemplate exists.
+  **Depends on:** 6c-i-a.
+  **Exit criterion:** anti-unifying two hand-constructed Rules produces
+  their least-general-generalization plus recovering substitutions; a
+  case engineered to yield multiple incomparable generalizations is
+  resolved via bottom-clause-style bounding, with the result covered by
+  unit tests using no real Capability or NativeTemplate.
+- **6e-ii — Generalization Fidelity / replay-testing harness.** The
+  kind-specific sandboxed replay semantics from §4/§5 (EffectCapability
+  re-invoked and compared; ObserveCapability replayed from recorded
+  Provenance instead of re-invoked). **Newly split out of "6e"**: distinct
+  engineering (sandboxed execution) from both the pure algorithm (6e-i)
+  and Catalog orchestration (6e-iii) — the spec's own §5/§6 split already
+  drew this boundary conceptually; the phase list just hadn't followed it.
+  **Depends on:** 6e-i (needs a Generalization to test against) and 6b-i
+  (needs the WASI sandbox to replay into).
+  **Exit criterion:** given a Generalization and its source Traces, the
+  harness reproduces each Trace's recorded effects (EffectCapability) or
+  recorded response (ObserveCapability) and reports fidelity pass/fail,
+  exercised against hand-authored fixture Capabilities.
+- **6e-iii — DedupGate orchestration.** Catalog lookup, the
+  `Reject`/`Merge`/`Admit` decision, and the human review workflow
+  (`scratch-command-bar`'s propose/review precedent). Built
+  scope-parameterized (`Tenant` or `Hub`, §6) from the start, so 6h-ii can
+  reuse it directly rather than generalizing a Tenant-only version later.
+  **Depends on:** 6e-i, 6e-ii, and 6d-i (needs a live NativeTemplate
+  producing real Traces to exercise the full path end-to-end, not just
+  synthetic fixtures).
+  **Exit criterion:** two independently-produced real Traces (from 6d-i's
+  NativeTemplate instances) anti-unify into a single Generalization, pass
+  the `Admit` path with 6e-ii's fidelity evidence and human review, and
+  become a live CatalogEntry.
+- **Capability grant flow (OAuth)** — a delegated/outbound OAuth client
+  (ported to Elixir by hand; no ecosystem to lean on) for obtaining a
+  Capability grant to an external system on the fly. **Newly split out of
+  "6f"**: this is Capability-layer infrastructure (§4 — granting access to
+  an external system), not something specific to LLM orchestration; 6f
+  can't be usefully tested without it if it stays inline, and nothing else
+  in 6f depends on OAuth's internals. Distinct from 6h-i's threat model
+  (that's inbound protection of Riptide's own Hub API; this is outbound,
+  delegated access to *other* systems) — checked, no shared work.
+  **Not required for the walking skeleton**: 9.1's own example (billing-
+  service deploy) plausibly uses pre-granted Capabilities; OAuth is only
+  needed for Capabilities requiring interactive consent, which 6f can
+  defer past its own first working version.
+  **Depends on:** 6b-i.
+  **Exit criterion:** given an external system requiring OAuth consent, a
+  Tenant can complete a grant flow that results in a usable Capability
+  grant, independent of any specific LLMFallback scenario.
+- **6f — LLM fallback loop.** Orchestration only, now that OAuth is its
+  own task: Task with no Catalog match → LLM-guided Capability invocation
+  → ground Trace.
+  **Depends on:** 6e-iii (the gate its output Trace must pass); the
+  Capability-grant/OAuth task only for the subset of fallbacks needing a
+  fresh external grant, not for the walking-skeleton path itself.
   **Exit criterion:** a Task with no Catalog match completes via
-  LLMFallback, produces a Trace, and that Trace is accepted by 6e's gate
-  without manual code changes.
-- **6g — Discovery**, split by readiness:
-  - **6g-i — Exact/keyword lookup**, viable as soon as any CatalogEntry
-    exists — the walking skeleton's own last step.
-    **Depends on:** 6e.
-    **Exit criterion:** a CatalogEntry admitted by 6e is found by exact/
-    keyword Discovery and invoked without an LLM call.
-  - **6g-ii — Hybrid keyword+embedding progressive disclosure**, deferred
-    until the catalog is large enough to need it.
-    **Depends on:** 6g-i.
-    **Exit criterion:** not yet defined — deferred with the phase.
-- **6h — Pattern Hub.** Stand up Hub-scope Catalog as a distinct,
-  network-publicly-reachable deployment of the same DedupGate mechanism
-  6e already builds. **"Publicly-reachable" is a network-exposure fact,
-  independent of §2's governance clarification** — the Hub can be
-  reachable by any Tenant (including future external ones) while curation
-  /admission authority stays Riptide-internal; these are orthogonal axes,
-  not in tension. Because this is Riptide's first network-public-facing
-  surface, it needs its own auth/rate-limit threat model defined in 6h's
-  own future spec **before implementation starts**, not discovered during
-  implementation (§10).
-  **Depends on:** 6e.
+  LLMFallback, produces a Trace, and that Trace is accepted by 6e-iii's
+  gate without manual code changes.
+- **6g-i — Exact/keyword lookup**, viable as soon as any CatalogEntry
+  exists — the walking skeleton's own last step. Built scope-parameterized
+  (`Tenant` or `Hub`) from the start, matching 6e-iii, so 6h-ii reuses it
+  directly.
+  **Depends on:** 6e-iii.
+  **Exit criterion:** a CatalogEntry admitted by 6e-iii is found by
+  exact/keyword Discovery and invoked without an LLM call.
+- **6g-ii — Hybrid keyword+embedding progressive disclosure**, deferred
+  until the catalog is large enough to need it.
+  **Depends on:** 6g-i.
+  **Exit criterion:** not yet defined — deferred with the phase.
+- **6h-ii — Pattern Hub deployment.** Stand up Hub-scope Catalog as a
+  distinct, network-publicly-reachable deployment of 6e-iii's
+  already-scope-parameterized DedupGate mechanism plus 6g-i's Discovery.
+  **"Publicly-reachable" is a network-exposure fact, independent of §2's
+  governance clarification** — the Hub can be reachable by any Tenant
+  (including future external ones) while curation/admission authority
+  stays Riptide-internal; these are orthogonal axes, not in tension.
+  **Depends on:** 6e-iii, 6g-i, and 6h-i (the threat model this
+  implementation must be gated by).
   **Exit criterion:** a CatalogEntry can be published to Hub scope and
   installed into a different Tenant via 6i, over a network-reachable
-  endpoint gated by the auth/rate-limit model that phase's own spec
-  defines.
+  endpoint gated by 6h-i's auth/rate-limit model.
 - **6i — Ontology Crosswalks and Installation.** SSSOM-shaped Hub-scope
   Crosswalk content, the Install operation, human-curation workflow.
-  **Depends on:** 6h.
+  **Depends on:** 6h-ii.
   **Exit criterion:** installing a Hub Pattern into a Tenant with partial
   vocabulary overlap binds matched fields through an existing Crosswalk
   and records manually-originated Provenance for unmatched fields, per
   §6.5.
+
+**Walking skeleton, restated at this finer grain:** **6b-i → 6c-i-a →
+6c-i-b → 6d-i → 6e-i → 6e-ii → 6e-iii → {6f, 6g-i}**. Concretely: a Task
+with no Catalog match runs through LLMFallback twice, and the resulting
+CatalogEntry is admitted; a third, similar Task hits Discovery's
+exact/keyword lookup directly, with **zero** LLM calls (§9.1's own worked
+example, made falsifiable). Nothing in Track B, Track C, 6d-ii, 6g-ii,
+6h-ii, or 6i gates this — they extend the skeleton, not gate it.
+
+### Track B — pure query capability (parallel to Track A, not a prerequisite for it)
+
+**A full pairwise check found this track was never actually on the path
+to Track A** — 6d-i needs only the Execute interpreter and basic
+matching (6c-i-b), 6e's phases need the Rule representation and
+anti-unification, and Discovery (6g-i) is a lookup index over
+CatalogEntry metadata, not a Datalog query. The walking-skeleton note in
+prior revisions already excluded 6c-ii/6c-iii, but the flat 6a–6j
+numbering visually implied a serial chain that wasn't real. This track
+serves the "answer a question about the facts" half of §1's vision; Track
+A serves the "cause an effect" half plus the Catalog/Discovery machinery
+around it.
+
+- **6c-ii — Recursion and fixpoint evaluation.**
+  **Depends on:** 6c-i-b.
+  **Exit criterion:** a recursive Rule (e.g. transitive closure) reaches
+  a correct fixpoint over the EDB, with a documented stratification/
+  termination discipline.
+- **6c-iii-a — Aggregation support.** COUNT/SUM/etc. in QueryInterpretation.
+  **Newly split out of "6c-iii"**: aggregation has no dependency on 6a;
+  bundling it with the ValidTime-aware slice (which does) forced a hedge
+  ("depends on 6c-ii; *additionally* depends on 6a for part of its
+  scope") that a clean split resolves instead of carrying forward.
+  **Depends on:** 6c-ii.
+  **Exit criterion:** QueryInterpretation supports aggregation over the
+  EDB, verified against a hand-written suite of representative queries.
+- **6c-iii-b — ValidTime-aware querying.** Bitemporal filter/join support
+  in QueryInterpretation.
+  **Depends on:** 6c-ii and 6a.
+  **Exit criterion:** QueryInterpretation can filter/join on Facts'
+  ValidTime intervals where present.
+
+### Track C — blob storage (fully independent)
+
+Shares nothing with Track A or B beyond Riptide's existing Ra log (used
+only for the hash-pointer Facts, not the blob bytes themselves) — this
+track can be resourced and scheduled entirely separately from the rest of
+Sub-project 6.
+
 - **6j — Large object (blob) storage.** Implements §3.3/the research
   log's Part 2 blob architecture: content-addressed chunk store as a
-  privileged, built-in supervised process, hash-pointer Facts through
-  Riptide's existing per-stream Ra log. No phase covered this in prior
-  revisions of this document — added this revision after the gap was
-  found during restructuring (§11).
-  **Depends on:** 6b (shares the supervised-process substrate 6b's own
-  daemon-capability grounding establishes, per §3.3/§4).
+  privileged, built-in instance of 6b-ii's supervised-process primitive,
+  hash-pointer Facts through Riptide's existing per-stream Ra log.
+  **Depends on:** 6b-ii (not 6b-i — blob storage never goes through the
+  WASI sandbox, by design, §3.3).
   **Exit criterion:** a Capability can write a blob larger than 10MB,
   addressed by content hash, retrievable via a hash-pointer Fact
   replicated through Riptide's existing per-stream Ra log, with a
   documented (even if provisional) garbage-collection scheme and an
   explicit statement of what security boundary governs the privileged
   blob-serving process.
+
+### Track D — design spikes
+
+Cheap, near-zero-dependency deliverables that feed Track A but don't
+block starting it. (6d-ii and 6h-i were checked against each other for
+shared content, since both are "cheap early design spikes" — none found;
+they stay separate.)
+
+- **6d-ii — Concurrent-effects design spike.** No established theory
+  answers coordinating concurrent ExecuteInterpretations over
+  overlapping, irreversible resources (checked: neither sagas nor CRDTs
+  establish this). Real, open design work.
+  **Depends on:** 6b-i (needs EffectCapability semantics to design
+  coordination for); benefits from 6d-i's concrete wiring as a
+  prototyping substrate but isn't blocked on it.
+  **Exit criterion:** a written design decision (not a test) for how
+  concurrent, overlapping EffectCapability invocations are coordinated.
 
 **Ongoing, not sequential:** LinkML authoring applied to each new schema as
 created (§8.6).
@@ -512,8 +680,8 @@ explicitly: DedupGate (§6) must handle the case where anti-unifying two
 Rules yields several mutually-incomparable candidate generalizations, not
 assume there's always exactly one. The concrete arbitration mechanism
 (present all candidates for human review; some ranking heuristic; bottom-
-clause-style bounding per §6; some other approach) is Sub-project 6e's
-job, once a real Rule representation exists to test it against.
+clause-style bounding per §6; some other approach) is Sub-project 6e-i's
+job, once a real Rule representation (6c-i-a) exists to test it against.
 
 **8.3 Execution kernel.** WASI Preview 2 excludes fork/exec/subprocess
 spawning by design; WASIX is the separate superset restoring it. See §4
@@ -528,10 +696,13 @@ it.
 fell out of tracing §9.2 through the model, not external research — this
 document's own synthesis, presented as such.
 
-**8.6 Authoring.** LinkML adopted for 6c's rule schema and 6h/6i's Pattern
-and Crosswalk schemas. `linkml-datalog`: last pushed 2024-02-14, one open
-issue, not archived — dormant. Re-check immediately before 6c-iii
-actually depends on it, not just at spec-writing time.
+**8.6 Authoring.** LinkML adopted for 6c-i-a's rule schema and 6h-ii/6i's
+Pattern and Crosswalk schemas. `linkml-datalog`: last pushed 2024-02-14,
+one open issue, not archived — dormant. Re-check immediately before
+6c-i-a actually depends on it, not just at spec-writing time (moved this
+check to 6c-i-a rather than 6c-iii, since 6c-i-a is where the rule schema
+itself is authored — `linkml-datalog`'s relevance is to schema authoring,
+not to aggregation/QueryInterpretation).
 
 **8.7 Versioning — formal supersedes theory for declarative rules.**
 TerminusDB and Fluree are both actively maintained (graph three-way merge
@@ -545,7 +716,7 @@ formalism that directly answers "rule B (refined) supersedes rule A
 (generalized)."** The pragmatic git/TerminusDB-style model is the adopted
 approach. The one genuinely actionable output of this research is
 recorded where it's used: bottom-clause-style bounding as a concrete tool
-for Sub-project 6e's DedupGate arbitration (§6). Full citations and the
+for Sub-project 6e-i's DedupGate arbitration (§6). Full citations and the
 per-pass narrative: research log, Part 1.
 
 **8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
@@ -570,11 +741,10 @@ document's own extension to that ordering, not documented CLIPS behavior.
 **8.11 Human review, UI, repo integration.** External research on
 review-gate placement and generic-shape-driven UI came back empty twice.
 Local precedent used instead: `scratch-command-bar`'s propose/review loop,
-`graphsheet`'s shipped SHACL-driven UI. **Two `PROGRESS.md` updates owed,
-no later than 6b's start:** add Sub-project 6 as a row in the sub-project
-table, and expand the existing "Post-4d hardening" section to reflect
-PR #32's full scope (currently documents only the atom-exhaustion slice,
-not the Turtle-parsing heap-cap fix or the rest of that PR — §3.1, §4).
+`graphsheet`'s shipped SHACL-driven UI. **Done:** `PROGRESS.md` now has
+Sub-project 6 as a row in the sub-project table, and the "Post-4d
+hardening" section now reflects PR #32's full scope (previously
+documented only the atom-exhaustion slice).
 
 **8.12 Large objects and persistent capabilities.** Researched together,
 per explicit direction not to treat them as separate, since a native blob
@@ -622,7 +792,7 @@ example caught.
   the bisimilar-term-graph fragment: **no constraint**; full
   expressiveness is kept, and DedupGate must arbitrate a finite set of
   incomparable generalizations when anti-unification isn't unitary (§8.2,
-  §6). The concrete arbitration mechanism is Sub-project 6e's own design
+  §6). The concrete arbitration mechanism is Sub-project 6e-i's own design
   work.
 
 **Still open:**
@@ -632,8 +802,8 @@ example caught.
 - Formal versioning/supersedes theory for declarative rules — three
   dedicated passes found no exact fit across five independent directions
   (§8.7, research log Part 1). Bottom-clause-style bounding is a concrete
-  actionable tool for 6e even without closing the formal gap itself.
-- `linkml-datalog`'s dormancy — re-check again immediately before 6c-iii
+  actionable tool for 6e-i even without closing the formal gap itself.
+- `linkml-datalog`'s dormancy — re-check again immediately before 6c-i-a
   depends on it, not just at spec-writing time (§8.6).
 - Large-object/persistent-capability engineering details (§3.3, §4,
   §8.12, research log Part 2): a garbage-collection scheme for many RDF
@@ -644,10 +814,12 @@ example caught.
   persistent process is a second dimension alongside StabilityClass or
   something structurally different. The formal grounding (session types
   with runtime adaptation; content-addressed chunking) is settled; the
-  concrete representation isn't.
-- A threat model for the Pattern Hub's public network surface (6h, §7) —
-  must be written as 6h's own spec, before 6h's implementation starts,
-  not discovered mid-implementation.
+  concrete representation isn't — 6b-ii builds the shared primitive, but
+  a general persistent-Capability grant built from it remains open.
+- A threat model for the Pattern Hub's public network surface — now its
+  own phase, **6h-i**, decoupled from 6h-ii's implementation (§7). Still
+  open in the sense that 6h-i's content hasn't been written yet, not in
+  the sense that it might get skipped.
 
 ## 11. Changelog
 
@@ -687,6 +859,62 @@ survived all eight prior revisions:
 - Normalized "Depends on:" phrasing across every phase.
 - Deduplicated the Riak CS/CORFU precedent text between §3.3 and §8.12 —
   detail lives in the research log only.
-- Flagged (not yet applied — tracked separately) that `PROGRESS.md`'s
-  "Post-4d hardening" section needs expanding to reflect PR #32's full
-  scope, not just the atom-exhaustion slice (§8.11).
+- Expanded `PROGRESS.md`'s "Post-4d hardening" section to reflect PR #32's
+  full scope (not just the atom-exhaustion slice) and added Sub-project 6
+  to its sub-projects table (§8.11).
+
+**This revision (tenth) — a full pairwise dependency/leverage review of
+§7's phase breakdown**, done independently of the ninth revision's
+cold-context review, using a different method: comparing every phase
+against every other phase directly (not just re-checking the existing
+DAG), specifically to catch hidden dependencies and bundled-together work
+that a top-down pass over the same content would tend to miss:
+- Found the flat 6a–6j sequence was hiding real structure: one shared,
+  low-dependency foundation feeds one primary spine (the walking
+  skeleton and its direct extensions) plus three genuinely independent
+  side-tracks (pure QueryInterpretation; blob storage; design spikes).
+  6c-ii/6c-iii were never actually prerequisites for 6d/6e/6f/6g/6h/6i —
+  the existing walking-skeleton note already implied this, but the flat
+  numbering obscured it. §7 is now organized by foundation/track instead
+  of by letter alone.
+- Found "Ready" (no dependency) is not the same as "highest priority":
+  6c-i's Rule/Signature representation has far more downstream consumers
+  than 6a or 6b did, despite all three previously reading as equally
+  unblocked. Split out as **6c-i-a**, promoted to the single
+  highest-leverage phase in the roadmap.
+- Found 6j's stated dependency on "6b" was fictional as written — 6b as
+  scoped never built the supervised-long-running-process primitive §3.3/
+  §8.12 says blob storage needs. Split 6b into **6b-i** (the original
+  WASI-substrate scope) and **6b-ii** (the primitive itself, needed only
+  by 6j and, later, any persistent-Capability work) — closing a
+  dependency that would otherwise have surfaced as a surprise when 6j
+  actually started.
+- Found 6e was three different kinds of engineering under one name (a
+  pure algorithm, a sandboxed-execution harness, and Catalog
+  orchestration+human review) — matching a boundary the spec's own §5/§6
+  split already drew conceptually. Split into **6e-i/6e-ii/6e-iii**; 6e-i
+  now depends only on 6c-i-a instead of waiting on 6d-i for no real
+  reason.
+- Found 6f's inline OAuth client is Capability-grant infrastructure (§4),
+  not LLM-orchestration-specific — extracted as its own **Capability
+  grant flow (OAuth)** task, and found it isn't actually required for the
+  walking skeleton (9.1's example plausibly uses pre-granted
+  Capabilities), narrowing the skeleton's true critical path.
+- Found 6c-iii and 6h were each carrying a hedge in their own prior text
+  ("additionally depends on 6a for part of its scope"; "needs a spec
+  written before implementation starts") — a hedge on one phase is a sign
+  of two. Split into **6c-iii-a/6c-iii-b** and **6h-i/6h-ii**
+  respectively.
+- Checked and explicitly rejected three plausible-looking further splits
+  (6c-i-b's single-pattern-vs-join matching; a merge of 6h-i's and the
+  OAuth task's "auth" framing; a merge of 6d-ii and 6h-i for both being
+  cheap design spikes) — recorded in §7 so they aren't re-litigated
+  without new information.
+- Net: 14 phases became 21, all single-concern, each carrying its real
+  dependencies rather than transitively-implied ones. Re-derived the
+  walking skeleton at this finer grain: **6b-i → 6c-i-a → 6c-i-b → 6d-i →
+  6e-i → 6e-ii → 6e-iii → {6f, 6g-i}**.
+- Moved `linkml-datalog`'s liveness re-check from 6c-iii to 6c-i-a (where
+  the rule schema is actually authored — a residual imprecision from the
+  ninth revision's fix, corrected while already restructuring this
+  section).
