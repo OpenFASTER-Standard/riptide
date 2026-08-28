@@ -166,9 +166,10 @@ deployment's concern — these manifests only expose the metrics, they don't ins
 
 ## Running on Fly.io
 
-`fly.toml` (included in this repo) deploys Riptide as a single Fly Machine with a persistent Fly
-Volume mounted at `/data` — the same single-node model as `docker-compose.yml` above, just on
-Fly's infrastructure instead of your own. This needs `flyctl` and an authenticated Fly.io org.
+[`fly.toml`](fly.toml) (included in this repo) deploys Riptide as a single Fly Machine with a
+persistent Fly Volume mounted at `/data` — the same single-node model as
+[`docker-compose.yml`](docker-compose.yml) above, just on Fly's infrastructure instead of your own.
+This needs `flyctl` and an authenticated Fly.io org.
 
 ```bash
 fly apps create <your-app-name>          # update fly.toml's `app` and `PHX_HOST` to match
@@ -183,36 +184,38 @@ fly deploy -a <your-app-name>
 
 `RELEASE_DISTRIBUTION`/`RELEASE_NODE`/`RELEASE_COOKIE` enable Erlang distribution scoped to
 loopback only (`127.0.0.1` — not reachable from outside the machine), solely so `bin/riptide rpc`
-can attach for one-off administrative calls (see "Seeding data" below) — this is the Fly
-equivalent of `iex -S mix phx.server`'s attached shell in local dev.
+can attach for one-off administrative calls (see [Seeding data](#seeding-data) below) — this is
+the Fly equivalent of `iex -S mix phx.server`'s attached shell in local dev.
 
 **Why `RELEASE_NODE=riptide@127.0.0.1`, not `@localhost`:** Erlang's longname distribution mode
 (`RELEASE_DISTRIBUTION=name`) requires the host part to be a real IP or fully-qualified hostname —
 `localhost` is rejected outright ("Hostname localhost is illegal"). This mirrors
-`rel/env.sh.eex`'s own `riptide@$POD_IP` choice for the Kubernetes path, just with the loopback
-address in place of a pod IP.
+[`rel/env.sh.eex`](rel/env.sh.eex)'s own `riptide@$POD_IP` choice for the Kubernetes path, just
+with the loopback address in place of a pod IP.
 
-`fly.toml` also sets `RIPTIDE_PLACEMENT_TARGET_SIZE=1` — a single-machine deployment (Fly, plain
-`docker run`, `docker-compose`) only ever has one node to form a placement cluster from, so the
-target size needs to match; see the comment above `placement_target_size` in `config/runtime.exs`
-for why. This isn't strictly required (the default target size of 3 still gracefully collapses to
-whatever's actually present), but leaving it unset means the ambient join loop keeps periodically
-probing for 2 more nodes that will never appear.
+[`fly.toml`](fly.toml) also sets `RIPTIDE_PLACEMENT_TARGET_SIZE=1` — a single-machine deployment
+(Fly, plain `docker run`, `docker-compose`) only ever has one node to form a placement cluster
+from, so the target size needs to match; see the comment above `placement_target_size` in
+[`config/runtime.exs`](config/runtime.exs) for why. This isn't strictly required (the default
+target size of 3 still gracefully collapses to whatever's actually present), but leaving it unset
+means the ambient join loop keeps periodically probing for 2 more nodes that will never appear.
 
-`fly.toml` also pins `HOSTNAME=riptide` — unlike Kubernetes, Fly Machines don't export a `HOSTNAME`
-env var at all (confirmed live: it's absent from `fly ssh console`'s own environment, even though
-the `hostname` command reports the machine ID), and `Riptide.RaCluster.data_dir/0` keys `:ra`'s
-on-disk data directory off that variable. Leaving it unset still works today — it just falls
-through to a hardcoded `"nonode"` default — but pins the data directory's name to an accident of
-Fly's current platform behavior rather than a deliberate value; see `data_dir/0`'s moduledoc.
+[`fly.toml`](fly.toml) also pins `HOSTNAME=riptide` — unlike Kubernetes, Fly Machines don't export
+a `HOSTNAME` env var at all (confirmed live: it's absent from `fly ssh console`'s own environment,
+even though the `hostname` command reports the machine ID), and `Riptide.RaCluster.data_dir/0`
+(in [`lib/riptide/ra_cluster.ex`](lib/riptide/ra_cluster.ex)) keys `:ra`'s on-disk data directory
+off that variable. Leaving it unset still works today — it just falls through to a hardcoded
+`"nonode"` default — but pins the data directory's name to an accident of Fly's current platform
+behavior rather than a deliberate value; see that function's own moduledoc for the full story.
 
 ### Seeding data
 
 There's no HTTP endpoint for tenant/policy administration (deliberately — it's an Elixir-native,
-operator-only action, same as local dev's `setup.exs`). Attach via `bin/riptide rpc`, not
-`bin/riptide remote`: the latter's `--remsh` silently falls back to a disconnected local session
-over a non-tty connection (exactly what `fly ssh console -C "..."` gives you), which looks like it
-worked but never touches the running app. `rpc` doesn't need a tty:
+operator-only action, same as local dev's
+[`examples/live-story/setup.exs`](examples/live-story/setup.exs)). Attach via `bin/riptide rpc`,
+not `bin/riptide remote`: the latter's `--remsh` silently falls back to a disconnected local
+session over a non-tty connection (exactly what `fly ssh console -C "..."` gives you), which looks
+like it worked but never touches the running app. `rpc` doesn't need a tty:
 
 ```bash
 fly ssh console -a <your-app-name> -C \
@@ -226,11 +229,13 @@ expression.
 
 ### Using the live-story browser demo against this deployment
 
-`examples/live-story/app.js` defaults to `http://localhost:4000` (see its own README for the local
-dev flow), so pointing the bundled browser demo at a Fly deployment instead needs one thing: open
-`examples/live-story/index.html?base=https://<your-app-name>.fly.dev` rather than the bare file —
-the `?base=` query param overrides which server the page talks to, no editing required. Riptide's
-CORS policy allows any origin (see `RiptideWeb.Endpoint`), so this works even opening the HTML file
+[`examples/live-story/app.js`](examples/live-story/app.js) defaults to `http://localhost:4000`
+(see [its own README](examples/live-story/README.md) for the local dev flow), so pointing the
+bundled browser demo at a Fly deployment instead needs one thing: open
+[`examples/live-story/index.html`](examples/live-story/index.html)`?base=https://<your-app-name>.fly.dev`
+rather than the bare file — the `?base=` query param overrides which server the page talks to, no
+editing required. Riptide's CORS policy allows any origin (see
+[`RiptideWeb.Endpoint`](lib/riptide_web/endpoint.ex)), so this works even opening the HTML file
 directly from disk (a `file://` origin).
 
 ### Verified
