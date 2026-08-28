@@ -229,9 +229,11 @@ expression.
 
 ### Using the live-story browser demo against this deployment
 
-[`examples/live-story/app.js`](examples/live-story/app.js) defaults to `http://localhost:4000`
-(see [its own README](examples/live-story/README.md) for the local dev flow), so pointing the
-bundled browser demo at a Fly deployment instead needs one thing: open
+[`examples/live-story/index.html`](examples/live-story/index.html) is a single, standalone file —
+CSS and JavaScript both inlined, nothing else to fetch — so it works identically whether you open
+it from a checkout or just download and double-click that one file on its own (see
+[its own README](examples/live-story/README.md) for the local dev flow). Its inline script defaults
+to `http://localhost:4000`, so pointing it at a Fly deployment instead needs one thing: open
 [`examples/live-story/index.html`](examples/live-story/index.html)`?base=https://<your-app-name>.fly.dev`
 rather than the bare file — the `?base=` query param overrides which server the page talks to, no
 editing required. Riptide's CORS policy allows any origin (see
