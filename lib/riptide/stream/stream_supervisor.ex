@@ -18,4 +18,11 @@ defmodule Riptide.Stream.StreamSupervisor do
       {:error, _reason} = error -> error
     end
   end
+
+  # Normalizes ensure_ready/1's result for callers (every LDP/SSE/WebSocket
+  # entry point) that only branch on success vs. failure, not the specific
+  # error reason.
+  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
+  def ensure_ready_status(:ok), do: :ok
+  def ensure_ready_status({:error, _reason}), do: :error
 end

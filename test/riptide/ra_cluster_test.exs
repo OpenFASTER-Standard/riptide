@@ -125,25 +125,6 @@ defmodule Riptide.RaClusterTest do
     end
   end
 
-  describe "ensure_placement_cluster_started/2" do
-    test "retries the attempt function until it succeeds" do
-      {:ok, counter} = Agent.start_link(fn -> 0 end)
-
-      attempt_fun = fn ->
-        count = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
-        if count < 2, do: {:error, :cluster_not_formed}, else: :ok
-      end
-
-      assert RaCluster.ensure_placement_cluster_started(1, attempt_fun) == :ok
-      assert Agent.get(counter, & &1) == 3
-    end
-
-    test "succeeds immediately if the first attempt succeeds" do
-      attempt_fun = fn -> :ok end
-      assert RaCluster.ensure_placement_cluster_started(1, attempt_fun) == :ok
-    end
-  end
-
   describe "placement_leader?/0" do
     test "returns true for this node's own already-running (collapsed) placement cluster" do
       assert RaCluster.placement_leader?()

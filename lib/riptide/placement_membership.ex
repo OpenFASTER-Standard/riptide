@@ -129,10 +129,10 @@ defmodule Riptide.PlacementMembership do
   end
 
   @doc """
-  One attempt at "get this node into a working placement cluster" — the
-  `attempt_fun` `RaCluster.ensure_placement_cluster_started/2` retries
-  indefinitely. Public so `RaCluster`'s own default argument can reference
-  it, and so tests can invoke it directly.
+  One attempt at "get this node into a working placement cluster" — called
+  once from `handle_info(:bootstrap, state)` at boot, with the periodic
+  `:reconcile` tick as the real retry mechanism if this attempt fails.
+  Public so tests can invoke it directly.
 
   Checks DISCOVERED CONSENSUS membership, not local disk, to decide what
   this node should do — `node()` is IP-based and changes on every real pod

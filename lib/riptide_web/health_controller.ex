@@ -1,5 +1,5 @@
 defmodule RiptideWeb.HealthController do
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   # Never a real stream — just needs to reach `PlacementMachine.get/2`'s O(1)
   # map lookup so `/health/ready` proves the placement Ra cluster answers,
@@ -13,10 +13,11 @@ defmodule RiptideWeb.HealthController do
     send_resp(conn, 200, "ok")
   end
 
-  # Riptide.Placement.lookup/1 raises (via with_ordinal_fallback/2 exhausting
-  # all 3 placement ordinals) when the shared placement Ra cluster is
-  # unreachable — every LDP/SSE/WebSocket request needs this cluster to
-  # resolve stream placement, so its reachability is what "ready" means here.
+  # Riptide.Placement.lookup/1 raises (via with_current_members/1 exhausting
+  # every discovered placement-cluster member) when the shared placement Ra
+  # cluster is unreachable — every LDP/SSE/WebSocket request needs this
+  # cluster to resolve stream placement, so its reachability is what "ready"
+  # means here.
   def ready(conn, _params) do
     Riptide.Placement.lookup(@health_check_stream_id)
     send_resp(conn, 200, "ok")
