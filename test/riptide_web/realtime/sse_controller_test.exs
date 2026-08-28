@@ -67,7 +67,14 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
       end)
 
-    Process.sleep(300)
+    # A fixed sleep can't reliably outlast however long the async Task
+    # takes to reach its own Phoenix.PubSub.subscribe/2 call under a busier
+    # scheduler (seen on CI) — appending before that subscribe registers
+    # means the event is published before anyone's listening and silently
+    # missed. Phoenix.PubSub.subscribe/3 registers via `Registry.register/3`
+    # on the pubsub itself, so polling `Registry.lookup/2` for this topic is
+    # a direct, non-sleep-based signal that the subscription is live.
+    assert eventually(fn -> Registry.lookup(Riptide.PubSub, "stream:" <> stream_id) != [] end)
     StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     conn = Task.await(task, 3_000)
@@ -345,6 +352,20 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 503
+    end
+  end
+
+  defp eventually(fun, attempts_left \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      attempts_left <= 1 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        eventually(fun, attempts_left - 1)
     end
   end
 end
