@@ -240,10 +240,10 @@ editing required. Riptide's CORS policy allows any origin (see
 [`RiptideWeb.Endpoint`](lib/riptide_web/endpoint.ex)), so this works even opening the HTML file
 directly from disk (a `file://` origin).
 
-[`examples/live-story/graph.html`](examples/live-story/graph.html) — a live WebGL visualization of
-`the-story`'s actual RDF graph, see [its own README section](examples/live-story/README.md#watching-it-as-a-graph)
-— takes the same `?base=` override, plus `?tenant=`/`?resource=` to point it at any resource rather
-than just this demo's.
+Want to see `the-story`'s actual RDF structure grow live instead of prose? The
+[live RDF graph viewer](examples/graph-viewer/) is a separate, general-purpose example — not tied
+to `the-story` specifically — that renders any Riptide resource's triples as a live WebGL graph.
+Point it at `story-demo`/`the-story` on this deployment's `?base=`, or at anything else.
 
 ### Verified
 
