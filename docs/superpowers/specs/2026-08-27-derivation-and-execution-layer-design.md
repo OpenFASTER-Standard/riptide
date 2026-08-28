@@ -1,13 +1,13 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, fourth revision — resolving three of §10's open
-decisions (Tenant name, governance, deployability) and a dedicated
-research pass on formal versioning/supersedes theory (§8.7.1). This is
-one architecture spec defining a single new top-level Riptide sub-project,
+**Status:** Draft, fifth revision — a dedicated research pass grounding
+§3.3 (large objects) and §4's daemon-capability gap together, per explicit
+direction not to treat them as separate concerns (§8.12). This is one
+architecture spec defining a single new top-level Riptide sub-project,
 **Sub-project 6**, decomposed into phases 6a–6i, the same way Riptide's
 own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
 own implementation plan (`writing-plans`) when work on it starts. See §11
-for the itemized changelog across all four revisions.
+for the itemized changelog across all five revisions.
 
 ## 1. Motivation and vision
 
@@ -57,10 +57,10 @@ this work, not something this spec reconciles with.
 execution coordination (confirmed this revision as real design work owed
 here, not a literature gap to close by more research); the bisimilar-
 term-graph constraint question; formal versioning/supersedes theory for
-rules; large object (blob) storage (§3.3, new this revision); whether
-long-running/daemon-shaped Capabilities need a second dimension beyond
-StabilityClass (§4, new this revision); automated detection of ontology
-overlap (out of scope *by design*, §6.5).
+rules; large-object/persistent-capability engineering details (§3.3, §4,
+§8.12 — the formal grounding is now confirmed, the concrete
+representation isn't); automated detection of ontology overlap (out of
+scope *by design*, §6.5).
 
 ## 3. Core concepts — facts and rules
 
@@ -121,7 +121,7 @@ overlap (out of scope *by design*, §6.5).
     Templates) is inexpressible — caught by tracing a real scenario (§9)
     through the model, not by re-reading the document.
 
-### 3.3 Large objects (blobs) — new this revision, not yet researched
+### 3.3 Large objects (blobs) — direction confirmed by research this revision
 
 **The problem, stated plainly.** Every Fact today is a small RDF triple,
 replicated through a per-stream Ra (Raft) cluster's consensus log. A
@@ -134,33 +134,62 @@ otherwise) as a second system operators must run and keep available
 alongside Riptide, and without blobs feeling bolted-on rather than a
 first-class Riptide concept.
 
-**A candidate direction (my own synthesis this revision — not yet
-independently verified the way the rest of this document's claims are,
-flagged honestly as such):** split identity from bytes, the same way this
-whole document already treats every other layer (§1's organizing idea).
-A blob is content-addressed (hashed) and immutable once written; a Fact
-references it by hash (e.g. as an IRI like `<urn:riptide-blob:sha256:...>`),
-making a blob just another kind of Term any Rule or Fact can point at —
-this is what "feels native" rather than bolted-on. Because the *bytes*
-are immutable, replicating them doesn't need consensus at all (unlike a
-Fact, which needs strict ordering) — only a small piece of metadata does
-("which nodes currently hold chunk `sha256:...`"), which is exactly the
-shape of thing Riptide's existing Fact/Ra machinery already handles well.
-Actual bytes could then transfer directly between Riptide nodes
-(peer-to-peer, outside consensus) rather than through any per-write
-replication path. This is structurally the same split Git itself makes —
-content-addressed, immutable object store versus a small, consistency-
-needing ref/commit layer — and this document already leans on git
-precedent elsewhere (§6's DedupGate `Merge`, §8.7's TerminusDB/Fluree
-grounding), so reusing it here would be consistent, not a new borrowed
-idea.
+**Direction confirmed by a dedicated research pass this revision (§8.12
+for full grounding):** split identity from bytes, the same way this whole
+document already treats every other layer (§1's organizing idea). A blob
+is content-addressed (hashed) and immutable once written; a Fact
+references it by hash (e.g. `<urn:riptide-blob:sha256:...>`), making a
+blob just another kind of Term any Rule or Fact can point at. The small
+hash-pointer goes through Riptide's existing per-stream Ra log exactly
+like any other RDF triple value; the actual bytes live in an ordinary,
+independently-replicated, content-addressed local store that no single
+replication mechanism needs to fully mirror everywhere — confirmed as the
+real, convergent architecture across git, casync/desync, and IPFS/UnixFS
+(content-defined chunking, e.g. casync/desync's buzhash with a 16KB/64KB/
+256KB min/avg/max window; strong content-hash naming; chunk storage
+deliberately decoupled from the pointer/index structure that names them).
+Mainstream Raft-based stores (etcd, TiKV, CockroachDB) were checked and
+confirmed to *discourage or hard-limit* large values through consensus
+(etcd's default max request size is 1.5MiB) rather than solving this
+themselves — validating the premise that a genuinely separate mechanism
+is needed, without supplying one ready-made.
 
-**Explicitly not resolved by the above:** chunking scheme, garbage
-collection of unreferenced blobs, how many replicas a blob needs versus
-a Fact's own replica count, and — unverified — whether this candidate
-direction survives contact with real research the way every other claim
-in this document has. Added to §10 as an open question rather than locked
-in.
+**A concrete production precedent for the chunk-store-plus-GC half of
+this** exists in Riak CS (discontinued — historical precedent, not a
+currently-maintained reference implementation): objects split into fixed
+1MB blocks keyed by `{UUID, BlockId}`, with garbage collection driven by
+an explicit manifest state machine
+(`writing → active → pending_delete → scheduled_delete`) plus a dedicated
+GC bucket scanned by a background process. Shared-log/consensus systems
+(CORFU, Delos) independently confirm the same shape at a different layer:
+a lightweight ordering/coordination step (CORFU's sequencer just hands
+out position tokens) stays separate from the bulk data plane (clients
+read/write flash units directly), with garbage collection via trim-plus-
+watermark rather than synchronous cross-replica compaction.
+
+**Connects directly to §4's daemon-capability question — see §8.12's
+verdict.** In every one of these precedents, the component clients
+actually talk to for bulk reads/writes is a **long-running, supervised,
+directly-addressable server process** — never a one-shot invocation. That
+is structurally the same shape §4 needs for a persistent capability like
+"serve this content over HTTP." Riptide's own blob store should be built
+as one privileged, built-in instance of that same supervised-process
+lifecycle pattern (a GenServer/supervision-tree-managed chunk store, hash-
+pointer metadata replicated via Ra) — **not** by routing blob storage
+through the general-purpose, tenant-facing, WASI-sandboxed Capability
+path meant for untrusted third-party code. "The blob store literally is a
+WASI capability grant" is the wrong framing; "both need the same
+supervised-long-running-process primitive underneath" is the right one.
+
+**Still genuinely open** (§10): a concrete garbage-collection/reference-
+counting scheme for the case this document's own EDB actually creates —
+many RDF triples referencing the *same* chunk hash, unlike the
+object-store/shared-log semantics every precedent above was built for;
+what security boundary/tenant-scoping governs the privileged blob-serving
+process itself, given it sits outside the general WASI sandbox by design;
+and whether WASI Preview 2 (or later) has any native notion of a
+persistent/resumable component instance that could simplify this, which
+this pass could not confirm either way.
 
 ## 4. Capability, NativeTemplate, Template
 
@@ -180,20 +209,35 @@ in.
   - Backed by WASI Preview 2 (no ambient authority, no subprocess spawning
     by design) plus WASIX where subprocess spawning is specifically
     granted (§8.3).
-  - **A real gap, not yet designed, surfaced this revision by a universality
-    check.** "File a tax return," "extract page 2 of a PDF," and "serve
+  - **A universality check surfaced a real gap, now grounded by research
+    (§8.12).** "File a tax return," "extract page 2 of a PDF," and "serve
     this web page over HTTP" should all be expressible as Capabilities —
     that's the whole point of the model's generality, not a feature to add
     later. The first two are one-shot: invoke, get a discrete Outcome,
     done — exactly what `(Rule, Bindings, EDB-state) → Outcome` (§5)
     already models. "Serve this page" is not: it's a long-running,
     continuously-listening process serving arbitrarily many requests over
-    its lifetime, closer in shape to something Riptide already knows how
-    to run and supervise (`Riptide.Stream.StreamServer` and friends) than
-    to a discrete Interpretation. Whether this becomes a second
-    Capability dimension (e.g. `Ephemeral` vs `Persistent`, alongside
-    StabilityClass) or something else entirely is genuinely open — noted
-    in §10, not designed here.
+    its lifetime. **The formalism that actually fits this shape is session
+    types with runtime adaptation (Di Giusto & Pérez), not an extension of
+    the algebraic-effect/handler theory §5 already leans on for one-shot
+    Interpretations** — no confirmed literature extends effect-handler
+    theory to persistent effects, but this process-calculus line proves
+    exactly the safety property a revocable, tenant-scoped long-running
+    Capability needs: an update/restart action on a running process is
+    only permitted when it isn't currently mid-session, so a long-running
+    Capability can be replaced or revoked without corrupting in-flight
+    requests. The same paper directly works out Erlang/OTP supervision
+    trees as a formal example of this calculus — both `one_for_one` and
+    `one_for_all` restart strategies typed within it — giving a real,
+    citable bridge between this theory and `Riptide.Stream.StreamServer`'s
+    own supervision-tree shape, not an analogy this document is making
+    unaided. A long-running Capability's implementation is a supervised
+    OTP process wearing a Capability grant, typed for exactly this
+    adaptation safety property. Whether that's a second Capability
+    dimension (e.g. `Ephemeral` vs `Persistent`, alongside StabilityClass)
+    or something structurally different is still open (§10) — this
+    revision confirms the right formal grounding, not the concrete
+    representation.
 - **NativeTemplate** — a Rule whose Body is exactly one capability-reference
   literal. The base case, backed by a real, capability-scoped WASI
   component. Sequencing note: Sub-project 6b (§7) builds the WASI execution
@@ -473,6 +517,63 @@ Riptide's `PROGRESS.md` sub-project table as Sub-project 6 no later than
 6b's start** — concrete now that 1–5 are confirmed complete and the table
 has an obvious next row.
 
+**8.12 Large objects and persistent capabilities — researched together
+this revision, per explicit direction not to treat them as separate.** A
+dedicated research pass investigated both §3.3 and §4's daemon-capability
+gap as one question, since a native blob store and a long-running
+capability are plausibly the same underlying problem. 18 underlying
+claims individually passed adversarial verification (mostly 3-vote,
+primary sources: official docs, project wikis, peer-reviewed papers).
+
+- **Blob architecture**: Ra (this project's own Raft library) already
+  implements chunked, non-blocking transfer for its *internal* consensus
+  snapshots — `ra_snapshot`'s leader-side `begin_read`/`read_chunk` and
+  follower-side `begin_accept`/`accept_chunk`/`complete_accept`, with
+  integrity validation. Real BEAM-ecosystem precedent, but scoped to Ra's
+  own snapshots, not a general blob API — suggestive, not ready-made.
+  Content-addressed chunking (git, casync/desync, IPFS/UnixFS) converges
+  on one architecture: content-defined chunks named by a strong hash,
+  stored as independently-addressable objects, with the pointer/index
+  structure that names them deliberately decoupled from chunk storage.
+  Riak CS (discontinued; historical precedent) is the closest concrete
+  precedent for the *whole* shape: fixed blocks keyed by `{UUID,
+  BlockId}`, garbage-collected via an explicit manifest state machine.
+  CORFU/Delos confirm the same separation at the consensus layer:
+  lightweight ordering stays separate from the bulk data plane, GC via
+  trim-plus-watermark rather than synchronous cross-replica compaction.
+- **Persistent-capability formalism**: session types with runtime
+  adaptation (Di Giusto & Pérez, arXiv:1312.2699) — not algebraic-effect
+  handler theory, which no confirmed source extends to persistent effects
+  — proves the safety property this needs: an update/restart action on a
+  running process is only valid when it isn't mid-session. The same paper
+  formalizes Erlang/OTP supervision trees (both `one_for_one` and
+  `one_for_all` restart strategies) as a worked example of this exact
+  calculus — a genuine, citable bridge from capability-lifecycle theory to
+  OTP semantics, not an analogy invented for this document.
+- **Connecting verdict** (medium confidence — a synthesis across two
+  source clusters, not itself one independently-verified claim): the two
+  problems need the *same* underlying primitive — a supervised, long-lived,
+  directly-addressable process with a revocable/restartable lifecycle —
+  but a native blob store should **not** be literally implemented as an
+  instance of the general-purpose, tenant-facing, WASI-sandboxed
+  Capability abstraction meant for untrusted third-party code. It should
+  be a privileged, built-in instance of the *same* supervision/lifecycle
+  formalism a persistent Capability would also use. "The blob store is a
+  WASI capability grant" is false; "both need the same supervised-process
+  primitive underneath" is real and load-bearing.
+- **Explicitly unresolved by this pass**: whether WASI Preview 2 (or
+  later) has any native notion of a persistent/resumable component
+  instance, as opposed to strict instantiate-call-terminate — no claim
+  survived verification either way; whether the RabbitMQ/Ra maintainer
+  team has ever discussed blob co-location with Raft-backed metadata
+  beyond Ra's own internal snapshot-chunking — no claim surfaced; a
+  concrete garbage-collection scheme for the case this document's own EDB
+  actually creates (many RDF triples referencing the *same* chunk hash,
+  unlike the object-store/shared-log semantics every precedent above was
+  built for); and what security boundary governs the privileged
+  blob-serving process itself, given it sits outside the general WASI
+  sandbox by design.
+
 ## 9. Worked examples
 
 **9.1 — the clean case.** Task "deploy the billing service" → no
@@ -518,15 +619,46 @@ deleted silently — see §11's changelog for the full reasoning):
   lattice literature is the most promising unresearched lead (§8.7.1).
 - `linkml-datalog`'s dormancy — re-check again immediately before 6c
   depends on it, not just at spec-writing time (§8.6).
-- **New this revision:** large object (blob) storage — a candidate
-  content-addressed direction sketched but not researched (§3.3).
-- **New this revision:** whether long-running/daemon-shaped Capabilities
-  (e.g. "serve this over HTTP") need a second Capability dimension beyond
-  StabilityClass, surfaced by a universality check but not designed (§4).
+- Large-object/persistent-capability engineering details researched but
+  not yet resolved this revision (§8.12): a garbage-collection scheme for
+  many RDF triples referencing the same content-addressed chunk hash
+  (every precedent found was built for object-store/shared-log semantics,
+  not this); the privileged blob-serving process's own security boundary,
+  given it sits outside the general WASI sandbox by design; whether WASI
+  Preview 2+ has any native persistent/resumable component-instance
+  notion; whether the concrete Capability representation for a persistent
+  process is a second dimension alongside StabilityClass or something
+  structurally different (§3.3, §4 confirm the formal grounding —
+  session types with runtime adaptation, content-addressed chunking — not
+  the concrete representation).
 
 ## 11. Changelog
 
-**This revision (fourth) — resolving open decisions plus new research:**
+**This revision (fifth) — §3.3 and §4 researched together, per direction
+not to treat them as separate:**
+- Rewrote §3.3 (large objects) from a flagged-unverified sketch to a
+  research-grounded direction: content-addressed chunking (git/casync/
+  desync/IPFS architecture), confirmed mainstream Raft stores discourage
+  rather than solve large values through consensus, and a concrete
+  chunk-plus-GC production precedent (Riak CS, historical).
+- Rewrote §4's daemon-capability gap: the fitting formalism is session
+  types with runtime adaptation (Di Giusto & Pérez), not an extension of
+  algebraic-effect handler theory — and the same paper directly formalizes
+  Erlang/OTP supervision trees as a worked example, a real citable bridge
+  to `Riptide.Stream.StreamServer`'s own shape.
+- Added §8.12 with the full grounding for both, including the connecting
+  verdict the research was explicitly asked to investigate: blob storage
+  and persistent capabilities need the same supervised-long-running-
+  process primitive underneath, but a blob store should be a privileged
+  built-in instance of that primitive, not literally a general-purpose
+  WASI Capability grant.
+- Updated §10: replaced "not yet researched"/"not designed" framing for
+  both items with the specific engineering questions the research
+  surfaced but didn't resolve (RDF-triple-shaped chunk GC, the privileged
+  process's own security boundary, WASI persistent-instance support,
+  concrete Capability representation).
+
+**Fourth revision — resolving open decisions plus new research:**
 - Resolved three of §10's open decisions: Tenant name (**"Tenant"**, no
   rename — Polity/Civitas/Demesne shortlist dropped), governance
   (**Riptide-internal for now**, not OpenFASTER-Standard public
