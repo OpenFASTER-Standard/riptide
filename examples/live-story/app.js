@@ -1,4 +1,7 @@
-const BASE_URL = "http://localhost:4000";
+// Defaults to local dev; override via a `?base=` query param (no trailing
+// slash) to point this static page at any other running Riptide instance —
+// e.g. a Fly.io deployment — without editing this file.
+const BASE_URL = new URLSearchParams(window.location.search).get("base") || "http://localhost:4000";
 const TENANT_ID = "story-demo";
 const STORY_PATH = `/tenants/${TENANT_ID}/resources/the-story`;
 const STREAM_ID = `https://riptide.example/tenants/${TENANT_ID}/resources/the-story`;

@@ -199,6 +199,13 @@ for why. This isn't strictly required (the default target size of 3 still gracef
 whatever's actually present), but leaving it unset means the ambient join loop keeps periodically
 probing for 2 more nodes that will never appear.
 
+`fly.toml` also pins `HOSTNAME=riptide` — unlike Kubernetes, Fly Machines don't export a `HOSTNAME`
+env var at all (confirmed live: it's absent from `fly ssh console`'s own environment, even though
+the `hostname` command reports the machine ID), and `Riptide.RaCluster.data_dir/0` keys `:ra`'s
+on-disk data directory off that variable. Leaving it unset still works today — it just falls
+through to a hardcoded `"nonode"` default — but pins the data directory's name to an accident of
+Fly's current platform behavior rather than a deliberate value; see `data_dir/0`'s moduledoc.
+
 ### Seeding data
 
 There's no HTTP endpoint for tenant/policy administration (deliberately — it's an Elixir-native,
@@ -217,11 +224,21 @@ shell — `fly ssh console -C` and the SSH session itself.) For a one-off tenant
 full live-story seed, pass a shorter expression the same way — `rpc` accepts any single Elixir
 expression.
 
+### Using the live-story browser demo against this deployment
+
+`examples/live-story/app.js` defaults to `http://localhost:4000` (see its own README for the local
+dev flow), so pointing the bundled browser demo at a Fly deployment instead needs one thing: open
+`examples/live-story/index.html?base=https://<your-app-name>.fly.dev` rather than the bare file —
+the `?base=` query param overrides which server the page talks to, no editing required. Riptide's
+CORS policy allows any origin (see `RiptideWeb.Endpoint`), so this works even opening the HTML file
+directly from disk (a `file://` origin).
+
 ### Verified
 
-Setup → deploy → seed → verify (health check, `PATCH` a line, confirm it via `GET` and over SSE) →
-complete teardown (`fly apps destroy <app> --yes`), run 3 times end-to-end with no manual
-intervention between runs, 2026-08-27.
+Setup → deploy → seed → verify (health check, `PATCH` a line, confirm it via `GET` and over SSE,
+data survives a machine restart) → complete teardown (`fly apps destroy <app> --yes`), run
+end-to-end with no manual intervention between runs, 2026-08-27 and re-verified 2026-08-28
+(HOSTNAME pinning + browser demo `?base=` override added after the 2026-08-28 run surfaced both).
 
 ## Performance
 

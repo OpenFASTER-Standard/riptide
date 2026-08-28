@@ -233,9 +233,13 @@ defmodule Riptide.RaCluster do
   # Stable across pod restarts/rescheduling even though Erlang distribution identity
   # (node()) is now IP-based and NOT stable — see Phase 3b design spec §1/§3.
   # Kubernetes sets a StatefulSet pod's HOSTNAME to its stable pod name (e.g.
-  # "riptide-0"); outside Kubernetes (local dev, docker-compose, tests) HOSTNAME
-  # still resolves to something stable per-container/per-host, so this doesn't
-  # regress non-clustered environments. Both `data_dir` and `wal_data_dir` are
+  # "riptide-0"). Outside Kubernetes, HOSTNAME is NOT guaranteed to be set at
+  # all — confirmed live on Fly Machines, which export no HOSTNAME env var
+  # whatsoever (unlike Docker, which does) — so single-node platforms fall
+  # through to the "nonode" default below. That default is stable only as
+  # long as the platform keeps leaving the env var unset; `fly.toml` pins
+  # `HOSTNAME` explicitly for exactly this reason rather than relying on it.
+  # Both `data_dir` and `wal_data_dir` are
   # pinned here — `:ra`'s own `default_config/0` would otherwise leave
   # `wal_data_dir` defaulted to the OLD node()-derived directory
   # (`ra_system.erl`'s `WalDataDir = application:get_env(ra, wal_data_dir,
