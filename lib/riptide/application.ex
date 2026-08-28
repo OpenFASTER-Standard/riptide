@@ -57,7 +57,7 @@ defmodule Riptide.Application do
   # as the repair/shrink leader (only if it currently is one and is the
   # cluster's Raft leader), replacing the old static HOSTNAME-matches-one-
   # of-3-fixed-ordinals gate entirely. Riptide.Stream.ReplicaHealer already
-  # only acts when `RaCluster.placement_leader?/0` is true, so running it
+  # only acts when `RaCluster.Placement.placement_leader?/0` is true, so running it
   # unconditionally is safe — it's a no-op everywhere except the one real
   # leader, exactly the same safety property it already had.
   #
@@ -78,7 +78,7 @@ defmodule Riptide.Application do
   # Every node that can serve a request needs its own live JWKS signer
   # cache, unconditionally — unlike placement_children/0, which is also
   # unconditional now but still delegates its own internal gating to
-  # Riptide.PlacementMembership/RaCluster.placement_leader?/0 — see
+  # Riptide.PlacementMembership/RaCluster.Placement.placement_leader?/0 — see
   # Riptide.Auth.JwksStrategy's own moduledoc for why no leader coordination
   # is needed here. Conditional on real OIDC config being present at all, so
   # dev/test boot doesn't require a reachable JWKS endpoint just to start —

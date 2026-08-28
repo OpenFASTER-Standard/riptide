@@ -89,7 +89,7 @@ defmodule Riptide.PlacementMembershipTest do
       :timer.sleep(50)
 
       assert PlacementMembership.bootstrap_once() == :ok
-      assert RaCluster.local_placement_members() == {:ok, [node()]}
+      assert RaCluster.Placement.local_placement_members() == {:ok, [node()]}
     end
   end
 

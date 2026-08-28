@@ -93,7 +93,9 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
 
     results =
       Enum.map(placement_peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [placement_nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [
+          placement_nodes
+        ])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
@@ -138,7 +140,7 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
     # Run the sweep directly from node_a rather than waiting on the real
     # 30s timer. `ReplicaHealer.sweep/0` itself performs no leader check —
     # only the timer-driven `handle_info(:sweep, state)` gates on
-    # `RaCluster.placement_leader?/0` before calling `sweep/0` — so calling
+    # `RaCluster.Placement.placement_leader?/0` before calling `sweep/0` — so calling
     # `sweep/0` directly here always attempts the repair regardless of
     # node_a's actual leadership status; this is a deliberate test-only
     # bypass of the production gating path, not a claim about node_a being

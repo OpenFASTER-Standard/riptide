@@ -107,7 +107,9 @@ defmodule Riptide.Stream.ReplicaHealerRetentionTest do
 
     results =
       Enum.map(placement_peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [placement_nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [
+          placement_nodes
+        ])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))

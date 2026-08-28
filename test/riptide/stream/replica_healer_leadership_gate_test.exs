@@ -113,7 +113,9 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
 
     results =
       Enum.map(placement_peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [placement_nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [
+          placement_nodes
+        ])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
@@ -154,7 +156,7 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
     # to be the leader itself.
     leader_node =
       eventually_find(survivors, fn node ->
-        :erpc.call(node, Riptide.RaCluster, :placement_leader?, [])
+        :erpc.call(node, Riptide.RaCluster.Placement, :placement_leader?, [])
       end)
 
     assert leader_node != nil, "no survivor became the placement leader in time"
@@ -166,7 +168,7 @@ defmodule Riptide.Stream.ReplicaHealerLeadershipGateTest do
 
     # Send :sweep to the NON-leader's real, registered ReplicaHealer process
     # first — exercising the exact production `handle_info(:sweep, state)`
-    # path, including its `RaCluster.placement_leader?/0` gate. Synchronize
+    # path, including its `RaCluster.Placement.placement_leader?/0` gate. Synchronize
     # with `:sys.get_state/2` (blocks until every message queued ahead of it,
     # including this :sweep, has been handled) before checking anything, so
     # this is a deterministic observation, not a timing guess.

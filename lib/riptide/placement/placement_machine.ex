@@ -21,7 +21,7 @@ defmodule Riptide.Placement.PlacementMachine do
 
   ## Repair claims (audit remediation, 2026-08-27)
 
-  `RaCluster.placement_leader?/0` is an unfenced, point-in-time local read
+  `RaCluster.Placement.placement_leader?/0` is an unfenced, point-in-time local read
   with no lease — during a leadership handoff or partition, two different
   placement ordinals can both briefly believe they're the leader and both
   run `Riptide.Stream.ReplicaHealer.sweep/0` concurrently for the same dead

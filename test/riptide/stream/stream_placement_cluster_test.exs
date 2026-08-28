@@ -278,7 +278,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
   defp bootstrap_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
