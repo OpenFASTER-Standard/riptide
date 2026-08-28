@@ -8,16 +8,11 @@ defmodule Riptide.Derivation.Parser do
 
   alias Riptide.Derivation.{Rule, Signature, Var}
   alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.Literal.{CapabilityReference, RuleReference}
 
   @relation_ns "urn:riptide:relation:"
-
-  # `@capability_ns`/`@rule_ns` are intentionally NOT defined yet: unlike
-  # unused local variables, Elixir's "module attribute set but never used"
-  # warning isn't suppressed by an underscore prefix (confirmed empirically
-  # against `mix compile --warnings-as-errors`), so the brief's suggested
-  # `_capability_ns`/`_rule_ns` fallback doesn't actually work. Task 3, which
-  # adds capability(...)/rule(...) literal support and is the first to need
-  # these namespaces, should introduce them at that point instead.
+  @capability_ns "urn:riptide:capability:"
+  @rule_ns "urn:riptide:rule:"
 
   # Datalog rule text is expected to be a single small clause, far smaller
   # than a Turtle document — see `Riptide.RDF.TurtleCodec.decode/1` for the
@@ -69,6 +64,27 @@ defmodule Riptide.Derivation.Parser do
     |> ignore(ascii_char([?)]))
     |> wrap()
 
+  capability_or_rule_args =
+    ignore(ascii_char([?(]))
+    |> concat(ws)
+    |> concat(lower_identifier)
+    |> concat(ws)
+    |> repeat(ignore(ascii_char([?,])) |> concat(ws) |> concat(term) |> concat(ws))
+    |> ignore(ascii_char([?)]))
+    |> wrap()
+
+  capability_literal =
+    ignore(string("capability"))
+    |> concat(ws)
+    |> concat(capability_or_rule_args)
+    |> map({__MODULE__, :build_capability_reference, []})
+
+  rule_literal =
+    ignore(string("rule"))
+    |> concat(ws)
+    |> concat(capability_or_rule_args)
+    |> map({__MODULE__, :build_rule_reference, []})
+
   fact_atom =
     predicate_name
     |> concat(ws)
@@ -76,11 +92,7 @@ defmodule Riptide.Derivation.Parser do
     |> wrap()
     |> map({__MODULE__, :build_fact_pattern, []})
 
-  # For fact-pattern-only rules (this task), a body literal is always a
-  # fact-pattern atom. `choice/2` requires at least two alternatives, so a
-  # single-element `choice([fact_atom])` doesn't compile — Task 3 reinstates
-  # a real `choice/2` here once capability(...)/rule(...) literals exist.
-  literal = fact_atom
+  literal = choice([capability_literal, rule_literal, fact_atom])
 
   body =
     literal
@@ -131,6 +143,18 @@ defmodule Riptide.Derivation.Parser do
 
   @doc false
   def build_fact_pattern([predicate, args]), do: %FactPattern{predicate: predicate, args: args}
+
+  @doc false
+  def build_capability_reference([name | rest]) do
+    {args, [result]} = Enum.split(rest, length(rest) - 1)
+    %CapabilityReference{capability: RDF.iri(@capability_ns <> name), args: args, result: result}
+  end
+
+  @doc false
+  def build_rule_reference([name | rest]) do
+    {args, [result]} = Enum.split(rest, length(rest) - 1)
+    %RuleReference{rule: RDF.iri(@rule_ns <> name), args: args, result: result}
+  end
 
   defp build_rule(%FactPattern{} = head, body) do
     %Rule{signature: build_signature(head, body), head: head, body: body}

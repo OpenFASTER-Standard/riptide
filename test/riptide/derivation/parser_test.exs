@@ -81,4 +81,66 @@ defmodule Riptide.Derivation.ParserTest do
                ])
     end
   end
+
+  describe "decode/1 — capability(...) and rule(...) literals" do
+    alias Riptide.Derivation.Literal.{CapabilityReference, RuleReference}
+
+    test "parses a capability-reference literal, with the last arg as result" do
+      text =
+        "deployed(Svc, Outcome) :- pendingDeploy(Svc, Target), capability(deployService, Svc, Target, Outcome)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert length(rule.body) == 2
+
+      assert Enum.at(rule.body, 1) == %CapabilityReference{
+               capability: RDF.iri("urn:riptide:capability:deployService"),
+               args: [%Var{name: "Svc"}, %Var{name: "Target"}],
+               result: %Var{name: "Outcome"}
+             }
+    end
+
+    test "parses a rule-reference literal, with the last arg as result" do
+      text =
+        "notified(Svc, Result) :- capability(deployService, Svc, Svc, Outcome), rule(notifyTeam, Svc, Outcome, Result)."
+
+      assert {:ok, rule} = Parser.decode(text)
+
+      assert Enum.at(rule.body, 1) == %RuleReference{
+               rule: RDF.iri("urn:riptide:rule:notifyTeam"),
+               args: [%Var{name: "Svc"}, %Var{name: "Outcome"}],
+               result: %Var{name: "Result"}
+             }
+    end
+
+    test "the walking-skeleton worked example (design spec §1) parses with all three literal kinds" do
+      text = """
+      deployed(Svc, Result) :-
+          pendingDeploy(Svc, Target),
+          capability(deployService, Svc, Target, Outcome),
+          rule(notifyTeam, Svc, Outcome, Result).
+      """
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert length(rule.body) == 3
+      assert %FactPattern{} = Enum.at(rule.body, 0)
+      assert %CapabilityReference{} = Enum.at(rule.body, 1)
+      assert %RuleReference{} = Enum.at(rule.body, 2)
+    end
+
+    test "an identifier that merely starts with \"capability\" is still an ordinary fact-pattern literal" do
+      text = "x(A, B) :- capabilityFoo(A, B)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert %FactPattern{predicate: predicate} = hd(rule.body)
+      assert predicate == RDF.iri("urn:riptide:relation:capabilityFoo")
+    end
+
+    test "the derived Signature's reads only includes fact-pattern predicates, not capability/rule names" do
+      text =
+        "deployed(Svc, Result) :- pendingDeploy(Svc, Target), capability(deployService, Svc, Target, Result)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert rule.signature.reads == [RDF.iri("urn:riptide:relation:pendingDeploy")]
+    end
+  end
 end
