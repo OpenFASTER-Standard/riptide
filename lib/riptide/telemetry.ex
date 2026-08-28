@@ -155,12 +155,13 @@ defmodule Riptide.Telemetry do
         event_name: [:riptide, :placement, :assign, :exception]
       ),
 
-      # Falling back past one placement ordinal to the next — previously
-      # silent (rescued with no log/metric), so a persistently unreachable
-      # (but not yet totally-down) ordinal had no visibility beyond a subtle
-      # latency increase in the aggregate duration distributions above.
-      counter("riptide.placement.ordinal_fallback",
-        event_name: [:riptide, :placement, :ordinal_fallback]
+      # Falling back past one placement-cluster member to the next —
+      # previously silent (rescued with no log/metric), so a persistently
+      # unreachable (but not yet totally-down) member had no visibility
+      # beyond a subtle latency increase in the aggregate duration
+      # distributions above.
+      counter("riptide.placement.member_fallback",
+        event_name: [:riptide, :placement, :member_fallback]
       ),
 
       # Replica healer — new :telemetry.execute calls added in Task 5

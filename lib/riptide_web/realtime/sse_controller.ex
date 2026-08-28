@@ -1,8 +1,9 @@
 defmodule RiptideWeb.Realtime.SseController do
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
   require Logger
 
   alias Riptide.Event
+  alias Riptide.{NewStreamRateLimit, Placement}
   alias Riptide.RDF.TurtleCodec
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
@@ -39,7 +40,36 @@ defmodule RiptideWeb.Realtime.SseController do
   end
 
   defp do_subscribe(conn, stream_id, cursor) do
-    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+    case Placement.lookup(stream_id) do
+      nil -> do_subscribe_new_stream(conn, stream_id, cursor)
+      _nodes -> do_subscribe_existing_stream(conn, stream_id, cursor)
+    end
+  end
+
+  # Subscribing before a stream's first write is intentional (a client
+  # watching for a soon-to-be-created resource), so — unlike
+  # RiptideWeb.LDP.ResourceController's read path — creation can't simply
+  # be refused here. Cap the RATE of new-stream creation instead: each one
+  # permanently mints a BEAM atom (RaCluster.uid_for/server_id) that's
+  # never freed, so this is the mitigation for the one entry point that
+  # must keep allowing it. An already-existing stream (the common case) is
+  # never rate-limited — only genuinely brand-new ones consume the quota.
+  defp do_subscribe_new_stream(conn, stream_id, cursor) do
+    case NewStreamRateLimit.check_new_stream(rate_limit_subject(conn)) do
+      :allow -> do_subscribe_existing_stream(conn, stream_id, cursor)
+      :deny -> send_resp(conn, 429, "")
+    end
+  end
+
+  defp rate_limit_subject(conn) do
+    case conn.assigns.current_subject do
+      %{"sub" => sub} -> sub
+      _ -> "anonymous"
+    end
+  end
+
+  defp do_subscribe_existing_stream(conn, stream_id, cursor) do
+    case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :ok ->
         # Subscribing before reading the backlog avoids ever missing an event
         # (Plug.Conn.chunk order: below), but opens a duplicate-delivery
@@ -71,10 +101,6 @@ defmodule RiptideWeb.Realtime.SseController do
         send_resp(conn, 503, "")
     end
   end
-
-  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
-  def ensure_ready_status(:ok), do: :ok
-  def ensure_ready_status({:error, _reason}), do: :error
 
   defp loop(conn, last_sequence) do
     receive do
