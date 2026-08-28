@@ -45,6 +45,49 @@ defmodule Riptide.Derivation.Matcher do
     end
   end
 
+  @doc """
+  Evaluates a Rule: finds every Body-satisfying binding (`bindings/2`) and
+  substitutes each into the Head to produce one concluded `RDF.Triple.t()`
+  per binding. Checks Rule safety (every Head variable must appear in the
+  Body) structurally, before any graph access.
+  """
+  @spec evaluate(Rule.t(), RDF.Graph.t()) ::
+          {:ok, [RDF.Triple.t()]}
+          | {:error,
+             :too_many_variables | {:unsupported_literal, Rule.literal()} | {:unsafe_rule, Var.t()}}
+  def evaluate(%Rule{head: head} = rule, %RDF.Graph{} = graph) do
+    with :ok <- check_safety(head, rule.body),
+         {:ok, results} <- bindings(rule, graph) do
+      {:ok, Enum.map(results, &conclude(head, &1))}
+    end
+  end
+
+  defp check_safety(%FactPattern{args: head_args}, body) do
+    body_vars =
+      body
+      |> Enum.flat_map(fn
+        %FactPattern{args: args} -> args
+        _other -> []
+      end)
+      |> Enum.filter(&match?(%Var{}, &1))
+      |> MapSet.new()
+
+    head_args
+    |> Enum.filter(&match?(%Var{}, &1))
+    |> Enum.find(&(not MapSet.member?(body_vars, &1)))
+    |> case do
+      nil -> :ok
+      unbound_var -> {:error, {:unsafe_rule, unbound_var}}
+    end
+  end
+
+  defp conclude(%FactPattern{predicate: predicate, args: [subject, object]}, binding) do
+    {substitute(subject, binding), predicate, substitute(object, binding)}
+  end
+
+  defp substitute(%Var{} = var, binding), do: Map.fetch!(binding, var)
+  defp substitute(term, _binding), do: term
+
   defp check_literal_kinds(body) do
     case Enum.find(body, &(not match?(%FactPattern{}, &1))) do
       nil -> :ok

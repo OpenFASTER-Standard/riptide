@@ -122,4 +122,63 @@ defmodule Riptide.Derivation.MatcherTest do
       assert {:error, {:unsupported_literal, _}} = Matcher.bindings(rule, RDF.Graph.new())
     end
   end
+
+  describe "evaluate/2 — concluding the Head" do
+    test "substitutes each binding into the Head to produce concluded triples" do
+      {:ok, rule} = Parser.decode("sibling(X, Y) :- parent(P, X), parent(P, Y).")
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("parent"), t("bob")},
+          {t("alice"), rel("parent"), t("carol")}
+        ])
+
+      assert {:ok, triples} = Matcher.evaluate(rule, graph)
+
+      assert MapSet.new(triples) ==
+               MapSet.new([
+                 {t("bob"), rel("sibling"), t("bob")},
+                 {t("bob"), rel("sibling"), t("carol")},
+                 {t("carol"), rel("sibling"), t("bob")},
+                 {t("carol"), rel("sibling"), t("carol")}
+               ])
+    end
+
+    test "a well-formed Body that matches nothing concludes no triples" do
+      {:ok, rule} = Parser.decode("sibling(X, Y) :- parent(P, X), parent(P, Y).")
+
+      assert Matcher.evaluate(rule, RDF.Graph.new()) == {:ok, []}
+    end
+
+    test "a Head variable absent from the Body is rejected as unsafe, before any graph access" do
+      head = %FactPattern{predicate: rel("bad"), args: [%Var{name: "X"}, %Var{name: "Unbound"}]}
+      body = [%FactPattern{predicate: rel("f"), args: [%Var{name: "X"}, %Var{name: "X"}]}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: head.args,
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert Matcher.evaluate(rule, RDF.Graph.new()) ==
+               {:error, {:unsafe_rule, %Var{name: "Unbound"}}}
+    end
+
+    test "evaluate/2 also enforces fact-pattern-only scope" do
+      # Head vars (Svc, Target) are both bound by the fact-pattern literal
+      # alone, so this Rule is safe — isolating the scope-check failure
+      # from the safety check (Outcome is body-only, irrelevant to safety).
+      {:ok, rule} =
+        Parser.decode(
+          "deployed(Svc, Target) :- pendingDeploy(Svc, Target), capability(deployService, Svc, Target, Outcome)."
+        )
+
+      assert {:error, {:unsupported_literal, _}} = Matcher.evaluate(rule, RDF.Graph.new())
+    end
+  end
 end
