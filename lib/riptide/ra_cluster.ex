@@ -20,20 +20,11 @@ defmodule Riptide.RaCluster do
     "riptide_" <> Base.encode16(:crypto.hash(:sha256, stream_id), case: :lower)
   end
 
-  # Fixed, not derived from fleet size — see Phase 3c-i design spec §2/§5. The
-  # metadata cluster stays this exact size regardless of how large the overall
-  # fleet grows.
-  @placement_ordinals ["riptide-0", "riptide-1", "riptide-2"]
   @placement_cluster_name :riptide_placement
   @placement_uid "riptide_placement"
 
-  @spec placement_ordinals() :: [String.t()]
-  def placement_ordinals, do: @placement_ordinals
-
-  @spec placement_server_id(String.t(), (String.t() -> node())) :: :ra.server_id()
-  def placement_server_id(ordinal, resolve_fun \\ &default_ordinal_resolver/1) do
-    {@placement_cluster_name, resolve_fun.(ordinal)}
-  end
+  @spec placement_server_id(node()) :: :ra.server_id()
+  def placement_server_id(node), do: {@placement_cluster_name, node}
 
   # Whether THIS node is currently the placement cluster's Raft leader —
   # used by `Riptide.Stream.ReplicaHealer` (Phase 3d-ii) to gate stream
@@ -64,34 +55,6 @@ defmodule Riptide.RaCluster do
     end
   catch
     :exit, _ -> false
-  end
-
-  # Resolves a StatefulSet ordinal to its *current* Erlang node identity.
-  # In production this is always the real DNS-based resolution below
-  # (mirroring exactly how `Cluster.Strategy.Kubernetes.DNS` resolves peers
-  # for libcluster); overridden in `config/test.exs` to an identity resolver
-  # (`fn _ordinal -> node() end`) since there's no real headless-service DNS
-  # in local dev/CI. This is the *default* every `Riptide.Placement`
-  # function falls back to — `Riptide.Stream.Placement`/`StreamServer`
-  # (Phase 3c-ii) deliberately never thread a resolver through their own
-  # public APIs, so making the default itself environment-correct is the
-  # only way their calls work in both places.
-  @spec default_ordinal_resolver(String.t()) :: node()
-  def default_ordinal_resolver(ordinal) do
-    case Application.get_env(:riptide, :ordinal_resolver) do
-      nil -> dns_ordinal_resolver(ordinal)
-      resolver when is_function(resolver, 1) -> resolver.(ordinal)
-    end
-  end
-
-  @spec dns_ordinal_resolver(String.t()) :: node()
-  defp dns_ordinal_resolver(ordinal) do
-    headless_service = System.get_env("RIPTIDE_HEADLESS_SERVICE", "riptide-headless")
-    hostname = String.to_charlist("#{ordinal}.#{headless_service}")
-
-    {:ok, {:hostent, _, _, _, _, [ip | _]}} = :inet.gethostbyname(hostname)
-    ip_string = ip |> :inet.ntoa() |> to_string()
-    String.to_atom("riptide@#{ip_string}")
   end
 
   @spec start_or_restart(String.t(), :ra_machine.machine()) :: :ra.server_id()
@@ -345,6 +308,148 @@ defmodule Riptide.RaCluster do
     Path.join(base, System.get_env("HOSTNAME", "nonode")) |> String.to_charlist()
   end
 
+  # Recovers a member that already has on-disk log data for this uid on
+  # THIS EXACT node() identity — only correct to call when the current,
+  # freshly-discovered consensus membership already lists `node()` as a
+  # member (see `Riptide.PlacementMembership.bootstrap_once/0`), since
+  # `:ra.restart_server/2` looks up on-disk state by the exact `{name, node}`
+  # server id, not by uid/data_dir alone. Deliberately NOT used to recover a
+  # node whose `node()` identity has drifted since its last run (e.g. a real
+  # Kubernetes pod restart under a new IP — `node()` is IP-based and
+  # unstable, per `data_dir/0`'s own doc): a drifted node is never listed
+  # under ITS NEW identity in the old consensus state, so this call would
+  # simply fail to find anything to restart. That case is handled instead by
+  # the ordinary ambient join loop (this "new" node joins fresh) plus the
+  # leader-only repair loop (evicts the stale old identity) — no special
+  # casing needed, it falls out of machinery already built for the
+  # dead-member-replacement case generally.
+  @spec restart_local_placement_member() :: :ok | {:error, term()}
+  def restart_local_placement_member do
+    ensure_system_started()
+    :ra.restart_server(@system, {@placement_cluster_name, node()})
+  end
+
+  # A fast, LOCAL-only membership check: does this node currently have a
+  # live placement-cluster member, and if so, what does Raft consensus
+  # itself say the full current membership is? `:ra.members/1`'s reply is
+  # self-describing and authoritative the instant any single caught-up
+  # member answers it — not a guess, a consensus fact (the same principle
+  # `remove_member/2`'s own `member_removed?/2` helper below already relies
+  # on). Returns `:error` (not raising) when this node has no live local
+  # member, mirroring `placement_leader?/0`'s own `catch :exit` treatment.
+  @spec local_placement_members() :: {:ok, [node()]} | :error
+  def local_placement_members do
+    case :ra.members({@placement_cluster_name, node()}) do
+      {:ok, members, _leader} -> {:ok, Enum.map(members, fn {_name, n} -> n end)}
+      _ -> :error
+    end
+  catch
+    :exit, _ -> :error
+  end
+
+  # The fleet-wide discovery fallback: ask every candidate node, in
+  # parallel, whether IT has a live placement-cluster member — the first one
+  # that answers wins, since any caught-up member's view of membership is
+  # authoritative (see `local_placement_members/0`'s own doc). This needs no
+  # hardcoded names at all — `candidate_nodes` is expected to be
+  # `[node() | Node.list()]`, the already-elastic fleet `libcluster`
+  # discovers, not a fixed ordinal list.
+  @spec probe_placement_members([node()]) :: {:ok, [node()]} | :error
+  def probe_placement_members(candidate_nodes) do
+    candidate_nodes
+    |> Enum.uniq()
+    |> Task.async_stream(&probe_one_placement_member/1, timeout: 6_000, on_timeout: :kill_task)
+    |> Enum.find_value(:error, fn
+      {:ok, {:ok, members}} -> {:ok, members}
+      _ -> nil
+    end)
+  end
+
+  defp probe_one_placement_member(n) when n == node(), do: local_placement_members()
+
+  defp probe_one_placement_member(n) do
+    :erpc.call(n, __MODULE__, :local_placement_members, [], 5_000)
+  rescue
+    _ -> :error
+  catch
+    :exit, _ -> :error
+  end
+
+  # Forms a brand-new placement cluster across exactly `member_nodes` — the
+  # genesis primitive `Riptide.PlacementMembership` calls once it's computed
+  # the same deterministic member list every other simultaneously-booting
+  # node would independently compute (see its own moduledoc). Generalizes
+  # what used to be `attempt_start_placement_cluster/1`'s hardcoded-3-ordinal
+  # version: same self-correcting shape (a redundant call whose members are
+  # already running also reports `{:error, :cluster_not_formed}` from
+  # `:ra.start_cluster/2` itself, corrected here by rechecking local
+  # liveness), just parameterized by a real, already-resolved node list
+  # instead of resolving symbolic ordinal names via DNS.
+  @spec start_genesis_placement_cluster([node()]) :: :ok | {:error, :cluster_not_formed}
+  def start_genesis_placement_cluster(member_nodes) do
+    ensure_system_started()
+    member_ids = Enum.map(member_nodes, &placement_server_id/1)
+    machine = {:module, Riptide.Placement.PlacementMachine, %{}}
+
+    configs =
+      Enum.map(member_ids, fn id ->
+        %{
+          id: id,
+          uid: @placement_uid,
+          cluster_name: "#{@placement_uid}_cluster",
+          log_init_args: %{uid: @placement_uid},
+          initial_members: member_ids,
+          machine: machine
+        }
+      end)
+
+    case :ra.start_cluster(@system, configs) do
+      {:ok, _started, _not_started} ->
+        :ok
+
+      {:error, :cluster_not_formed} ->
+        if server_alive?(@placement_cluster_name) do
+          :ok
+        else
+          {:error, :cluster_not_formed}
+        end
+    end
+  end
+
+  # This node joins an already-existing placement cluster — the same
+  # add-then-start sequence `replace_member/5` below already proves correct
+  # (add to the existing cluster's configuration FIRST, then start the
+  # joining server), just without a matching `remove_member` step, since
+  # joining doesn't evict anyone. `:ra.add_member/2` is a command sent TO an
+  # existing member; the caller doesn't need to already be one itself, so
+  # this node can safely call it before it has any local server running.
+  @spec join_placement_cluster([node()]) :: :ok | {:error, term()}
+  def join_placement_cluster(existing_nodes) do
+    ensure_system_started()
+    existing_ids = Enum.map(existing_nodes, &placement_server_id/1)
+    my_id = placement_server_id(node())
+    machine = {:module, Riptide.Placement.PlacementMachine, %{}}
+    cluster_name = "#{@placement_uid}_cluster"
+
+    with :ok <- add_member(existing_ids, my_id) do
+      start_joining_server(cluster_name, my_id, machine, existing_ids)
+    end
+  end
+
+  # Removes `node_to_remove` from the placement cluster with no replacement
+  # — used both for a confirmed-dead member (the repair side of
+  # `Riptide.PlacementMembership`'s reconciliation loop) and for shrinking
+  # to a lowered target size. Thin wrapper over the same private
+  # `remove_member/2` `replace_member/5` already uses, just without the
+  # add-a-replacement half of that pipeline.
+  @spec remove_placement_member([node()], node()) :: :ok | {:error, term()}
+  def remove_placement_member(survivor_nodes, node_to_remove) do
+    ensure_system_started()
+    survivor_ids = Enum.map(survivor_nodes, &placement_server_id/1)
+    target_id = placement_server_id(node_to_remove)
+    remove_member(survivor_ids, target_id)
+  end
+
   # Public (not `defp`) specifically so `member_alive?/1` below can call it
   # over `:erpc` for a server id on a remote node, not just the local one.
   @spec server_alive?(atom()) :: boolean()
@@ -376,17 +481,15 @@ defmodule Riptide.RaCluster do
     :exit, _ -> false
   end
 
-  # Retries indefinitely until the placement cluster is formed — intended to
-  # be started as a fire-and-forget background task at application boot (see
-  # Task 4), not called synchronously from a request path. StatefulSet pods
-  # start ordinally by default, so early attempts legitimately fail while
-  # sibling ordinals aren't yet reachable; `attempt_fun` returning
-  # `{:error, :cluster_not_formed}` is the expected, retriable outcome during
-  # that startup window, not a bug.
+  # Retries indefinitely until the placement cluster is either genuinely
+  # formed (genesis) or this node successfully joins an already-existing
+  # one — intended to be started as a fire-and-forget background task at
+  # application boot (see Riptide.PlacementMembership), not called
+  # synchronously from a request path.
   @spec ensure_placement_cluster_started(pos_integer(), (-> :ok | {:error, term()})) :: :ok
   def ensure_placement_cluster_started(
         retry_interval_ms \\ 1000,
-        attempt_fun \\ &attempt_start_placement_cluster/0
+        attempt_fun \\ &Riptide.PlacementMembership.bootstrap_once/0
       ) do
     do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, 1)
   end
@@ -427,85 +530,7 @@ defmodule Riptide.RaCluster do
     end
   end
 
-  # A single attempt to form (or rejoin) the placement cluster. Safe to call
-  # redundantly from multiple ordinals concurrently, and safe to call again on
-  # a routine pod restart when the cluster is already running elsewhere — but
-  # NOT because `:ra.start_cluster/2` itself tolerates a redundant call
-  # transparently. It does not: `:ra.start_cluster/3`'s own `Started` list
-  # (confirmed directly against `deps/ra/src/ra.erl:427-465`) tracks only
-  # servers *this call* newly started, not servers that are merely alive —
-  # so once every member is already running (e.g. because an earlier call,
-  # from this same ordinal or another one, already won), every member's
-  # per-server `:ra.start_server/2` attempt returns
-  # `{:error, {:already_started, pid}}` instead of `ok`, `Started` ends up
-  # empty, and `:ra.start_cluster/2` reports the whole call as
-  # `{:error, :cluster_not_formed}` — even though the cluster is completely
-  # healthy. This function is safe anyway because it self-corrects: on that
-  # exact error, it rechecks whether THIS node's own local placement-cluster
-  # member is alive (mirroring `start_new_cluster/4`'s own "recheck locally
-  # after an error, in case someone else already won" pattern below) and
-  # returns `:ok` if so, rather than propagating a false failure. Only a
-  # genuine failure to form (the local member really isn't running) still
-  # surfaces as `{:error, :cluster_not_formed}`.
-  #
-  # Uses the same deterministic, non-random uid for every member's config
-  # (`@placement_uid`) — each member's data still lives in a distinct,
-  # non-colliding directory because it's nested under that node's own
-  # HOSTNAME-scoped data_dir (see `RaCluster.data_dir/0`), so a shared uid
-  # string across members is correct here, not a collision risk.
-  #
-  # `resolve_fun` (whether the real `default_ordinal_resolver/1`, doing a live
-  # DNS lookup, or a caller-supplied stand-in) can legitimately fail to
-  # resolve a sibling ordinal during the normal StatefulSet startup window —
-  # `default_ordinal_resolver/1`'s hard match on `:inet.gethostbyname/1`
-  # raises `MatchError` in that case rather than returning an error tuple, so
-  # we rescue it here and fold it into the same retriable
-  # `{:error, :cluster_not_formed}` outcome `:ra.start_cluster/2` itself
-  # already returns for "couldn't form the cluster yet" — from
-  # `ensure_placement_cluster_started/2`'s point of view, an unresolvable
-  # sibling and a cluster that failed to form are the same "try again later"
-  # signal, not two different error shapes it needs to distinguish.
-  @spec attempt_start_placement_cluster((String.t() -> node())) ::
-          :ok | {:error, :cluster_not_formed}
-  def attempt_start_placement_cluster(resolve_fun \\ &default_ordinal_resolver/1) do
-    ensure_system_started()
-
-    try do
-      member_ids = Enum.map(@placement_ordinals, &placement_server_id(&1, resolve_fun))
-
-      configs =
-        Enum.map(member_ids, fn id ->
-          %{
-            id: id,
-            uid: @placement_uid,
-            cluster_name: "#{@placement_uid}_cluster",
-            log_init_args: %{uid: @placement_uid},
-            initial_members: member_ids,
-            machine: {:module, Riptide.Placement.PlacementMachine, %{}}
-          }
-        end)
-
-      case :ra.start_cluster(@system, configs) do
-        {:ok, _started, _not_started} ->
-          :ok
-
-        {:error, :cluster_not_formed} ->
-          # See the moduledoc comment above: a redundant call whose members
-          # (including this node's own) are already running also reports
-          # `:cluster_not_formed`, indistinguishable at this point from a
-          # genuine failure to reach quorum unless we check locally.
-          if server_alive?(@placement_cluster_name) do
-            :ok
-          else
-            {:error, :cluster_not_formed}
-          end
-      end
-    rescue
-      MatchError -> {:error, :cluster_not_formed}
-    end
-  end
-
-  # Generalizes `attempt_start_placement_cluster/1`'s per-member-config +
+  # Generalizes what used to be attempt_start_placement_cluster/1's per-member-config +
   # `:ra.start_cluster/2` pattern beyond the hardcoded 3 placement ordinals
   # to an arbitrary node list — used by `Riptide.Stream.Placement` (Phase
   # 3c-ii) to form a real, multi-node cluster for a single stream. Shares
@@ -514,7 +539,7 @@ defmodule Riptide.RaCluster do
   # own HOSTNAME-scoped data_dir — see `data_dir/0`).
   #
   # Self-corrects the same false-failure case documented on
-  # `attempt_start_placement_cluster/1`: a redundant call whose members
+  # `start_genesis_placement_cluster/1`: a redundant call whose members
   # (including this node's own, if present) are already running also
   # reports `{:error, :cluster_not_formed}` from `:ra.start_cluster/2`
   # itself, since its `Started` list only counts servers *this call* newly
@@ -692,7 +717,7 @@ defmodule Riptide.RaCluster do
   end
 
   # Self-corrects the exact same "redundant retry after a partial prior
-  # success" shape `start_new_cluster/4` and `attempt_start_placement_cluster/1`
+  # success" shape `start_new_cluster/4` and `start_genesis_placement_cluster/1`
   # already handle for their own `:ra` calls (see their own docs): if a
   # previous `replace_member/5` attempt's `add_member` step already landed
   # (e.g. this node crashed before reaching `remove_member`), `:ra.add_member/2`

@@ -41,23 +41,26 @@ if config_env() != :test do
     data_dir: System.get_env("RIPTIDE_RA_DATA_DIR", "priv/ra_data") |> String.to_charlist()
 end
 
-# Opt-in single-node override, mirroring config/dev.exs's and config/test.exs's
-# own identical `ordinal_resolver` override (see either's comment for the full
-# rationale) — collapses all 3 placement ordinals to whatever node this
-# process actually is. A real single-machine deployment outside Kubernetes
-# (Fly.io, plain `docker run`/`docker-compose`) has no headless-service DNS
-# resolving "riptide-0"/"riptide-1"/"riptide-2" the way
-# `default_ordinal_resolver/1`'s real-DNS fallback expects. Without this,
-# `/health/ready` — and every LDP/SSE/WebSocket request, all of which route
-# through `Riptide.Placement.lookup/1` — permanently 503s on any such
-# deployment (confirmed live on Fly.io: `nxdomain` resolving each ordinal).
-# A deployment opting into this must ALSO run with `HOSTNAME` set to one of
-# the 3 fixed ordinals ("riptide-0"/"riptide-1"/"riptide-2") for
-# `Riptide.Application.placement_bootstrap_children/0`'s own separate gate to
-# even attempt bootstrapping the (now single-member) placement cluster.
-if System.get_env("RIPTIDE_SINGLE_NODE") do
-  config :riptide, ordinal_resolver: fn _ordinal -> node() end
+# The placement/metadata Raft cluster's target member count (Phase 3e) —
+# replaces the old fixed-3-ordinal scheme entirely. Deliberately NOT
+# excluded for :test (unlike RIPTIDE_RA_DATA_DIR/OIDC above): the async
+# suite's own bootstrap (test_helper.exs) forms a real 1-member cluster
+# regardless of this value, and letting it default the same way everywhere
+# means dev/test/prod all go through the exact same code path with zero
+# special-casing. Validated odd: an even-sized Raft cluster doesn't improve
+# fault tolerance over the next-lower odd size and risks tie votes.
+placement_target_size =
+  System.get_env("RIPTIDE_PLACEMENT_TARGET_SIZE", "3") |> String.to_integer()
+
+unless Riptide.PlacementMembership.valid_target_size?(placement_target_size) do
+  raise """
+  environment variable RIPTIDE_PLACEMENT_TARGET_SIZE must be a positive odd \
+  number (got #{placement_target_size}) — an even-sized Raft cluster doesn't \
+  improve fault tolerance over the next-lower odd size and risks tie votes.
+  """
 end
+
+config :riptide, placement_target_size: placement_target_size
 
 # Only present when the k8s/statefulset.yaml pod spec's Downward API sets it —
 # everywhere else (local dev, docker-compose, tests) libcluster stays configured

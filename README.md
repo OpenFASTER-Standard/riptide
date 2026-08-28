@@ -50,14 +50,14 @@ Riptide exposes that event log through three HTTP/WS surfaces:
 
 ## Running locally for development
 
-`mix phx.server` needs two things a real Kubernetes deployment gets for free (see "Running via
-Kubernetes" below): a `HOSTNAME` matching one of the 3 fixed placement ordinals, and
-`config/dev.exs`'s own `ordinal_resolver` override (already set) standing in for the real
-headless-service DNS that doesn't exist on a developer's own machine.
+`mix phx.server` just works — no `HOSTNAME`, no special config. The placement cluster
+self-forms as a single-node cluster automatically (Phase 3e): every node's `Riptide.
+PlacementMembership` controller checks for an existing cluster, finds none, and forms one from
+whatever's actually connected (just this one process, locally).
 
 ```bash
 mix deps.get
-HOSTNAME=riptide-0 mix phx.server
+mix phx.server
 ```
 
 Wait for `curl http://localhost:4000/health/ready` to return `200` (the placement cluster forms in
@@ -95,7 +95,8 @@ compose file — set it to your real hostname for anything beyond local testing.
 
 ## Running via Kubernetes
 
-Example manifests live in `k8s/` — a 3-replica `StatefulSet` (`k8s/statefulset.yaml`), a
+Example manifests live in `k8s/` — a `StatefulSet` (`k8s/statefulset.yaml`, defaulting to 3
+replicas — this is just a starting point now, not a hard requirement; see Phase 3e), a
 `ClusterIP` Service for client traffic (`k8s/service.yaml`), a headless Service for internal Ra/
 Erlang-distribution peer discovery (`k8s/headless-service.yaml`), and a Secret template for the
 two required env vars (`k8s/secret.example.yaml`). These assume a Kubernetes cluster and `kubectl`
@@ -191,9 +192,12 @@ equivalent of `iex -S mix phx.server`'s attached shell in local dev.
 `rel/env.sh.eex`'s own `riptide@$POD_IP` choice for the Kubernetes path, just with the loopback
 address in place of a pod IP.
 
-`fly.toml` also sets `HOSTNAME=riptide-0` and `RIPTIDE_SINGLE_NODE=true` — required together for
-any single-machine deployment (Fly, plain `docker run`, `docker-compose`) to actually pass
-`/health/ready`: see the comment on `RIPTIDE_SINGLE_NODE` in `config/runtime.exs` for why.
+`fly.toml` also sets `RIPTIDE_PLACEMENT_TARGET_SIZE=1` — a single-machine deployment (Fly, plain
+`docker run`, `docker-compose`) only ever has one node to form a placement cluster from, so the
+target size needs to match; see the comment above `placement_target_size` in `config/runtime.exs`
+for why. This isn't strictly required (the default target size of 3 still gracefully collapses to
+whatever's actually present), but leaving it unset means the ambient join loop keeps periodically
+probing for 2 more nodes that will never appear.
 
 ### Seeding data
 

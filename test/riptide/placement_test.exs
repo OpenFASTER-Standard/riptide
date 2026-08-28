@@ -1,5 +1,11 @@
 defmodule Riptide.PlacementTest do
-  use ExUnit.Case, async: true
+  # async: false — the "emits an exception event when every member fails"
+  # test below sets :placement_members_override, global Application state
+  # every other test touching Riptide.Placement anywhere in the suite also
+  # reads, matching the same reasoning test/riptide_web/health_test.exs and
+  # test/riptide_web/realtime/sse_controller_test.exs already use for the
+  # identical hazard.
+  use ExUnit.Case, async: false
 
   alias Riptide.Placement
 
@@ -155,8 +161,10 @@ defmodule Riptide.PlacementTest do
       assert is_integer(duration)
     end
 
-    test "lookup/1 emits an exception event when every ordinal fails" do
-      failing_resolver = fn _ordinal -> :nonexistent@nohost end
+    test "lookup/1 emits an exception event when every member fails" do
+      original = Application.get_env(:riptide, :placement_members_override)
+      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
+      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
 
       ref =
         :telemetry_test.attach_event_handlers(self(), [
@@ -164,7 +172,7 @@ defmodule Riptide.PlacementTest do
         ])
 
       assert_raise RuntimeError, fn ->
-        Placement.lookup("some-stream-id", failing_resolver)
+        Placement.lookup("some-stream-id")
       end
 
       assert_received {[:riptide, :placement, :lookup, :exception], ^ref, %{duration: _},

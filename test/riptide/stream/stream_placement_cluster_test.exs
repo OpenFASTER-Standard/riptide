@@ -29,7 +29,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
   end
 
   test "a genuinely new stream forms a real 3-member cluster across 3 real nodes and replicates writes" do
-    {peers, nodes, resolve_fun} = start_and_bootstrap_peers(@new_stream_peers)
+    {peers, nodes} = start_and_bootstrap_peers(@new_stream_peers)
 
     on_exit(fn -> stop_peers_and_cleanup(peers, @new_stream_peers) end)
 
@@ -71,12 +71,10 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
 
     assert {:ok, [%{sequence: 1}]} =
              :erpc.call(reader_node, Riptide.Stream.StreamServer, :get_since, [stream_id, 0])
-
-    _ = resolve_fun
   end
 
   test "a stream with real pre-existing on-disk data on one node backfills to that node alone" do
-    {peers, _nodes, resolve_fun} = start_and_bootstrap_peers(@backfill_peers)
+    {peers, _nodes} = start_and_bootstrap_peers(@backfill_peers)
 
     on_exit(fn -> stop_peers_and_cleanup(peers, @backfill_peers) end)
 
@@ -90,7 +88,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     # ever existed.
     :erpc.call(origin_node, Riptide.RaCluster, :start_or_restart, [stream_id, machine])
 
-    assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id, resolve_fun]) == nil
+    assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id]) == nil
 
     # Goes through the real StreamServer entry point, same as the other
     # test above, so this proves the backfill path end-to-end through
@@ -103,9 +101,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     uid = :erpc.call(origin_node, Riptide.RaCluster, :uid_for, [stream_id])
     assert server_ids == [{String.to_atom(uid), origin_node}]
 
-    assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id, resolve_fun]) == [
-             origin_node
-           ]
+    assert :erpc.call(origin_node, Riptide.Placement, :lookup, [stream_id]) == [origin_node]
   end
 
   # Spawns the given peers, connects them, pre-starts each one's local :ra
@@ -114,7 +110,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
   # same sequential-pass ordering placement_cluster_test.exs (Phase 3c-i)
   # already proved necessary (:ra must be started as an OTP app on every
   # member before any of them attempts cluster formation, since
-  # attempt_start_placement_cluster/1 reaches out to the *other* members
+  # attempt_start_placement_cluster/1 (now start_genesis_placement_cluster/1) reaches out to the *other* members
   # over RPC too, not just the local one).
   defp start_and_bootstrap_peers(peer_specs) do
     pa_args = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
@@ -124,18 +120,15 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     push_test_module_to_peers(peers)
 
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
-    ordinal_to_node = Map.new(peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
-    resolve_fun = fn ordinal -> Map.fetch!(ordinal_to_node, ordinal) end
 
-    configure_ordinal_resolver(peers, resolve_fun)
     connect_peers(nodes)
     start_ra_application(peers)
     start_ra_systems(peers)
-    bootstrap_placement_cluster(peers, resolve_fun)
+    bootstrap_placement_cluster(peers, nodes)
     start_pubsub(peers)
     start_placement_server(peers)
 
-    {peers, nodes, resolve_fun}
+    {peers, nodes}
   end
 
   # NEW GOTCHA (found empirically while implementing this test, beyond the
@@ -166,7 +159,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
   # `:net_kernel.start/2`'s `hidden: true` (`Node.start/2,3` doesn't
   # expose it) — closed the immediate assertion failure but broke much
   # more: `test/test_helper.exs` calls
-  # `Riptide.RaCluster.attempt_start_placement_cluster/0` once at suite
+  # `Riptide.RaCluster.attempt_start_placement_cluster/0` (now `start_genesis_placement_cluster/1`) once at suite
   # boot, before *any* test's `setup_all` runs and before anything makes
   # this BEAM distributed, so that shared, collapsed placement cluster's
   # Ra server ends up permanently registered under `{:riptide_placement,
@@ -256,23 +249,6 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     end
   end
 
-  # Riptide.Placement.assign/2's and lookup/2's *default* argument is
-  # RaCluster.default_ordinal_resolver/1, which (since Task 1) consults
-  # Application.get_env(:riptide, :ordinal_resolver) — but :peer-spawned
-  # nodes never load Mix config at all, so config/test.exs's override
-  # (an identity resolver, correct for the collapsed single-node async
-  # suite) never reaches them, and isn't what real distinct peers need
-  # anyway. Riptide.Stream.Placement/StreamServer (called via erpc below)
-  # never pass an explicit resolver — their public APIs deliberately
-  # don't expose one — so each peer needs this set explicitly here, using
-  # the SAME real ordinal->node mapping used for the placement cluster's
-  # own bootstrap immediately below.
-  defp configure_ordinal_resolver(peers, resolve_fun) do
-    for {_pid, node, _ordinal} <- peers do
-      :erpc.call(node, Application, :put_env, [:riptide, :ordinal_resolver, resolve_fun])
-    end
-  end
-
   defp connect_peers(nodes) do
     for {n1, n2} <- unique_pairs(nodes) do
       assert :erpc.call(n1, :net_kernel, :connect_node, [n2]) == true
@@ -297,10 +273,10 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
     end
   end
 
-  defp bootstrap_placement_cluster(peers, resolve_fun) do
+  defp bootstrap_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [resolve_fun])
+        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.any?(results, &(&1 == :ok))
@@ -331,7 +307,7 @@ defmodule Riptide.Stream.StreamPlacementClusterTest do
   # exits normally" fact: the identical call via a plain
   # `:erlang.spawn(node, Riptide.Stream.Placement, :start_link, [[]])`
   # (bypassing erpc entirely) leaves the GenServer alive and well past the
-  # call. `Riptide.RaCluster.attempt_start_placement_cluster/1` and
+  # call. `Riptide.RaCluster.attempt_start_placement_cluster/1` (now `start_genesis_placement_cluster/1`) and
   # `start_or_restart/2` elsewhere in this same test are unaffected because
   # `:ra` starts its servers under its own supervision tree
   # (`ra_server_sup`), never linked to the calling process — this is

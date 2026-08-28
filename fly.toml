@@ -7,8 +7,7 @@ primary_region = "fra"
 [env]
   PHX_HOST = "riptide-live-story.fly.dev"
   PORT = "4000"
-  HOSTNAME = "riptide-0"
-  RIPTIDE_SINGLE_NODE = "true"
+  RIPTIDE_PLACEMENT_TARGET_SIZE = "1"
 
 [[mounts]]
   source = "riptide_data"

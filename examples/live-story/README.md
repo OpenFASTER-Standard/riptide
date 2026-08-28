@@ -7,12 +7,11 @@ genuinely Linked Data underneath, not a chat log with extra steps.
 
 ## Running it
 
-From a Riptide checkout (see the top-level README's own "Running locally for development" section
-for why `HOSTNAME` matters here):
+From a Riptide checkout:
 
 ```bash
 mix deps.get
-HOSTNAME=riptide-0 iex -S mix phx.server -e 'Code.eval_file("examples/live-story/setup.exs")'
+iex -S mix phx.server -e 'Code.eval_file("examples/live-story/setup.exs")'
 ```
 
 Wait for the confirmation banner, then open `examples/live-story/index.html` directly in a

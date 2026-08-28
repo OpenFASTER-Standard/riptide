@@ -4,7 +4,7 @@
 # files. Load it into that ALREADY-RUNNING process instead, from a
 # Riptide checkout, with the server not yet started:
 #
-#   HOSTNAME=riptide-0 iex -S mix phx.server -e 'Code.eval_file("examples/live-story/setup.exs")'
+#   iex -S mix phx.server -e 'Code.eval_file("examples/live-story/setup.exs")'
 #
 # Wait for the printed confirmation, then open examples/live-story/index.html
 # in a browser. Leave this terminal open — it's your running server.

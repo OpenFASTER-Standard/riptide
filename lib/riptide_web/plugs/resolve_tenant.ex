@@ -3,9 +3,8 @@ defmodule RiptideWeb.Plugs.ResolveTenant do
   Resolves `conn.assigns.tenant_id` via the configured
   `Riptide.Tenancy.Resolver` implementation
   (`Application.get_env(:riptide, :tenancy_resolver)`, defaulting to
-  `Riptide.Tenancy.Resolver.PathSegment`) — mirrors
-  `Riptide.RaCluster.default_ordinal_resolver/1`'s config-driven resolver
-  swap (Phase 3c-i). Halts with `400` if no tenant_id can be resolved; no
+  `Riptide.Tenancy.Resolver.PathSegment`) — a config-driven resolver swap
+  (Phase 4a). Halts with `400` if no tenant_id can be resolved; no
   resource logic should ever run without a resolved tenant.
 
   A resolved `tenant_id` is additionally validated against a conservative

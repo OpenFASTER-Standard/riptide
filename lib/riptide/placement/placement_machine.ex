@@ -1,7 +1,7 @@
 defmodule Riptide.Placement.PlacementMachine do
   @moduledoc """
   The `:ra_machine` for Riptide's placement metadata cluster — a small,
-  fixed-membership Ra cluster (see `Riptide.RaCluster.placement_server_id/1,2`)
+  elastic-membership Ra cluster (see `Riptide.PlacementMembership`)
   recording which nodes host each stream's Ra replicas, plus (Phase 4c)
   authorization policies. Pure and process-free by design, mirroring
   `Riptide.Stream.RaMachine`: `init/1`/`apply/3` are the only functions Ra

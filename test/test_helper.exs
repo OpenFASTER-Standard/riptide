@@ -79,18 +79,20 @@ unless Node.alive?() do
     })
 end
 
-# Riptide.Application's own placement-cluster bootstrap only runs on pods
-# whose HOSTNAME matches one of the 3 fixed ordinals — never true here. This
-# gives the whole async suite a real, running (single-node-collapsed)
-# placement cluster to assign/lookup against, so every test that goes
-# through Riptide.Stream.Placement (Phase 3c-ii) can exercise real
-# Placement.assign/2/lookup/2 calls, not just pure logic. Uses the same
-# config-driven ordinal_resolver Step 3 just added (config/test.exs), not
-# an explicit resolver here — this must resolve exactly the same way
-# Placement.assign/2/lookup/2's own default argument will later, or the
-# bootstrapped cluster and later calls address different servers.
+# Riptide.Application now starts Riptide.PlacementMembership unconditionally
+# on every node (Phase 3e) rather than gating on a fixed HOSTNAME allowlist
+# — but that controller's own genesis logic has a settle window and isn't
+# guaranteed to have formed a cluster by the time the very first test runs.
+# Forming it explicitly and synchronously here, once, before any test runs,
+# gives the whole async suite a real, running (single-node) placement
+# cluster to assign/lookup against immediately, so every test that goes
+# through Riptide.Stream.Placement can exercise real Placement.assign/2/
+# lookup/1 calls from its very first line, not just pure logic. Redundant
+# with whatever Riptide.PlacementMembership's own genesis attempt does on
+# this same node — self-corrects via the same idempotent-redundant-call
+# handling `start_genesis_placement_cluster/1` already provides.
 #
-# Now runs under a stable, real node() (set immediately above) rather than
+# Runs under a stable, real node() (set immediately above) rather than
 # :nonode@nohost — see the SIDE-FIX comment above for why that stability is
 # required for this bootstrap to survive the rest of the suite.
-:ok = Riptide.RaCluster.attempt_start_placement_cluster()
+:ok = Riptide.RaCluster.start_genesis_placement_cluster([node()])

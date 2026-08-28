@@ -18,14 +18,14 @@ defmodule Riptide.PlacementClusterTest do
   end
 
   test "the placement metadata cluster bootstraps across 3 real nodes and agrees on assignments" do
-    {peers, nodes, resolve_fun} = bootstrap()
+    {peers, nodes} = bootstrap()
 
     {_pid, entry_node, _ordinal} = hd(peers)
     stream_id = "placement-test-" <> Uniq.UUID.uuid4()
     proposed = Enum.take(nodes, 2)
 
     assigned =
-      :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed, resolve_fun])
+      :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed])
 
     assert Enum.sort(assigned) == Enum.sort(proposed)
 
@@ -34,7 +34,7 @@ defmodule Riptide.PlacementClusterTest do
     # through the metadata cluster's own Raft consensus rather than just
     # being remembered by whichever node handled the write.
     for {_pid, node, _ordinal} <- peers do
-      looked_up = :erpc.call(node, Riptide.Placement, :lookup, [stream_id, resolve_fun])
+      looked_up = :erpc.call(node, Riptide.Placement, :lookup, [stream_id])
       assert Enum.sort(looked_up) == Enum.sort(proposed)
     end
 
@@ -47,8 +47,7 @@ defmodule Riptide.PlacementClusterTest do
     reassigned =
       :erpc.call(other_node, Riptide.Placement, :assign, [
         stream_id,
-        different_proposal,
-        resolve_fun
+        different_proposal
       ])
 
     assert Enum.sort(reassigned) == Enum.sort(proposed)
@@ -64,7 +63,7 @@ defmodule Riptide.PlacementClusterTest do
   # keeps a live 2-of-3 quorum, but the *client's own addressing*, not
   # consensus, was the thing that used to break.
   test "assign/2 and lookup/2 fall back to a surviving ordinal when riptide-0 is unreachable" do
-    {peers, nodes, resolve_fun} = bootstrap()
+    {peers, nodes} = bootstrap()
 
     [{pid0, node0, _ord0}, {_pid1, node1, _ord1} = peer1, {_pid2, node2, _ord2} = peer2] = peers
     surviving_peers = [peer1, peer2]
@@ -76,12 +75,12 @@ defmodule Riptide.PlacementClusterTest do
     proposed = Enum.take(nodes, 2)
 
     assigned =
-      :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed, resolve_fun])
+      :erpc.call(entry_node, Riptide.Placement, :assign, [stream_id, proposed])
 
     assert Enum.sort(assigned) == Enum.sort(proposed)
 
     for {_pid, node, _ordinal} <- surviving_peers do
-      looked_up = :erpc.call(node, Riptide.Placement, :lookup, [stream_id, resolve_fun])
+      looked_up = :erpc.call(node, Riptide.Placement, :lookup, [stream_id])
       assert Enum.sort(looked_up) == Enum.sort(proposed)
     end
 
@@ -97,17 +96,15 @@ defmodule Riptide.PlacementClusterTest do
     push_module_to_peers(peers)
 
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
-    ordinal_to_node = Map.new(peers, fn {_pid, node, ordinal} -> {ordinal, node} end)
-    resolve_fun = fn ordinal -> Map.fetch!(ordinal_to_node, ordinal) end
 
     for {n1, n2} <- unique_pairs(nodes) do
       assert :erpc.call(n1, :net_kernel, :connect_node, [n2]) == true
     end
 
     bootstrap_ra_on_peers(peers)
-    form_placement_cluster(peers, resolve_fun)
+    form_placement_cluster(peers, nodes)
 
-    {peers, nodes, resolve_fun}
+    {peers, nodes}
   end
 
   defp spawn_peers(pa_args) do
@@ -185,25 +182,25 @@ defmodule Riptide.PlacementClusterTest do
   end
 
   # `:ra` must be started as an OTP application on EVERY member before ANY
-  # of them attempts to form the cluster — `attempt_start_placement_cluster/1`
+  # of them attempts to form the cluster — `start_genesis_placement_cluster/1`
   # calls `:ra.start_cluster/2`, which reaches out over RPC to start the
   # *other* members too, not just the local one. Confirmed empirically:
   # interleaving "start :ra, then immediately attempt to form" per node (as
   # a single combined loop) races the still-not-started siblings and fails
   # with `{:error, :system_not_started}` on every remote member the caller
   # gets to before its own turn comes up — surfacing as
-  # `{:error, :cluster_not_formed}` from `attempt_start_placement_cluster/1`
+  # `{:error, :cluster_not_formed}` from `start_genesis_placement_cluster/1`
   # itself. Splitting into two passes avoids the race.
   #
-  # `attempt_start_placement_cluster/1` only starts the *local* `:default`
+  # `start_genesis_placement_cluster/1` only starts the *local* `:default`
   # Ra system (via its own private `ensure_system_started/0`) on whichever
   # node calls it — but internally it calls `:ra.start_cluster/2`, which
   # tries to start EVERY member's server, including the ones on the *other*
   # two nodes, over RPC. Confirmed empirically: without this, calling
-  # `attempt_start_placement_cluster/1` on each node in turn fails with
+  # `start_genesis_placement_cluster/1` on each node in turn fails with
   # `{:error, :cluster_not_formed}` every time — `:ra`'s own logs show
   # `{:error, :system_not_started}` for whichever sibling members haven't
-  # yet run `attempt_start_placement_cluster/1` themselves (so never
+  # yet run `start_genesis_placement_cluster/1` themselves (so never
   # started their own local system), which is every sibling except
   # whichever one is on its own turn. Pre-start every node's local
   # `:default` system directly (mirroring `RaCluster`'s own private
@@ -231,7 +228,7 @@ defmodule Riptide.PlacementClusterTest do
   end
 
   # NEW GOTCHA (found empirically while implementing this test, beyond the
-  # brief's own list): `attempt_start_placement_cluster/1`'s moduledoc
+  # brief's own list): `start_genesis_placement_cluster/1`'s moduledoc
   # comment in `ra_cluster.ex` claims it's "safe to call redundantly from
   # multiple ordinals concurrently" because `:ra.start_cluster/2` tolerates
   # `{:error, {:already_started, _pid}}` per member internally — but that
@@ -251,10 +248,10 @@ defmodule Riptide.PlacementClusterTest do
   # genuinely forms the cluster fresh, and (b) the cluster that results is
   # for real — proven below by successful, replicated assign/lookup calls
   # across all 3 members, not by this step's return values alone.
-  defp form_placement_cluster(peers, resolve_fun) do
+  defp form_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :attempt_start_placement_cluster, [resolve_fun])
+        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.all?(results, &(&1 in [:ok, {:error, :cluster_not_formed}]))

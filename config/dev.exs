@@ -16,22 +16,6 @@ config :riptide, RiptideWeb.Endpoint,
   secret_key_base: "yC4ZYgTNRajoqvMfeUp2kBQ0op+N4b7+7GsF3gdDxTjhmf64A5mgkdNMSdsGEKDF",
   watchers: []
 
-# No real headless-service DNS exists on a developer's own machine — every
-# ordinal resolves to whichever node is actually asking, exactly mirroring
-# config/test.exs's own identical override (see its own comment for the
-# full rationale). Without this, Riptide.RaCluster.default_ordinal_resolver/1
-# falls through to real DNS (riptide-1.riptide-headless, etc.), which never
-# resolves locally. Real Kubernetes deployments (config/runtime.exs) are
-# untouched and keep using real DNS. A developer must still run with
-# HOSTNAME set to one of the 3 fixed ordinals
-# ("riptide-0"/"riptide-1"/"riptide-2") for
-# Riptide.Application.placement_bootstrap_children/0's own separate gate to
-# even attempt bootstrapping — this override alone isn't sufficient by
-# itself, see the README's "Running locally for development" section. It
-# is ALSO not sufficient on its own without Part B's fix below — see that
-# section for why.
-config :riptide, ordinal_resolver: fn _ordinal -> node() end
-
 # ## SSL Support
 #
 # In order to use HTTPS in development, a self-signed

@@ -35,7 +35,7 @@ defmodule Riptide.Application do
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++
-        placement_bootstrap_children() ++
+        placement_children() ++
         auth_children() ++
         [
           # Start a worker by calling: Riptide.Worker.start_link(arg)
@@ -50,56 +50,34 @@ defmodule Riptide.Application do
     Supervisor.start_link(children, opts)
   end
 
-  # Only the 3 fixed placement-cluster ordinals attempt to host a member of
-  # it — every other fleet node just consults it via Riptide.Placement, never
-  # hosting a replica itself. Runs as a fire-and-forget Task (not a blocking
-  # call in start/2 itself) since ensure_placement_cluster_started/0 retries
-  # indefinitely until quorum is reachable, which shouldn't hold up the rest
-  # of the application (Phoenix Endpoint, etc.) from booting normally.
-  defp placement_bootstrap_children do
-    if System.get_env("HOSTNAME") in Riptide.RaCluster.placement_ordinals() do
-      [
-        # `Task`'s own default child_spec restarts as `:temporary` — fine
-        # for `ensure_placement_cluster_started/0`'s own {:error, _} branch,
-        # which already retries forever internally, but NOT fine for any
-        # exception that isn't already anticipated there (e.g. `:ra.start_cluster/2`
-        # exiting instead of returning): a `:temporary` Task that dies from
-        # one of those is never restarted, silently leaving this ordinal
-        # permanently out of the placement cluster for the rest of the
-        # pod's lifetime. `ensure_placement_cluster_started/0` is itself
-        # documented as safe to call redundantly (self-corrects on
-        # `{:error, :cluster_not_formed}` from an already-formed cluster),
-        # so a supervisor-driven restart on an ABNORMAL exit is a safe,
-        # correct recovery path with no special-casing needed here — see
-        # the comment on the child_spec itself for why `:transient`, not
-        # `:permanent`, is the right restart strategy.
-        #
-        # `:transient`, not `:permanent` — `ensure_placement_cluster_started/0`
-        # returns `:ok` (a NORMAL exit) once the cluster forms, and
-        # `:permanent` restarts a child on ANY exit, including `:normal`.
-        # That combination is a real, confirmed-live bug: the moment the
-        # cluster forms, this Task exits normally, gets restarted, its
-        # retry loop immediately re-succeeds (self-corrects via
-        # server_alive?/1, since the cluster is already up) and exits
-        # normally again — a tight successful-exit/restart loop that
-        # exceeds the supervisor's default restart intensity and crashes
-        # the entire application, moments after the placement cluster
-        # first forms. `:transient` restarts only on an ABNORMAL exit
-        # (an unanticipated exception — the actual failure mode the
-        # original `:permanent` choice was meant to guard against), and
-        # correctly leaves a `:normal` "job's done" exit alone.
-        Supervisor.child_spec({Task, &Riptide.RaCluster.ensure_placement_cluster_started/0},
-          restart: :transient
-        ),
-        Riptide.Stream.ReplicaHealer
-      ]
-    else
-      []
-    end
+  # Every fleet node runs both of these now — Riptide.PlacementMembership's
+  # own reconciliation loop (Phase 3e) decides internally whether THIS node
+  # should be a placement-cluster member (join if under target size) or act
+  # as the repair/shrink leader (only if it currently is one and is the
+  # cluster's Raft leader), replacing the old static HOSTNAME-matches-one-
+  # of-3-fixed-ordinals gate entirely. Riptide.Stream.ReplicaHealer already
+  # only acts when `RaCluster.placement_leader?/0` is true, so running it
+  # unconditionally is safe — it's a no-op everywhere except the one real
+  # leader, exactly the same safety property it already had.
+  #
+  # Riptide.PlacementMembership gets an explicit, generous shutdown timeout:
+  # its own `terminate/2` (graceful drain) calls `RaCluster.remove_placement_
+  # member/2`, whose underlying `:ra.remove_member/2` can retry up to 50
+  # times at 100ms apiece on a transient `:cluster_change_not_permitted`
+  # (`retry_cluster_change/2`'s own default in `ra_cluster.ex`) — up to 5
+  # seconds. The default Supervisor child shutdown timeout (5000ms) doesn't
+  # leave enough margin for that plus the call itself.
+  defp placement_children do
+    [
+      Supervisor.child_spec(Riptide.PlacementMembership, shutdown: 10_000),
+      Riptide.Stream.ReplicaHealer
+    ]
   end
 
   # Every node that can serve a request needs its own live JWKS signer
-  # cache, unlike placement_bootstrap_children/0's 3-ordinal gating — see
+  # cache, unconditionally — unlike placement_children/0, which is also
+  # unconditional now but still delegates its own internal gating to
+  # Riptide.PlacementMembership/RaCluster.placement_leader?/0 — see
   # Riptide.Auth.JwksStrategy's own moduledoc for why no leader coordination
   # is needed here. Conditional on real OIDC config being present at all, so
   # dev/test boot doesn't require a reachable JWKS endpoint just to start —

@@ -27,14 +27,14 @@ defmodule RiptideWeb.HealthTest do
       assert conn.resp_body == "ok"
     end
 
-    # :ordinal_resolver is global Application state that every other test
-    # touching Riptide.Placement/RaCluster also reads (config/test.exs:33
-    # sets it suite-wide) — this test module is async: false specifically so
-    # this override never races a concurrently-running async test.
+    # :placement_members_override is global Application state that every
+    # other test touching Riptide.Placement also reads — this test module is
+    # async: false specifically so this override never races a concurrently-
+    # running async test.
     test "returns 503 when the placement cluster is unreachable" do
-      original = Application.get_env(:riptide, :ordinal_resolver)
-      Application.put_env(:riptide, :ordinal_resolver, fn _ordinal -> :nonexistent@nohost end)
-      on_exit(fn -> Application.put_env(:riptide, :ordinal_resolver, original) end)
+      original = Application.get_env(:riptide, :placement_members_override)
+      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
+      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
 
       conn =
         :get
