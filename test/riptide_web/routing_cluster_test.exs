@@ -1,6 +1,8 @@
 defmodule RiptideWeb.RoutingClusterTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   @peer_specs [
@@ -184,12 +186,5 @@ defmodule RiptideWeb.RoutingClusterTest do
     after
       timeout -> {:error, :timeout}
     end
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end

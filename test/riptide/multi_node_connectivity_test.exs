@@ -1,6 +1,8 @@
 defmodule Riptide.MultiNodeConnectivityTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   @peers [{:riptide0, "riptide-0"}, {:riptide1, "riptide-1"}, {:riptide2, "riptide-2"}]
@@ -99,12 +101,5 @@ defmodule Riptide.MultiNodeConnectivityTest do
       assert Path.basename(config.data_dir) == hostname
       assert Path.basename(config.wal_data_dir) == hostname
     end
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end
