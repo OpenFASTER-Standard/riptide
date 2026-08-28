@@ -99,4 +99,27 @@ defmodule Riptide.Derivation.MatcherTest do
       assert Matcher.bindings(rule, RDF.Graph.new()) == {:error, :too_many_variables}
     end
   end
+
+  describe "bindings/2 — scope enforcement" do
+    alias Riptide.Derivation.Literal.CapabilityReference
+
+    test "a Body containing a capability(...) literal is rejected" do
+      {:ok, rule} =
+        Parser.decode(
+          "deployed(Svc, Outcome) :- pendingDeploy(Svc, Target), capability(deployService, Svc, Target, Outcome)."
+        )
+
+      assert {:error, {:unsupported_literal, %CapabilityReference{}}} =
+               Matcher.bindings(rule, RDF.Graph.new())
+    end
+
+    test "a Body containing a rule(...) literal is rejected" do
+      {:ok, rule} =
+        Parser.decode(
+          "notified(Svc, Result) :- capability(deployService, Svc, Svc, Outcome), rule(notifyTeam, Svc, Outcome, Result)."
+        )
+
+      assert {:error, {:unsupported_literal, _}} = Matcher.bindings(rule, RDF.Graph.new())
+    end
+  end
 end

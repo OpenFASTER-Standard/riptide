@@ -31,15 +31,24 @@ defmodule Riptide.Derivation.Matcher do
   Body is well-formed but unsatisfiable against `graph`.
   """
   @spec bindings(Rule.t(), RDF.Graph.t()) ::
-          {:ok, [%{Var.t() => RDF.Term.t()}]} | {:error, :too_many_variables}
+          {:ok, [%{Var.t() => RDF.Term.t()}]}
+          | {:error, :too_many_variables | {:unsupported_literal, Rule.literal()}}
   def bindings(%Rule{body: body}, %RDF.Graph{} = graph) do
-    with {:ok, var_to_atom} <- assign_variable_pool(body) do
+    with :ok <- check_literal_kinds(body),
+         {:ok, var_to_atom} <- assign_variable_pool(body) do
       triple_patterns = Enum.map(body, &to_triple_pattern(&1, var_to_atom))
       bgp = %RDF.Query.BGP{triple_patterns: triple_patterns}
       {:ok, results} = RDF.Query.execute(bgp, graph)
 
       atom_to_var = Map.new(var_to_atom, fn {var, atom} -> {atom, var} end)
       {:ok, Enum.map(results, &translate_binding(&1, atom_to_var))}
+    end
+  end
+
+  defp check_literal_kinds(body) do
+    case Enum.find(body, &(not match?(%FactPattern{}, &1))) do
+      nil -> :ok
+      literal -> {:error, {:unsupported_literal, literal}}
     end
   end
 
