@@ -132,7 +132,7 @@ defmodule Riptide.Placement do
   # failure/timeout, so a failing member is caught here and the next one
   # tried instead of the whole call failing outright. If every member from
   # the fast-path cache fails, falls back to a live fleet-wide probe
-  # (`RaCluster.probe_placement_members/1`) before finally raising — a
+  # (`RaCluster.Placement.probe_placement_members/1`) before finally raising — a
   # totally unreachable metadata cluster is a genuine, fully-down failure no
   # caller here can paper over.
   #
@@ -159,7 +159,7 @@ defmodule Riptide.Placement do
   end
 
   defp with_current_members_via_probe(fun) do
-    case RaCluster.probe_placement_members([node() | Node.list()]) do
+    case RaCluster.Placement.probe_placement_members([node() | Node.list()]) do
       {:ok, members} -> with_current_members_via_list(members, fun)
       :error -> raise "Riptide.Placement: no placement-cluster members could be discovered"
     end
@@ -175,7 +175,7 @@ defmodule Riptide.Placement do
   defp try_members([], _fun), do: :error
 
   defp try_members([node | rest], fun) do
-    {:ok, fun.(RaCluster.placement_server_id(node))}
+    {:ok, fun.(RaCluster.Placement.placement_server_id(node))}
   rescue
     e ->
       log_member_fallback(node, Exception.message(e))

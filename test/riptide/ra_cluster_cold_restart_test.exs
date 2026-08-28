@@ -56,7 +56,7 @@ defmodule Riptide.RaClusterColdRestartTest do
     # correlated monotonic timestamps showed `Process.whereis(:riptide_placement)`
     # already `nil` the instant `:ra` comes back up, tens of seconds before
     # the failures it caused elsewhere in the suite.
-    :ok = RaCluster.start_genesis_placement_cluster([node()])
+    :ok = RaCluster.Placement.start_genesis_placement_cluster([node()])
 
     # Use the shared `RaCluster.system_config/0` to build the exact same
     # config `RaCluster.ensure_system_started/0` does — see that function's

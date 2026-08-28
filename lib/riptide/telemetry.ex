@@ -19,6 +19,8 @@ defmodule Riptide.Telemetry do
   constraint immediately).
   """
   use Supervisor
+
+  alias Riptide.RaCluster.Placement
   import Telemetry.Metrics
 
   @placement_leader_poll_interval_ms 30_000
@@ -46,7 +48,7 @@ defmodule Riptide.Telemetry do
   """
   @spec measure_placement_leadership() :: :ok
   def measure_placement_leadership do
-    value = if Riptide.RaCluster.placement_leader?(), do: 1, else: 0
+    value = if Placement.placement_leader?(), do: 1, else: 0
     :telemetry.execute([:riptide, :ra, :placement_leader], %{value: value}, %{})
   end
 

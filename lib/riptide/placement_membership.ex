@@ -117,10 +117,10 @@ defmodule Riptide.PlacementMembership do
   # callback on a non-:normal exit signal).
   @impl GenServer
   def terminate(_reason, _state) do
-    case RaCluster.local_placement_members() do
+    case RaCluster.Placement.local_placement_members() do
       {:ok, members} when length(members) > 1 ->
         survivors = members -- [node()]
-        _ = RaCluster.remove_placement_member(survivors, node())
+        _ = RaCluster.Placement.remove_placement_member(survivors, node())
         :ok
 
       _ ->
@@ -146,7 +146,7 @@ defmodule Riptide.PlacementMembership do
   """
   @spec bootstrap_once() :: :ok | {:error, term()}
   def bootstrap_once do
-    case RaCluster.local_placement_members() do
+    case RaCluster.Placement.local_placement_members() do
       {:ok, members} ->
         cache_members(members)
         :ok
@@ -157,7 +157,7 @@ defmodule Riptide.PlacementMembership do
   end
 
   defp join_or_form_genesis do
-    case RaCluster.probe_placement_members([node() | Node.list()]) do
+    case RaCluster.Placement.probe_placement_members([node() | Node.list()]) do
       {:ok, members} ->
         cache_members(members)
 
@@ -166,7 +166,7 @@ defmodule Riptide.PlacementMembership do
           # right now — a restart under the SAME node() identity (no IP
           # change), or this BEAM simply hasn't started its own member yet.
           # Recover from this node's own persisted log.
-          RaCluster.restart_local_placement_member()
+          RaCluster.Placement.restart_local_placement_member()
         else
           # A cluster exists, but this node isn't (or is no longer) part of
           # it — including the identity-drift case, where the membership
@@ -187,7 +187,7 @@ defmodule Riptide.PlacementMembership do
 
     # Re-probe after settling, in case another node already formed the
     # cluster while this one waited.
-    case RaCluster.probe_placement_members([node() | Node.list()]) do
+    case RaCluster.Placement.probe_placement_members([node() | Node.list()]) do
       {:ok, members} ->
         cache_members(members)
         :ok
@@ -212,7 +212,7 @@ defmodule Riptide.PlacementMembership do
   end
 
   defp do_form_genesis(genesis_members) do
-    case RaCluster.start_genesis_placement_cluster(genesis_members) do
+    case RaCluster.Placement.start_genesis_placement_cluster(genesis_members) do
       :ok ->
         broadcast_members(genesis_members)
         :ok
@@ -239,10 +239,10 @@ defmodule Riptide.PlacementMembership do
   end
 
   defp reconcile do
-    case RaCluster.local_placement_members() do
+    case RaCluster.Placement.local_placement_members() do
       {:ok, members} ->
         cache_members(members)
-        if RaCluster.placement_leader?(), do: reconcile_as_leader(members)
+        if RaCluster.Placement.placement_leader?(), do: reconcile_as_leader(members)
 
       :error ->
         reconcile_as_non_member()
@@ -250,7 +250,7 @@ defmodule Riptide.PlacementMembership do
   end
 
   defp reconcile_as_non_member do
-    case RaCluster.probe_placement_members([node() | Node.list()]) do
+    case RaCluster.Placement.probe_placement_members([node() | Node.list()]) do
       {:ok, members} ->
         cache_members(members)
         if length(members) < target_size(), do: try_join(members)
@@ -261,7 +261,7 @@ defmodule Riptide.PlacementMembership do
   end
 
   defp try_join(existing_members) do
-    case RaCluster.join_placement_cluster(existing_members) do
+    case RaCluster.Placement.join_placement_cluster(existing_members) do
       :ok -> broadcast_members(Enum.uniq([node() | existing_members]))
       {:error, _reason} -> :ok
     end
@@ -269,14 +269,14 @@ defmodule Riptide.PlacementMembership do
 
   defp reconcile_as_leader(members) do
     dead =
-      Enum.reject(members, &RaCluster.member_alive?(RaCluster.placement_server_id(&1)))
+      Enum.reject(members, &RaCluster.member_alive?(RaCluster.Placement.placement_server_id(&1)))
 
     cond do
       dead != [] ->
         [dead_node | _] = dead
         survivors = members -- [dead_node]
 
-        case RaCluster.remove_placement_member(survivors, dead_node) do
+        case RaCluster.Placement.remove_placement_member(survivors, dead_node) do
           :ok -> broadcast_members(survivors)
           {:error, _reason} -> :ok
         end
@@ -285,7 +285,7 @@ defmodule Riptide.PlacementMembership do
         to_remove = Enum.max(members)
         survivors = members -- [to_remove]
 
-        case RaCluster.remove_placement_member(survivors, to_remove) do
+        case RaCluster.Placement.remove_placement_member(survivors, to_remove) do
           :ok -> broadcast_members(survivors)
           {:error, _reason} -> :ok
         end

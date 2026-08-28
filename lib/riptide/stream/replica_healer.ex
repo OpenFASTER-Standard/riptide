@@ -5,7 +5,7 @@ defmodule Riptide.Stream.ReplicaHealer do
   ordinals (wired in `Riptide.Application`, same gating as
   `Riptide.RaCluster.ensure_placement_cluster_started/0`), and only the
   placement cluster's current Raft leader ever acts on a given sweep
-  (`RaCluster.placement_leader?/0`) — reusing that cluster's own existing
+  (`RaCluster.Placement.placement_leader?/0`) — reusing that cluster's own existing
   leader election as single-writer safety, rather than a new coordination
   mechanism. No operator action is required in the steady-state case.
   """
@@ -32,7 +32,7 @@ defmodule Riptide.Stream.ReplicaHealer do
 
   @impl GenServer
   def handle_info(:sweep, state) do
-    if RaCluster.placement_leader?() do
+    if RaCluster.Placement.placement_leader?() do
       safe_sweep()
     end
 
@@ -100,7 +100,7 @@ defmodule Riptide.Stream.ReplicaHealer do
 
   # Fences this repair through the placement Ra cluster's own consensus
   # (see Riptide.Placement.PlacementMachine's moduledoc, "Repair claims")
-  # rather than trusting `RaCluster.placement_leader?/0`'s unfenced,
+  # rather than trusting `RaCluster.Placement.placement_leader?/0`'s unfenced,
   # point-in-time belief alone — closes a dual-leader race where two
   # placement ordinals both briefly believing they're the leader during a
   # handoff/partition could each fully commit a *different* replacement
@@ -231,7 +231,7 @@ defmodule Riptide.Stream.ReplicaHealer do
   # Also catches `:exit`, not just `rescue`s: `RaCluster.consistent_query/2`
   # (and the underlying `:ra.consistent_query/2` it wraps) can genuinely
   # *exit* rather than raise or return an `{:error, _}`/`{:timeout, _}` in
-  # some failure modes — the same class of failure `RaCluster.placement_leader?/0`
+  # some failure modes — the same class of failure `RaCluster.Placement.placement_leader?/0`
   # already guards against with its own `catch :exit` (see finding 5, Phase
   # 3d-ii final review). A `rescue` clause alone does not catch an `exit`, so
   # without this a survivor dying exactly during this query would crash this

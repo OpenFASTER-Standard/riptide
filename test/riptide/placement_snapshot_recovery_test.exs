@@ -113,7 +113,10 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
     # member list when no snapshot exists — see this file's own moduledoc)
     # independent of the higher-level controller's timing.
     for {_pid, node, _ordinal} <- replacement_peers do
-      _ = :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [fresh_nodes])
+      _ =
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [
+          fresh_nodes
+        ])
     end
 
     # Membership reconciles to the fresh identities, queried from the one
@@ -179,7 +182,7 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
   defp form_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.all?(results, &(&1 in [:ok, {:error, :cluster_not_formed}]))

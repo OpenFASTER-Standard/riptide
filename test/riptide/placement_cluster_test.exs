@@ -251,7 +251,7 @@ defmodule Riptide.PlacementClusterTest do
   defp form_placement_cluster(peers, nodes) do
     results =
       Enum.map(peers, fn {_pid, node, _ordinal} ->
-        :erpc.call(node, Riptide.RaCluster, :start_genesis_placement_cluster, [nodes])
+        :erpc.call(node, Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [nodes])
       end)
 
     assert Enum.all?(results, &(&1 in [:ok, {:error, :cluster_not_formed}]))

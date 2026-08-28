@@ -52,9 +52,14 @@ defmodule Riptide.PlacementMembershipClusterTest do
       :erpc.call(node, Application, :put_env, [:riptide, :placement_target_size, 3])
     end
 
-    assert :erpc.call(hd(first_three), Riptide.RaCluster, :start_genesis_placement_cluster, [
-             first_three
-           ]) == :ok
+    assert :erpc.call(
+             hd(first_three),
+             Riptide.RaCluster.Placement,
+             :start_genesis_placement_cluster,
+             [
+               first_three
+             ]
+           ) == :ok
 
     for {_pid, node} <- peers do
       :erpc.call(node, Application, :put_env, [:riptide, :placement_target_size, 5])
@@ -78,7 +83,9 @@ defmodule Riptide.PlacementMembershipClusterTest do
       :erpc.call(node, Application, :put_env, [:riptide, :placement_target_size, 5])
     end
 
-    assert :erpc.call(hd(nodes), Riptide.RaCluster, :start_genesis_placement_cluster, [nodes]) ==
+    assert :erpc.call(hd(nodes), Riptide.RaCluster.Placement, :start_genesis_placement_cluster, [
+             nodes
+           ]) ==
              :ok
 
     for {_pid, node} <- peers do
@@ -93,7 +100,7 @@ defmodule Riptide.PlacementMembershipClusterTest do
     :erpc.call(leader_node, Riptide.PlacementMembership, :bootstrap_once, [])
 
     poll_until(fn ->
-      case :erpc.call(leader_node, Riptide.RaCluster, :local_placement_members, []) do
+      case :erpc.call(leader_node, Riptide.RaCluster.Placement, :local_placement_members, []) do
         {:ok, members} when length(members) == 4 -> members
         _ -> nil
       end
@@ -104,7 +111,12 @@ defmodule Riptide.PlacementMembershipClusterTest do
 
     members =
       poll_until(fn ->
-        case :erpc.call(new_leader_node, Riptide.RaCluster, :local_placement_members, []) do
+        case :erpc.call(
+               new_leader_node,
+               Riptide.RaCluster.Placement,
+               :local_placement_members,
+               []
+             ) do
           {:ok, members} when length(members) == 3 -> members
           _ -> nil
         end
@@ -123,12 +135,19 @@ defmodule Riptide.PlacementMembershipClusterTest do
 
     member_nodes = Enum.take(nodes, 3)
 
-    assert :erpc.call(hd(member_nodes), Riptide.RaCluster, :start_genesis_placement_cluster, [
-             member_nodes
-           ]) == :ok
+    assert :erpc.call(
+             hd(member_nodes),
+             Riptide.RaCluster.Placement,
+             :start_genesis_placement_cluster,
+             [
+               member_nodes
+             ]
+           ) == :ok
 
     {_pid, leaving_node} = leaving_peer
-    membership_before = :erpc.call(leaving_node, Riptide.RaCluster, :local_placement_members, [])
+
+    membership_before =
+      :erpc.call(leaving_node, Riptide.RaCluster.Placement, :local_placement_members, [])
 
     if membership_before == :error do
       # This peer never won genesis (only 3 of the 4 real members are
@@ -142,11 +161,11 @@ defmodule Riptide.PlacementMembershipClusterTest do
     # callback, not just a crash.
     actual_member_node =
       Enum.find(nodes, fn n ->
-        match?({:ok, _}, :erpc.call(n, Riptide.RaCluster, :local_placement_members, []))
+        match?({:ok, _}, :erpc.call(n, Riptide.RaCluster.Placement, :local_placement_members, []))
       end)
 
     {:ok, before_members} =
-      :erpc.call(actual_member_node, Riptide.RaCluster, :local_placement_members, [])
+      :erpc.call(actual_member_node, Riptide.RaCluster.Placement, :local_placement_members, [])
 
     assert length(before_members) == 3
 
@@ -157,7 +176,12 @@ defmodule Riptide.PlacementMembershipClusterTest do
 
     members =
       poll_until(fn ->
-        case :erpc.call(other_member_node, Riptide.RaCluster, :local_placement_members, []) do
+        case :erpc.call(
+               other_member_node,
+               Riptide.RaCluster.Placement,
+               :local_placement_members,
+               []
+             ) do
           {:ok, members} when length(members) == 2 -> members
           _ -> nil
         end
@@ -176,9 +200,14 @@ defmodule Riptide.PlacementMembershipClusterTest do
       :erpc.call(node, Application, :put_env, [:riptide, :placement_target_size, 3])
     end
 
-    assert :erpc.call(hd(member_nodes), Riptide.RaCluster, :start_genesis_placement_cluster, [
-             member_nodes
-           ]) == :ok
+    assert :erpc.call(
+             hd(member_nodes),
+             Riptide.RaCluster.Placement,
+             :start_genesis_placement_cluster,
+             [
+               member_nodes
+             ]
+           ) == :ok
 
     {dead_pid, dead_node} = hd(members_peers)
     :peer.stop(dead_pid)
@@ -199,7 +228,7 @@ defmodule Riptide.PlacementMembershipClusterTest do
     members =
       poll_until(
         fn ->
-          case :erpc.call(survivor_node, Riptide.RaCluster, :probe_placement_members, [
+          case :erpc.call(survivor_node, Riptide.RaCluster.Placement, :probe_placement_members, [
                  [survivor_node, spare_node]
                ]) do
             {:ok, members} ->
@@ -348,7 +377,9 @@ defmodule Riptide.PlacementMembershipClusterTest do
   end
 
   defp find_leader(nodes) do
-    Enum.find(nodes, fn n -> :erpc.call(n, Riptide.RaCluster, :placement_leader?, []) end)
+    Enum.find(nodes, fn n ->
+      :erpc.call(n, Riptide.RaCluster.Placement, :placement_leader?, [])
+    end)
   end
 
   defp poll_until(fun, timeout_ms \\ 10_000) do
@@ -377,7 +408,7 @@ defmodule Riptide.PlacementMembershipClusterTest do
   end
 
   defp poll_membership(candidate_nodes, expected_size, deadline) do
-    case :erpc.call(hd(candidate_nodes), Riptide.RaCluster, :probe_placement_members, [
+    case :erpc.call(hd(candidate_nodes), Riptide.RaCluster.Placement, :probe_placement_members, [
            candidate_nodes
          ]) do
       {:ok, members} when expected_size == nil or length(members) == expected_size ->

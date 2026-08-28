@@ -95,4 +95,4 @@ end
 # Runs under a stable, real node() (set immediately above) rather than
 # :nonode@nohost — see the SIDE-FIX comment above for why that stability is
 # required for this bootstrap to survive the rest of the suite.
-:ok = Riptide.RaCluster.start_genesis_placement_cluster([node()])
+:ok = Riptide.RaCluster.Placement.start_genesis_placement_cluster([node()])
