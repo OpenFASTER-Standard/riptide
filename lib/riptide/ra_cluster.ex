@@ -145,7 +145,7 @@ defmodule Riptide.RaCluster do
   # `ra_server_proc` crashing for an unrelated reason mid-call) propagates as
   # a raw `exit` a plain `case` can't catch, which previously meant callers
   # relying on "this function always raises, never exits" (e.g.
-  # `Riptide.Placement.with_ordinal_fallback/2`'s `rescue`-based ordinal
+  # `Riptide.Placement.with_current_members/1`'s `rescue`-based member
   # fallback) could still crash outright on that one failure class. Uniformly
   # `raise`ing here — whether the underlying failure came back as an
   # `{:error, _}`/`{:timeout, _}` tuple or a raw `exit` — restores that

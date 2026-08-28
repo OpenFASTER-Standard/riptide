@@ -3,8 +3,8 @@ defmodule Riptide.Authz.Store do
   Behaviour for where `Riptide.Authz.Policy` structs are persisted. Selected
   via `Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)`
   — the same config-driven swap `Riptide.Auth.Verifier`/`Riptide.Tenancy.Resolver`
-  already use (Phases 3c-i/4a/4b), so tests can inject a fake store the same
-  way `config/test.exs` overrides the ordinal resolver.
+  already use (Phases 3c-i/4a/4b), so a test can inject a fake store with
+  `Application.put_env(:riptide, :authz_store, MyFakeStore)`.
   """
 
   alias Riptide.Authz.Policy
