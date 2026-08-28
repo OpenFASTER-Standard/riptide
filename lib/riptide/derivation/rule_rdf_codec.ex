@@ -17,12 +17,13 @@ defmodule Riptide.Derivation.RuleRDFCodec do
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @sp_triple_pattern RDF.iri("http://spinrdf.org/sp#TriplePattern")
-  # SPIN's own subclass of sp:TriplePattern used for CONSTRUCT-template triples
-  # (`sp:Construct`'s `sp:templates`) rather than WHERE-clause match patterns
-  # (`sp:where`) — exactly the Head-vs-Body distinction a Rule's `head` (what
-  # to assert) vs. `body` (what to match) draws. Reusing it keeps a rule's
-  # `head` fact-pattern out of the `sp:TriplePattern`-typed node count that
-  # `from_rdf/2` (Task 5) and callers use to enumerate Body literals.
+  # SPIN's own sibling class of sp:TriplePattern (both are subclasses of
+  # sp:Triple, not one a subclass of the other) used for CONSTRUCT-template
+  # triples (`sp:Construct`'s `sp:templates`) rather than WHERE-clause match
+  # patterns (`sp:where`) — exactly the Head-vs-Body distinction a Rule's
+  # `head` (what to assert) vs. `body` (what to match) draws. Reusing it keeps
+  # a rule's `head` fact-pattern out of the `sp:TriplePattern`-typed node count
+  # that `from_rdf/2` (Task 5) and callers use to enumerate Body literals.
   @sp_triple_template RDF.iri("http://spinrdf.org/sp#TripleTemplate")
   @sp_subject RDF.iri("http://spinrdf.org/sp#subject")
   @sp_predicate RDF.iri("http://spinrdf.org/sp#predicate")
@@ -186,4 +187,87 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   end
 
   defp encode_term(term), do: {term, RDF.Graph.new()}
+
+  @doc "See moduledoc. The inverse of `to_rdf/1`."
+  @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: Rule.t()
+  def from_rdf(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    sig_node = RDF.Description.first(description, @riptide_signature)
+    head_node = RDF.Description.first(description, @riptide_head)
+    body_head = RDF.Description.first(description, @riptide_body)
+
+    %Rule{
+      signature: decode_signature(sig_node, graph),
+      head: decode_literal(head_node, graph),
+      body:
+        RDF.List.new(body_head, graph)
+        |> RDF.List.values()
+        |> Enum.map(&decode_literal(&1, graph))
+    }
+  end
+
+  defp decode_signature(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    params_head = RDF.Description.first(description, @riptide_parameters)
+
+    %Signature{
+      name: RDF.Description.first(description, @riptide_name),
+      parameters:
+        RDF.List.new(params_head, graph)
+        |> RDF.List.values()
+        |> Enum.map(&decode_term(&1, graph)),
+      reads: RDF.Description.get(description, @riptide_reads, []),
+      produces: RDF.Description.get(description, @riptide_produces, [])
+    }
+  end
+
+  # A rule's `head` is reified as `sp:TripleTemplate` (see `@sp_triple_template`)
+  # while Body fact-pattern literals are reified as `sp:TriplePattern` — siblings
+  # under `sp:Triple` carrying the same `sp:subject`/`sp:predicate`/`sp:object`
+  # properties, so both decode to the identical `%FactPattern{}` shape here.
+  defp decode_literal(node, graph) do
+    description = RDF.Graph.get(graph, node)
+
+    case RDF.Description.first(description, @rdf_type) do
+      type when type in [@sp_triple_pattern, @sp_triple_template] ->
+        %FactPattern{
+          predicate: RDF.Description.first(description, @sp_predicate),
+          args: [
+            decode_term(RDF.Description.first(description, @sp_subject), graph),
+            decode_term(RDF.Description.first(description, @sp_object), graph)
+          ]
+        }
+
+      @riptide_capability_reference ->
+        %CapabilityReference{
+          capability: RDF.Description.first(description, @riptide_capability),
+          args: decode_args(description, graph),
+          result: decode_term(RDF.Description.first(description, @riptide_result), graph)
+        }
+
+      @riptide_rule_reference ->
+        %RuleReference{
+          rule: RDF.Description.first(description, @riptide_rule_prop),
+          args: decode_args(description, graph),
+          result: decode_term(RDF.Description.first(description, @riptide_result), graph)
+        }
+    end
+  end
+
+  defp decode_args(description, graph) do
+    args_head = RDF.Description.first(description, @riptide_args)
+
+    RDF.List.new(args_head, graph)
+    |> RDF.List.values()
+    |> Enum.map(&decode_term(&1, graph))
+  end
+
+  defp decode_term(%RDF.BlankNode{} = node, graph) do
+    case RDF.Description.first(RDF.Graph.get(graph, node), @sp_var_name) do
+      nil -> node
+      name_literal -> %Var{name: RDF.Literal.value(name_literal)}
+    end
+  end
+
+  defp decode_term(term, _graph), do: term
 end

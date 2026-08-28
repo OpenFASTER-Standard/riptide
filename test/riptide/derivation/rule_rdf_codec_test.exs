@@ -105,4 +105,74 @@ defmodule Riptide.Derivation.RuleRDFCodecTest do
 
     assert_raise ArgumentError, ~r/exactly 2 args/, fn -> RuleRDFCodec.to_rdf(rule) end
   end
+
+  describe "from_rdf/2 — inverse of to_rdf/1" do
+    test "round-trips a fact-pattern-only rule" do
+      {:ok, rule} = Parser.decode("deployed(Svc, Result) :- pendingDeploy(Svc, Result).")
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips a rule with multiple conjoined fact-pattern literals" do
+      {:ok, rule} = Parser.decode("path(X, Y) :- edge(X, Z), path(Z, Y).")
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips a rule with a capability-reference literal" do
+      {:ok, rule} =
+        Parser.decode(
+          "deployed(Svc, Outcome) :- pendingDeploy(Svc, Target), capability(deployService, Svc, Target, Outcome)."
+        )
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips a rule with a rule-reference literal" do
+      {:ok, rule} =
+        Parser.decode(
+          "notified(Svc, Result) :- capability(deployService, Svc, Svc, Outcome), rule(notifyTeam, Svc, Outcome, Result)."
+        )
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips the walking-skeleton worked example with all three literal kinds" do
+      {:ok, rule} =
+        Parser.decode("""
+        deployed(Svc, Result) :-
+            pendingDeploy(Svc, Target),
+            capability(deployService, Svc, Target, Outcome),
+            rule(notifyTeam, Svc, Outcome, Result).
+        """)
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips a recursive rule" do
+      {:ok, rule} = Parser.decode("path(X, Y) :- edge(X, Y).")
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "round-trips a rule with a string constant" do
+      {:ok, rule} = Parser.decode(~s|status(Svc, "healthy") :- pendingDeploy(Svc, "healthy").|)
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+  end
 end
