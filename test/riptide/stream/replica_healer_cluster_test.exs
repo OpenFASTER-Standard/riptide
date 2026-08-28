@@ -1,6 +1,8 @@
 defmodule Riptide.Stream.ReplicaHealerClusterTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   @peers [
@@ -218,12 +220,5 @@ defmodule Riptide.Stream.ReplicaHealerClusterTest do
         Process.sleep(200)
         eventually(fun, attempts_left - 1)
     end
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end

@@ -1,8 +1,19 @@
 defmodule RiptideWeb.LDP.ResourceController do
-  use Phoenix.Controller
+  @moduledoc """
+  LDP CRUD over `/tenants/:tenant_id/resources/*path` — each resource is a
+  stream of `Riptide.Event`s folded into its current RDF state. `GET` folds
+  the stream into a graph; `PUT`/`DELETE` append snapshot events; `PATCH`
+  appends a delta event from a JSON body's `additions`/`removals` Turtle
+  fields; `POST` to a container path creates a child resource and records
+  an `ldp:contains` triple back on the container (see `finish_create_child/4`
+  for the compensating cleanup if the containment patch itself fails).
+  """
+
+  use Phoenix.Controller, formats: [:json]
   require Logger
 
   alias Riptide.Event
+  alias Riptide.Placement
   alias Riptide.RDF.{Patch, TurtleCodec}
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
 
@@ -30,7 +41,9 @@ defmodule RiptideWeb.LDP.ResourceController do
 
     case TurtleCodec.decode(body) do
       {:ok, graph} ->
-        case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+        case stream_id
+             |> StreamSupervisor.ensure_ready()
+             |> StreamSupervisor.ensure_ready_status() do
           :ok ->
             StreamServer.append(stream_id, Event.new(stream_id, :replace, graph))
             send_resp(conn, 201, "")
@@ -47,7 +60,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   def delete(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
-    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+    case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :ok ->
         StreamServer.append(stream_id, Event.new(stream_id, :delete, RDF.Graph.new()))
         send_resp(conn, 204, "")
@@ -76,7 +89,9 @@ defmodule RiptideWeb.LDP.ResourceController do
         removals: RDF.Graph.triples(removals_graph)
       }
 
-      case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+      case stream_id
+           |> StreamSupervisor.ensure_ready()
+           |> StreamSupervisor.ensure_ready_status() do
         :ok ->
           StreamServer.append(stream_id, Event.new(stream_id, :patch, patch))
           send_resp(conn, 200, "")
@@ -108,9 +123,14 @@ defmodule RiptideWeb.LDP.ResourceController do
     child_id = Uniq.UUID.uuid4()
     child_stream_id = container_stream_id <> "/" <> child_id
 
-    with :ok <- child_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status(),
+    with :ok <-
+           child_stream_id
+           |> StreamSupervisor.ensure_ready()
+           |> StreamSupervisor.ensure_ready_status(),
          :ok <-
-           container_stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+           container_stream_id
+           |> StreamSupervisor.ensure_ready()
+           |> StreamSupervisor.ensure_ready_status() do
       StreamServer.append(child_stream_id, Event.new(child_stream_id, :replace, child_graph))
 
       containment_triple =
@@ -135,10 +155,6 @@ defmodule RiptideWeb.LDP.ResourceController do
       :error -> send_resp(conn, 503, "")
     end
   end
-
-  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
-  def ensure_ready_status(:ok), do: :ok
-  def ensure_ready_status({:error, _reason}), do: :error
 
   # StreamServer.append/2 can raise if the container's own replicas are all
   # unreachable at this exact moment (e.g. a transient partition after the
@@ -211,8 +227,22 @@ defmodule RiptideWeb.LDP.ResourceController do
 
   def parse_stream_id(_other), do: :error
 
+  # A read must never create anything: StreamSupervisor.ensure_ready/1 mints
+  # a permanent BEAM atom and a real Ra cluster for any stream_id it's asked
+  # about, so it must only ever run for a stream that's genuinely known.
+  # Placement.lookup/1 is a cheap, atom-free existence check against the
+  # small fixed placement-metadata cluster — nil means this stream_id has
+  # never been assigned, i.e. nobody has ever written to it, so it's a
+  # plain 404 with no side effects at all.
   defp current_state(stream_id) do
-    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+    case Placement.lookup(stream_id) do
+      nil -> :not_found
+      _nodes -> current_state_for_existing(stream_id)
+    end
+  end
+
+  defp current_state_for_existing(stream_id) do
+    case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :error ->
         :service_unavailable
 

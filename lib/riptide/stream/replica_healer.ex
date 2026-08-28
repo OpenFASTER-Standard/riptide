@@ -1,13 +1,13 @@
 defmodule Riptide.Stream.ReplicaHealer do
   @moduledoc """
   Fully automatic background repair for a stream's replica set — see Phase
-  3d-ii design spec for the full motivation. Runs only on the 3 placement
-  ordinals (wired in `Riptide.Application`, same gating as
-  `Riptide.RaCluster.ensure_placement_cluster_started/0`), and only the
+  3d-ii design spec for the full motivation. Runs unconditionally on every
+  fleet node (Phase 3e removed the old 3-fixed-ordinal gate) — but only the
   placement cluster's current Raft leader ever acts on a given sweep
-  (`RaCluster.Placement.placement_leader?/0`) — reusing that cluster's own existing
-  leader election as single-writer safety, rather than a new coordination
-  mechanism. No operator action is required in the steady-state case.
+  (`RaCluster.Placement.placement_leader?/0`), so it's a no-op everywhere
+  except that one node. Reuses that cluster's own existing leader election
+  as single-writer safety, rather than a new coordination mechanism. No
+  operator action is required in the steady-state case.
   """
 
   use GenServer
@@ -224,7 +224,7 @@ defmodule Riptide.Stream.ReplicaHealer do
   # own moduledoc) — this goes through `RaCluster.consistent_query/2`, the
   # existing linearizable-read primitive, rather than reaching into `:ra`
   # itself. Tries every survivor in turn (mirroring `Riptide.Placement`'s own
-  # `with_ordinal_fallback/2` "try the next one on failure" shape) since any
+  # `with_current_members/1` "try the next one on failure" shape) since any
   # single survivor being briefly unreachable shouldn't block discovering a
   # value every survivor's machine state agrees on.
   #

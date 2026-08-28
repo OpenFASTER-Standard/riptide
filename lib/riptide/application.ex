@@ -30,6 +30,7 @@ defmodule Riptide.Application do
       [
         {Phoenix.PubSub, name: Riptide.PubSub},
         Riptide.Telemetry,
+        Riptide.NewStreamRateLimit,
         {Plug.Cowboy, scheme: :http, plug: RiptideWeb.MetricsEndpoint, options: [port: 9090]},
         Riptide.Stream.Placement,
         {Cluster.Supervisor,

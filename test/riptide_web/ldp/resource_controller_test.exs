@@ -57,6 +57,23 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     assert conn.status == 404
   end
 
+  test "GET on a resource that was never written to never creates a placement assignment (atom-exhaustion guard)" do
+    path = unique_path()
+    stream_id = stream_id_for(path)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+    conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 404
+    # StreamSupervisor.ensure_ready/1 (called via current_state/1) mints a
+    # permanent BEAM atom and a real 3-member Ra cluster for any stream_id
+    # it's asked about — a GET is read-only and must never trigger that for
+    # a resource nobody ever wrote to. Placement.lookup/1 is the cheap,
+    # atom-free existence signal: nil means ensure_ready/1 was never
+    # reached at all for this stream_id.
+    assert Riptide.Placement.lookup(stream_id) == nil
+  end
+
   test "PUT creates a resource, and GET then returns its Turtle state" do
     path = unique_path()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(path)) end)
@@ -296,13 +313,6 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     # its absence here means the child's own :delete append succeeded, i.e.
     # the orphan was actually cleaned up rather than left dangling.
     refute log =~ "manual cleanup needed"
-  end
-
-  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
-    assert ResourceController.ensure_ready_status(:ok) == :ok
-
-    assert ResourceController.ensure_ready_status({:error, :cluster_not_formed}) ==
-             :error
   end
 
   describe "stream_id_for/2 and parse_stream_id/1" do

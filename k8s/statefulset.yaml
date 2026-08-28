@@ -65,6 +65,12 @@ spec:
             # target depends on it matching what clients actually connect to.
             - name: PHX_HOST
               value: "riptide-headless"
+            # Independently configurable from replicas: above -- the placement
+            # cluster only grows/shrinks to this target, not automatically to
+            # however many pods happen to be running. Change both together if
+            # you change replicas: (see README.md's own note on this coupling).
+            - name: RIPTIDE_PLACEMENT_TARGET_SIZE
+              value: "3"
             - name: RELEASE_COOKIE
               valueFrom:
                 secretKeyRef:

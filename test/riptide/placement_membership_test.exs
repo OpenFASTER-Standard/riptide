@@ -78,6 +78,14 @@ defmodule Riptide.PlacementMembershipTest do
       # as every other test that touches it depends on.
       pid = Process.whereis(:riptide_placement)
       Process.exit(pid, :kill)
+
+      # Not a fixed-sleep-as-synchronization risk like the PubSub-broadcast
+      # test above: `ra_server_sup`'s child spec restarts a killed member
+      # with `restart: :transient` (confirmed via deps/ra/src/ra_server_sup.erl),
+      # so :riptide_placement is back under a NEW pid almost immediately —
+      # there's no observable "nil" window to poll for. This sleep exists
+      # only to let that OTP-level restart settle before bootstrap_once/0
+      # runs its own, separate `:ra.restart_server/2`-based recovery.
       :timer.sleep(50)
 
       assert PlacementMembership.bootstrap_once() == :ok

@@ -1,8 +1,12 @@
 # Deploying Riptide to Kubernetes
 
-Phase 3b's multi-node connectivity manifests: a 3-replica `StatefulSet`, a headless
-`Service` for peer discovery, a regular `Service` for client traffic, and a `Secret`
-template.
+Multi-node connectivity manifests: a `StatefulSet` (defaulting to 3 replicas — a starting point,
+not a hard requirement; see the top-level [`README.md`'s "Running via Kubernetes"
+section](../README.md#running-via-kubernetes) and Phase 3e), a headless `Service` for peer
+discovery, a regular `Service` for client traffic, and a `Secret` template. If you change
+`replicas:` in `statefulset.yaml`, also set `RIPTIDE_PLACEMENT_TARGET_SIZE` to match — they're
+independently configurable, and the placement cluster only grows/shrinks to the target size you
+give it, not automatically to however many pods happen to be running.
 
 ## Deploy
 
@@ -21,6 +25,7 @@ template.
    kubectl apply -f headless-service.yaml
    kubectl apply -f service.yaml
    kubectl apply -f statefulset.yaml
+   kubectl apply -f pdb.yaml
    ```
 
 3. Wait for all 3 pods to become ready:
@@ -47,7 +52,7 @@ Repeat against `riptide-1`/`riptide-2` to confirm all three see the other two.
 ## Teardown
 
 ```bash
-kubectl delete -f statefulset.yaml -f service.yaml -f headless-service.yaml -f secret.yaml
+kubectl delete -f pdb.yaml -f statefulset.yaml -f service.yaml -f headless-service.yaml -f secret.yaml
 ```
 
 `secret.yaml` is git-ignored (see the repo's `.gitignore`) — never commit real

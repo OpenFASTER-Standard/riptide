@@ -1,6 +1,8 @@
 defmodule Riptide.MultiNodeConnectivityTest do
   use ExUnit.Case, async: false
 
+  import Riptide.MultiNodeTestHelpers, only: [unique_pairs: 1]
+
   @moduletag timeout: 60_000
 
   @peers [{:riptide0, "riptide-0"}, {:riptide1, "riptide-1"}, {:riptide2, "riptide-2"}]
@@ -59,6 +61,14 @@ defmodule Riptide.MultiNodeConnectivityTest do
           end
         end
       end)
+
+      # Each peer's Ra data directory (keyed on HOSTNAME, per the assertion
+      # below) is real, on-disk state — @peers' hostnames ("riptide-0/1/2")
+      # are reused by several other :peer-based test files, so leaving this
+      # behind lets a later test collide with it.
+      Enum.each(@peers, fn {_alive_name, hostname} ->
+        File.rm_rf!(Path.join(File.cwd!(), hostname))
+      end)
     end)
 
     nodes = Enum.map(peers, fn {_pid, node, _hostname} -> node end)
@@ -99,12 +109,5 @@ defmodule Riptide.MultiNodeConnectivityTest do
       assert Path.basename(config.data_dir) == hostname
       assert Path.basename(config.wal_data_dir) == hostname
     end
-  end
-
-  defp unique_pairs(list) do
-    for {a, i} <- Enum.with_index(list),
-        {b, j} <- Enum.with_index(list),
-        i < j,
-        do: {a, b}
   end
 end

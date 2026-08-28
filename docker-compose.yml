@@ -7,6 +7,13 @@ services:
     environment:
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?Set SECRET_KEY_BASE, e.g. via: openssl rand -base64 48}
       PHX_HOST: ${PHX_HOST:-localhost}
+      # A single-container deploy only ever has one node to form a placement
+      # cluster from -- matches fly.toml's own single-node setting. Not
+      # strictly required (the default target size of 3 still gracefully
+      # collapses to whatever's actually present), but avoids the ambient
+      # join loop periodically probing for 2 more nodes that will never
+      # appear.
+      RIPTIDE_PLACEMENT_TARGET_SIZE: ${RIPTIDE_PLACEMENT_TARGET_SIZE:-1}
     volumes:
       - riptide_data:/data
 
