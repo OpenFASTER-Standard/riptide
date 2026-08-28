@@ -240,6 +240,11 @@ editing required. Riptide's CORS policy allows any origin (see
 [`RiptideWeb.Endpoint`](lib/riptide_web/endpoint.ex)), so this works even opening the HTML file
 directly from disk (a `file://` origin).
 
+[`examples/live-story/graph.html`](examples/live-story/graph.html) — a live WebGL visualization of
+`the-story`'s actual RDF graph, see [its own README section](examples/live-story/README.md#watching-it-as-a-graph)
+— takes the same `?base=` override, plus `?tenant=`/`?resource=` to point it at any resource rather
+than just this demo's.
+
 ### Verified
 
 Setup → deploy → seed → verify (health check, `PATCH` a line, confirm it via `GET` and over SSE,
