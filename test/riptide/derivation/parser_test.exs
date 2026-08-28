@@ -1,8 +1,8 @@
 defmodule Riptide.Derivation.ParserTest do
   use ExUnit.Case, async: true
 
-  alias Riptide.Derivation.{Parser, Var}
   alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{Parser, Var}
 
   describe "decode/1 — fact-pattern-only rules" do
     test "parses a rule with a single body literal" do

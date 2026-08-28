@@ -12,8 +12,8 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   Constraints).
   """
 
-  alias Riptide.Derivation.{Rule, Signature, Var}
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
+  alias Riptide.Derivation.{Rule, Signature, Var}
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @sp_triple_pattern RDF.iri("http://spinrdf.org/sp#TriplePattern")

@@ -16,9 +16,9 @@ defmodule Riptide.Derivation.Parser do
 
   import NimbleParsec
 
-  alias Riptide.Derivation.{Rule, Signature, Var}
-  alias Riptide.Derivation.Literal.FactPattern
   alias Riptide.Derivation.Literal.{CapabilityReference, RuleReference}
+  alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{Rule, Signature, Var}
 
   @relation_ns "urn:riptide:relation:"
   @capability_ns "urn:riptide:capability:"

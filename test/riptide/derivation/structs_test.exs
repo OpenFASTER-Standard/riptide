@@ -1,8 +1,8 @@
 defmodule Riptide.Derivation.StructsTest do
   use ExUnit.Case, async: true
 
-  alias Riptide.Derivation.{Rule, Signature, Var}
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
+  alias Riptide.Derivation.{Rule, Signature, Var}
 
   test "Var carries a name" do
     assert %Var{name: "Svc"} == %Var{name: "Svc"}
