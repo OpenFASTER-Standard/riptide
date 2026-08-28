@@ -49,6 +49,10 @@ every predicate becomes an edge, and new nodes ease into place via a small live 
 layout as lines get submitted. It talks to the exact same SSE stream `index.html` does, so nothing
 on the server needs to change to watch it.
 
+Click and drag any node to reposition it — it's pinned to the cursor while dragging (highlighted
+with a ring so it's clear which one you've grabbed) and rejoins the live layout normally the moment
+you release it, rather than staying stuck wherever you dropped it.
+
 Unlike `index.html` (hardcoded to `story-demo`/`the-story`), `graph.html` is a general RDF graph
 viewer — point it at any tenant/resource with `?tenant=` and `?resource=` query params (both
 default to `story-demo`/`the-story` so it shows this demo out of the box), combined with the same
