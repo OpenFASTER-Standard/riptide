@@ -25,6 +25,7 @@ give it, not automatically to however many pods happen to be running.
    kubectl apply -f headless-service.yaml
    kubectl apply -f service.yaml
    kubectl apply -f statefulset.yaml
+   kubectl apply -f pdb.yaml
    ```
 
 3. Wait for all 3 pods to become ready:
@@ -51,7 +52,7 @@ Repeat against `riptide-1`/`riptide-2` to confirm all three see the other two.
 ## Teardown
 
 ```bash
-kubectl delete -f statefulset.yaml -f service.yaml -f headless-service.yaml -f secret.yaml
+kubectl delete -f pdb.yaml -f statefulset.yaml -f service.yaml -f headless-service.yaml -f secret.yaml
 ```
 
 `secret.yaml` is git-ignored (see the repo's `.gitignore`) — never commit real
