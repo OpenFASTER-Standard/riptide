@@ -67,7 +67,14 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
       end)
 
-    Process.sleep(300)
+    # A fixed sleep can't reliably outlast however long the async Task
+    # takes to reach its own Phoenix.PubSub.subscribe/2 call under a busier
+    # scheduler (seen on CI) — appending before that subscribe registers
+    # means the event is published before anyone's listening and silently
+    # missed. Phoenix.PubSub.subscribe/3 registers via `Registry.register/3`
+    # on the pubsub itself, so polling `Registry.lookup/2` for this topic is
+    # a direct, non-sleep-based signal that the subscription is live.
+    assert eventually(fn -> Registry.lookup(Riptide.PubSub, "stream:" <> stream_id) != [] end)
     StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
 
     conn = Task.await(task, 3_000)
@@ -171,6 +178,105 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     end
   end
 
+  describe "new-stream rate limiting (atom-exhaustion guard)" do
+    setup do
+      original_limit = Application.get_env(:riptide, :new_stream_rate_limit)
+      Application.put_env(:riptide, :new_stream_rate_limit, 2)
+      on_exit(fn -> Application.put_env(:riptide, :new_stream_rate_limit, original_limit) end)
+
+      Store.Placement.add_policy("sse-ratelimit-test-tenant", [], %Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+
+      :ok
+    end
+
+    defp new_ratelimit_stream_id do
+      ResourceController.stream_id_for("sse-ratelimit-test-tenant", [
+        "doc-#{System.unique_integer([:positive])}"
+      ])
+    end
+
+    test "subscribing to more distinct brand-new streams than the configured limit is rejected with 429" do
+      subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.Realtime.SseControllerTest.FixedSubjectVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+      Application.put_env(:riptide, :ratelimit_test_subject, subject)
+      on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
+
+      stream_ids = for _ <- 1..3, do: new_ratelimit_stream_id()
+
+      for stream_id <- stream_ids,
+          do: on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+
+      statuses =
+        for stream_id <- stream_ids do
+          :get
+          |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+          |> put_req_header("authorization", "Bearer any-token")
+          |> RiptideWeb.Endpoint.call(@opts)
+          |> Map.fetch!(:status)
+        end
+
+      assert statuses == [200, 200, 429]
+    end
+
+    test "subscribing to an already-existing stream is never rate-limited, regardless of volume" do
+      subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
+      original_verifier = Application.get_env(:riptide, :auth_verifier)
+
+      Application.put_env(
+        :riptide,
+        :auth_verifier,
+        RiptideWeb.Realtime.SseControllerTest.FixedSubjectVerifier
+      )
+
+      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
+      Application.put_env(:riptide, :ratelimit_test_subject, subject)
+      on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
+
+      stream_id = new_ratelimit_stream_id()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+      StreamSupervisor.ensure_ready(stream_id)
+
+      # 3 subscribes to the SAME already-existing stream — one more than the
+      # limit of 2 configured above — must all succeed, since only creating
+      # a BRAND NEW stream is rate-limited, never reading an existing one.
+      statuses =
+        for _ <- 1..3 do
+          :get
+          |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+          |> put_req_header("authorization", "Bearer any-token")
+          |> RiptideWeb.Endpoint.call(@opts)
+          |> Map.fetch!(:status)
+        end
+
+      assert statuses == [200, 200, 200]
+    end
+  end
+
+  # Every token authenticates as the SAME configured test subject, regardless
+  # of the token's actual value — lets the rate-limiting tests above drive
+  # every subscribe attempt as one consistent subject without needing a real
+  # JWT for each request.
+  defmodule FixedSubjectVerifier do
+    @behaviour Riptide.Auth.Verifier
+
+    @impl true
+    def verify(_token) do
+      {:ok, %{"sub" => Application.fetch_env!(:riptide, :ratelimit_test_subject)}}
+    end
+  end
+
   describe "authorization" do
     test "subscribing to a stream_id shaped like a tenant resource with no matching policy is denied with 403" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
@@ -246,6 +352,20 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 503
+    end
+  end
+
+  defp eventually(fun, attempts_left \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      attempts_left <= 1 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        eventually(fun, attempts_left - 1)
     end
   end
 end
