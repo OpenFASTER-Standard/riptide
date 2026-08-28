@@ -119,9 +119,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     # `resource_controller_test.exs`'s Task 5 setup) so authorization now
     # being enforced doesn't change their expected statuses.
     setup do
-      original = Application.get_env(:riptide, :auth_verifier)
-      Application.put_env(:riptide, :auth_verifier, StubVerifier)
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :auth_verifier, StubVerifier)
 
       Store.Placement.add_policy("sse-auth-test-tenant", [], %Policy{
         effect: :allow,
@@ -172,9 +170,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   describe "new-stream rate limiting (atom-exhaustion guard)" do
     setup do
-      original_limit = Application.get_env(:riptide, :new_stream_rate_limit)
-      Application.put_env(:riptide, :new_stream_rate_limit, 2)
-      on_exit(fn -> Application.put_env(:riptide, :new_stream_rate_limit, original_limit) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
 
       Store.Placement.add_policy("sse-ratelimit-test-tenant", [], %Policy{
         effect: :allow,
@@ -193,15 +189,13 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "subscribing to more distinct brand-new streams than the configured limit is rejected with 429" do
       subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
 
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.Realtime.SseControllerTest.FixedSubjectVerifier
       )
 
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
       Application.put_env(:riptide, :ratelimit_test_subject, subject)
       on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
 
@@ -224,15 +218,13 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "subscribing to an already-existing stream is never rate-limited, regardless of volume" do
       subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
 
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.Realtime.SseControllerTest.FixedSubjectVerifier
       )
 
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
       Application.put_env(:riptide, :ratelimit_test_subject, subject)
       on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
 
@@ -331,9 +323,9 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     # the policy store is totally unreachable — this must surface as a
     # clean 503 (retry-able), not an uncaught crash / generic 500.
     test "subscribing when the placement cluster is fully unreachable returns 503, not a crash" do
-      original = Application.get_env(:riptide, :placement_members_override)
-      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
-      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :placement_members_override, [
+        :nonexistent@nohost
+      ])
 
       tenant_id = "sse-authz-down-test-" <> Uniq.UUID.uuid4()
       stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])

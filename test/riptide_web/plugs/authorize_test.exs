@@ -22,25 +22,7 @@ defmodule RiptideWeb.Plugs.AuthorizeTest do
   end
 
   setup do
-    original = Application.get_env(:riptide, :authz_store)
-    Application.put_env(:riptide, :authz_store, FakeStore)
-
-    on_exit(fn ->
-      # `Application.put_env(key, nil)` leaves the key present with value
-      # `nil`, which is NOT equivalent to the key being absent:
-      # `Application.get_env(:riptide, :authz_store, SomeDefault)`'s default
-      # only applies when the key is entirely unset, so if `original` here
-      # is `nil` (as it always is in this suite — nothing configures
-      # `:authz_store` anywhere), restoring via `put_env` would permanently
-      # poison it to `nil` for the rest of the same `mix test` run instead
-      # of restoring the "absent, fall back to the real default" state.
-      if is_nil(original) do
-        Application.delete_env(:riptide, :authz_store)
-      else
-        Application.put_env(:riptide, :authz_store, original)
-      end
-    end)
-
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :authz_store, FakeStore)
     :ok
   end
 

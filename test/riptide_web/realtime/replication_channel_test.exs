@@ -26,9 +26,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   end
 
   setup do
-    original = Application.get_env(:riptide, :auth_verifier)
-    Application.put_env(:riptide, :auth_verifier, StubVerifier)
-    on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :auth_verifier, StubVerifier)
     :ok
   end
 
@@ -268,9 +266,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
   describe "new-stream rate limiting (atom-exhaustion guard)" do
     setup do
-      original_limit = Application.get_env(:riptide, :new_stream_rate_limit)
-      Application.put_env(:riptide, :new_stream_rate_limit, 2)
-      on_exit(fn -> Application.put_env(:riptide, :new_stream_rate_limit, original_limit) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
 
       Store.Placement.add_policy("ws-ratelimit-test-tenant", [], %Policy{
         effect: :allow,
@@ -289,15 +285,13 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     test "joining more distinct brand-new streams than the configured limit is rejected" do
       subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
 
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.Realtime.ReplicationChannelTest.FixedSubjectVerifier
       )
 
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
       Application.put_env(:riptide, :ratelimit_test_subject, subject)
       on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
 
@@ -323,15 +317,13 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
 
     test "joining an already-existing stream is never rate-limited, regardless of volume" do
       subject = "ratelimit-subject-" <> Uniq.UUID.uuid4()
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
 
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.Realtime.ReplicationChannelTest.FixedSubjectVerifier
       )
 
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
       Application.put_env(:riptide, :ratelimit_test_subject, subject)
       on_exit(fn -> Application.delete_env(:riptide, :ratelimit_test_subject) end)
 

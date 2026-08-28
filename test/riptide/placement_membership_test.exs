@@ -31,17 +31,14 @@ defmodule Riptide.PlacementMembershipTest do
 
   describe "target_size/0" do
     test "defaults to 3 when no application env is configured" do
-      original = Application.get_env(:riptide, :placement_target_size)
+      Riptide.AppEnvTestHelpers.ensure_restored(:riptide, :placement_target_size)
       Application.delete_env(:riptide, :placement_target_size)
-      on_exit(fn -> Application.put_env(:riptide, :placement_target_size, original) end)
 
       assert PlacementMembership.target_size() == 3
     end
 
     test "reads the configured value when present" do
-      original = Application.get_env(:riptide, :placement_target_size)
-      Application.put_env(:riptide, :placement_target_size, 5)
-      on_exit(fn -> Application.put_env(:riptide, :placement_target_size, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :placement_target_size, 5)
 
       assert PlacementMembership.target_size() == 5
     end
@@ -103,9 +100,9 @@ defmodule Riptide.PlacementMembershipTest do
     end
 
     test "falls back to a live fleet probe and raises when no member is reachable at all" do
-      original = Application.get_env(:riptide, :placement_members_override)
-      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
-      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :placement_members_override, [
+        :nonexistent@nohost
+      ])
 
       assert_raise RuntimeError, ~r/no placement-cluster members could be/, fn ->
         Riptide.Placement.lookup("irrelevant-stream-id")

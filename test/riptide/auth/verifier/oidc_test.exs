@@ -8,10 +8,8 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
   @audience "riptide-test-audience"
 
   setup do
-    original_issuer = Application.get_env(:riptide, :oidc_issuer)
-    original_audience = Application.get_env(:riptide, :oidc_audience)
-    Application.put_env(:riptide, :oidc_issuer, @issuer)
-    Application.put_env(:riptide, :oidc_audience, @audience)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :oidc_issuer, @issuer)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :oidc_audience, @audience)
 
     jwk = JOSE.JWK.generate_key({:rsa, 2048})
     {_, public_jwk_map} = JOSE.JWK.to_public_map(jwk)
@@ -32,11 +30,6 @@ defmodule Riptide.Auth.Verifier.OIDCTest do
        http_adapter: Tesla.Mock,
        first_fetch_sync: true}
     )
-
-    on_exit(fn ->
-      Application.put_env(:riptide, :oidc_issuer, original_issuer)
-      Application.put_env(:riptide, :oidc_audience, original_audience)
-    end)
 
     %{signer: signer}
   end

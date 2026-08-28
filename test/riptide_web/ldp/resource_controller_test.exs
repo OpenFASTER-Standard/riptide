@@ -410,15 +410,11 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
       Application.put_env(:riptide, :authz_test_verifier_claims, owner_claims)
       on_exit(fn -> Application.delete_env(:riptide, :authz_test_verifier_claims) end)
 
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
-
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.LDP.ResourceControllerTest.StubOwnerVerifier
       )
-
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
 
       put_conn =
         :put
@@ -444,15 +440,11 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
       path = "/tenants/#{tenant_id}/resources/doc"
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(tenant_id, path)) end)
 
-      original_verifier = Application.get_env(:riptide, :auth_verifier)
-
-      Application.put_env(
+      Riptide.AppEnvTestHelpers.put_env(
         :riptide,
         :auth_verifier,
         RiptideWeb.LDP.ResourceControllerTest.StubOwnerVerifier
       )
-
-      on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original_verifier) end)
 
       :put
       |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"z\" .\n")
