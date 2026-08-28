@@ -163,6 +163,62 @@ metadata:
 Setting up Prometheus itself (and any Grafana dashboards/alerting on top of it) is your own
 deployment's concern — these manifests only expose the metrics, they don't install a scraper.
 
+## Running on Fly.io
+
+`fly.toml` (included in this repo) deploys Riptide as a single Fly Machine with a persistent Fly
+Volume mounted at `/data` — the same single-node model as `docker-compose.yml` above, just on
+Fly's infrastructure instead of your own. This needs `flyctl` and an authenticated Fly.io org.
+
+```bash
+fly apps create <your-app-name>          # update fly.toml's `app` and `PHX_HOST` to match
+fly volumes create riptide_data --region <region> --size 1 -a <your-app-name>
+fly secrets set -a <your-app-name> \
+  SECRET_KEY_BASE="$(openssl rand -base64 48)" \
+  RELEASE_DISTRIBUTION=name \
+  RELEASE_NODE=riptide@127.0.0.1 \
+  RELEASE_COOKIE="$(openssl rand -hex 16)"
+fly deploy -a <your-app-name>
+```
+
+`RELEASE_DISTRIBUTION`/`RELEASE_NODE`/`RELEASE_COOKIE` enable Erlang distribution scoped to
+loopback only (`127.0.0.1` — not reachable from outside the machine), solely so `bin/riptide rpc`
+can attach for one-off administrative calls (see "Seeding data" below) — this is the Fly
+equivalent of `iex -S mix phx.server`'s attached shell in local dev.
+
+**Why `RELEASE_NODE=riptide@127.0.0.1`, not `@localhost`:** Erlang's longname distribution mode
+(`RELEASE_DISTRIBUTION=name`) requires the host part to be a real IP or fully-qualified hostname —
+`localhost` is rejected outright ("Hostname localhost is illegal"). This mirrors
+`rel/env.sh.eex`'s own `riptide@$POD_IP` choice for the Kubernetes path, just with the loopback
+address in place of a pod IP.
+
+`fly.toml` also sets `HOSTNAME=riptide-0` and `RIPTIDE_SINGLE_NODE=true` — required together for
+any single-machine deployment (Fly, plain `docker run`, `docker-compose`) to actually pass
+`/health/ready`: see the comment on `RIPTIDE_SINGLE_NODE` in `config/runtime.exs` for why.
+
+### Seeding data
+
+There's no HTTP endpoint for tenant/policy administration (deliberately — it's an Elixir-native,
+operator-only action, same as local dev's `setup.exs`). Attach via `bin/riptide rpc`, not
+`bin/riptide remote`: the latter's `--remsh` silently falls back to a disconnected local session
+over a non-tty connection (exactly what `fly ssh console -C "..."` gives you), which looks like it
+worked but never touches the running app. `rpc` doesn't need a tty:
+
+```bash
+fly ssh console -a <your-app-name> -C \
+  "/app/bin/riptide rpc 'Code.eval_string(Base.decode64!(\"$(base64 -w0 examples/live-story/setup.exs)\"))'"
+```
+
+(Base64-encoding the script sidesteps quoting a multi-line Elixir expression through two layers of
+shell — `fly ssh console -C` and the SSH session itself.) For a one-off tenant policy without the
+full live-story seed, pass a shorter expression the same way — `rpc` accepts any single Elixir
+expression.
+
+### Verified
+
+Setup → deploy → seed → verify (health check, `PATCH` a line, confirm it via `GET` and over SSE) →
+complete teardown (`fly apps destroy <app> --yes`), run 3 times end-to-end with no manual
+intervention between runs, 2026-08-27.
+
 ## Performance
 
 Measured 2026-08-27 against the code at this point in `main`. Every number below is from a real
