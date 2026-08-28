@@ -17,7 +17,7 @@ defmodule Riptide.Derivation.GoldenCaseTest do
         capability(deployService, Svc, Target, Outcome),
         rule(notifyTeam, Svc, Outcome, Result).
     """,
-    "recursive" => "path(X, Y) :- edge(X, Y)."
+    "recursive" => "path(X, Y) :- edge(X, Z), path(Z, Y)."
   }
 
   for {name, text} <- @golden_cases do
