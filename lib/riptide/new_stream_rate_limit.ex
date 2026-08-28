@@ -15,9 +15,23 @@ defmodule Riptide.NewStreamRateLimit do
   still allow creation.
 
   Deliberately narrow: not a general-purpose rate limiter for every route.
+
+  Uses Hammer's `:fix_window_per_key` algorithm rather than the default
+  `:fix_window`. The default anchors every key's window to the same
+  globally-synchronized wall-clock boundary (multiples of `scale_ms`
+  since the Unix epoch) — a burst of hits for one subject can straddle
+  that boundary purely by chance of what real time it is when the burst
+  happens, resetting the count mid-burst and allowing more hits than the
+  configured limit. `:fix_window_per_key` anchors each key's window to
+  that key's own first hit instead, so a subject's own burst is
+  evaluated against its own window regardless of the wall clock. This
+  was a real bug, not just a test artifact: it surfaced as a recurring
+  CI flake (`NewStreamRateLimitTest`, `SseControllerTest`,
+  `ReplicationChannelTest`), but the same under-counting could let a
+  real subject briefly exceed the configured limit in production too.
   """
 
-  use Hammer, backend: :ets
+  use Hammer, backend: :ets, algorithm: :fix_window_per_key
 
   @default_limit 30
   @default_scale_ms :timer.minutes(1)
