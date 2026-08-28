@@ -18,12 +18,14 @@ defmodule Riptide.PlacementMembershipTest do
         {:placement_membership_changed, [node(), :"riptide@10.0.0.7"]}
       )
 
-      # Give the already-running Riptide.PlacementMembership process (started
-      # by the application supervision tree — see Task 4) a moment to
-      # receive and cache the broadcast.
-      :timer.sleep(50)
-
-      assert PlacementMembership.current_members() == [node(), :"riptide@10.0.0.7"]
+      # The already-running Riptide.PlacementMembership process (started by
+      # the application supervision tree — see Task 4) processes the
+      # broadcast asynchronously — poll instead of a fixed sleep, since a
+      # busier scheduler (seen on CI) can take longer than any fixed delay
+      # to deliver and handle the message.
+      assert eventually(fn ->
+               PlacementMembership.current_members() == [node(), :"riptide@10.0.0.7"]
+             end)
     end
   end
 
@@ -100,6 +102,20 @@ defmodule Riptide.PlacementMembershipTest do
       assert_raise RuntimeError, ~r/no placement-cluster members could be/, fn ->
         Riptide.Placement.lookup("irrelevant-stream-id")
       end
+    end
+  end
+
+  defp eventually(fun, attempts_left \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      attempts_left <= 1 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        eventually(fun, attempts_left - 1)
     end
   end
 end
