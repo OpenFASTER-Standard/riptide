@@ -18,15 +18,8 @@ defmodule Riptide.NewStreamRateLimitTest do
     limit = 2
     subject = "boundary-test-" <> Uniq.UUID.uuid4()
 
-    original_limit = Application.get_env(:riptide, :new_stream_rate_limit)
-    original_scale = Application.get_env(:riptide, :new_stream_rate_scale_ms)
-    Application.put_env(:riptide, :new_stream_rate_limit, limit)
-    Application.put_env(:riptide, :new_stream_rate_scale_ms, scale_ms)
-
-    on_exit(fn ->
-      Application.put_env(:riptide, :new_stream_rate_limit, original_limit)
-      Application.put_env(:riptide, :new_stream_rate_scale_ms, original_scale)
-    end)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, limit)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_scale_ms, scale_ms)
 
     # Align so the first hit lands just before the next window boundary,
     # and the remaining hits land just after it.

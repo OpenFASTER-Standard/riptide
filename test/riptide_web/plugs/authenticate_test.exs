@@ -14,9 +14,7 @@ defmodule RiptideWeb.Plugs.AuthenticateTest do
   end
 
   setup do
-    original = Application.get_env(:riptide, :auth_verifier)
-    Application.put_env(:riptide, :auth_verifier, StubVerifier)
-    on_exit(fn -> Application.put_env(:riptide, :auth_verifier, original) end)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :auth_verifier, StubVerifier)
     :ok
   end
 

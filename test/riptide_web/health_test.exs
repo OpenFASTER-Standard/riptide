@@ -32,9 +32,9 @@ defmodule RiptideWeb.HealthTest do
     # async: false specifically so this override never races a concurrently-
     # running async test.
     test "returns 503 when the placement cluster is unreachable" do
-      original = Application.get_env(:riptide, :placement_members_override)
-      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
-      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :placement_members_override, [
+        :nonexistent@nohost
+      ])
 
       conn =
         :get

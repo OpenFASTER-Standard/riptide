@@ -5,16 +5,7 @@ defmodule RiptideWeb.Plugs.ResolveTenantTest do
   alias RiptideWeb.Plugs.ResolveTenant
 
   setup do
-    original = Application.get_env(:riptide, :tenancy_resolver)
-
-    on_exit(fn ->
-      if is_nil(original) do
-        Application.delete_env(:riptide, :tenancy_resolver)
-      else
-        Application.put_env(:riptide, :tenancy_resolver, original)
-      end
-    end)
-
+    Riptide.AppEnvTestHelpers.ensure_restored(:riptide, :tenancy_resolver)
     :ok
   end
 

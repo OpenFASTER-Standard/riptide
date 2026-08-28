@@ -4,8 +4,7 @@ defmodule Riptide.Auth.JwksStrategyTest do
   alias Riptide.Auth.JwksStrategy
 
   setup do
-    original = Application.get_env(:riptide, :oidc_jwks_url)
-    on_exit(fn -> Application.put_env(:riptide, :oidc_jwks_url, original) end)
+    Riptide.AppEnvTestHelpers.ensure_restored(:riptide, :oidc_jwks_url)
     :ok
   end
 

@@ -162,9 +162,9 @@ defmodule Riptide.PlacementTest do
     end
 
     test "lookup/1 emits an exception event when every member fails" do
-      original = Application.get_env(:riptide, :placement_members_override)
-      Application.put_env(:riptide, :placement_members_override, [:nonexistent@nohost])
-      on_exit(fn -> Application.put_env(:riptide, :placement_members_override, original) end)
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :placement_members_override, [
+        :nonexistent@nohost
+      ])
 
       ref =
         :telemetry_test.attach_event_handlers(self(), [
