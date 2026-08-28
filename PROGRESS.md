@@ -16,9 +16,12 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3e** — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
+| 6 | Derivation and execution layer | **Design drafted, decomposed into phases 6a-6j** — see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
+Sub-project 6 is the first thing built on top of 1-5's now-complete foundation, not a parallel
+effort — see that spec's own §1.
 
 ## 1. Persistence & durability — shipped
 
@@ -372,20 +375,49 @@ sub-project 3 was decomposed into phases 3a-3d.
   design spec's Out of scope section. Verified via `kubectl apply --dry-run=server` against a
   scratch namespace on a live cluster (schema-valid), not a live-issued certificate — real ACME
   issuance needs public DNS + a reachable ingress IP, which this phase does not provision.
-- **Post-4d hardening — unbounded atom creation via read-only requests.** Found during a deep
-  repo-health investigation, 2026-08-28: `RaCluster.server_id/1` mints a permanent, never-freed
-  BEAM atom for any `stream_id` it's asked about, and `RiptideWeb.LDP.ResourceController`'s `GET`
-  action, `SseController`'s subscribe, and `ReplicationChannel`'s join all called
-  `StreamSupervisor.ensure_ready/1` (which mints that atom) unconditionally — including for a
-  resource nobody had ever written to. An authenticated user with ordinary read access to their
-  own tenant could loop distinct never-created paths to exhaust the BEAM's atom table and crash
-  the shared node for every tenant; `Riptide.Stream.Placement`'s existing 10,000-streams-per-tenant
-  quota only partially bounded this (unlimited free, write-free atom creation via reads was still
-  possible). Fixed: the `GET` path now checks `Riptide.Placement.lookup/1` (a cheap, atom-free
-  existence query) before calling `ensure_ready/1` — 404 immediately if unassigned, no atom ever
-  minted. SSE subscribe and WS replication join must keep allowing "subscribe before first
-  write," so creation there is instead rate-limited per subject (`Riptide.NewStreamRateLimit`,
-  Hammer-backed) rather than refused outright.
+- **Post-4d hardening (PR #32) — full-repo audit remediation, not just atom exhaustion.** A
+  7-pass audit (correctness, security, concurrency, error handling, resource management, data
+  integrity, observability) found and fixed, with every finding independently re-verified against
+  real code/library source before being fixed:
+  - **Unbounded atom creation via read-only requests.** Found during a deep repo-health
+    investigation, 2026-08-28: `RaCluster.server_id/1` mints a permanent, never-freed BEAM atom for
+    any `stream_id` it's asked about, and `RiptideWeb.LDP.ResourceController`'s `GET` action,
+    `SseController`'s subscribe, and `ReplicationChannel`'s join all called
+    `StreamSupervisor.ensure_ready/1` (which mints that atom) unconditionally — including for a
+    resource nobody had ever written to. An authenticated user with ordinary read access to their
+    own tenant could loop distinct never-created paths to exhaust the BEAM's atom table and crash
+    the shared node for every tenant; `Riptide.Stream.Placement`'s existing 10,000-streams-per-tenant
+    quota only partially bounded this (unlimited free, write-free atom creation via reads was still
+    possible). Fixed: the `GET` path now checks `Riptide.Placement.lookup/1` (a cheap, atom-free
+    existence query) before calling `ensure_ready/1` — 404 immediately if unassigned, no atom ever
+    minted. SSE subscribe and WS replication join must keep allowing "subscribe before first
+    write," so creation there is instead rate-limited per subject (`Riptide.NewStreamRateLimit`,
+    Hammer-backed) rather than refused outright.
+  - **Turtle-parsing memory bomb.** A per-process heap cap was added after confirming empirically
+    that a ~3MB deeply-nested Turtle body drives ~863MB/~19s in the decoding process — the same
+    resource-exhaustion class as the atom issue above, from a different angle (untrusted input
+    driving unbounded resource use), and the concrete precedent motivating the Derivation and
+    Execution Layer spec's WASI fuel/memory-metering requirement for Capabilities
+    (`docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` §4).
+  - **Security**: closed a tenant-hijack path (sub-less JWTs sharing a bootstrapped owner policy);
+    scoped the `?token=` auth fallback to SSE only.
+  - **Concurrency/data-integrity**: fenced `ReplicaHealer`'s repair through the placement Ra
+    cluster's own consensus (new `{:claim_repair, ...}`/`{:release_repair, ...}` commands) instead
+    of trusting an unfenced leader check — closes a dual-leader race that could permanently orphan
+    a Ra member; made `RaCluster.replace_member/5`'s `remove_member` step fully idempotent.
+  - **Correctness**: `StreamServer.append/2`/`get_since/2` now fall back across all of a stream's
+    replicas (previously a de-facto SPOF on the first one); fixed `create_child`'s orphaned-child
+    risk on partial failure.
+  - **Error handling**: `RaMachine.apply/3` no longer crash-loops a replica forever on an
+    undecodable committed event; `RaCluster`'s core Ra wrappers now catch `:exit` uniformly;
+    placement-cluster-down now maps to 503 everywhere (`Authorize`, `PolicyController`, SSE, WS),
+    not a generic 500.
+  - **Resource management**: per-tenant live-stream quota (bounds unbounded Ra-cluster creation via
+    a POST loop), JWKS fetch timeout, policy-list dedup/cap, k8s resource limits + hardened
+    securityContext.
+  - **Observability**: new telemetry for authz decisions, HTTP exceptions, WS connect/join results,
+    ordinal fallback, placement-cluster formation attempts, stream formation failures, dropped
+    poison commands, quota rejections; logging added for previously-silent failure paths.
 
   **Known flake, confirmed 2026-08-28**: `SseControllerTest`'s "subscribing to more distinct
   brand-new streams than the configured limit is rejected with 429" test occasionally observes

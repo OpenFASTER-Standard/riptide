@@ -1,24 +1,30 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, eighth revision — a third, capped research pass
-chasing the ILP/anti-unification lead directly (§8.7.3): still no formal
-supersedes criterion, but a concrete, well-precedented arbitration tool
-for Sub-project 6e (bottom-clause-style bounding). This is one
+**Status:** Draft, ninth revision (2026-08-28 restructuring). This is one
 architecture spec defining a single new top-level Riptide sub-project,
-**Sub-project 6**, decomposed into phases 6a–6i, the same way Riptide's
+**Sub-project 6**, decomposed into phases 6a–6j, the same way Riptide's
 own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
-own implementation plan (`writing-plans`) when work on it starts. See §11
-for the itemized changelog across all eight revisions.
+own implementation plan (`writing-plans`) when work on it starts.
+
+This revision followed an independent cold-context architecture review
+(the review found real, previously-undetected defects — see §11) and
+restructured the document itself: the detailed research trail (three
+versioning-research passes, the blob/persistent-capability research) and
+the full revision-by-revision changelog through revision eight now live
+in a companion file,
+[`2026-08-27-derivation-and-execution-layer-research-log.md`](2026-08-27-derivation-and-execution-layer-research-log.md)
+("the research log" below). This document states current decisions and
+open questions plainly, without re-narrating "resolved this revision" /
+"corrected this revision" framing for facts that are now simply true —
+that framing is preserved, once, in the research log's own history.
 
 ## 1. Motivation and vision
 
 **Riptide's production-readiness roadmap (its own sub-projects 1–5:
 persistence, Docker/CI, clustering/HA, security/multi-tenancy,
-observability) is complete as of today**, per `PROGRESS.md`. This spec's
-work is the first thing built on top of that now-stable foundation, not a
-parallel effort competing with an unfinished one — worth stating plainly,
-since most of this document was drafted while that roadmap was still
-in flight.
+observability) is complete**, per `PROGRESS.md`. This spec's work is the
+first thing built on top of that stable foundation, not a parallel effort
+competing with an unfinished one.
 
 Riptide today is an event-sourced fact store: an append-only, per-resource
 log of RDF facts, with one hardcoded derivation. This spec adds the layer
@@ -38,30 +44,37 @@ the gap once, and the bridge gets built incrementally from real use — never
 front-loaded. Not three separate design choices; one discipline, applied
 consistently.
 
-**Deployment — resolved this revision.** This layer shares Riptide's Fact
-store, Rule representation, and Signature/Dialect definitions as one
-substrate, **and runs in the same OS process as Riptide's existing LDP
-surface** — one deployable, not a companion service. No separate
-scheduling, no separate deploy pipeline, no second thing to keep
-available.
+**Deployment.** This layer shares Riptide's Fact store, Rule
+representation, and Signature/Dialect definitions as one substrate, **and
+runs in the same OS process as Riptide's existing LDP surface** — one
+deployable, not a companion service. No separate scheduling, no separate
+deploy pipeline, no second thing to keep available.
 
 ## 2. Scope
 
 **In scope:** the object model (§3–6), the grounding for each decision
 (§8), two worked examples (§9), and Sub-project 6's phase breakdown (§7).
 
-**`administration-commons` note.** An earlier local project used the term
-"pattern" for a similar idea and sketched its own kernel. Superseded by
-this work, not something this spec reconciles with.
+**`administration-commons` note.** An earlier local project
+(`/work/misc/administration-commons`) used the term "pattern" for a
+similar idea and sketched its own kernel. Superseded by this work, not
+something this spec reconciles with.
 
-**Explicitly still open** (§10 for the full list): concurrent-effectful-
-execution coordination (confirmed this revision as real design work owed
-here, not a literature gap to close by more research); formal
-versioning/supersedes theory for rules; large-object/persistent-capability
-engineering details (§3.3, §4, §8.12 — the formal grounding is now
-confirmed, the concrete
-representation isn't); automated detection of ontology overlap (out of
-scope *by design*, §6.5).
+**"OpenFASTER-Standard" naming note.** This repo (`riptide`) lives in the
+`OpenFASTER-Standard` GitHub org — an aspirational name chosen early, not
+evidence of an active, independently-governed standards body today. §10's
+governance resolution ("Riptide-internal for now") means decision
+authority over what gets admitted to the Catalog/Hub rests with Riptide's
+own maintainers, regardless of which org hosts the repo. If OpenFASTER-
+Standard ever becomes a real multi-stakeholder governance body, that's a
+distinct future decision, not something this spec's org placement implies.
+
+**Still open** (§10 has the full list, kept in one place — not duplicated
+here or in a separate changelog): concurrent-effectful-execution
+coordination; formal versioning/supersedes theory for rules; large-object/
+persistent-capability engineering details; a threat model for the
+Pattern Hub's public surface; automated detection of ontology overlap
+(out of scope *by design*, §6.5).
 
 ## 3. Core concepts — facts and rules
 
@@ -70,21 +83,20 @@ scope *by design*, §6.5).
 - **Fact** — an atomic RDF(-star) assertion in the EDB. Carries
   *TransactionTime* (from Riptide's sequence number) and optionally a
   *ValidTime* interval (RDF-star-annotated, §8.4). Produced by one **Event**.
-- **Tenant** *(name settled this revision — "Tenant" itself, no rename)* —
-  an isolated administrative/institutional space. Facts, Rules,
-  CatalogEntries, and Capabilities are all tenant-partitioned. A Capability
-  grant in one Tenant is never exercisable by a Rule in another; this
-  composes with Riptide's shipped Phase 4c ACP authorization (default-deny,
-  container-level inheritance, deny-overrides-allow, tenant-root bootstrap
-  claim — confirmed accurate against the shipped design, `PROGRESS.md`
-  §4), not a parallel system. **Current note, updated this revision**: the
-  security-audit remediation flagged as in-progress on a sibling branch in
-  the prior revision has since landed on `main` (three parts: auth/authz,
-  Ra error handling, resource limits, and observability; dual-leader
-  repair fencing; closing the SSE/WS `Authz.evaluate` placement-down gap —
-  merged via PR #32) — as regular commits, not its own committed design
-  spec. Sub-project 6b's integration point should target this now-current
-  ACP surface directly.
+- **Tenant** — an isolated administrative/institutional space (this is the
+  final name — no rename). Facts, Rules, CatalogEntries, and Capabilities
+  are all tenant-partitioned. A Capability grant in one Tenant is never
+  exercisable by a Rule in another; this composes with Riptide's shipped
+  Phase 4c ACP authorization (default-deny, container-level inheritance,
+  deny-overrides-allow, tenant-root bootstrap claim — confirmed accurate
+  against the shipped design, `PROGRESS.md` §4), not a parallel system.
+  **Current integration target:** the security-audit remediation on
+  Riptide's ACP/auth surface has landed on `main` (PR #32) — a broad
+  remediation (auth/authz correctness, Ra error handling, resource limits,
+  concurrency/resilience fixes, observability), not only the narrower
+  atom-exhaustion fix `PROGRESS.md` currently documents for it (tracked as
+  a `PROGRESS.md` update, §8.11). Sub-project 6b's integration point
+  should target this full, current ACP surface directly.
 - **A Tenant's vocabulary is observed, not declared.** No separate
   "ontology preference" object. Whichever Signature a Tenant's own Facts
   happen to already use *is* their working vocabulary for that area. A
@@ -98,20 +110,13 @@ scope *by design*, §6.5).
 - **Signature** — a Rule's typed interface: its parameters and which
   predicates it reads/produces. Institution-theoretically, this is DOL's
   `Sign`, reused precisely (§8.1).
-- **Dialect — corrected this revision.** Previously described as two
-  independent, parallel W3C drafts (SPARQL-RL and SHACL 1.2 Rules). **As of
-  a direct re-check today, that's no longer accurate**: the live,
-  always-current URL for "SHACL 1.2 Rules" (`w3.org/TR/shacl12-rules/`) now
-  redirects to `w3.org/TR/sparql12-rl/` — the two appear to have been
-  consolidated by the Data Shapes Working Group into one document under the
-  SPARQL-RL name. The historical dated snapshot
-  (`w3.org/TR/2025/WD-shacl12-rules-20251209/`) is still directly reachable
-  as an archival artifact, per normal W3C practice, but is no longer the
-  current version of anything. **Target Dialect: SPARQL-RL**, tracked as
-  one document, not two — simpler than the prior revision assumed. Worth a
-  fresh check again before Sub-project 6c locks in a concrete grammar,
-  since this is a live Working Draft, not a finished Recommendation.
-  Reference evaluation engine: Soufflé's extended Datalog.
+- **Dialect: SPARQL-RL**, tracked as one document. (The separate "SHACL
+  1.2 Rules" draft this spec originally tracked in parallel has been
+  consolidated by the Data Shapes Working Group into the SPARQL-RL
+  document — confirm this hasn't changed again before Sub-project 6c-i
+  locks in a concrete grammar, since it's a live Working Draft, not a
+  finished Recommendation.) Reference evaluation engine: Soufflé's
+  extended Datalog.
 - **Rule** — a declarative IDB definition over a Signature: given a Body,
   conclude a Head. A Body is a conjunction of three literal kinds:
   - **Fact-pattern literals** — matched against the EDB, classical Datalog.
@@ -122,7 +127,7 @@ scope *by design*, §6.5).
     Templates) is inexpressible — caught by tracing a real scenario (§9)
     through the model, not by re-reading the document.
 
-### 3.3 Large objects (blobs) — direction confirmed by research this revision
+### 3.3 Large objects (blobs)
 
 **The problem, stated plainly.** Every Fact today is a small RDF triple,
 replicated through a per-stream Ra (Raft) cluster's consensus log. A
@@ -135,62 +140,42 @@ otherwise) as a second system operators must run and keep available
 alongside Riptide, and without blobs feeling bolted-on rather than a
 first-class Riptide concept.
 
-**Direction confirmed by a dedicated research pass this revision (§8.12
-for full grounding):** split identity from bytes, the same way this whole
-document already treats every other layer (§1's organizing idea). A blob
-is content-addressed (hashed) and immutable once written; a Fact
-references it by hash (e.g. `<urn:riptide-blob:sha256:...>`), making a
-blob just another kind of Term any Rule or Fact can point at. The small
-hash-pointer goes through Riptide's existing per-stream Ra log exactly
-like any other RDF triple value; the actual bytes live in an ordinary,
-independently-replicated, content-addressed local store that no single
-replication mechanism needs to fully mirror everywhere — confirmed as the
-real, convergent architecture across git, casync/desync, and IPFS/UnixFS
-(content-defined chunking, e.g. casync/desync's buzhash with a 16KB/64KB/
-256KB min/avg/max window; strong content-hash naming; chunk storage
-deliberately decoupled from the pointer/index structure that names them).
-Mainstream Raft-based stores (etcd, TiKV, CockroachDB) were checked and
-confirmed to *discourage or hard-limit* large values through consensus
-(etcd's default max request size is 1.5MiB) rather than solving this
-themselves — validating the premise that a genuinely separate mechanism
-is needed, without supplying one ready-made.
+**Direction (full grounding: research log Part 2):** split identity from
+bytes, the same way this whole document already treats every other layer
+(§1's organizing idea). A blob is content-addressed (hashed) and
+immutable once written; a Fact references it by hash (e.g.
+`<urn:riptide-blob:sha256:...>`), making a blob just another kind of Term
+any Rule or Fact can point at. The small hash-pointer goes through
+Riptide's existing per-stream Ra log exactly like any other RDF triple
+value; the actual bytes live in an ordinary, independently-replicated,
+content-addressed local store that no single replication mechanism needs
+to fully mirror everywhere — this is the convergent architecture across
+git, casync/desync, and IPFS/UnixFS, and mainstream Raft-based stores
+(etcd, TiKV, CockroachDB) confirm the same thing negatively: they
+discourage or hard-limit large values through consensus rather than
+solving this themselves.
 
-**A concrete production precedent for the chunk-store-plus-GC half of
-this** exists in Riak CS (discontinued — historical precedent, not a
-currently-maintained reference implementation): objects split into fixed
-1MB blocks keyed by `{UUID, BlockId}`, with garbage collection driven by
-an explicit manifest state machine
-(`writing → active → pending_delete → scheduled_delete`) plus a dedicated
-GC bucket scanned by a background process. Shared-log/consensus systems
-(CORFU, Delos) independently confirm the same shape at a different layer:
-a lightweight ordering/coordination step (CORFU's sequencer just hands
-out position tokens) stays separate from the bulk data plane (clients
-read/write flash units directly), with garbage collection via trim-plus-
-watermark rather than synchronous cross-replica compaction.
-
-**Connects directly to §4's daemon-capability question — see §8.12's
-verdict.** In every one of these precedents, the component clients
-actually talk to for bulk reads/writes is a **long-running, supervised,
-directly-addressable server process** — never a one-shot invocation. That
-is structurally the same shape §4 needs for a persistent capability like
-"serve this content over HTTP." Riptide's own blob store should be built
-as one privileged, built-in instance of that same supervised-process
-lifecycle pattern (a GenServer/supervision-tree-managed chunk store, hash-
-pointer metadata replicated via Ra) — **not** by routing blob storage
-through the general-purpose, tenant-facing, WASI-sandboxed Capability
-path meant for untrusted third-party code. "The blob store literally is a
-WASI capability grant" is the wrong framing; "both need the same
-supervised-long-running-process primitive underneath" is the right one.
+**Connects directly to §4's persistent-capability question.** Every
+concrete precedent for the chunk-store-plus-GC half of this (Riak CS;
+CORFU/Delos) puts a **long-running, supervised, directly-addressable
+server process** between clients and bulk data — never a one-shot
+invocation. That is structurally the same shape §4 needs for a persistent
+capability like "serve this content over HTTP." Riptide's own blob store
+should be built as one privileged, built-in instance of that same
+supervised-process lifecycle pattern (a GenServer/supervision-tree-managed
+chunk store, hash-pointer metadata replicated via Ra) — **not** by routing
+blob storage through the general-purpose, tenant-facing, WASI-sandboxed
+Capability path meant for untrusted third-party code. Sub-project 6j
+(§7) is where this gets built.
 
 **Still genuinely open** (§10): a concrete garbage-collection/reference-
 counting scheme for the case this document's own EDB actually creates —
 many RDF triples referencing the *same* chunk hash, unlike the
-object-store/shared-log semantics every precedent above was built for;
-what security boundary/tenant-scoping governs the privileged blob-serving
+object-store/shared-log semantics every precedent was built for; what
+security boundary/tenant-scoping governs the privileged blob-serving
 process itself, given it sits outside the general WASI sandbox by design;
 and whether WASI Preview 2 (or later) has any native notion of a
-persistent/resumable component instance that could simplify this, which
-this pass could not confirm either way.
+persistent/resumable component instance that could simplify this.
 
 ## 4. Capability, NativeTemplate, Template
 
@@ -210,35 +195,43 @@ this pass could not confirm either way.
   - Backed by WASI Preview 2 (no ambient authority, no subprocess spawning
     by design) plus WASIX where subprocess spawning is specifically
     granted (§8.3).
-  - **A universality check surfaced a real gap, now grounded by research
-    (§8.12).** "File a tax return," "extract page 2 of a PDF," and "serve
-    this web page over HTTP" should all be expressible as Capabilities —
-    that's the whole point of the model's generality, not a feature to add
-    later. The first two are one-shot: invoke, get a discrete Outcome,
-    done — exactly what `(Rule, Bindings, EDB-state) → Outcome` (§5)
-    already models. "Serve this page" is not: it's a long-running,
+  - **Resource metering is a hard requirement, not an enhancement.**
+    Riptide has already hit two independent resource-exhaustion incidents
+    from unmetered execution against untrusted-shaped input: unbounded
+    BEAM atom creation via unauthenticated-adjacent reads, and a
+    ~3MB deeply-nested Turtle body driving ~863MB/~19s in the decoding
+    process (both fixed in PR #32; the second is not yet reflected in
+    `PROGRESS.md`, §8.11). A Capability is exactly this risk shape again —
+    tenant-scoped, but running arbitrary WASI component code — so 6b
+    (§7) must enforce fuel and memory limits from its first exit
+    criterion, not add them after a third incident. `wasmex` (the Elixir
+    WASM host this stack would use) has verified, real APIs for both:
+    `Wasmex.EngineConfig.consume_fuel/2` plus `Wasmex.StoreOrCaller.set_fuel/2`
+    trap deterministically when a component's fuel is exhausted, and
+    `Wasmex.StoreLimits` bounds `:memory_size`, `:table_elements`,
+    `:instances`, `:tables`, and `:memories` per store.
+  - **Long-running Capabilities.** "File a tax return," "extract page 2 of
+    a PDF," and "serve this web page over HTTP" should all be expressible
+    as Capabilities — that's the whole point of the model's generality.
+    The first two are one-shot: invoke, get a discrete Outcome, done —
+    exactly what `(Rule, Bindings, EDB-state) → Outcome` (§5) already
+    models. "Serve this page" is not: it's a long-running,
     continuously-listening process serving arbitrarily many requests over
-    its lifetime. **The formalism that actually fits this shape is session
-    types with runtime adaptation (Di Giusto & Pérez), not an extension of
-    the algebraic-effect/handler theory §5 already leans on for one-shot
-    Interpretations** — no confirmed literature extends effect-handler
-    theory to persistent effects, but this process-calculus line proves
-    exactly the safety property a revocable, tenant-scoped long-running
-    Capability needs: an update/restart action on a running process is
-    only permitted when it isn't currently mid-session, so a long-running
-    Capability can be replaced or revoked without corrupting in-flight
-    requests. The same paper directly works out Erlang/OTP supervision
-    trees as a formal example of this calculus — both `one_for_one` and
-    `one_for_all` restart strategies typed within it — giving a real,
-    citable bridge between this theory and `Riptide.Stream.StreamServer`'s
-    own supervision-tree shape, not an analogy this document is making
-    unaided. A long-running Capability's implementation is a supervised
-    OTP process wearing a Capability grant, typed for exactly this
-    adaptation safety property. Whether that's a second Capability
-    dimension (e.g. `Ephemeral` vs `Persistent`, alongside StabilityClass)
-    or something structurally different is still open (§10) — this
-    revision confirms the right formal grounding, not the concrete
-    representation.
+    its lifetime. The formalism that fits this shape is session types with
+    runtime adaptation (Di Giusto & Pérez — full grounding in the research
+    log's Part 2), not an extension of the algebraic-effect/handler theory
+    §5 leans on for one-shot Interpretations: it proves the safety property
+    a revocable, tenant-scoped long-running Capability needs (an
+    update/restart action on a running process is only permitted when it
+    isn't currently mid-session), and the same paper formalizes Erlang/OTP
+    supervision trees as a worked example — a real, citable bridge to
+    `Riptide.Stream.StreamServer`'s own supervision-tree shape. A
+    long-running Capability's implementation is a supervised OTP process
+    wearing a Capability grant, typed for exactly this adaptation-safety
+    property. Whether that's a second Capability dimension (e.g.
+    `Ephemeral` vs `Persistent`, alongside StabilityClass) or something
+    structurally different is still open (§10) — the formal grounding is
+    settled, the concrete representation isn't.
 - **NativeTemplate** — a Rule whose Body is exactly one capability-reference
   literal. The base case, backed by a real, capability-scoped WASI
   component. Sequencing note: Sub-project 6b (§7) builds the WASI execution
@@ -288,16 +281,16 @@ two scopes:
   `scratch-command-bar`'s existing propose/review precedent; `Merge`
   additionally because graph three-way merge is provably weaker than
   git's. `Reject` skips review. **Must also handle multiple candidates**:
-  per §8.2's resolved decision not to constrain Rule expressiveness to the
-  bisimilar-term-graph fragment, anti-unifying two Rules can yield several
+  Rule expressiveness is not constrained to the bisimilar-term-graph
+  fragment (§8.2), so anti-unifying two Rules can yield several
   mutually-incomparable generalizations rather than one canonical answer —
   DedupGate's arbitration mechanism for that case is Sub-project 6e's own
-  design work, not specified here. §8.7.3 surfaces a real, well-precedented
-  tool worth trying first: bottom-clause-style bounding (Muggleton's
-  inverse entailment) applied per anti-unification call, which recovers a
+  design work, not specified here. One concrete, well-precedented tool
+  worth trying first: bottom-clause-style bounding (Muggleton's inverse
+  entailment), applied per anti-unification call, which recovers a
   well-defined single generalization locally without a blanket restriction
-  on Rule expressiveness — a real ILP-system technique (Progol, Golem), not
-  invented for this spec.
+  on Rule expressiveness — a real ILP-system technique (Progol, Golem),
+  not invented for this spec (full grounding: research log Part 1, Pass 3).
 - **CatalogEntry** — `⊑ Rule`, admitted or merged by DedupGate, subject to
   §5's admission consequence.
 - **Pattern is not a separate type.** It's the name for a CatalogEntry at
@@ -319,17 +312,14 @@ two scopes:
 
 ### 6.5 Crosswalk
 
-- **Same-Dialect translation** (the common case, especially now that §3.2
-  consolidates the Dialect target to one document): a **signature
+- **Same-Dialect translation** (the common case, especially with §3.2's
+  Dialect target consolidated to one document): a **signature
   morphism** — an arrow within one institution's `Sign` category, already
   this document's own vocabulary. Soundness vocabulary, if ever checked:
   model-conservativeness / Mod-strictness / Sen-maximality.
 - **Cross-Dialect translation**: a full **comorphism** — categorically
   heavier, and the case where the sublogic/embedding/faithful/(weakly)
-  exact fidelity scale actually applies (per DOL's own worked practice). An
-  earlier draft proposed modeling *all* Crosswalks as comorphisms; checked
-  against the primary literature, that was wrong for the same-Dialect
-  case, which is the common one.
+  exact fidelity scale actually applies (per DOL's own worked practice).
 - **Human-facing representation, either case: SSSOM** —
   `exact_match`/`close_match`/`broad_match`/`narrow_match`/`related_match`,
   a curator's practical judgment ("fitness for purpose," explicitly not a
@@ -353,48 +343,145 @@ two scopes:
 
 Riptide's own `PROGRESS.md` sub-projects (1–5) are complete; this becomes
 **Sub-project 6**, decomposed the same way sub-projects 3–5 already are.
-Each phase becomes its own spec → plan → implementation cycle.
+Each phase becomes its own spec → plan → implementation cycle. Every
+phase below states its dependencies (normalized as **Depends on:**) and
+one falsifiable exit criterion.
+
+### Walking skeleton
+
+The minimal phase subset that proves the whole design end-to-end, ahead
+of the full roadmap: **6b → 6c-i → 6d-i → 6e → 6f → 6g-i**. Exit
+criterion, concretely: a Task with no Catalog match runs through
+LLMFallback twice, and the resulting CatalogEntry is admitted; a third,
+similar Task hits Discovery's exact/keyword lookup directly, with **zero**
+LLM calls (this is §9.1's own worked example, made falsifiable). Getting
+here doesn't require 6a, 6c-ii/6c-iii, 6d-ii, 6g-ii, 6h, 6i, or 6j — those
+extend the skeleton, they don't gate it.
+
+### Phases
 
 - **6a — Bitemporal fact shape.** RDF-star `validFrom`/`validTo`, a defined
   OWL-Time Allen-relation subset, ValidTime defaulting to TransactionTime.
-  Applies to Riptide's existing LDP write path. **Must build on the
-  already-shipped Phase 3a schema-versioning envelope** (`PROGRESS.md`
-  §3, shipped 2026-08-24) rather than treat the `Event`/`Patch` shape
-  change as a fresh, unaddressed risk — that envelope exists specifically
-  so a struct-shape change like this one doesn't break reading
-  previously-persisted data. Depends on nothing else. Deferred to 6c+:
-  making ValidTime queryable/joinable in rule logic.
+  Applies to Riptide's existing LDP write path, building on the
+  already-shipped Phase 3a schema-versioning envelope (`PROGRESS.md` §3,
+  shipped 2026-08-24) rather than treating the `Event`/`Patch` shape
+  change as a fresh, unaddressed risk.
+  **Depends on:** nothing.
+  **Exit criterion:** a Fact can carry a ValidTime interval distinct from
+  its TransactionTime, round-trips through the existing LDP write/read
+  path unchanged for Facts that don't set one, and is covered by a
+  migration test against the Phase 3a envelope.
 - **6b — Execution substrate.** WASI component execution, WASIX capability
   grant, tenant-scoped and split into EffectCapability/ObserveCapability
-  from the start. Must produce the integration point with Riptide's
-  *current* ACP model (§3.1's live-audit-remediation note) as an exit
-  criterion. Tested with no Rule representation involved.
-- **6c — Pure derivation engine.** Cross-stream joins, recursion,
-  aggregation, query interpretation only. Depends on 6a.
+  from the start. Tested with no Rule representation involved.
+  **Depends on:** nothing.
+  **Exit criterion:** a tenant-scoped WASI component can be invoked as an
+  EffectCapability or ObserveCapability against Riptide's current ACP
+  surface (§3.1); a component that exceeds a configured fuel or memory
+  limit (§4's `wasmex` APIs) traps deterministically instead of degrading
+  the host, exercised by a test analogous to the Turtle-parsing and
+  atom-exhaustion incidents already fixed in PR #32.
+- **6c — Pure derivation engine**, split by concern (following the
+  established Phase 3c-i/ii/iii precedent for splitting an oversized
+  phase):
+  - **6c-i — Fact-pattern matching and joins.**
+    **Depends on:** nothing beyond Riptide's fact store as it exists
+    today (bitemporal joins are 6c-iii's concern, not this one's).
+    **Exit criterion:** a Rule with only fact-pattern literals in its Body
+    evaluates correctly against multi-stream joins in the EDB, verified
+    against a hand-written suite of representative join queries.
+  - **6c-ii — Recursion and fixpoint evaluation.**
+    **Depends on:** 6c-i.
+    **Exit criterion:** a recursive Rule (e.g. transitive closure) reaches
+    a correct fixpoint over the EDB, with a documented stratification/
+    termination discipline.
+  - **6c-iii — Aggregation and full QueryInterpretation.**
+    **Depends on:** 6c-ii. ValidTime-aware querying additionally depends
+    on 6a — that dependency is scoped to this sub-phase, not to 6c as a
+    whole, so 6a and 6c-i/6c-ii can proceed in parallel.
+    **Exit criterion:** QueryInterpretation supports aggregation and, for
+    Facts carrying a ValidTime interval, can filter/join on it.
+    `linkml-datalog`'s liveness (§8.6) must be re-checked immediately
+    before this phase starts, not assumed from spec-writing time.
 - **6d — Wiring**, split by risk:
-  - **6d-i — mechanical wiring.** Execute interpreter, real NativeTemplate
-    instances, `call_template` against a small hand-authored set. Low risk.
-  - **6d-ii — concurrent-effects design spike.** No established theory
+  - **6d-i — Mechanical wiring.** Execute interpreter, real NativeTemplate
+    instances, `call_template` against a small hand-authored set.
+    **Depends on:** 6b (execution substrate) and 6c-i (fact-pattern
+    matching — the minimum Rule representation NativeTemplate needs;
+    6c-ii/6c-iii are not required here).
+    **Exit criterion:** a hand-authored set of NativeTemplate instances is
+    invoked end-to-end through ExecuteInterpretation via `call_template`,
+    exercising 6b's substrate and 6c-i's matching together.
+  - **6d-ii — Concurrent-effects design spike.** No established theory
     answers coordinating concurrent ExecuteInterpretations over
     overlapping, irreversible resources (checked: neither sagas nor CRDTs
     establish this). Real, open design work.
+    **Depends on:** 6b (needs EffectCapability semantics to design
+    coordination for); benefits from 6d-i's concrete wiring as a
+    prototyping substrate but isn't blocked on it.
+    **Exit criterion:** a written design decision (not a test) for how
+    concurrent, overlapping EffectCapability invocations are coordinated.
 - **6e — Generalization and DedupGate**, including replay-testing fidelity
-  with the kind-specific semantics from §4. Depends on 6d-i.
+  with the kind-specific semantics from §4.
+  **Depends on:** 6d-i.
+  **Exit criterion:** two independently-produced Traces anti-unify into a
+  single Generalization, pass DedupGate's `Admit` path with sandboxed
+  replay-testing evidence, and become a live CatalogEntry.
 - **6f — LLM fallback loop.** OAuth ported to Elixir by hand (no ecosystem
   to lean on — `lambdaclass/datalog` dead, `fogfish/datalog` real but
-  dormant since 2019, re-confirmed today, no change). Needs 6e's gate.
+  dormant since 2019; full Datalog-library liveness tracking lives in
+  §8.6/6c-iii, not here, since this phase's own subject is the LLM
+  fallback loop, not Datalog tooling).
+  **Depends on:** 6e.
+  **Exit criterion:** a Task with no Catalog match completes via
+  LLMFallback, produces a Trace, and that Trace is accepted by 6e's gate
+  without manual code changes.
 - **6g — Discovery**, split by readiness:
-  - **6g-i — exact/keyword lookup**, viable as soon as any CatalogEntry
-    exists (as early as 6e) — a real walking skeleton well before the rest
-    of the roadmap ships.
-  - **6g-ii — hybrid keyword+embedding progressive disclosure**, deferred
+  - **6g-i — Exact/keyword lookup**, viable as soon as any CatalogEntry
+    exists — the walking skeleton's own last step.
+    **Depends on:** 6e.
+    **Exit criterion:** a CatalogEntry admitted by 6e is found by exact/
+    keyword Discovery and invoked without an LLM call.
+  - **6g-ii — Hybrid keyword+embedding progressive disclosure**, deferred
     until the catalog is large enough to need it.
+    **Depends on:** 6g-i.
+    **Exit criterion:** not yet defined — deferred with the phase.
 - **6h — Pattern Hub.** Stand up Hub-scope Catalog as a distinct,
-  publicly-reachable deployment of the same DedupGate mechanism 6e already
-  builds. Depends on 6e.
+  network-publicly-reachable deployment of the same DedupGate mechanism
+  6e already builds. **"Publicly-reachable" is a network-exposure fact,
+  independent of §2's governance clarification** — the Hub can be
+  reachable by any Tenant (including future external ones) while curation
+  /admission authority stays Riptide-internal; these are orthogonal axes,
+  not in tension. Because this is Riptide's first network-public-facing
+  surface, it needs its own auth/rate-limit threat model defined in 6h's
+  own future spec **before implementation starts**, not discovered during
+  implementation (§10).
+  **Depends on:** 6e.
+  **Exit criterion:** a CatalogEntry can be published to Hub scope and
+  installed into a different Tenant via 6i, over a network-reachable
+  endpoint gated by the auth/rate-limit model that phase's own spec
+  defines.
 - **6i — Ontology Crosswalks and Installation.** SSSOM-shaped Hub-scope
   Crosswalk content, the Install operation, human-curation workflow.
-  Depends on 6h.
+  **Depends on:** 6h.
+  **Exit criterion:** installing a Hub Pattern into a Tenant with partial
+  vocabulary overlap binds matched fields through an existing Crosswalk
+  and records manually-originated Provenance for unmatched fields, per
+  §6.5.
+- **6j — Large object (blob) storage.** Implements §3.3/the research
+  log's Part 2 blob architecture: content-addressed chunk store as a
+  privileged, built-in supervised process, hash-pointer Facts through
+  Riptide's existing per-stream Ra log. No phase covered this in prior
+  revisions of this document — added this revision after the gap was
+  found during restructuring (§11).
+  **Depends on:** 6b (shares the supervised-process substrate 6b's own
+  daemon-capability grounding establishes, per §3.3/§4).
+  **Exit criterion:** a Capability can write a blob larger than 10MB,
+  addressed by content hash, retrievable via a hash-pointer Fact
+  replicated through Riptide's existing per-stream Ra log, with a
+  documented (even if provisional) garbage-collection scheme and an
+  explicit statement of what security boundary governs the privileged
+  blob-serving process.
 
 **Ongoing, not sequential:** LinkML authoring applied to each new schema as
 created (§8.6).
@@ -416,7 +503,7 @@ only **finitary**, with unitarity proven only for the narrower
 bisimilar-term-graph case. Minimizing generalization variables is
 NP-complete in the closest scalable formalism (Yernaux & Vanhoof 2022).
 
-**Resolved this revision: Rule expressiveness is not constrained to the
+**Decision: Rule expressiveness is not constrained to the
 bisimilar-term-graph fragment.** A Rule's Body may express arbitrary
 cross-referencing between rule-reference literals (real composability,
 e.g. one sub-Rule's output feeding another's input, matters more than
@@ -424,12 +511,13 @@ guaranteed-unique anti-unification). The consequence is accepted
 explicitly: DedupGate (§6) must handle the case where anti-unifying two
 Rules yields several mutually-incomparable candidate generalizations, not
 assume there's always exactly one. The concrete arbitration mechanism
-(present all candidates for human review; some ranking heuristic; some
-other approach) is not designed here — Sub-project 6e's job, once a real
-Rule representation exists to test it against.
+(present all candidates for human review; some ranking heuristic; bottom-
+clause-style bounding per §6; some other approach) is Sub-project 6e's
+job, once a real Rule representation exists to test it against.
 
 **8.3 Execution kernel.** WASI Preview 2 excludes fork/exec/subprocess
-spawning by design; WASIX is the separate superset restoring it.
+spawning by design; WASIX is the separate superset restoring it. See §4
+for the resource-metering requirement layered on top of this kernel.
 
 **8.4 Bitemporal facts.** Datomic is unitemporal; XTDB's two-axis model is
 the target shape, via RDF-star + OWL-Time. Valid-time must be duplicated
@@ -440,238 +528,25 @@ it.
 fell out of tracing §9.2 through the model, not external research — this
 document's own synthesis, presented as such.
 
-**8.6 Authoring — liveness re-checked today.** LinkML adopted for 6c's
-rule schema and 6h/6i's Pattern and Crosswalk schemas. `linkml-datalog`:
-re-checked, still last pushed 2024-02-14, one open issue, not archived —
-dormant, unchanged from the prior check, worth another look immediately
-before 6c actually depends on it rather than assuming continued dormancy.
+**8.6 Authoring.** LinkML adopted for 6c's rule schema and 6h/6i's Pattern
+and Crosswalk schemas. `linkml-datalog`: last pushed 2024-02-14, one open
+issue, not archived — dormant. Re-check immediately before 6c-iii
+actually depends on it, not just at spec-writing time.
 
-**8.7 Versioning — liveness re-checked today.** TerminusDB: last pushed
-2026-08-10 (~2.5 weeks ago), actively maintained. Fluree: last pushed
-2026-08-27 (today), very actively maintained. Both current as of this
-check; graph three-way merge is still weaker than git's (§6's DedupGate
-`Merge` rule) regardless of either project's activity level.
-
-**8.7.1 Formal supersedes theory — real anchors found this revision, no
-exact fit.** A dedicated research pass (four angles, 20 primary sources,
-25 claims adversarially verified) found two genuine formal theories in
-this space, and closed off one dead end:
-
-- **AGM/Katsuno-Mendelzon logic-program-update theory is real, peer-reviewed,
-  and still actively cited (2007–2023)** — Delgrande/Peppas/Woltran (LPNMR
-  2013) rephrase the AGM postulates for logic programs with SE-model-based
-  semantic revision operators and representation theorems by program class;
-  Slota & Leite (TPLP 2014) adapt Katsuno-Mendelzon's postulates to
-  answer-set-program *update* specifically, with a constructive
-  representation theorem. This is the closest existing formalism to "what
-  does it mean to update a rule set given a new rule" found anywhere in
-  this research. **But it comes with a proven limitation, not just a
-  caveat**: Slota & Leite's Theorem 31 proves any SE-model/KM-based ASP
-  update operator satisfying syntax-independence cannot simultaneously
-  satisfy both the *support* and *fact update* properties — a real
-  adequacy ceiling on this branch of theory, to design around rather than
-  discover the hard way.
-- **Description-logic conservative-extension/inseparability theory was
-  directly extended in 2022 to existential rules (TGDs)** — Jung, Lutz &
-  Marcinkowski (KR 2022) give two independent formal criteria (conjunctive-
-  query-answer preservation; chase-homomorphism preservation) for whether
-  one TGD set safely extends another, the closest syntactic match to
-  Datalog-style rules found. Decidable only for restricted fragments
-  (e.g. frontier-one TGDs) — undecidable in general (linear/guarded TGDs).
-  This formalizes *safe extension without changing prior entailments*, not
-  a directional generalize/refine "supersedes" relation — a real, useful,
-  but different question than the one this spec actually has.
-- **Patch theory (categorical and homotopical/HoTT formalizations of
-  Darcs) is a confirmed non-fit, not an unexplored option.** Every formal
-  object and worked example across four primary sources is generic
-  text/structured data (lines, integers, boolean lists) — zero mentions of
-  rules, logic programs, ontologies, or knowledge bases anywhere in the
-  primary literature. Its only notion of combining changes (merge as
-  categorical pushout) is symmetric, not the directional relation needed
-  here. Should not be revisited as a lead without new information.
-- **No rigorous, non-conventional theory of breaking-vs-compatible
-  schema/rule change was found** — a genuine gap in what this pass
-  surfaced, not proof none exists; it may hide under different
-  terminology (view update problem, schema mapping evolution, Horn/rule
-  theory revision) a future pass should search directly.
-- **The most promising unexplored angle, surfaced by this research but not
-  itself researched yet:** anti-unification's own literature (Plotkin's
-  least-general-generalization, Inductive Logic Programming's
-  generalization/specialization lattices under θ-subsumption) may connect
-  *directly* to a formal subsumption ordering between rules — closer to
-  this spec's actual mechanism (§5's Generalization) than either DL/TGD or
-  AGM/KM, and not covered by any of the four angles this pass researched.
-  Worth its own dedicated pass before concluding no exact fit exists
-  anywhere.
-
-**8.7.2 Second pass, chasing this revision's own leads — real literature
-found, still no exact fit.** Following up directly on the terminology
-§8.7.1 named (view update problem, schema mapping evolution, Horn/rule
-theory revision) plus a fresh check for 2023–2026 advances:
-
-- **The classical view update problem (Bancilhon & Spyratos 1981;
-  Cosmadakis & Papadimitriou 1984, JACM; Franconi & Guagliardo 2012) is
-  real, rigorous, and decidable in restricted cases** — the "constant
-  complement" principle, operationalized as view-mapping invertibility,
-  reducing to a decidable polynomial-time dependency-implication test for
-  FD+JD-only schemas. **But confirmed, via full-text negative search, to
-  answer a different question**: it's about translating a *data* update
-  through a *fixed* view/rule, never about changing the rule mapping
-  itself — zero occurrences of "evolution" or "compatible" anywhere in
-  the primary literature. One transferable hint: extending even the
-  propositional-level result to full first-order logic already requires
-  structural restrictions (weak stratification, definiteness) — any
-  analogous safe-generalization criterion for Riptide's own Rules would
-  likely need similar restrictions, not a fully general result.
-- **Schema-mapping-evolution literature (Fagin/Kolaitis/Popa/Tan 2011;
-  Yu & Popa, VLDB 2005; Velegrakis/Miller/Popa, VLDB 2003) is real,
-  foundational, and TGD-based** — directly relevant in substance, since
-  it uses the same source-to-target TGD formalism as existential rules.
-  Formalizes evolution as mapping composition/inversion, with a hierarchy
-  of chase-based inverse notions and a "mapping universe" membership
-  test. **But the authors never define an independent
-  compatible/breaking predicate** — a change is judged safe only
-  operationally, by whether the adaptation procedure succeeds — and a
-  stronger reading (that this literature offers a clean two-tier
-  validity/consistency breaking-change taxonomy) was explicitly refuted
-  on verification. There's also a hard expressiveness ceiling: plain
-  source-to-target TGDs aren't closed under composition in general, so
-  composing two TGD-level changes can require stepping outside the
-  TGD/Datalog language entirely (second-order TGDs) just to stay
-  expressible.
-- **No 2023–2026 advance was found for any previously-researched
-  branch** — not AGM/Katsuno-Mendelzon logic-program update, not TGD
-  conservative extension. The Jung/Lutz/Marcinkowski KR 2022 paper
-  re-surfaced under this pass's own search is the *same* paper §8.7.1
-  already found, not new information; its undecidability limits for
-  linear/guarded TGDs stand unchanged.
-- **Horn-theory/Datalog-program revision under database-dependency-theory
-  framing (distinct from AGM/KR), and "does classical FD/IND implication
-  theory give a safe-extension notion for a whole dependency set"** —
-  both came back with zero on-point literature. After two dedicated
-  passes searching different terminology for each, these are now
-  confirmed gaps, not just unsearched corners.
-- **This pass's own new leads, not yet researched:** does any literature
-  treat *anti-unification-based* rule generalization specifically as its
-  own formal object with a compatibility criterion tuned to that
-  operation — rather than generic TGD composition or conservative
-  extension? (This independently arrives at the same place §8.7.1's ILP
-  generalization-lattice lead already pointed to.) Is there a
-  sound-but-incomplete, decidable approximation of conservative extension
-  for Datalog-style rules, trading completeness the way DL literature
-  sometimes does with syntactic sufficient conditions? Does any work
-  combine schema-mapping-evolution's composition/inversion *mechanism*
-  with conservative extension's *safety test*?
-
-**Net, after two dedicated research passes**: no single existing
-formalism directly answers "rule B (refined) supersedes rule A
-(generalized)." The pragmatic git/TerminusDB-style model stays the
-adopted approach. Two real candidate anchors exist (AGM/KM update theory;
-TGD conservative-extension) plus two real-but-answering-a-different-
-question bodies of work now ruled out as direct fits (view update
-problem; schema-mapping-evolution correctness). **Every path now points
-at the same next step**: ILP's own anti-unification/generalization-
-lattice literature, independently surfaced by both this revision and the
-prior one as the lead closest to this spec's actual mechanism — worth
-its own dedicated pass before any further generic sweep of adjacent
-database-theory terminology, which has now been tried twice with
-diminishing returns.
-
-**8.7.3 Third pass, chasing the ILP/anti-unification lead directly — no
-full supersedes criterion, but one genuinely actionable connection.** A
-capped five-angle pass (Plotkin's lattice itself; θ-subsumption/refinement
-operators; ILP theory-revision systems FORTE/INTHELEX/CLINT/Wrobel;
-version spaces; modern 2015–2026 anti-unification/MIL/probabilistic-ILP
-work) confirms the gap from a fifth different direction, but surfaces one
-real, concrete, implementable technique:
-
-- **Four of five angles confirm the same gap, again, from ILP's own home
-  field.** The subsumption lattice itself is a pure ordering, not a
-  validity criterion — and θ-subsumption is a *sound but incomplete*
-  proxy for logical implication, a gap so real that a widely-cited
-  "convenient" special case of the field's own "Subsumption Theorem" was
-  later proven **false**, requiring some published inverse-resolution
-  results to be reconsidered (Nienhuys-Cheng & de Wolf, ILP-95). Refinement
-  operators have precise soundness/completeness properties, but these
-  characterize *search-traversal reachability* within an already-fixed
-  ordering, not validity of replacing one rule with another — and a
-  general **nonexistence** result holds: no "ideal" (locally-finite +
-  proper + complete) refinement operator exists for unrestricted clause
-  sets under θ-subsumption *or* full logical implication (van der Laag &
-  Nienhuys-Cheng). Real ILP theory-revision systems (FORTE, INTHELEX,
-  CLINT) uniformly accept a revision by an empirical/heuristic test
-  (coverage of a fixed example set, accuracy improvement) — never a
-  proof-theoretic guarantee that untouched entailments survive the
-  revision. Wrobel (1993) is the one partial exception — formal AGM-style
-  "base revision postulates" for *specialization* only, explicitly scoped
-  away from generalization. FORTE's own authors independently rediscover
-  and state the same AGM/ILP mismatch §8.7.1 already found from the belief-
-  revision side: "this work does not address the inductive problem of
-  generalizing a theory... [it] tends to focus on minimal semantic change
-  which requires memorizing exceptions" — real corroboration from a
-  second, independent lineage.
-- **Version spaces (Mitchell 1978/1982; Hirsh 1991) is the one angle that
-  gives something new and concretely usable.** Hirsh's theorem is
-  domain-independent and rule-language-agnostic: *any* partially-ordered
-  hypothesis language is representable by safe generalization/
-  specialization boundary sets **if and only if it is convex and
-  definite** — a real, checkable, general criterion, not
-  attribute-value-specific. Applied honestly to an unrestricted Horn-
-  clause/Datalog rule space, this typically **fails** (not definite) —
-  the same nonexistence result as above, confirmed concretely: Progol's
-  own unbounded hypothesis space is proven **not a lattice** (a
-  generalization of two reachable clauses can itself be unreachable).
-  **But there's a proven fix, already used in working ILP systems**:
-  bounding the hypothesis space below by a "bottom clause" (Muggleton's
-  inverse entailment) restores a genuine lattice — lgg and most-general-
-  specialization both guaranteed to exist, ideal refinement operators
-  provably exist for the *bounded* order even though they don't for the
-  unbounded one (Tamaddoni-Nezhad & Muggleton 2009). And: anti-unification
-  — the exact mechanism this spec already adopted for Generalization (§5)
-  — is confirmed to be literally the operation that builds the
-  generalization/S-boundary side of this lattice for Horn clauses (Golem,
-  ProGolem); the specialization/G-boundary side is the half that provably
-  breaks down without bounding.
-- **The actionable connection to this spec's own Decision 1 (§8.2, §6):**
-  this doesn't reverse that decision (Rule expressiveness stays
-  unconstrained; DedupGate arbitrates incomparable generalizations) — but
-  it gives Sub-project 6e a concrete, well-precedented *tool* for that
-  arbitration, worth recording now rather than rediscovering later:
-  bottom-clause-style bounding **per anti-unification call** (anchoring a
-  generalization attempt to a maximally-specific reference point) can
-  recover a well-defined lgg locally, exactly where DedupGate needs one,
-  without a blanket restriction on what a Rule's Body can express overall.
-  A genuinely different lever than "constrain globally" (rejected) or
-  "arbitrate freely with no structure" (chosen) — a third option worth
-  testing once 6c produces a real Rule representation to try it against.
-- **Modern (2015–2026) work reuses classical machinery or answers a
-  different question.** Popper (Cropper & Morel 2021) has a real, modern,
-  machine-checked soundness theorem for pruning during search — built
-  explicitly on unchanged Plotkin (1971)/Midelfart (1999) subsumption, not
-  new theory. Patsantzis & Muggleton (2022) genuinely extend subsumption
-  itself (to higher-order metarules) but for *search-procedure* validity,
-  not rule-base update. `babble` (Cao et al., POPL 2023) — anti-
-  unification-based library learning via e-graphs — has a real 2023
-  soundness+completeness theorem for "abstraction validly replaces
-  specific code," but the validity notion is semantic/operational
-  equivalence (β-reduction), a structurally different tool than logical
-  subsumption, answering "is this the same program," not "does this rule
-  supersede that rule." The field's own authoritative retrospective ("ILP
-  at 30," Cropper/Dumančić/Evans/Muggleton 2022) does not treat rule-
-  supersession-for-versioning as either solved or an open problem — it is
-  simply not on the mainstream research agenda.
-
-**Net, after three dedicated research passes**: still no existing
-formalism directly answers "rule B (refined) supersedes rule A
-(generalized)" — the gap is now confirmed from five independent
-directions (DL/AGM, patch theory, view update/schema-mapping-evolution,
-and now ILP's own home field). The pragmatic git/TerminusDB-style model
-remains the adopted approach. What this pass adds isn't a missing
-criterion but a concrete implementation tool for the decision already
-made: bottom-clause-style local bounding as Sub-project 6e's way of
-recovering well-defined generalizations exactly where DedupGate needs
-them, informed by real, working ILP-system precedent rather than invented
-from scratch.
+**8.7 Versioning — formal supersedes theory for declarative rules.**
+TerminusDB and Fluree are both actively maintained (graph three-way merge
+is still weaker than git's regardless — §6's DedupGate `Merge` rule).
+Three dedicated research passes (five independent directions: AGM/
+Katsuno-Mendelzon logic-program update theory, description-logic
+conservative-extension/TGD theory, patch theory, the view-update problem
+and schema-mapping-evolution theory, and ILP's own subsumption/
+refinement-operator/version-space literature) found **no existing
+formalism that directly answers "rule B (refined) supersedes rule A
+(generalized)."** The pragmatic git/TerminusDB-style model is the adopted
+approach. The one genuinely actionable output of this research is
+recorded where it's used: bottom-clause-style bounding as a concrete tool
+for Sub-project 6e's DedupGate arbitration (§6). Full citations and the
+per-pass narrative: research log, Part 1.
 
 **8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
 C++ implementing semi-naive evaluation, backed by a concurrent B-tree and
@@ -695,67 +570,22 @@ document's own extension to that ordering, not documented CLIPS behavior.
 **8.11 Human review, UI, repo integration.** External research on
 review-gate placement and generic-shape-driven UI came back empty twice.
 Local precedent used instead: `scratch-command-bar`'s propose/review loop,
-`graphsheet`'s shipped SHACL-driven UI. **This work should be added to
-Riptide's `PROGRESS.md` sub-project table as Sub-project 6 no later than
-6b's start** — concrete now that 1–5 are confirmed complete and the table
-has an obvious next row.
+`graphsheet`'s shipped SHACL-driven UI. **Two `PROGRESS.md` updates owed,
+no later than 6b's start:** add Sub-project 6 as a row in the sub-project
+table, and expand the existing "Post-4d hardening" section to reflect
+PR #32's full scope (currently documents only the atom-exhaustion slice,
+not the Turtle-parsing heap-cap fix or the rest of that PR — §3.1, §4).
 
-**8.12 Large objects and persistent capabilities — researched together
-this revision, per explicit direction not to treat them as separate.** A
-dedicated research pass investigated both §3.3 and §4's daemon-capability
-gap as one question, since a native blob store and a long-running
-capability are plausibly the same underlying problem. 18 underlying
-claims individually passed adversarial verification (mostly 3-vote,
-primary sources: official docs, project wikis, peer-reviewed papers).
-
-- **Blob architecture**: Ra (this project's own Raft library) already
-  implements chunked, non-blocking transfer for its *internal* consensus
-  snapshots — `ra_snapshot`'s leader-side `begin_read`/`read_chunk` and
-  follower-side `begin_accept`/`accept_chunk`/`complete_accept`, with
-  integrity validation. Real BEAM-ecosystem precedent, but scoped to Ra's
-  own snapshots, not a general blob API — suggestive, not ready-made.
-  Content-addressed chunking (git, casync/desync, IPFS/UnixFS) converges
-  on one architecture: content-defined chunks named by a strong hash,
-  stored as independently-addressable objects, with the pointer/index
-  structure that names them deliberately decoupled from chunk storage.
-  Riak CS (discontinued; historical precedent) is the closest concrete
-  precedent for the *whole* shape: fixed blocks keyed by `{UUID,
-  BlockId}`, garbage-collected via an explicit manifest state machine.
-  CORFU/Delos confirm the same separation at the consensus layer:
-  lightweight ordering stays separate from the bulk data plane, GC via
-  trim-plus-watermark rather than synchronous cross-replica compaction.
-- **Persistent-capability formalism**: session types with runtime
-  adaptation (Di Giusto & Pérez, arXiv:1312.2699) — not algebraic-effect
-  handler theory, which no confirmed source extends to persistent effects
-  — proves the safety property this needs: an update/restart action on a
-  running process is only valid when it isn't mid-session. The same paper
-  formalizes Erlang/OTP supervision trees (both `one_for_one` and
-  `one_for_all` restart strategies) as a worked example of this exact
-  calculus — a genuine, citable bridge from capability-lifecycle theory to
-  OTP semantics, not an analogy invented for this document.
-- **Connecting verdict** (medium confidence — a synthesis across two
-  source clusters, not itself one independently-verified claim): the two
-  problems need the *same* underlying primitive — a supervised, long-lived,
-  directly-addressable process with a revocable/restartable lifecycle —
-  but a native blob store should **not** be literally implemented as an
-  instance of the general-purpose, tenant-facing, WASI-sandboxed
-  Capability abstraction meant for untrusted third-party code. It should
-  be a privileged, built-in instance of the *same* supervision/lifecycle
-  formalism a persistent Capability would also use. "The blob store is a
-  WASI capability grant" is false; "both need the same supervised-process
-  primitive underneath" is real and load-bearing.
-- **Explicitly unresolved by this pass**: whether WASI Preview 2 (or
-  later) has any native notion of a persistent/resumable component
-  instance, as opposed to strict instantiate-call-terminate — no claim
-  survived verification either way; whether the RabbitMQ/Ra maintainer
-  team has ever discussed blob co-location with Raft-backed metadata
-  beyond Ra's own internal snapshot-chunking — no claim surfaced; a
-  concrete garbage-collection scheme for the case this document's own EDB
-  actually creates (many RDF triples referencing the *same* chunk hash,
-  unlike the object-store/shared-log semantics every precedent above was
-  built for); and what security boundary governs the privileged
-  blob-serving process itself, given it sits outside the general WASI
-  sandbox by design.
+**8.12 Large objects and persistent capabilities.** Researched together,
+per explicit direction not to treat them as separate, since a native blob
+store and a long-running capability are plausibly the same underlying
+problem. Full grounding, citations, and the 18 individually-verified
+claims behind this: research log, Part 2. Net conclusions are stated
+where they're used: the blob architecture in §3.3, the persistent-
+capability formalism in §4, and the connecting verdict (both need the
+same supervised-process primitive, but the blob store should be a
+privileged built-in instance of it, not a general WASI Capability grant)
+in both places consistently.
 
 ## 9. Worked examples
 
@@ -764,7 +594,8 @@ CatalogEntry match → LLMFallback produces a ground Trace → not admitted
 alone (§5) → weeks later, a second Task's Trace anti-unifies against the
 first → DedupGate `Admit` with human review and sandboxed-replay fidelity
 evidence → CatalogEntry `deploy-service-to-prod` → a third occurrence hits
-Discovery's exact lookup directly, zero LLM calls.
+Discovery's exact lookup directly, zero LLM calls. (This is the walking
+skeleton's own exit criterion, §7.)
 
 **9.2 — the case that found real gaps: a German tax filing**, walked
 through deliberately, not as a domain this spec builds. A fresh Tenant,
@@ -781,204 +612,81 @@ example caught.
 
 ## 10. Open questions
 
-**Resolved this revision** (kept here, struck through, rather than
-deleted silently — see §11's changelog for the full reasoning):
-- ~~Final Tenant name~~ — resolved: **"Tenant"**, no rename.
-- ~~OpenFASTER-Standard public governance status~~ — resolved:
-  **Riptide-internal for now**, not public/OpenFASTER-Standard governance.
-- ~~Whether this engine is a separate deployable from Riptide's LDP
-  surface~~ — resolved: **same OS process**, one deployable (§1).
-- ~~Whether the Rule/workflow-graph representation can be constrained to
-  the bisimilar-term-graph fragment~~ — resolved: **no constraint**; full
+**Resolved:**
+- Final Tenant name: **"Tenant"**, no rename.
+- OpenFASTER-Standard public governance status: **Riptide-internal for
+  now** (§2 disambiguates this from the org name itself).
+- Whether this engine is a separate deployable from Riptide's LDP
+  surface: **same OS process**, one deployable (§1).
+- Whether the Rule/workflow-graph representation can be constrained to
+  the bisimilar-term-graph fragment: **no constraint**; full
   expressiveness is kept, and DedupGate must arbitrate a finite set of
   incomparable generalizations when anti-unification isn't unitary (§8.2,
   §6). The concrete arbitration mechanism is Sub-project 6e's own design
-  work, not resolved here.
+  work.
 
 **Still open:**
 - Concurrent-effectful-execution coordination (6d-ii's actual subject
-  matter) — confirmed this revision as real design work owed directly by
-  this project, not a literature gap a further research pass would close.
+  matter) — real design work this project owes directly, not a
+  literature gap a further research pass would close.
 - Formal versioning/supersedes theory for declarative rules — three
-  dedicated passes now (§8.7.1–§8.7.3): AGM/KM logic-program update and
-  TGD conservative-extension are real candidate anchors; view update
-  problem, schema-mapping-evolution, and ILP's own subsumption/refinement-
-  operator/theory-revision literature are all real but answer a different
-  question. No exact fit found across five independent directions. §8.7.3
-  does surface one concrete, actionable tool (bottom-clause-style
-  bounding, informing 6e's DedupGate arbitration — §6) even without
-  closing the formal gap itself.
-- `linkml-datalog`'s dormancy — re-check again immediately before 6c
+  dedicated passes found no exact fit across five independent directions
+  (§8.7, research log Part 1). Bottom-clause-style bounding is a concrete
+  actionable tool for 6e even without closing the formal gap itself.
+- `linkml-datalog`'s dormancy — re-check again immediately before 6c-iii
   depends on it, not just at spec-writing time (§8.6).
-- Large-object/persistent-capability engineering details researched but
-  not yet resolved this revision (§8.12): a garbage-collection scheme for
-  many RDF triples referencing the same content-addressed chunk hash
-  (every precedent found was built for object-store/shared-log semantics,
-  not this); the privileged blob-serving process's own security boundary,
-  given it sits outside the general WASI sandbox by design; whether WASI
+- Large-object/persistent-capability engineering details (§3.3, §4,
+  §8.12, research log Part 2): a garbage-collection scheme for many RDF
+  triples referencing the same content-addressed chunk hash; the
+  privileged blob-serving process's own security boundary; whether WASI
   Preview 2+ has any native persistent/resumable component-instance
-  notion; whether the concrete Capability representation for a persistent
-  process is a second dimension alongside StabilityClass or something
-  structurally different (§3.3, §4 confirm the formal grounding —
-  session types with runtime adaptation, content-addressed chunking — not
-  the concrete representation).
+  notion; whether the concrete Capability representation for a
+  persistent process is a second dimension alongside StabilityClass or
+  something structurally different. The formal grounding (session types
+  with runtime adaptation; content-addressed chunking) is settled; the
+  concrete representation isn't.
+- A threat model for the Pattern Hub's public network surface (6h, §7) —
+  must be written as 6h's own spec, before 6h's implementation starts,
+  not discovered mid-implementation.
 
 ## 11. Changelog
 
-**This revision (eighth) — third research pass, chasing the ILP/anti-
-unification lead directly (capped at 5 subagents to bound token spend):**
-- Added §8.7.3. Four of five angles (Plotkin's lattice; θ-subsumption/
-  refinement operators; ILP theory-revision systems FORTE/INTHELEX/CLINT/
-  Wrobel; modern 2015–2026 MIL/program-synthesis work) confirm the same
-  gap from ILP's own home field — no formal "rule B supersedes rule A"
-  criterion, only search-traversal reachability properties, empirically-
-  accepted revisions, or (Wrobel) a narrow specialization-only postulate
-  set. Independently rediscovered the same AGM/ILP mismatch §8.7.1 found,
-  this time from FORTE's own authors.
-- The fifth angle (version spaces, Hirsh 1991) is a genuine hit: a
-  domain-independent convexity+definiteness criterion for when any rule
-  language admits safe generalization-boundary tracking, plus a real,
-  working-system technique (bottom-clause bounding, Progol/Golem) for
-  recovering that property in an otherwise-unbounded Horn-clause/Datalog
-  space. Confirms anti-unification (this spec's own Generalization
-  mechanism, §5) is literally the operation ILP systems already use for
-  the generalization-boundary half of that lattice.
-- Updated §6's DedupGate note and §10 to record bottom-clause-style
-  bounding as a concrete tool for Sub-project 6e's arbitration mechanism
-  (§8.2/§6's Decision 1, from the prior revision) — informs the decision
-  already made, doesn't reopen it.
-- Net across three passes now: the formal-supersedes gap is confirmed
-  from five independent directions (DL/AGM, patch theory, view
-  update/schema-mapping-evolution, ILP). The pragmatic git/TerminusDB
-  model remains adopted; further research on this specific question is
-  not recommended without new information, per the same discipline
-  already applied to patch theory in §8.7.1.
+Revisions one through eight — including the full research narrative for
+the three versioning-research passes and the blob/persistent-capability
+research — are archived in the research log's Part 3, not repeated here.
 
-**Seventh revision — resolved the bisimilar-term-graph question:**
-- §8.2/§6: Rule expressiveness is **not** constrained to the
-  bisimilar-term-graph fragment. Real composability (rule-reference
-  literals sharing values across calls) wins over guaranteed-unique
-  anti-unification. DedupGate must arbitrate incomparable generalizations
-  when they arise; the concrete mechanism is left to Sub-project 6e, not
-  designed here.
-- Moved this item from §10's "still open" list to "resolved," matching
-  the pattern already used for the Tenant/governance/deployability
-  decisions.
-
-**Sixth revision — second research pass on formal
-versioning/supersedes theory, requested explicitly rather than accepting
-the prior "not found" result:**
-- Added §8.7.2, chasing §8.7.1's own named leads directly (view update
-  problem, schema mapping evolution, Horn/rule theory revision under
-  database-dependency-theory framing, and a fresh 2023–2026 liveness
-  check) instead of a generic re-sweep.
-- Found real, rigorous literature for two of these (classical view update
-  problem; schema-mapping-evolution/composition-inversion theory) —
-  both confirmed to answer an adjacent-but-different question than
-  Riptide's actual "is this rule change breaking" need, not a hidden
-  exact fit.
-- Confirmed no 2023–2026 advance exists for either previously-found
-  anchor (AGM/KM logic-program update; TGD conservative-extension).
-- Confirmed Horn/rule-theory-revision-via-database-dependency-theory and
-  "does classical FD/IND theory give a safe-extension notion" as genuine
-  gaps after two dedicated passes each, not just unsearched corners.
-- Net effect: this document's own two independent research passes now
-  converge on the same next step (ILP's anti-unification/generalization-
-  lattice literature) from two different directions — recorded as the
-  clear next move in §10, ahead of any further generic terminology sweep.
-
-**Fifth revision — §3.3 and §4 researched together, per direction
-not to treat them as separate:**
-- Rewrote §3.3 (large objects) from a flagged-unverified sketch to a
-  research-grounded direction: content-addressed chunking (git/casync/
-  desync/IPFS architecture), confirmed mainstream Raft stores discourage
-  rather than solve large values through consensus, and a concrete
-  chunk-plus-GC production precedent (Riak CS, historical).
-- Rewrote §4's daemon-capability gap: the fitting formalism is session
-  types with runtime adaptation (Di Giusto & Pérez), not an extension of
-  algebraic-effect handler theory — and the same paper directly formalizes
-  Erlang/OTP supervision trees as a worked example, a real citable bridge
-  to `Riptide.Stream.StreamServer`'s own shape.
-- Added §8.12 with the full grounding for both, including the connecting
-  verdict the research was explicitly asked to investigate: blob storage
-  and persistent capabilities need the same supervised-long-running-
-  process primitive underneath, but a blob store should be a privileged
-  built-in instance of that primitive, not literally a general-purpose
-  WASI Capability grant.
-- Updated §10: replaced "not yet researched"/"not designed" framing for
-  both items with the specific engineering questions the research
-  surfaced but didn't resolve (RDF-triple-shaped chunk GC, the privileged
-  process's own security boundary, WASI persistent-instance support,
-  concrete Capability representation).
-
-**Fourth revision — resolving open decisions plus new research:**
-- Resolved three of §10's open decisions: Tenant name (**"Tenant"**, no
-  rename — Polity/Civitas/Demesne shortlist dropped), governance
-  (**Riptide-internal for now**, not OpenFASTER-Standard public
-  governance), and deployability (**same OS process** as Riptide's
-  existing LDP surface, confirmed as one deployable, §1).
-- Confirmed concurrent-effectful-execution coordination (6d-ii) as real
-  design work this project owes directly, not a literature gap — no
-  change to its treatment as an open question, but the framing is now
-  explicit rather than ambiguous between "unresearched" and "unresolvable
-  by research."
-- Added §8.7.1: a dedicated four-angle research pass on formal
-  versioning/supersedes theory for declarative rules. Found two genuine
-  candidate anchors (AGM/Katsuno-Mendelzon logic-program-update theory;
-  description-logic conservative-extension theory extended to existential
-  rules/TGDs in 2022) — neither an exact fit for this spec's directional
-  "rule B supersedes rule A" need. Confirmed patch theory (Darcs,
-  categorical and homotopical) as a closed non-fit, not an unexplored
-  option. Surfaced ILP's own generalization-lattice literature
-  (anti-unification's own home field) as the most promising unresearched
-  lead — closer to this spec's actual mechanism than either anchor found.
-- Added §3.3: large object (blob) storage as a new open concern, with a
-  candidate content-addressed direction sketched (git's own object-store/
-  ref-layer split, reused rather than invented) — explicitly not yet
-  researched the way the rest of this document's claims are.
-- Added to §4: a universality check (does "serve this web page," not just
-  "file a tax return," fit the Capability model?) surfaced a real gap —
-  the current model implicitly assumes one-shot Interpretations, and a
-  long-running/daemon-shaped Capability doesn't fit that shape. Noted as
-  open, not designed.
-- Updated §3.1's currency note: the security-audit remediation flagged as
-  in-progress in the prior revision has since landed on `main` (PR #32) —
-  Sub-project 6b's integration point is no longer targeting a moving
-  target.
-
-**Third revision — a currency pass, not new design work:**
-- Restructured all phase numbering from independent "Sub-project 1–9" into
-  a single **Sub-project 6** with phases 6a–6i, avoiding a real collision
-  with Riptide's own `PROGRESS.md` table (its sub-projects 1–5, confirmed
-  complete as of today, use exactly this numbering scheme already).
-- Corrected Dialect (§3.2, §8.1): SHACL 1.2 Rules' current URL now
-  redirects to SPARQL 1.2 RL — the two W3C drafts previously tracked as
-  independent appear to have been consolidated. Target simplified to
-  SPARQL-RL alone.
-- Added the live audit-remediation caveat on Riptide's ACP/auth surface
-  (§3.1) — observed directly as in-progress, uncommitted work on a sibling
-  branch as of this writing.
-- Noted 6a's dependency on the already-shipped Phase 3a schema-versioning
-  envelope (§7), which exists specifically to handle a fact-shape change
-  like this one safely.
-- Re-verified liveness of `linkml-datalog` (unchanged, still dormant),
-  TerminusDB (active), and Fluree (very active, pushed today) against
-  their actual current state, not carried forward from an earlier check
-  (§8.6, §8.7).
-- Noted Riptide's own production-readiness roadmap (sub-projects 1–5) is
-  now complete (§1) — this work is the first thing built on a finished
-  foundation, not alongside an unfinished one.
-
-**Second revision:** added the Pattern Hub and Crosswalk mechanism, split
-Capability into Effect/Observe kinds, added rule-reference literals fixing
-a real composability bug, corrected an institution-theory overreach
-(Crosswalks are signature morphisms in the common case, not universally
-comorphisms), added StabilityClass, and reframed `administration-commons`
-as superseded.
-
-**First revision:** fixed Rule's definition to accommodate NativeTemplate,
-made Trace `⊑ Rule` with one consistent Generalization type signature,
-reframed Generalization Fidelity from an inherited proof to an engineering
-obligation, corrected the term-graph anti-unification citation and scope,
-added tenant-scoping to Capability, split the wiring phase by risk, and
-added a walking-skeleton milestone.
+**This revision (ninth) — restructuring after an independent cold-context
+architecture review**, which found several genuine defects that had
+survived all eight prior revisions:
+- Split the detailed research trail and full revision history out to a
+  companion research log, so this document states current decisions once
+  instead of interleaving them with "resolved this revision" narration.
+- Fixed a real dependency-graph gap: 6d-i/6d-ii previously stated no
+  dependency on 6b or 6c despite needing both — now explicit.
+- Moved a misplaced Datalog-library-liveness note from 6f (LLM fallback
+  loop — the wrong home for it) to §8.6/6c-iii.
+- Added WASI resource metering (fuel + memory limits, via `wasmex`'s
+  verified `EngineConfig.consume_fuel`/`StoreLimits` APIs) as an explicit
+  6b exit criterion, grounded in two real prior incidents (atom
+  exhaustion; the Turtle-parsing heap cap), not a hypothetical concern.
+- Added a phase for the blob-storage design that had never been assigned
+  one: **6j**.
+- Split 6c into 6c-i/6c-ii/6c-iii (matching/joins; recursion/fixpoint;
+  aggregation + full QueryInterpretation), following the established
+  Phase 3c-i/ii/iii precedent, and relaxed 6c's blanket dependency on 6a
+  to apply only to 6c-iii's ValidTime-aware slice.
+- Added a "Walking skeleton" subsection to §7 naming the minimal phase
+  subset and making §9.1's own example its falsifiable exit criterion.
+- Added a falsifiable exit criterion to every phase.
+- Clarified that 6h's "publicly-reachable" is a network-exposure axis
+  independent of §2's Riptide-internal-governance axis, and required a
+  threat model before 6h's implementation starts.
+- Disambiguated the "OpenFASTER-Standard" org name from the governance
+  decision (§2).
+- Linked `administration-commons` to its real path.
+- Normalized "Depends on:" phrasing across every phase.
+- Deduplicated the Riak CS/CORFU precedent text between §3.3 and §8.12 —
+  detail lives in the research log only.
+- Flagged (not yet applied — tracked separately) that `PROGRESS.md`'s
+  "Post-4d hardening" section needs expanding to reflect PR #32's full
+  scope, not just the atom-exhaustion slice (§8.11).
