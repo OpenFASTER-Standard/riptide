@@ -20,6 +20,11 @@ second browser) to watch lines you add in one appear live in the other.
 
 Leave the `iex` session running — it's your live server. Stop it with Ctrl-C (twice) when done.
 
+Talking to a server somewhere other than `localhost:4000` (e.g. a Fly.io deployment — see the root
+README's "Running on Fly.io" section)? Open `index.html?base=https://your-server-host` instead of
+the bare file — `app.js` reads the `base` query param and defaults to `http://localhost:4000` only
+when it's absent.
+
 ## What to look at
 
 - Type a line and submit it — watch it appear on every open tab immediately.

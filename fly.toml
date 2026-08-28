@@ -8,6 +8,18 @@ primary_region = "fra"
   PHX_HOST = "riptide-live-story.fly.dev"
   PORT = "4000"
   RIPTIDE_PLACEMENT_TARGET_SIZE = "1"
+  # Unlike Kubernetes (which sets a pod's HOSTNAME automatically — see
+  # Riptide.RaCluster.data_dir/0's moduledoc), Fly Machines do NOT export a
+  # HOSTNAME env var at all (confirmed live: `fly ssh console -C env` shows
+  # no HOSTNAME entry, even though the `hostname` command itself reports the
+  # machine ID) — so data_dir/0's fallback silently keys the on-disk Ra data
+  # directory off the literal string "nonode" instead. That happens to be
+  # stable today only because Fly never sets the env var; pin it explicitly
+  # instead of depending on that absence, so a future Fly platform change
+  # (e.g. auto-populating HOSTNAME with the machine ID, which DOES change
+  # across `fly deploy`) can't silently orphan this volume's data under a
+  # new directory name.
+  HOSTNAME = "riptide"
 
 [[mounts]]
   source = "riptide_data"
