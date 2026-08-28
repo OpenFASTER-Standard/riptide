@@ -41,33 +41,7 @@ the bare file — the inline script reads the `base` query param and defaults to
 
 ## Watching it as a graph
 
-`examples/live-story/graph.html` is a second, independent page — open it in a third tab alongside
-`index.html` — that renders `the-story`'s actual RDF structure live with
-[Sigma.js](https://www.sigmajs.org/) (WebGL) instead of prose: every subject and object becomes a
-node (gold for literal values like the submitted text/author, blue for IRIs — entities and types),
-every predicate becomes an edge, and new nodes ease into place via a small live force-directed
-layout as lines get submitted. It talks to the exact same SSE stream `index.html` does, so nothing
-on the server needs to change to watch it.
-
-Click and drag any node to reposition it — it's pinned to the cursor while dragging (highlighted
-with a ring so it's clear which one you've grabbed) and rejoins the live layout normally the moment
-you release it, rather than staying stuck wherever you dropped it.
-
-Unlike `index.html` (hardcoded to `story-demo`/`the-story`), `graph.html` is a general RDF graph
-viewer — point it at any tenant/resource with `?tenant=` and `?resource=` query params (both
-default to `story-demo`/`the-story` so it shows this demo out of the box), combined with the same
-`?base=` override as `index.html` for a non-local server:
-
-```
-graph.html?base=https://your-server-host&tenant=story-demo&resource=the-story
-```
-
-It loads Sigma.js and its `graphology` graph library from a CDN (via `esm.sh`, not a bare
-`jsdelivr` dist file — see the comment above the imports in `graph.html` for why: graphology's own
-browser build imports Node's `events` module, which only `esm.sh` resolves for a plain
-`<script type="module">` with no bundler), so unlike `index.html` it needs real internet access to
-that CDN, not just to your Riptide server.
-
-Scoped deliberately to what `the-story` actually does: it only ever handles `:patch` *additions*
-(the only operation this demo ever sends), not `:delete`/`:replace` or patch removals — a resource
-that actually mutates or shrinks would need that handled, which is out of scope here.
+Want to see `the-story`'s actual RDF structure grow live instead of prose? See the
+[live RDF graph viewer](../graph-viewer/) example — a separate, general-purpose tool (not specific
+to this demo) that renders any Riptide resource's triples as a live WebGL graph. Point it at
+`story-demo`/`the-story` on whichever server you're running this example against.
