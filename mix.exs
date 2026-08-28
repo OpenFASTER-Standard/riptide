@@ -38,6 +38,7 @@ defmodule Riptide.MixProject do
       {:plug_cowboy, "~> 2.7"},
       {:jason, "~> 1.4"},
       {:rdf, "~> 3.0"},
+      {:nimble_parsec, "~> 1.4"},
       {:json_ld, "~> 1.0"},
       {:uniq, "~> 0.6"},
       {:ra, "~> 2.15.0"},

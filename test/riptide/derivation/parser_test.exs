@@ -1,0 +1,84 @@
+defmodule Riptide.Derivation.ParserTest do
+  use ExUnit.Case, async: true
+
+  alias Riptide.Derivation.{Parser, Var}
+  alias Riptide.Derivation.Literal.FactPattern
+
+  describe "decode/1 — fact-pattern-only rules" do
+    test "parses a rule with a single body literal" do
+      text = "deployed(Svc, Result) :- pendingDeploy(Svc, Result)."
+
+      assert {:ok, rule} = Parser.decode(text)
+
+      assert rule.head == %FactPattern{
+               predicate: RDF.iri("urn:riptide:relation:deployed"),
+               args: [%Var{name: "Svc"}, %Var{name: "Result"}]
+             }
+
+      assert rule.body == [
+               %FactPattern{
+                 predicate: RDF.iri("urn:riptide:relation:pendingDeploy"),
+                 args: [%Var{name: "Svc"}, %Var{name: "Result"}]
+               }
+             ]
+    end
+
+    test "parses a rule with multiple conjoined body literals" do
+      text = "path(X, Y) :- edge(X, Z), path(Z, Y)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert length(rule.body) == 2
+
+      assert Enum.at(rule.body, 0) == %FactPattern{
+               predicate: RDF.iri("urn:riptide:relation:edge"),
+               args: [%Var{name: "X"}, %Var{name: "Z"}]
+             }
+
+      assert Enum.at(rule.body, 1) == %FactPattern{
+               predicate: RDF.iri("urn:riptide:relation:path"),
+               args: [%Var{name: "Z"}, %Var{name: "Y"}]
+             }
+    end
+
+    test "recursive rules parse fine — the head's predicate may match a body literal's" do
+      text = "path(X, Y) :- edge(X, Y)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert rule.head.predicate == RDF.iri("urn:riptide:relation:path")
+    end
+
+    test "an explicit bracketed IRI may be used as a fact-pattern predicate" do
+      text =
+        "<http://www.w3.org/ns/ldp#contains>(Container, Member) :- pendingDeploy(Container, Member)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert rule.head.predicate == RDF.iri("http://www.w3.org/ns/ldp#contains")
+    end
+
+    test "string constants are supported as args" do
+      text = ~s|status(Svc, "healthy") :- pendingDeploy(Svc, "healthy").|
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert rule.head.args == [%Var{name: "Svc"}, RDF.literal("healthy")]
+    end
+
+    test "returns an error tuple, not a crash, on malformed input" do
+      assert {:error, _reason} = Parser.decode("this is not a rule")
+    end
+
+    test "the derived Signature reflects the head and body" do
+      text = "deployed(Svc, Result) :- pendingDeploy(Svc, Target), other(Target, Result)."
+
+      assert {:ok, rule} = Parser.decode(text)
+      assert rule.signature.name == RDF.iri("urn:riptide:relation:deployed")
+      assert rule.signature.parameters == [%Var{name: "Svc"}, %Var{name: "Result"}]
+      assert rule.signature.produces == [RDF.iri("urn:riptide:relation:deployed")]
+
+      assert Enum.sort(rule.signature.reads) ==
+               Enum.sort([
+                 RDF.iri("urn:riptide:relation:pendingDeploy"),
+                 RDF.iri("urn:riptide:relation:other")
+               ])
+    end
+  end
+end
