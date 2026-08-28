@@ -1,12 +1,13 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, third revision — a currency pass against Riptide's actual
-current state and external facts this document depends on, not new design
-work. This is one architecture spec defining a single new top-level
-Riptide sub-project, **Sub-project 6**, decomposed into phases 6a–6i, the
-same way Riptide's own sub-projects 3, 4, and 5 are already decomposed.
-Each phase gets its own implementation plan (`writing-plans`) when work on
-it starts. See §11 for the itemized changelog across all three revisions.
+**Status:** Draft, fourth revision — resolving three of §10's open
+decisions (Tenant name, governance, deployability) and a dedicated
+research pass on formal versioning/supersedes theory (§8.7.1). This is
+one architecture spec defining a single new top-level Riptide sub-project,
+**Sub-project 6**, decomposed into phases 6a–6i, the same way Riptide's
+own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
+own implementation plan (`writing-plans`) when work on it starts. See §11
+for the itemized changelog across all four revisions.
 
 ## 1. Motivation and vision
 
@@ -36,10 +37,12 @@ the gap once, and the bridge gets built incrementally from real use — never
 front-loaded. Not three separate design choices; one discipline, applied
 consistently.
 
-**What's settled about deployment, and what isn't.** Settled: this layer
-shares Riptide's Fact store, Rule representation, and Signature/Dialect
-definitions as one substrate. Not settled: whether the engine runs in the
-same OS process as Riptide's existing LDP surface — genuinely open, §10.
+**Deployment — resolved this revision.** This layer shares Riptide's Fact
+store, Rule representation, and Signature/Dialect definitions as one
+substrate, **and runs in the same OS process as Riptide's existing LDP
+surface** — one deployable, not a companion service. No separate
+scheduling, no separate deploy pipeline, no second thing to keep
+available.
 
 ## 2. Scope
 
@@ -51,10 +54,13 @@ same OS process as Riptide's existing LDP surface — genuinely open, §10.
 this work, not something this spec reconciles with.
 
 **Explicitly still open** (§10 for the full list): concurrent-effectful-
-execution coordination; whether this engine is a separate deployable from
-Riptide's LDP surface; formal versioning/supersedes theory for rules;
-the final Tenant name; automated detection of ontology overlap (out of
-scope *by design*, §6.5).
+execution coordination (confirmed this revision as real design work owed
+here, not a literature gap to close by more research); the bisimilar-
+term-graph constraint question; formal versioning/supersedes theory for
+rules; large object (blob) storage (§3.3, new this revision); whether
+long-running/daemon-shaped Capabilities need a second dimension beyond
+StabilityClass (§4, new this revision); automated detection of ontology
+overlap (out of scope *by design*, §6.5).
 
 ## 3. Core concepts — facts and rules
 
@@ -63,18 +69,21 @@ scope *by design*, §6.5).
 - **Fact** — an atomic RDF(-star) assertion in the EDB. Carries
   *TransactionTime* (from Riptide's sequence number) and optionally a
   *ValidTime* interval (RDF-star-annotated, §8.4). Produced by one **Event**.
-- **Tenant** *(name TBD — shortlist: Polity, Enclave, Civitas, Demesne)* —
+- **Tenant** *(name settled this revision — "Tenant" itself, no rename)* —
   an isolated administrative/institutional space. Facts, Rules,
   CatalogEntries, and Capabilities are all tenant-partitioned. A Capability
   grant in one Tenant is never exercisable by a Rule in another; this
   composes with Riptide's shipped Phase 4c ACP authorization (default-deny,
   container-level inheritance, deny-overrides-allow, tenant-root bootstrap
   claim — confirmed accurate against the shipped design, `PROGRESS.md`
-  §4), not a parallel system. **Current note**: this ACP/auth surface is
-  under active security-audit remediation in a sibling branch as of this
-  writing (observed directly, not yet its own committed spec) — Sub-project
-  6b's integration point should target whatever that lands as, not a frozen
-  snapshot of the original Phase 4a–4d design.
+  §4), not a parallel system. **Current note, updated this revision**: the
+  security-audit remediation flagged as in-progress on a sibling branch in
+  the prior revision has since landed on `main` (three parts: auth/authz,
+  Ra error handling, resource limits, and observability; dual-leader
+  repair fencing; closing the SSE/WS `Authz.evaluate` placement-down gap —
+  merged via PR #32) — as regular commits, not its own committed design
+  spec. Sub-project 6b's integration point should target this now-current
+  ACP surface directly.
 - **A Tenant's vocabulary is observed, not declared.** No separate
   "ontology preference" object. Whichever Signature a Tenant's own Facts
   happen to already use *is* their working vocabulary for that area. A
@@ -112,6 +121,47 @@ scope *by design*, §6.5).
     Templates) is inexpressible — caught by tracing a real scenario (§9)
     through the model, not by re-reading the document.
 
+### 3.3 Large objects (blobs) — new this revision, not yet researched
+
+**The problem, stated plainly.** Every Fact today is a small RDF triple,
+replicated through a per-stream Ra (Raft) cluster's consensus log. A
+multi-MB/GB blob (a PDF a Capability extracted a page from, a submitted
+tax form, an uploaded file) does not belong directly in that log — every
+replica would need to push the full blob through consensus on every
+write, and Ra's own snapshots would grow with it. This needs solving
+without introducing an external blob-storage service (S3-shaped or
+otherwise) as a second system operators must run and keep available
+alongside Riptide, and without blobs feeling bolted-on rather than a
+first-class Riptide concept.
+
+**A candidate direction (my own synthesis this revision — not yet
+independently verified the way the rest of this document's claims are,
+flagged honestly as such):** split identity from bytes, the same way this
+whole document already treats every other layer (§1's organizing idea).
+A blob is content-addressed (hashed) and immutable once written; a Fact
+references it by hash (e.g. as an IRI like `<urn:riptide-blob:sha256:...>`),
+making a blob just another kind of Term any Rule or Fact can point at —
+this is what "feels native" rather than bolted-on. Because the *bytes*
+are immutable, replicating them doesn't need consensus at all (unlike a
+Fact, which needs strict ordering) — only a small piece of metadata does
+("which nodes currently hold chunk `sha256:...`"), which is exactly the
+shape of thing Riptide's existing Fact/Ra machinery already handles well.
+Actual bytes could then transfer directly between Riptide nodes
+(peer-to-peer, outside consensus) rather than through any per-write
+replication path. This is structurally the same split Git itself makes —
+content-addressed, immutable object store versus a small, consistency-
+needing ref/commit layer — and this document already leans on git
+precedent elsewhere (§6's DedupGate `Merge`, §8.7's TerminusDB/Fluree
+grounding), so reusing it here would be consistent, not a new borrowed
+idea.
+
+**Explicitly not resolved by the above:** chunking scheme, garbage
+collection of unreferenced blobs, how many replicas a blob needs versus
+a Fact's own replica count, and — unverified — whether this candidate
+direction survives contact with real research the way every other claim
+in this document has. Added to §10 as an open question rather than locked
+in.
+
 ## 4. Capability, NativeTemplate, Template
 
 - **Capability** — an explicit, tenant-scoped, grantable permission. Two
@@ -130,6 +180,20 @@ scope *by design*, §6.5).
   - Backed by WASI Preview 2 (no ambient authority, no subprocess spawning
     by design) plus WASIX where subprocess spawning is specifically
     granted (§8.3).
+  - **A real gap, not yet designed, surfaced this revision by a universality
+    check.** "File a tax return," "extract page 2 of a PDF," and "serve
+    this web page over HTTP" should all be expressible as Capabilities —
+    that's the whole point of the model's generality, not a feature to add
+    later. The first two are one-shot: invoke, get a discrete Outcome,
+    done — exactly what `(Rule, Bindings, EDB-state) → Outcome` (§5)
+    already models. "Serve this page" is not: it's a long-running,
+    continuously-listening process serving arbitrarily many requests over
+    its lifetime, closer in shape to something Riptide already knows how
+    to run and supervise (`Riptide.Stream.StreamServer` and friends) than
+    to a discrete Interpretation. Whether this becomes a second
+    Capability dimension (e.g. `Ephemeral` vs `Persistent`, alongside
+    StabilityClass) or something else entirely is genuinely open — noted
+    in §10, not designed here.
 - **NativeTemplate** — a Rule whose Body is exactly one capability-reference
   literal. The base case, backed by a real, capability-scoped WASI
   component. Sequencing note: Sub-project 6b (§7) builds the WASI execution
@@ -323,6 +387,65 @@ before 6c actually depends on it rather than assuming continued dormancy.
 check; graph three-way merge is still weaker than git's (§6's DedupGate
 `Merge` rule) regardless of either project's activity level.
 
+**8.7.1 Formal supersedes theory — real anchors found this revision, no
+exact fit.** A dedicated research pass (four angles, 20 primary sources,
+25 claims adversarially verified) found two genuine formal theories in
+this space, and closed off one dead end:
+
+- **AGM/Katsuno-Mendelzon logic-program-update theory is real, peer-reviewed,
+  and still actively cited (2007–2023)** — Delgrande/Peppas/Woltran (LPNMR
+  2013) rephrase the AGM postulates for logic programs with SE-model-based
+  semantic revision operators and representation theorems by program class;
+  Slota & Leite (TPLP 2014) adapt Katsuno-Mendelzon's postulates to
+  answer-set-program *update* specifically, with a constructive
+  representation theorem. This is the closest existing formalism to "what
+  does it mean to update a rule set given a new rule" found anywhere in
+  this research. **But it comes with a proven limitation, not just a
+  caveat**: Slota & Leite's Theorem 31 proves any SE-model/KM-based ASP
+  update operator satisfying syntax-independence cannot simultaneously
+  satisfy both the *support* and *fact update* properties — a real
+  adequacy ceiling on this branch of theory, to design around rather than
+  discover the hard way.
+- **Description-logic conservative-extension/inseparability theory was
+  directly extended in 2022 to existential rules (TGDs)** — Jung, Lutz &
+  Marcinkowski (KR 2022) give two independent formal criteria (conjunctive-
+  query-answer preservation; chase-homomorphism preservation) for whether
+  one TGD set safely extends another, the closest syntactic match to
+  Datalog-style rules found. Decidable only for restricted fragments
+  (e.g. frontier-one TGDs) — undecidable in general (linear/guarded TGDs).
+  This formalizes *safe extension without changing prior entailments*, not
+  a directional generalize/refine "supersedes" relation — a real, useful,
+  but different question than the one this spec actually has.
+- **Patch theory (categorical and homotopical/HoTT formalizations of
+  Darcs) is a confirmed non-fit, not an unexplored option.** Every formal
+  object and worked example across four primary sources is generic
+  text/structured data (lines, integers, boolean lists) — zero mentions of
+  rules, logic programs, ontologies, or knowledge bases anywhere in the
+  primary literature. Its only notion of combining changes (merge as
+  categorical pushout) is symmetric, not the directional relation needed
+  here. Should not be revisited as a lead without new information.
+- **No rigorous, non-conventional theory of breaking-vs-compatible
+  schema/rule change was found** — a genuine gap in what this pass
+  surfaced, not proof none exists; it may hide under different
+  terminology (view update problem, schema mapping evolution, Horn/rule
+  theory revision) a future pass should search directly.
+- **The most promising unexplored angle, surfaced by this research but not
+  itself researched yet:** anti-unification's own literature (Plotkin's
+  least-general-generalization, Inductive Logic Programming's
+  generalization/specialization lattices under θ-subsumption) may connect
+  *directly* to a formal subsumption ordering between rules — closer to
+  this spec's actual mechanism (§5's Generalization) than either DL/TGD or
+  AGM/KM, and not covered by any of the four angles this pass researched.
+  Worth its own dedicated pass before concluding no exact fit exists
+  anywhere.
+
+Net: no single existing formalism directly answers "rule B (refined)
+supersedes rule A (generalized)" — the pragmatic git/TerminusDB-style
+model stays the adopted approach, but AGM/KM update theory and TGD
+conservative-extension are now real candidate anchors to build a more
+rigorous foundation on later, and ILP's own generalization-lattice
+literature is the most promising unexplored lead.
+
 **8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
 C++ implementing semi-naive evaluation, backed by a concurrent B-tree and
 Brie (a concurrent trie). Adoptable for QueryInterpretation.
@@ -374,23 +497,71 @@ example caught.
 
 ## 10. Open questions
 
-- OpenFASTER-Standard public governance status for this work.
-- Whether this engine is operationally a separate deployable from
-  Riptide's LDP surface.
+**Resolved this revision** (kept here, struck through, rather than
+deleted silently — see §11's changelog for the full reasoning):
+- ~~Final Tenant name~~ — resolved: **"Tenant"**, no rename.
+- ~~OpenFASTER-Standard public governance status~~ — resolved:
+  **Riptide-internal for now**, not public/OpenFASTER-Standard governance.
+- ~~Whether this engine is a separate deployable from Riptide's LDP
+  surface~~ — resolved: **same OS process**, one deployable (§1).
+
+**Still open:**
 - Concurrent-effectful-execution coordination (6d-ii's actual subject
-  matter).
+  matter) — confirmed this revision as real design work owed directly by
+  this project, not a literature gap a further research pass would close.
 - Whether the Rule/workflow-graph representation can be constrained to the
   bisimilar-term-graph fragment, or whether DedupGate must arbitrate a
   finite set of incomparable generalizations (§8.2).
-- Formal versioning/supersedes theory for declarative rules — none found;
-  pragmatic git/TerminusDB model adopted instead.
-- Final Tenant name.
+- Formal versioning/supersedes theory for declarative rules — real
+  candidate anchors found this revision (AGM/KM logic-program update, TGD
+  conservative-extension), neither an exact fit; ILP's generalization-
+  lattice literature is the most promising unresearched lead (§8.7.1).
 - `linkml-datalog`'s dormancy — re-check again immediately before 6c
   depends on it, not just at spec-writing time (§8.6).
+- **New this revision:** large object (blob) storage — a candidate
+  content-addressed direction sketched but not researched (§3.3).
+- **New this revision:** whether long-running/daemon-shaped Capabilities
+  (e.g. "serve this over HTTP") need a second Capability dimension beyond
+  StabilityClass, surfaced by a universality check but not designed (§4).
 
 ## 11. Changelog
 
-**This revision (third) — a currency pass, not new design work:**
+**This revision (fourth) — resolving open decisions plus new research:**
+- Resolved three of §10's open decisions: Tenant name (**"Tenant"**, no
+  rename — Polity/Civitas/Demesne shortlist dropped), governance
+  (**Riptide-internal for now**, not OpenFASTER-Standard public
+  governance), and deployability (**same OS process** as Riptide's
+  existing LDP surface, confirmed as one deployable, §1).
+- Confirmed concurrent-effectful-execution coordination (6d-ii) as real
+  design work this project owes directly, not a literature gap — no
+  change to its treatment as an open question, but the framing is now
+  explicit rather than ambiguous between "unresearched" and "unresolvable
+  by research."
+- Added §8.7.1: a dedicated four-angle research pass on formal
+  versioning/supersedes theory for declarative rules. Found two genuine
+  candidate anchors (AGM/Katsuno-Mendelzon logic-program-update theory;
+  description-logic conservative-extension theory extended to existential
+  rules/TGDs in 2022) — neither an exact fit for this spec's directional
+  "rule B supersedes rule A" need. Confirmed patch theory (Darcs,
+  categorical and homotopical) as a closed non-fit, not an unexplored
+  option. Surfaced ILP's own generalization-lattice literature
+  (anti-unification's own home field) as the most promising unresearched
+  lead — closer to this spec's actual mechanism than either anchor found.
+- Added §3.3: large object (blob) storage as a new open concern, with a
+  candidate content-addressed direction sketched (git's own object-store/
+  ref-layer split, reused rather than invented) — explicitly not yet
+  researched the way the rest of this document's claims are.
+- Added to §4: a universality check (does "serve this web page," not just
+  "file a tax return," fit the Capability model?) surfaced a real gap —
+  the current model implicitly assumes one-shot Interpretations, and a
+  long-running/daemon-shaped Capability doesn't fit that shape. Noted as
+  open, not designed.
+- Updated §3.1's currency note: the security-audit remediation flagged as
+  in-progress in the prior revision has since landed on `main` (PR #32) —
+  Sub-project 6b's integration point is no longer targeting a moving
+  target.
+
+**Third revision — a currency pass, not new design work:**
 - Restructured all phase numbering from independent "Sub-project 1–9" into
   a single **Sub-project 6** with phases 6a–6i, avoiding a real collision
   with Riptide's own `PROGRESS.md` table (its sub-projects 1–5, confirmed
