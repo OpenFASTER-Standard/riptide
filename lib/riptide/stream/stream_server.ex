@@ -79,7 +79,7 @@ defmodule Riptide.Stream.StreamServer do
     end)
   end
 
-  # Mirrors Riptide.Placement.with_ordinal_fallback/2's own "try each
+  # Mirrors Riptide.Placement.with_current_members/1's own "try each
   # member in turn" shape (see its own moduledoc for the SPOF finding this
   # pattern originally fixed for the placement cluster): a stream's replica
   # list is fixed once assigned, and any one of them being briefly
