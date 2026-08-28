@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a shipped** (Rule/Signature representation and parser) — 20 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b shipped** (Rule/Signature representation and parser; fact-pattern matching and joins) — 19 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -515,4 +515,24 @@ new persistence path. `linkml-datalog` re-checked 2026-08-28: still dormant (las
 2024-02-14) — unchanged from the design spec's prior checks.
 
 **Status**: Phase 6c-i-a shipped 2026-08-28. 20 phases remaining across the primary spine and the
+three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6c-i-b — Fact-pattern matching and joins
+
+Second link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → ...`), following
+6c-i-a's Rule/Signature representation. **Shipped 2026-08-28** — see
+`docs/superpowers/specs/2026-08-28-phase-6c-i-b-fact-pattern-matching-design.md`.
+
+`Riptide.Derivation.Matcher.bindings/2`/`evaluate/2` evaluate the fact-pattern-only fragment of
+QueryInterpretation: joins across a Rule's Body against a caller-supplied `RDF.Graph.t()`, then
+concludes the Head. Built as a thin adapter over `RDF.Query`/`RDF.Query.BGP` (already available
+transitively via the `rdf` hex dependency, no new dependency) rather than a hand-rolled join
+algorithm. Closes a real unbounded-atom-creation risk found during design: `RDF.Query.BGP`'s
+matcher requires atom-based variables, so Body variables are translated through a small, fixed,
+compile-time-created pool of placeholder atoms rather than `String.to_atom/1` on untrusted
+variable-name text. Also enforces Datalog rule safety (every Head variable must appear in the
+Body) and rejects Bodies containing capability-reference/rule-reference literals (out of scope
+until 6b-i's WASI substrate exists).
+
+**Status**: Phase 6c-i-b shipped 2026-08-28. 19 phases remaining across the primary spine and the
 three parallel tracks — see the design spec's §7 for the full roadmap.
