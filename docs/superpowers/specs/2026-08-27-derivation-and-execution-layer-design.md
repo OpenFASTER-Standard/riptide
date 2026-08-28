@@ -1,13 +1,14 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, seventh revision — resolved the bisimilar-term-graph
-question (§8.2, §6): Rule expressiveness stays unconstrained, DedupGate
-owns arbitrating incomparable generalizations. This is one architecture
-spec defining a single new top-level Riptide sub-project, **Sub-project
-6**, decomposed into phases 6a–6i, the same way Riptide's own sub-projects
-3, 4, and 5 are already decomposed. Each phase gets its own implementation
-plan (`writing-plans`) when work on it starts. See §11 for the itemized
-changelog across all seven revisions.
+**Status:** Draft, eighth revision — a third, capped research pass
+chasing the ILP/anti-unification lead directly (§8.7.3): still no formal
+supersedes criterion, but a concrete, well-precedented arbitration tool
+for Sub-project 6e (bottom-clause-style bounding). This is one
+architecture spec defining a single new top-level Riptide sub-project,
+**Sub-project 6**, decomposed into phases 6a–6i, the same way Riptide's
+own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
+own implementation plan (`writing-plans`) when work on it starts. See §11
+for the itemized changelog across all eight revisions.
 
 ## 1. Motivation and vision
 
@@ -291,7 +292,12 @@ two scopes:
   bisimilar-term-graph fragment, anti-unifying two Rules can yield several
   mutually-incomparable generalizations rather than one canonical answer —
   DedupGate's arbitration mechanism for that case is Sub-project 6e's own
-  design work, not specified here.
+  design work, not specified here. §8.7.3 surfaces a real, well-precedented
+  tool worth trying first: bottom-clause-style bounding (Muggleton's
+  inverse entailment) applied per anti-unification call, which recovers a
+  well-defined single generalization locally without a blanket restriction
+  on Rule expressiveness — a real ILP-system technique (Progol, Golem), not
+  invented for this spec.
 - **CatalogEntry** — `⊑ Rule`, admitted or merged by DedupGate, subject to
   §5's admission consequence.
 - **Pattern is not a separate type.** It's the name for a CatalogEntry at
@@ -571,6 +577,102 @@ its own dedicated pass before any further generic sweep of adjacent
 database-theory terminology, which has now been tried twice with
 diminishing returns.
 
+**8.7.3 Third pass, chasing the ILP/anti-unification lead directly — no
+full supersedes criterion, but one genuinely actionable connection.** A
+capped five-angle pass (Plotkin's lattice itself; θ-subsumption/refinement
+operators; ILP theory-revision systems FORTE/INTHELEX/CLINT/Wrobel;
+version spaces; modern 2015–2026 anti-unification/MIL/probabilistic-ILP
+work) confirms the gap from a fifth different direction, but surfaces one
+real, concrete, implementable technique:
+
+- **Four of five angles confirm the same gap, again, from ILP's own home
+  field.** The subsumption lattice itself is a pure ordering, not a
+  validity criterion — and θ-subsumption is a *sound but incomplete*
+  proxy for logical implication, a gap so real that a widely-cited
+  "convenient" special case of the field's own "Subsumption Theorem" was
+  later proven **false**, requiring some published inverse-resolution
+  results to be reconsidered (Nienhuys-Cheng & de Wolf, ILP-95). Refinement
+  operators have precise soundness/completeness properties, but these
+  characterize *search-traversal reachability* within an already-fixed
+  ordering, not validity of replacing one rule with another — and a
+  general **nonexistence** result holds: no "ideal" (locally-finite +
+  proper + complete) refinement operator exists for unrestricted clause
+  sets under θ-subsumption *or* full logical implication (van der Laag &
+  Nienhuys-Cheng). Real ILP theory-revision systems (FORTE, INTHELEX,
+  CLINT) uniformly accept a revision by an empirical/heuristic test
+  (coverage of a fixed example set, accuracy improvement) — never a
+  proof-theoretic guarantee that untouched entailments survive the
+  revision. Wrobel (1993) is the one partial exception — formal AGM-style
+  "base revision postulates" for *specialization* only, explicitly scoped
+  away from generalization. FORTE's own authors independently rediscover
+  and state the same AGM/ILP mismatch §8.7.1 already found from the belief-
+  revision side: "this work does not address the inductive problem of
+  generalizing a theory... [it] tends to focus on minimal semantic change
+  which requires memorizing exceptions" — real corroboration from a
+  second, independent lineage.
+- **Version spaces (Mitchell 1978/1982; Hirsh 1991) is the one angle that
+  gives something new and concretely usable.** Hirsh's theorem is
+  domain-independent and rule-language-agnostic: *any* partially-ordered
+  hypothesis language is representable by safe generalization/
+  specialization boundary sets **if and only if it is convex and
+  definite** — a real, checkable, general criterion, not
+  attribute-value-specific. Applied honestly to an unrestricted Horn-
+  clause/Datalog rule space, this typically **fails** (not definite) —
+  the same nonexistence result as above, confirmed concretely: Progol's
+  own unbounded hypothesis space is proven **not a lattice** (a
+  generalization of two reachable clauses can itself be unreachable).
+  **But there's a proven fix, already used in working ILP systems**:
+  bounding the hypothesis space below by a "bottom clause" (Muggleton's
+  inverse entailment) restores a genuine lattice — lgg and most-general-
+  specialization both guaranteed to exist, ideal refinement operators
+  provably exist for the *bounded* order even though they don't for the
+  unbounded one (Tamaddoni-Nezhad & Muggleton 2009). And: anti-unification
+  — the exact mechanism this spec already adopted for Generalization (§5)
+  — is confirmed to be literally the operation that builds the
+  generalization/S-boundary side of this lattice for Horn clauses (Golem,
+  ProGolem); the specialization/G-boundary side is the half that provably
+  breaks down without bounding.
+- **The actionable connection to this spec's own Decision 1 (§8.2, §6):**
+  this doesn't reverse that decision (Rule expressiveness stays
+  unconstrained; DedupGate arbitrates incomparable generalizations) — but
+  it gives Sub-project 6e a concrete, well-precedented *tool* for that
+  arbitration, worth recording now rather than rediscovering later:
+  bottom-clause-style bounding **per anti-unification call** (anchoring a
+  generalization attempt to a maximally-specific reference point) can
+  recover a well-defined lgg locally, exactly where DedupGate needs one,
+  without a blanket restriction on what a Rule's Body can express overall.
+  A genuinely different lever than "constrain globally" (rejected) or
+  "arbitrate freely with no structure" (chosen) — a third option worth
+  testing once 6c produces a real Rule representation to try it against.
+- **Modern (2015–2026) work reuses classical machinery or answers a
+  different question.** Popper (Cropper & Morel 2021) has a real, modern,
+  machine-checked soundness theorem for pruning during search — built
+  explicitly on unchanged Plotkin (1971)/Midelfart (1999) subsumption, not
+  new theory. Patsantzis & Muggleton (2022) genuinely extend subsumption
+  itself (to higher-order metarules) but for *search-procedure* validity,
+  not rule-base update. `babble` (Cao et al., POPL 2023) — anti-
+  unification-based library learning via e-graphs — has a real 2023
+  soundness+completeness theorem for "abstraction validly replaces
+  specific code," but the validity notion is semantic/operational
+  equivalence (β-reduction), a structurally different tool than logical
+  subsumption, answering "is this the same program," not "does this rule
+  supersede that rule." The field's own authoritative retrospective ("ILP
+  at 30," Cropper/Dumančić/Evans/Muggleton 2022) does not treat rule-
+  supersession-for-versioning as either solved or an open problem — it is
+  simply not on the mainstream research agenda.
+
+**Net, after three dedicated research passes**: still no existing
+formalism directly answers "rule B (refined) supersedes rule A
+(generalized)" — the gap is now confirmed from five independent
+directions (DL/AGM, patch theory, view update/schema-mapping-evolution,
+and now ILP's own home field). The pragmatic git/TerminusDB-style model
+remains the adopted approach. What this pass adds isn't a missing
+criterion but a concrete implementation tool for the decision already
+made: bottom-clause-style local bounding as Sub-project 6e's way of
+recovering well-defined generalizations exactly where DedupGate needs
+them, informed by real, working ILP-system precedent rather than invented
+from scratch.
+
 **8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
 C++ implementing semi-naive evaluation, backed by a concurrent B-tree and
 Brie (a concurrent trie). Adoptable for QueryInterpretation.
@@ -697,13 +799,15 @@ deleted silently — see §11's changelog for the full reasoning):
 - Concurrent-effectful-execution coordination (6d-ii's actual subject
   matter) — confirmed this revision as real design work owed directly by
   this project, not a literature gap a further research pass would close.
-- Formal versioning/supersedes theory for declarative rules — two
-  dedicated passes now (§8.7.1, §8.7.2): AGM/KM logic-program update and
-  TGD conservative-extension are real candidate anchors, view update
-  problem and schema-mapping-evolution are real but answer a different
-  question, none an exact fit. ILP's anti-unification/generalization-
-  lattice literature is the converging next lead — worth its own pass
-  before another generic terminology sweep.
+- Formal versioning/supersedes theory for declarative rules — three
+  dedicated passes now (§8.7.1–§8.7.3): AGM/KM logic-program update and
+  TGD conservative-extension are real candidate anchors; view update
+  problem, schema-mapping-evolution, and ILP's own subsumption/refinement-
+  operator/theory-revision literature are all real but answer a different
+  question. No exact fit found across five independent directions. §8.7.3
+  does surface one concrete, actionable tool (bottom-clause-style
+  bounding, informing 6e's DedupGate arbitration — §6) even without
+  closing the formal gap itself.
 - `linkml-datalog`'s dormancy — re-check again immediately before 6c
   depends on it, not just at spec-writing time (§8.6).
 - Large-object/persistent-capability engineering details researched but
@@ -721,7 +825,36 @@ deleted silently — see §11's changelog for the full reasoning):
 
 ## 11. Changelog
 
-**This revision (seventh) — resolved the bisimilar-term-graph question:**
+**This revision (eighth) — third research pass, chasing the ILP/anti-
+unification lead directly (capped at 5 subagents to bound token spend):**
+- Added §8.7.3. Four of five angles (Plotkin's lattice; θ-subsumption/
+  refinement operators; ILP theory-revision systems FORTE/INTHELEX/CLINT/
+  Wrobel; modern 2015–2026 MIL/program-synthesis work) confirm the same
+  gap from ILP's own home field — no formal "rule B supersedes rule A"
+  criterion, only search-traversal reachability properties, empirically-
+  accepted revisions, or (Wrobel) a narrow specialization-only postulate
+  set. Independently rediscovered the same AGM/ILP mismatch §8.7.1 found,
+  this time from FORTE's own authors.
+- The fifth angle (version spaces, Hirsh 1991) is a genuine hit: a
+  domain-independent convexity+definiteness criterion for when any rule
+  language admits safe generalization-boundary tracking, plus a real,
+  working-system technique (bottom-clause bounding, Progol/Golem) for
+  recovering that property in an otherwise-unbounded Horn-clause/Datalog
+  space. Confirms anti-unification (this spec's own Generalization
+  mechanism, §5) is literally the operation ILP systems already use for
+  the generalization-boundary half of that lattice.
+- Updated §6's DedupGate note and §10 to record bottom-clause-style
+  bounding as a concrete tool for Sub-project 6e's arbitration mechanism
+  (§8.2/§6's Decision 1, from the prior revision) — informs the decision
+  already made, doesn't reopen it.
+- Net across three passes now: the formal-supersedes gap is confirmed
+  from five independent directions (DL/AGM, patch theory, view
+  update/schema-mapping-evolution, ILP). The pragmatic git/TerminusDB
+  model remains adopted; further research on this specific question is
+  not recommended without new information, per the same discipline
+  already applied to patch theory in §8.7.1.
+
+**Seventh revision — resolved the bisimilar-term-graph question:**
 - §8.2/§6: Rule expressiveness is **not** constrained to the
   bisimilar-term-graph fragment. Real composability (rule-reference
   literals sharing values across calls) wins over guaranteed-unique
