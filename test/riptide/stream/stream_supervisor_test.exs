@@ -4,6 +4,11 @@ defmodule Riptide.Stream.StreamSupervisorTest do
   alias Riptide.Event
   alias Riptide.Stream.{Placement, StreamServer, StreamSupervisor}
 
+  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
+    assert StreamSupervisor.ensure_ready_status(:ok) == :ok
+    assert StreamSupervisor.ensure_ready_status({:error, :cluster_not_formed}) == :error
+  end
+
   test "ensure_ready/1 returns :ok for an unseen stream id" do
     stream_id = "stream-#{System.unique_integer([:positive])}"
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)

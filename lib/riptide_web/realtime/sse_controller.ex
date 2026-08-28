@@ -1,5 +1,5 @@
 defmodule RiptideWeb.Realtime.SseController do
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
   require Logger
 
   alias Riptide.Event
@@ -69,7 +69,7 @@ defmodule RiptideWeb.Realtime.SseController do
   end
 
   defp do_subscribe_existing_stream(conn, stream_id, cursor) do
-    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+    case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :ok ->
         # Subscribing before reading the backlog avoids ever missing an event
         # (Plug.Conn.chunk order: below), but opens a duplicate-delivery
@@ -101,10 +101,6 @@ defmodule RiptideWeb.Realtime.SseController do
         send_resp(conn, 503, "")
     end
   end
-
-  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
-  def ensure_ready_status(:ok), do: :ok
-  def ensure_ready_status({:error, _reason}), do: :error
 
   defp loop(conn, last_sequence) do
     receive do

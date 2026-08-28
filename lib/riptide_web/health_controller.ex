@@ -1,5 +1,5 @@
 defmodule RiptideWeb.HealthController do
-  use Phoenix.Controller
+  use Phoenix.Controller, formats: [:json]
 
   # Never a real stream — just needs to reach `PlacementMachine.get/2`'s O(1)
   # map lookup so `/health/ready` proves the placement Ra cluster answers,

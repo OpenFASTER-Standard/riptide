@@ -24,10 +24,10 @@ defmodule Riptide.Placement do
   @replication_factor 3
 
   @spec propose_nodes(pos_integer(), [node()]) :: [node()]
-  def propose_nodes(replication_factor \\ @replication_factor, peers \\ Node.list()) do
+  def propose_nodes(replication_factor \\ @replication_factor, candidate_nodes \\ Node.list()) do
     local = node()
     remaining = max(replication_factor - 1, 0)
-    other_candidates = peers -- [local]
+    other_candidates = candidate_nodes -- [local]
 
     [local | select_nodes(other_candidates, remaining)]
   end

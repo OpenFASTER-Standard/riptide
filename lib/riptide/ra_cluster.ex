@@ -481,55 +481,6 @@ defmodule Riptide.RaCluster do
     :exit, _ -> false
   end
 
-  # Retries indefinitely until the placement cluster is either genuinely
-  # formed (genesis) or this node successfully joins an already-existing
-  # one — intended to be started as a fire-and-forget background task at
-  # application boot (see Riptide.PlacementMembership), not called
-  # synchronously from a request path.
-  @spec ensure_placement_cluster_started(pos_integer(), (-> :ok | {:error, term()})) :: :ok
-  def ensure_placement_cluster_started(
-        retry_interval_ms \\ 1000,
-        attempt_fun \\ &Riptide.PlacementMembership.bootstrap_once/0
-      ) do
-    do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, 1)
-  end
-
-  # Every failed attempt was previously silent — an operator watching
-  # `/health/ready` = 503 forever had no log line or metric explaining why,
-  # only a real `:ra`-state introspection session to diagnose it. Logs the
-  # first attempt's failure immediately (so the very first sign of trouble
-  # is visible right away) and then only every 30th attempt thereafter (with
-  # the default 1s retry interval, roughly once every 30s) to avoid log-spam
-  # during a startup window where early failures are routine and expected
-  # (sibling ordinals legitimately not resolvable yet). Every attempt still
-  # increments the telemetry counter regardless of whether it logs.
-  @log_every_nth_attempt 30
-  defp do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, attempt) do
-    case attempt_fun.() do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        :telemetry.execute(
-          [:riptide, :ra, :placement_cluster_formation_attempts],
-          %{},
-          %{result: :error}
-        )
-
-        if attempt == 1 or rem(attempt, @log_every_nth_attempt) == 0 do
-          Logger.warning(
-            "Placement cluster not yet formed, still retrying (attempt #{attempt}): " <>
-              inspect(reason),
-            attempt: attempt,
-            reason: inspect(reason)
-          )
-        end
-
-        Process.sleep(retry_interval_ms)
-        do_ensure_placement_cluster_started(retry_interval_ms, attempt_fun, attempt + 1)
-    end
-  end
-
   # Generalizes what used to be attempt_start_placement_cluster/1's per-member-config +
   # `:ra.start_cluster/2` pattern beyond the hardcoded 3 placement ordinals
   # to an arbitrary node list — used by `Riptide.Stream.Placement` (Phase

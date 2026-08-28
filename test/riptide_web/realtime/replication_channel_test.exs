@@ -175,11 +175,6 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     Task.await(task_b)
   end
 
-  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
-    assert ReplicationChannel.ensure_ready_status(:ok) == :ok
-    assert ReplicationChannel.ensure_ready_status({:error, :cluster_not_formed}) == :error
-  end
-
   test "connecting with no auth_token still succeeds, current_subject is nil" do
     assert {:ok, socket} = connect(Socket, %{})
     assert socket.assigns.current_subject == nil

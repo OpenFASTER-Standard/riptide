@@ -92,7 +92,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   end
 
   defp do_join(stream_id, cursor, socket) do
-    case stream_id |> StreamSupervisor.ensure_ready() |> ensure_ready_status() do
+    case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :ok ->
         # Same subscribe-before-read ordering (and the same duplicate-delivery
         # window it opens) as RiptideWeb.Realtime.SseController.do_subscribe/3
@@ -132,10 +132,6 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   def handle_info({:new_event, %Event{}}, socket) do
     {:noreply, socket}
   end
-
-  @spec ensure_ready_status(:ok | {:error, term()}) :: :ok | :error
-  def ensure_ready_status(:ok), do: :ok
-  def ensure_ready_status({:error, _reason}), do: :error
 
   defp frame(%Event{} = event) do
     {:ok, turtle} = TurtleCodec.encode(Event.wire_payload(event))
