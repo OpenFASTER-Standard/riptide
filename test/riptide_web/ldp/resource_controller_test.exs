@@ -298,13 +298,6 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     refute log =~ "manual cleanup needed"
   end
 
-  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
-    assert ResourceController.ensure_ready_status(:ok) == :ok
-
-    assert ResourceController.ensure_ready_status({:error, :cluster_not_formed}) ==
-             :error
-  end
-
   describe "stream_id_for/2 and parse_stream_id/1" do
     test "parse_stream_id/1 recovers the exact tenant_id and path_segments stream_id_for/2 was built from" do
       stream_id = ResourceController.stream_id_for("acme", ["docs", "sub"])

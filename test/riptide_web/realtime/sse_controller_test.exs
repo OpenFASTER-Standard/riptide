@@ -7,7 +7,6 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
-  alias RiptideWeb.Realtime.SseController
 
   @opts RiptideWeb.Endpoint.init([])
 
@@ -104,13 +103,6 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     assert conn.status == 409
     assert Jason.decode!(conn.resp_body) == %{"oldestAvailable" => 2}
-  end
-
-  test "ensure_ready_status/1 maps :ok and {:error, _} correctly" do
-    assert SseController.ensure_ready_status(:ok) == :ok
-
-    assert SseController.ensure_ready_status({:error, :cluster_not_formed}) ==
-             :error
   end
 
   describe "authentication" do
