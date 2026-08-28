@@ -1,0 +1,17 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: riptide
+  labels:
+    app: riptide
+spec:
+  # With the default replicas: 3 in statefulset.yaml, Ra's Raft quorum needs
+  # 2 of 3 members up. A voluntary disruption (node drain, cluster upgrade)
+  # with no PDB could evict 2+ pods at once and break quorum -- this caps
+  # voluntary evictions to one pod at a time, regardless of replica count.
+  # If you change replicas: in statefulset.yaml, this maxUnavailable: 1
+  # still holds (quorum needs a majority up either way).
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: riptide
