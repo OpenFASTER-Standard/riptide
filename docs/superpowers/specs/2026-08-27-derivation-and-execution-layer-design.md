@@ -1,13 +1,14 @@
 # Derivation and Execution Layer — Architecture Design
 
-**Status:** Draft, fifth revision — a dedicated research pass grounding
-§3.3 (large objects) and §4's daemon-capability gap together, per explicit
-direction not to treat them as separate concerns (§8.12). This is one
-architecture spec defining a single new top-level Riptide sub-project,
-**Sub-project 6**, decomposed into phases 6a–6i, the same way Riptide's
-own sub-projects 3, 4, and 5 are already decomposed. Each phase gets its
-own implementation plan (`writing-plans`) when work on it starts. See §11
-for the itemized changelog across all five revisions.
+**Status:** Draft, sixth revision — a second dedicated research pass on
+formal versioning/supersedes theory (§8.7.2), chasing this document's own
+prior leads (view update problem, schema mapping evolution, 2023–2026
+advances) rather than a fresh generic sweep. This is one architecture
+spec defining a single new top-level Riptide sub-project, **Sub-project
+6**, decomposed into phases 6a–6i, the same way Riptide's own sub-projects
+3, 4, and 5 are already decomposed. Each phase gets its own implementation
+plan (`writing-plans`) when work on it starts. See §11 for the itemized
+changelog across all six revisions.
 
 ## 1. Motivation and vision
 
@@ -483,12 +484,78 @@ this space, and closed off one dead end:
   Worth its own dedicated pass before concluding no exact fit exists
   anywhere.
 
-Net: no single existing formalism directly answers "rule B (refined)
-supersedes rule A (generalized)" — the pragmatic git/TerminusDB-style
-model stays the adopted approach, but AGM/KM update theory and TGD
-conservative-extension are now real candidate anchors to build a more
-rigorous foundation on later, and ILP's own generalization-lattice
-literature is the most promising unexplored lead.
+**8.7.2 Second pass, chasing this revision's own leads — real literature
+found, still no exact fit.** Following up directly on the terminology
+§8.7.1 named (view update problem, schema mapping evolution, Horn/rule
+theory revision) plus a fresh check for 2023–2026 advances:
+
+- **The classical view update problem (Bancilhon & Spyratos 1981;
+  Cosmadakis & Papadimitriou 1984, JACM; Franconi & Guagliardo 2012) is
+  real, rigorous, and decidable in restricted cases** — the "constant
+  complement" principle, operationalized as view-mapping invertibility,
+  reducing to a decidable polynomial-time dependency-implication test for
+  FD+JD-only schemas. **But confirmed, via full-text negative search, to
+  answer a different question**: it's about translating a *data* update
+  through a *fixed* view/rule, never about changing the rule mapping
+  itself — zero occurrences of "evolution" or "compatible" anywhere in
+  the primary literature. One transferable hint: extending even the
+  propositional-level result to full first-order logic already requires
+  structural restrictions (weak stratification, definiteness) — any
+  analogous safe-generalization criterion for Riptide's own Rules would
+  likely need similar restrictions, not a fully general result.
+- **Schema-mapping-evolution literature (Fagin/Kolaitis/Popa/Tan 2011;
+  Yu & Popa, VLDB 2005; Velegrakis/Miller/Popa, VLDB 2003) is real,
+  foundational, and TGD-based** — directly relevant in substance, since
+  it uses the same source-to-target TGD formalism as existential rules.
+  Formalizes evolution as mapping composition/inversion, with a hierarchy
+  of chase-based inverse notions and a "mapping universe" membership
+  test. **But the authors never define an independent
+  compatible/breaking predicate** — a change is judged safe only
+  operationally, by whether the adaptation procedure succeeds — and a
+  stronger reading (that this literature offers a clean two-tier
+  validity/consistency breaking-change taxonomy) was explicitly refuted
+  on verification. There's also a hard expressiveness ceiling: plain
+  source-to-target TGDs aren't closed under composition in general, so
+  composing two TGD-level changes can require stepping outside the
+  TGD/Datalog language entirely (second-order TGDs) just to stay
+  expressible.
+- **No 2023–2026 advance was found for any previously-researched
+  branch** — not AGM/Katsuno-Mendelzon logic-program update, not TGD
+  conservative extension. The Jung/Lutz/Marcinkowski KR 2022 paper
+  re-surfaced under this pass's own search is the *same* paper §8.7.1
+  already found, not new information; its undecidability limits for
+  linear/guarded TGDs stand unchanged.
+- **Horn-theory/Datalog-program revision under database-dependency-theory
+  framing (distinct from AGM/KR), and "does classical FD/IND implication
+  theory give a safe-extension notion for a whole dependency set"** —
+  both came back with zero on-point literature. After two dedicated
+  passes searching different terminology for each, these are now
+  confirmed gaps, not just unsearched corners.
+- **This pass's own new leads, not yet researched:** does any literature
+  treat *anti-unification-based* rule generalization specifically as its
+  own formal object with a compatibility criterion tuned to that
+  operation — rather than generic TGD composition or conservative
+  extension? (This independently arrives at the same place §8.7.1's ILP
+  generalization-lattice lead already pointed to.) Is there a
+  sound-but-incomplete, decidable approximation of conservative extension
+  for Datalog-style rules, trading completeness the way DL literature
+  sometimes does with syntactic sufficient conditions? Does any work
+  combine schema-mapping-evolution's composition/inversion *mechanism*
+  with conservative extension's *safety test*?
+
+**Net, after two dedicated research passes**: no single existing
+formalism directly answers "rule B (refined) supersedes rule A
+(generalized)." The pragmatic git/TerminusDB-style model stays the
+adopted approach. Two real candidate anchors exist (AGM/KM update theory;
+TGD conservative-extension) plus two real-but-answering-a-different-
+question bodies of work now ruled out as direct fits (view update
+problem; schema-mapping-evolution correctness). **Every path now points
+at the same next step**: ILP's own anti-unification/generalization-
+lattice literature, independently surfaced by both this revision and the
+prior one as the lead closest to this spec's actual mechanism — worth
+its own dedicated pass before any further generic sweep of adjacent
+database-theory terminology, which has now been tried twice with
+diminishing returns.
 
 **8.8 Parallelism.** Soufflé compiles `par...endpar` to OpenMP-annotated
 C++ implementing semi-naive evaluation, backed by a concurrent B-tree and
@@ -613,10 +680,13 @@ deleted silently — see §11's changelog for the full reasoning):
 - Whether the Rule/workflow-graph representation can be constrained to the
   bisimilar-term-graph fragment, or whether DedupGate must arbitrate a
   finite set of incomparable generalizations (§8.2).
-- Formal versioning/supersedes theory for declarative rules — real
-  candidate anchors found this revision (AGM/KM logic-program update, TGD
-  conservative-extension), neither an exact fit; ILP's generalization-
-  lattice literature is the most promising unresearched lead (§8.7.1).
+- Formal versioning/supersedes theory for declarative rules — two
+  dedicated passes now (§8.7.1, §8.7.2): AGM/KM logic-program update and
+  TGD conservative-extension are real candidate anchors, view update
+  problem and schema-mapping-evolution are real but answer a different
+  question, none an exact fit. ILP's anti-unification/generalization-
+  lattice literature is the converging next lead — worth its own pass
+  before another generic terminology sweep.
 - `linkml-datalog`'s dormancy — re-check again immediately before 6c
   depends on it, not just at spec-writing time (§8.6).
 - Large-object/persistent-capability engineering details researched but
@@ -634,7 +704,29 @@ deleted silently — see §11's changelog for the full reasoning):
 
 ## 11. Changelog
 
-**This revision (fifth) — §3.3 and §4 researched together, per direction
+**This revision (sixth) — second research pass on formal
+versioning/supersedes theory, requested explicitly rather than accepting
+the prior "not found" result:**
+- Added §8.7.2, chasing §8.7.1's own named leads directly (view update
+  problem, schema mapping evolution, Horn/rule theory revision under
+  database-dependency-theory framing, and a fresh 2023–2026 liveness
+  check) instead of a generic re-sweep.
+- Found real, rigorous literature for two of these (classical view update
+  problem; schema-mapping-evolution/composition-inversion theory) —
+  both confirmed to answer an adjacent-but-different question than
+  Riptide's actual "is this rule change breaking" need, not a hidden
+  exact fit.
+- Confirmed no 2023–2026 advance exists for either previously-found
+  anchor (AGM/KM logic-program update; TGD conservative-extension).
+- Confirmed Horn/rule-theory-revision-via-database-dependency-theory and
+  "does classical FD/IND theory give a safe-extension notion" as genuine
+  gaps after two dedicated passes each, not just unsearched corners.
+- Net effect: this document's own two independent research passes now
+  converge on the same next step (ILP's anti-unification/generalization-
+  lattice literature) from two different directions — recorded as the
+  clear next move in §10, ahead of any further generic terminology sweep.
+
+**Fifth revision — §3.3 and §4 researched together, per direction
 not to treat them as separate:**
 - Rewrote §3.3 (large objects) from a flagged-unverified sketch to a
   research-grounded direction: content-addressed chunking (git/casync/
