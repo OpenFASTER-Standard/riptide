@@ -13,7 +13,7 @@ first place to check for current status, not a historical log.
 |---|---|---|
 | 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | **Shipped** — see below |
-| 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3e** — see below |
+| 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
 | 6 | Derivation and execution layer | **Design drafted, decomposed into 21 phases** (one shared foundation, one primary spine, three parallel tracks — after a full pairwise dependency/leverage review) — see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
@@ -71,11 +71,10 @@ just "add more Ra groups on the same disk."
   `RaCluster.consistent_query/2` for a linearizable read). This was the root cause of the
   crash-recovery test's earlier ~1-in-12 flake, now fixed by asserting durability via a consistent
   read.
-- **No schema-versioning envelope on persisted `Event`/`Patch` terms.** `Ra` stores raw Erlang
-  terms; a future `Event` struct-shape change (like this sub-project's own `is_snapshot?` →
-  `operation` change) would make previously-persisted data unreadable. Fine today (no deployment
-  has data across such a change), but needs a versioned envelope + migration path before Riptide
-  runs somewhere with existing persisted data. Deferred deliberately.
+- **No schema-versioning envelope on persisted `Event`/`Patch` terms** — true when this sub-project
+  shipped, deliberately deferred at the time. **Resolved by Phase 3a** (shipped 2026-08-24, see
+  §3 below): a versioned wrapper around persisted `Event`/`Patch` terms now exists specifically so
+  a struct-shape change like this doesn't break reading previously-persisted data.
 
 **Status**: shipped — see
 [PR #2](https://github.com/OpenFASTER-Standard/riptide/pull/2) (implementation) and
@@ -306,7 +305,7 @@ proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (automatic stream replica h
 they do), multi-tenancy (data isolation between tenants sharing one deployment), and TLS
 (transport security) — bundled under one roadmap line originally, but these are independent
 concerns, each getting its own brainstorm → spec → plan → implementation cycle, the same way
-sub-project 3 was decomposed into phases 3a-3d.
+sub-project 3 was decomposed into phases 3a-3e.
 
 **Key decisions made:**
 
@@ -419,15 +418,22 @@ sub-project 3 was decomposed into phases 3a-3d.
     ordinal fallback, placement-cluster formation attempts, stream formation failures, dropped
     poison commands, quota rejections; logging added for previously-silent failure paths.
 
-  **Known flake, confirmed 2026-08-28**: `SseControllerTest`'s "subscribing to more distinct
-  brand-new streams than the configured limit is rejected with 429" test occasionally observes
-  `[200, 200, 200]` instead of the expected `[200, 200, 429]` — Hammer's ETS-backed fixed window
-  can roll over between the 2nd and 3rd request under CI runner scheduling variance, letting the
-  3rd request land in a fresh window instead of tripping the limit. Confirmed transient: an
-  unrelated PR's CI failed on this exact assertion, then passed cleanly on an immediate rerun with
-  no code changes. Not a regression in the rate limiter itself — a real request only 30/min apart
-  should never legitimately land in a new window this fast; the flake is specific to test-suite
-  timing, not documented as blocking here because a rerun already demonstrates it.
+  **Flake fixed 2026-08-28 (previously tolerated as "known," now root-caused and resolved):**
+  `SseControllerTest`/`ReplicationChannelTest`'s "subscribing/joining more distinct brand-new
+  streams than the configured limit is rejected" tests occasionally observed one extra `:allow`
+  where a `:deny` was expected (e.g. `[200, 200, 200]` instead of `[200, 200, 429]`). Root cause,
+  confirmed via a dedicated reproduction test (`NewStreamRateLimitTest`) that deliberately times a
+  burst to straddle a window boundary rather than waiting on rare CI timing to surface it:
+  `Riptide.NewStreamRateLimit` used Hammer's default `:fix_window` algorithm, which anchors every
+  key's window to the same globally-synchronized wall-clock boundary (multiples of `scale_ms`
+  since the Unix epoch) rather than to when that subject's own activity began — a same-subject
+  burst can straddle that global boundary purely by chance of what real time it is when the burst
+  happens, resetting the count mid-burst. This was a real bug, not just a test artifact: the same
+  under-counting could let a real subject briefly exceed the configured limit in production, not
+  only in tests. Fixed by switching to Hammer's `:fix_window_per_key` algorithm, which anchors
+  each key's window to that key's own first hit instead — verified via 10 consecutive clean runs
+  of the affected test files with no failures (previously ~40% locally reproducible once the
+  underlying algorithm bug was isolated).
 
 **Status**: Phases 4a-4d shipped 2026-08-26. Sub-project 4 (Security & multi-tenancy) complete.
 Post-4d hardening fix shipped 2026-08-28.
