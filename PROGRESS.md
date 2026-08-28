@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-27
+**Last updated:** 2026-08-28
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -13,7 +13,7 @@ first place to check for current status, not a historical log.
 |---|---|---|
 | 1 | Persistence & durability | **Shipped** — see below |
 | 2 | Docker image + CI/CD | **Shipped** — see below |
-| 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3d** — see below |
+| 3 | Clustering / horizontal scale / HA | **Decomposed into phases 3a-3e** — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
 
@@ -275,9 +275,27 @@ sub-projects 1 and 2 did internally):
     cache keeps routing to the dead replica. Live-proved against a real 5-pod GKE StatefulSet
     (RF=3): a killed replica pod was automatically replaced with no operator action and no data
     loss.
+- **Phase 3e — Elastic placement-cluster membership.** Every other piece of clustering was
+  already elastic (general fleet connectivity, per-stream replica placement) — the ONE place
+  that genuinely assumed a fixed node count was the placement/metadata cluster's own membership,
+  hardcoded to exactly 3 fixed ordinals (`riptide-0`/`riptide-1`/`riptide-2`). **Shipped
+  2026-08-28** — see `docs/superpowers/specs/2026-08-27-phase-3e-elastic-placement-membership-design.md`.
+  Replaced with self-forming genesis (any node finding no existing placement cluster
+  deterministically computes and forms one from whoever's actually connected, after a short
+  settle window), discovery-based addressing (an ETS-cached fast path kept current via PubSub,
+  falling back to a fleet-wide probe — no more fixed ordinal names anywhere in
+  `Riptide.Placement`), and automatic reconciliation to a configurable `RIPTIDE_PLACEMENT_TARGET_SIZE`
+  (default 3, validated as a positive odd integer): ambient join when under target, leader-only
+  shrink/dead-member-repair when over target or a member is confirmed dead. Also added graceful
+  drain — a node proactively removes itself from the placement cluster on supervised shutdown.
+  Verified via a new `:peer`-based multi-node test suite (genesis convergence, grow, shrink,
+  dead-member replacement, graceful drain) and the full existing suite; unlike 3c-i/3c-ii/3c-iii/
+  3d-i/3d-ii, **not yet live-proved against a real GKE StatefulSet** — a reasonable follow-up,
+  not silently assumed equivalent to those phases' live-fire proof.
 
 **Status**: Phases 3a-3b shipped. Phase 3c (3c-i/3c-ii/3c-iii) fully shipped. Phase 3d-i (HA
-proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (automatic stream replica healing) shipped 2026-08-25.
+proof spike + fixes) shipped 2026-08-25. Phase 3d-ii (automatic stream replica healing) shipped
+2026-08-25. Phase 3e (elastic placement-cluster membership) shipped 2026-08-28.
 
 ## 4. Security & multi-tenancy — decomposed into phases
 
@@ -354,8 +372,23 @@ sub-project 3 was decomposed into phases 3a-3d.
   design spec's Out of scope section. Verified via `kubectl apply --dry-run=server` against a
   scratch namespace on a live cluster (schema-valid), not a live-issued certificate — real ACME
   issuance needs public DNS + a reachable ingress IP, which this phase does not provision.
+- **Post-4d hardening — unbounded atom creation via read-only requests.** Found during a deep
+  repo-health investigation, 2026-08-28: `RaCluster.server_id/1` mints a permanent, never-freed
+  BEAM atom for any `stream_id` it's asked about, and `RiptideWeb.LDP.ResourceController`'s `GET`
+  action, `SseController`'s subscribe, and `ReplicationChannel`'s join all called
+  `StreamSupervisor.ensure_ready/1` (which mints that atom) unconditionally — including for a
+  resource nobody had ever written to. An authenticated user with ordinary read access to their
+  own tenant could loop distinct never-created paths to exhaust the BEAM's atom table and crash
+  the shared node for every tenant; `Riptide.Stream.Placement`'s existing 10,000-streams-per-tenant
+  quota only partially bounded this (unlimited free, write-free atom creation via reads was still
+  possible). Fixed: the `GET` path now checks `Riptide.Placement.lookup/1` (a cheap, atom-free
+  existence query) before calling `ensure_ready/1` — 404 immediately if unassigned, no atom ever
+  minted. SSE subscribe and WS replication join must keep allowing "subscribe before first
+  write," so creation there is instead rate-limited per subject (`Riptide.NewStreamRateLimit`,
+  Hammer-backed) rather than refused outright.
 
 **Status**: Phases 4a-4d shipped 2026-08-26. Sub-project 4 (Security & multi-tenancy) complete.
+Post-4d hardening fix shipped 2026-08-28.
 
 ## 5. Observability & operability — decomposed into phases
 
@@ -402,4 +435,5 @@ one monolithic spec.
   (Observability & operability) and completes Riptide's entire production-readiness roadmap.
 
 **Status**: Phases 5a-5c shipped 2026-08-27. Sub-project 5 (Observability & operability) complete.
-Production-readiness roadmap complete.
+Production-readiness roadmap complete as of 2026-08-27 — see sub-projects 3 and 4 above for
+hardening work (Phase 3e, the post-4d atom-exhaustion fix) that continued to land afterward.
