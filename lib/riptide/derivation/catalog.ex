@@ -88,9 +88,27 @@ defmodule Riptide.Derivation.Catalog do
     end
   end
 
+  @riptide_pending_review RDF.iri("urn:riptide:vocab:PendingReview")
+
+  @spec queue_pending_review(scope(), DedupGate.PendingReview.t()) ::
+          {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
+  def queue_pending_review(scope, %DedupGate.PendingReview{} = pending_review) do
+    {node, graph} = DedupGate.PendingReview.to_rdf(pending_review)
+
+    case write_patch(pending_review_stream_id(scope), RDF.Graph.triples(graph), []) do
+      :ok -> {:ok, node}
+      {:error, _reason} = error -> error
+    end
+  end
+
   @spec list_pending_reviews(scope()) ::
           {:ok, [{RDF.BlankNode.t(), DedupGate.PendingReview.t()}]} | {:error, :not_ready}
-  def list_pending_reviews(_scope), do: {:ok, []}
+  def list_pending_reviews(scope) do
+    with {:ok, graph} <- read_graph(pending_review_stream_id(scope)) do
+      nodes = nodes_of_type(graph, @riptide_pending_review)
+      {:ok, Enum.map(nodes, &{&1, DedupGate.PendingReview.from_rdf(&1, graph)})}
+    end
+  end
 
   defp read_graph(stream_id) do
     case Placement.lookup(stream_id) do

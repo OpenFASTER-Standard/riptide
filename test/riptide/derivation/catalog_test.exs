@@ -2,6 +2,7 @@ defmodule Riptide.Derivation.CatalogTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Derivation.Catalog
+  alias Riptide.Derivation.DedupGate.PendingReview
   alias Riptide.Derivation.Literal.FactPattern
   alias Riptide.Derivation.{Rule, Signature}
 
@@ -91,6 +92,23 @@ defmodule Riptide.Derivation.CatalogTest do
       :ok = Catalog.supersede_entry(scope, old_node)
 
       assert {:ok, [{_node, ^new_rule}]} = Catalog.list_entries(scope)
+    end
+  end
+
+  describe "queue_pending_review/2 + list_pending_reviews/1 — real round-trip" do
+    test "a queued PendingReview is found live by list_pending_reviews/1" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope)) end)
+
+      pending_review = %PendingReview{
+        kind: :admit,
+        candidate: sample_rule("alice"),
+        fidelity_evidence: [:fidelity_pass, :fidelity_pass],
+        replaces: nil
+      }
+
+      assert {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+      assert {:ok, [{^node, ^pending_review}]} = Catalog.list_pending_reviews(scope)
     end
   end
 end
