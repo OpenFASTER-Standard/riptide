@@ -98,7 +98,10 @@ defmodule Riptide.Derivation.CatalogTest do
   describe "queue_pending_review/2 + list_pending_reviews/1 — real round-trip" do
     test "a queued PendingReview is found live by list_pending_reviews/1" do
       scope = unique_tenant()
-      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope)) end)
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
 
       pending_review = %PendingReview{
         kind: :admit,
@@ -109,6 +112,46 @@ defmodule Riptide.Derivation.CatalogTest do
 
       assert {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
       assert {:ok, [{^node, ^pending_review}]} = Catalog.list_pending_reviews(scope)
+    end
+  end
+
+  describe "resolve_pending_review/3" do
+    test "an approved item disappears from list_pending_reviews/1" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      pending_review = %PendingReview{
+        kind: :admit,
+        candidate: sample_rule("alice"),
+        fidelity_evidence: [:fidelity_pass, :fidelity_pass],
+        replaces: nil
+      }
+
+      {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+      assert :ok == Catalog.resolve_pending_review(scope, node, :approved)
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
+    end
+
+    test "a declined item disappears from list_pending_reviews/1" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      pending_review = %PendingReview{
+        kind: :admit,
+        candidate: sample_rule("alice"),
+        fidelity_evidence: [:fidelity_pass, :fidelity_pass],
+        replaces: nil
+      }
+
+      {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+      assert :ok == Catalog.resolve_pending_review(scope, node, :declined)
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
   end
 end
