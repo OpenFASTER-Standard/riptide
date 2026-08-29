@@ -438,4 +438,71 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       assert is_binary(object) or match?(%RDF.Literal{}, object)
     end
   end
+
+  describe "resolve_bindings/3" do
+    test "returns the raw bindings list instead of concluding into triples" do
+      head = %FactPattern{predicate: rel("sibling"), args: [%Var{name: "X"}, %Var{name: "Y"}]}
+      body = [%FactPattern{predicate: rel("worksAt"), args: [%Var{name: "X"}, %Var{name: "Y"}]}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: head.args,
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      graph = RDF.Graph.new([{t("alice"), rel("worksAt"), t("acme")}])
+
+      assert ExecuteInterpreter.resolve_bindings(rule, graph, context()) ==
+               {:ok, [%{%Var{name: "X"} => t("alice"), %Var{name: "Y"} => t("acme")}]}
+    end
+
+    test "an unresolvable capability IRI is rejected before any graph access" do
+      head = %FactPattern{predicate: rel("out"), args: [t("x"), %Var{name: "Result"}]}
+
+      body = [
+        %CapabilityReference{
+          capability: RDF.iri("urn:riptide:capability:notRegistered"),
+          args: [t("x")],
+          result: %Var{name: "Result"}
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert ExecuteInterpreter.resolve_bindings(rule, RDF.Graph.new(), context()) ==
+               {:error, {:unresolvable, RDF.iri("urn:riptide:capability:notRegistered")}}
+    end
+
+    test "a Body with zero matches returns {:ok, []}, not an error" do
+      head = %FactPattern{predicate: rel("sibling"), args: [%Var{name: "X"}, %Var{name: "Y"}]}
+      body = [%FactPattern{predicate: rel("worksAt"), args: [%Var{name: "X"}, %Var{name: "Y"}]}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: head.args,
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert ExecuteInterpreter.resolve_bindings(rule, RDF.Graph.new(), context()) == {:ok, []}
+    end
+  end
 end
