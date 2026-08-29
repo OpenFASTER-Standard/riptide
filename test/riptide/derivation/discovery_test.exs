@@ -90,4 +90,20 @@ defmodule Riptide.Derivation.DiscoveryTest do
                Discovery.find(scope, "greeted")
     end
   end
+
+  describe "find/2 — exact outranks a higher-overlap keyword hit" do
+    test "tier is the primary sort key, not raw overlap count" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      exact_rule = sample_rule("pendingDeploy", 0)
+      keyword_rule = sample_rule("pendingDeployNow", 0)
+
+      :ok = Catalog.admit_entry(scope, keyword_rule, nil)
+      :ok = Catalog.admit_entry(scope, exact_rule, nil)
+
+      assert {:ok, [{_node1, ^exact_rule}, {_node2, ^keyword_rule}]} =
+               Discovery.find(scope, "pending deploy")
+    end
+  end
 end
