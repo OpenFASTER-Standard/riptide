@@ -198,4 +198,22 @@ defmodule Riptide.Derivation.LLMFallbackTest do
       end)
     end
   end
+
+  describe "run/3 — ambiguous match" do
+    test "a response whose Body matches more than one way is :ambiguous_match" do
+      response = "greeted(<urn:test:riptide>, Target) :- pendingDeploy(<urn:test:riptide>, Target)."
+
+      graph =
+        RDF.Graph.new([
+          {t("riptide"), rel("pendingDeploy"), t("v1")},
+          {t("riptide"), rel("pendingDeploy"), t("v2")}
+        ])
+
+      ctx = context()
+
+      with_fake_client({:ok, response}, fn ->
+        assert LLMFallback.run("deploy riptide", graph, ctx) == {:error, :ambiguous_match}
+      end)
+    end
+  end
 end
