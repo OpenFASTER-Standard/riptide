@@ -228,4 +228,25 @@ defmodule Riptide.Stream.StreamServerTest do
       end
     end
   end
+
+  test "a Patch addition whose triple is RDF-star-annotated survives a real Ra append/read round trip",
+       %{stream_id: stream_id} do
+    alice = RDF.iri("urn:test:alice")
+    works_at = RDF.iri("urn:riptide:relation:worksAt")
+    acme = RDF.iri("urn:test:acme")
+    valid_from = RDF.iri("urn:riptide:relation:validFrom")
+
+    base_triple = {alice, works_at, acme}
+    annotation_triple = {base_triple, valid_from, RDF.literal(~U[2026-01-01 00:00:00Z])}
+
+    patch = %Riptide.RDF.Patch{additions: [base_triple, annotation_triple], removals: []}
+    event = Event.new(stream_id, :patch, patch)
+
+    appended = StreamServer.append(stream_id, event)
+    assert appended.sequence == 1
+
+    assert {:ok, [read_back]} = StreamServer.get_since(stream_id, 0)
+    assert read_back.payload == patch
+    assert read_back.payload.additions == [base_triple, annotation_triple]
+  end
 end
