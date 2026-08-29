@@ -132,6 +132,41 @@ defmodule Riptide.Derivation.AntiUnifierTest do
     assert hd(bar.args) == subject_var
   end
 
+  test "two same-predicate Body literals admit multiple alignments, tied at the same minimum variable count" do
+    rule1 =
+      rule(%FactPattern{predicate: rel("pair"), args: [%Var{name: "X"}, %Var{name: "Y"}]}, [
+        %FactPattern{predicate: rel("likes"), args: [%Var{name: "X"}, RDF.literal("cats")]},
+        %FactPattern{predicate: rel("likes"), args: [%Var{name: "Y"}, RDF.literal("dogs")]}
+      ])
+
+    rule2 =
+      rule(%FactPattern{predicate: rel("pair"), args: [%Var{name: "A"}, %Var{name: "B"}]}, [
+        %FactPattern{predicate: rel("likes"), args: [%Var{name: "A"}, RDF.literal("dogs")]},
+        %FactPattern{predicate: rel("likes"), args: [%Var{name: "B"}, RDF.literal("cats")]}
+      ])
+
+    assert {:ok, candidates} = AntiUnifier.generalize(rule1, rule2)
+
+    # Both valid pairings (straight: X~A,Y~B; crossed: X~B,Y~A) introduce
+    # exactly 4 distinct fresh variables each and are mutually incomparable
+    # — neither should be discarded in favor of the other. The straight
+    # pairing legitimately reuses two of those variables across the head
+    # and body (per the shared-memo-map sharing rule), so occurrence count
+    # differs between the two candidates even though distinct-variable
+    # count does not — hence dedup before counting.
+    assert length(candidates) == 2
+
+    for {generalization, _sub1, _sub2} <- candidates do
+      assert all_generalization_vars?(generalization)
+      assert generalization |> vars_in_rule() |> Enum.uniq() |> length() == 4
+    end
+
+    # The two candidates must actually be structurally different from
+    # each other (not two copies of the same generalization).
+    [{gen1, _, _}, {gen2, _, _}] = candidates
+    refute gen1.body == gen2.body
+  end
+
   defp substitute_rule(%Rule{head: head, body: body, signature: signature} = rule, substitution) do
     %{
       rule

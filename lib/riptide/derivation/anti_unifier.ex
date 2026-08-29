@@ -43,19 +43,63 @@ defmodule Riptide.Derivation.AntiUnifier do
   defp check_heads_compatible(%FactPattern{predicate: p}, %FactPattern{predicate: p}), do: :ok
   defp check_heads_compatible(_head1, _head2), do: {:error, :no_common_structure}
 
-  # Task 1: exactly one trivial pairing per shared identifying key — valid
-  # only when neither Body has two literals sharing a key. Task 2 replaces
-  # this with a full combinatorial bijection search.
+  # Alignments are built and returned in body1's own literal order, so the
+  # generalized Body's literal order (and thus its substitution round-trip)
+  # matches body1's — grouping/enumerating by key alone loses that order.
   defp alignments(body1, body2) do
+    indexed_body1 = Enum.with_index(body1)
+    groups1 = Enum.group_by(indexed_body1, fn {lit, _idx} -> literal_key(lit) end)
     groups2 = Enum.group_by(body2, &literal_key/1)
-    matched_keys = MapSet.new(Map.keys(groups2))
+    shared_keys = MapSet.intersection(MapSet.new(Map.keys(groups1)), MapSet.new(Map.keys(groups2)))
 
-    pairs =
-      body1
-      |> Enum.filter(&MapSet.member?(matched_keys, literal_key(&1)))
-      |> Enum.map(fn lit1 -> {lit1, hd(Map.fetch!(groups2, literal_key(lit1)))} end)
+    shared_keys
+    |> Enum.map(fn key -> all_bijections(Map.fetch!(groups1, key), Map.fetch!(groups2, key)) end)
+    |> cartesian_product()
+    |> Enum.map(fn combo ->
+      combo
+      |> List.flatten()
+      |> Enum.sort_by(fn {{_lit1, idx}, _lit2} -> idx end)
+      |> Enum.map(fn {{lit1, _idx}, lit2} -> {lit1, lit2} end)
+    end)
+  end
 
-    [pairs]
+  # All ways to pair up to min(length(list_a), length(list_b)) elements
+  # between the two lists — the shorter list is always fully paired; the
+  # longer list's excess elements are left unmatched in that pairing (and
+  # WHICH excess elements are left out, and in what order the rest pair,
+  # both vary across the returned alignments).
+  defp all_bijections(list_a, list_b) when length(list_a) <= length(list_b) do
+    list_b
+    |> combinations(length(list_a))
+    |> Enum.flat_map(&permutations/1)
+    |> Enum.map(fn chosen_b -> Enum.zip(list_a, chosen_b) end)
+  end
+
+  defp all_bijections(list_a, list_b) do
+    list_b
+    |> all_bijections(list_a)
+    |> Enum.map(fn pairs -> Enum.map(pairs, fn {b, a} -> {a, b} end) end)
+  end
+
+  defp permutations([]), do: [[]]
+
+  defp permutations(list) do
+    for elem <- list, rest <- permutations(list -- [elem]), do: [elem | rest]
+  end
+
+  defp combinations(_list, 0), do: [[]]
+  defp combinations([], _n), do: []
+
+  defp combinations([head | tail], n) do
+    with_head = for combo <- combinations(tail, n - 1), do: [head | combo]
+    without_head = combinations(tail, n)
+    with_head ++ without_head
+  end
+
+  defp cartesian_product([]), do: [[]]
+
+  defp cartesian_product([options | rest]) do
+    for option <- options, combo <- cartesian_product(rest), do: [option | combo]
   end
 
   defp literal_key(%FactPattern{predicate: p, args: args}), do: {:fact_pattern, p, length(args)}
