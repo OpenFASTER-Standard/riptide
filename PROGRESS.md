@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness) — 15 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration) — 14 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -644,4 +644,33 @@ a Generalization and its source Traces...") end-to-end via test composition rath
 module's own signature.
 
 **Status**: Phase 6e-ii shipped 2026-08-29. 15 phases remaining across the primary spine and
+the three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6e-iii — DedupGate orchestration
+
+Sixth link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → 6e-i → 6e-ii → 6e-iii →
+{6f, 6g-i}`), unblocked by 6e-i (#78), 6e-ii (#79), and 6d-i (#64). **Shipped 2026-08-29** —
+see `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
+
+Two new modules: `Riptide.Derivation.Catalog` (storage) and `Riptide.Derivation.DedupGate`
+(the `Reject`/`Merge`/`Admit` decision plus the human review workflow), scope-parameterized
+`Tenant`/`Hub` from the start. The key insight: a `CatalogEntry ⊑ Rule` is just more RDF
+Facts, so Catalog needed no new persistence subsystem — it reuses `StreamServer`/`Event`/
+`Patch`/`RuleRDFCodec`/`Matcher` exactly as `RiptideWeb.LDP.ResourceController` already does
+for LDP resources, as one more resource-stream namespace. `Merge` reuses
+`AntiUnifier.generalize/2` a second time (candidate × existing entry) instead of inventing a
+graph-merge algorithm; `Reject` vs. `Merge` reduces to a mechanical check on the recovering
+substitution's own values (`entry_unchanged? = Enum.all?(Map.values(sub_entry),
+&match?(%Var{}, &1))`) — no alpha-equivalence checker needed. `supersede_entry/2` and
+`resolve_pending_review/3` both retag rather than delete (a 2-triple patch swapping one
+`rdf:type`), avoiding a transitive-closure graph-deletion problem discovered while grounding
+the implementation plan and fixed in the spec before any code was written.
+`AntiUnifier.substitute/2` was promoted from a helper duplicated in 6e-i's and 6e-ii's own
+test files into real production code, since `DedupGate` needed it for real for the first
+time. One real finding surfaced only by testing: two "tied" candidate generalizations from
+`AntiUnifier.generalize/2` are not guaranteed to be alpha-equivalent to each other (a
+symmetric literal swap happens to produce isomorphic ones; an asymmetric one does not) —
+verified directly rather than assumed, after an initial proof attempt turned out to be wrong.
+
+**Status**: Phase 6e-iii shipped 2026-08-29. 14 phases remaining across the primary spine and
 the three parallel tracks — see the design spec's §7 for the full roadmap.
