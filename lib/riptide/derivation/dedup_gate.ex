@@ -1,0 +1,139 @@
+defmodule Riptide.Derivation.DedupGate.PendingReview do
+  @moduledoc """
+  A proposed Catalog change (`Admit` or `Merge`) awaiting human review, with
+  6e-ii's fidelity evidence attached. See design spec
+  `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`
+  §6.
+  """
+
+  alias Riptide.Derivation.{Rule, RuleRDFCodec}
+
+  @enforce_keys [:kind, :candidate, :fidelity_evidence, :replaces]
+  defstruct [:kind, :candidate, :fidelity_evidence, :replaces]
+
+  @type kind :: :admit | :merge
+  @type fidelity_evidence :: :fidelity_pass | {:fidelity_fail, term()}
+
+  @type t :: %__MODULE__{
+          kind: kind(),
+          candidate: Rule.t(),
+          fidelity_evidence: [fidelity_evidence()],
+          replaces: RDF.BlankNode.t() | nil
+        }
+
+  @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+  @riptide_pending_review RDF.iri("urn:riptide:vocab:PendingReview")
+  @riptide_kind RDF.iri("urn:riptide:vocab:kind")
+  @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
+  @riptide_fidelity_evidence RDF.iri("urn:riptide:vocab:fidelityEvidence")
+  @riptide_fidelity_status RDF.iri("urn:riptide:vocab:fidelityStatus")
+  @riptide_fidelity_reason RDF.iri("urn:riptide:vocab:fidelityReason")
+  @riptide_replaces RDF.iri("urn:riptide:vocab:replaces")
+
+  @doc "See moduledoc. Returns the item's own (blank) node plus the graph fragment reifying it."
+  @spec to_rdf(t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
+  def to_rdf(%__MODULE__{} = pending_review) do
+    node = RDF.BlankNode.new()
+    {candidate_node, candidate_graph} = RuleRDFCodec.to_rdf(pending_review.candidate)
+    {evidence_head, evidence_graph} = encode_evidence(pending_review.fidelity_evidence)
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add(candidate_graph)
+      |> RDF.Graph.add(evidence_graph)
+      |> RDF.Graph.add({node, @rdf_type, @riptide_pending_review})
+      |> RDF.Graph.add({node, @riptide_kind, RDF.literal(Atom.to_string(pending_review.kind))})
+      |> RDF.Graph.add({node, @riptide_candidate, candidate_node})
+      |> RDF.Graph.add({node, @riptide_fidelity_evidence, evidence_head})
+      |> maybe_add_replaces(node, pending_review.replaces)
+
+    {node, graph}
+  end
+
+  defp maybe_add_replaces(graph, _node, nil), do: graph
+
+  defp maybe_add_replaces(graph, node, replaces),
+    do: RDF.Graph.add(graph, {node, @riptide_replaces, replaces})
+
+  defp encode_evidence(evidence_list) do
+    {nodes, graph} =
+      Enum.reduce(evidence_list, {[], RDF.Graph.new()}, fn evidence, {acc, graph} ->
+        {node, evidence_graph} = encode_one_evidence(evidence)
+        {[node | acc], RDF.Graph.add(graph, evidence_graph)}
+      end)
+
+    list = RDF.List.from(Enum.reverse(nodes))
+    {list.head, RDF.Graph.add(graph, list.graph)}
+  end
+
+  defp encode_one_evidence(:fidelity_pass) do
+    node = RDF.BlankNode.new()
+    {node, RDF.Graph.new() |> RDF.Graph.add({node, @riptide_fidelity_status, RDF.literal("pass")})}
+  end
+
+  defp encode_one_evidence({:fidelity_fail, reason}) do
+    node = RDF.BlankNode.new()
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add({node, @riptide_fidelity_status, RDF.literal("fail")})
+      |> RDF.Graph.add({node, @riptide_fidelity_reason, RDF.literal(inspect(reason))})
+
+    {node, graph}
+  end
+
+  @doc "See moduledoc. The inverse of `to_rdf/1`. Requires the item's own node to already be known."
+  @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: t()
+  def from_rdf(node, graph) do
+    description = RDF.Graph.get(graph, node)
+
+    # Safe: "admit"/"merge" are the only two values `to_rdf/1` ever writes,
+    # and both atoms already exist in the atom table from this module's own
+    # @type/struct usage above — never derived from untrusted input.
+    kind =
+      description
+      |> RDF.Description.first(@riptide_kind)
+      |> RDF.Literal.value()
+      |> String.to_existing_atom()
+
+    candidate_node = RDF.Description.first(description, @riptide_candidate)
+    candidate = RuleRDFCodec.from_rdf(candidate_node, graph)
+    evidence_head = RDF.Description.first(description, @riptide_fidelity_evidence)
+
+    fidelity_evidence =
+      RDF.List.new(evidence_head, graph)
+      |> RDF.List.values()
+      |> Enum.map(&decode_one_evidence(&1, graph))
+
+    replaces = RDF.Description.first(description, @riptide_replaces)
+
+    %__MODULE__{
+      kind: kind,
+      candidate: candidate,
+      fidelity_evidence: fidelity_evidence,
+      replaces: replaces
+    }
+  end
+
+  defp decode_one_evidence(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    status = description |> RDF.Description.first(@riptide_fidelity_status) |> RDF.Literal.value()
+
+    case status do
+      "pass" ->
+        :fidelity_pass
+
+      "fail" ->
+        reason = description |> RDF.Description.first(@riptide_fidelity_reason) |> RDF.Literal.value()
+        {:fidelity_fail, reason}
+    end
+  end
+end
+
+defmodule Riptide.Derivation.DedupGate do
+  @moduledoc """
+  Catalog lookup, the `Reject`/`Merge`/`Admit` decision, and the human
+  review workflow. See design spec
+  `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
+  """
+end
