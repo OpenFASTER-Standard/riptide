@@ -75,16 +75,19 @@ defmodule Riptide.Derivation.LLMFallbackTest do
     @behaviour Riptide.Derivation.LLMFallback.Client
 
     @impl true
-    def complete(_prompt) do
-      Agent.get(__MODULE__, & &1)
+    def complete(prompt) do
+      Agent.update(__MODULE__, &Map.put(&1, :last_prompt, prompt))
+      Map.fetch!(Agent.get(__MODULE__, & &1), :result)
     end
 
     def start(result) do
-      case Agent.start_link(fn -> result end, name: __MODULE__) do
+      case Agent.start_link(fn -> %{result: result, last_prompt: nil} end, name: __MODULE__) do
         {:ok, pid} -> pid
-        {:error, {:already_started, pid}} -> pid
+        {:error, {:already_started, pid}} -> Agent.update(pid, &%{&1 | result: result}); pid
       end
     end
+
+    def last_prompt, do: Agent.get(__MODULE__, & &1.last_prompt)
   end
 
   setup do
@@ -134,6 +137,27 @@ defmodule Riptide.Derivation.LLMFallbackTest do
         assert capability_reference.capability == cap("greetSomeone")
         assert capability_reference.args == [RDF.literal("Alice")]
         assert capability_reference.result == "\"Hello, Alice!\""
+      end)
+    end
+  end
+
+  describe "run/3 — prompt content" do
+    test "the prompt lists the tenant's real capability names, not a hallucinated one" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetSomeone"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      response =
+        "greeted(<urn:test:riptide>, Greeting) :- capability(greetSomeone, \"Alice\", Greeting)."
+
+      ctx = context(%{capabilities: %{cap("greetSomeone") => greet_definition("greetSomeone")}})
+
+      with_fake_client({:ok, response}, fn ->
+        {:ok, _trace} = LLMFallback.run("greet Alice", RDF.Graph.new(), ctx)
+
+        assert FakeClient.last_prompt() =~ "urn:riptide:capability:greetSomeone"
       end)
     end
   end
