@@ -106,4 +106,10 @@ defmodule Riptide.Derivation.DiscoveryTest do
                Discovery.find(scope, "pending deploy")
     end
   end
+
+  describe "find/2 — empty Catalog" do
+    test "a Tenant scope with no CatalogEntry admitted yet returns {:ok, []}" do
+      assert Discovery.find(unique_tenant(), "anything") == {:ok, []}
+    end
+  end
 end
