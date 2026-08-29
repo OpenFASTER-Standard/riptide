@@ -82,8 +82,12 @@ defmodule Riptide.Derivation.LLMFallbackTest do
 
     def start(result) do
       case Agent.start_link(fn -> %{result: result, last_prompt: nil} end, name: __MODULE__) do
-        {:ok, pid} -> pid
-        {:error, {:already_started, pid}} -> Agent.update(pid, &%{&1 | result: result}); pid
+        {:ok, pid} ->
+          pid
+
+        {:error, {:already_started, pid}} ->
+          Agent.update(pid, &%{&1 | result: result})
+          pid
       end
     end
 
@@ -181,7 +185,9 @@ defmodule Riptide.Derivation.LLMFallbackTest do
       ctx = context()
 
       with_fake_client({:ok, response}, fn ->
-        assert {:error, {:unresolvable, iri}} = LLMFallback.run("greet Alice", RDF.Graph.new(), ctx)
+        assert {:error, {:unresolvable, iri}} =
+                 LLMFallback.run("greet Alice", RDF.Graph.new(), ctx)
+
         assert iri == cap("notRegistered")
       end)
     end
@@ -189,7 +195,8 @@ defmodule Riptide.Derivation.LLMFallbackTest do
 
   describe "run/3 — no match" do
     test "a response whose Body matches nothing in the graph is :no_match" do
-      response = "greeted(<urn:test:riptide>, Result) :- pendingDeploy(<urn:test:riptide>, Result)."
+      response =
+        "greeted(<urn:test:riptide>, Result) :- pendingDeploy(<urn:test:riptide>, Result)."
 
       ctx = context()
 
@@ -201,7 +208,8 @@ defmodule Riptide.Derivation.LLMFallbackTest do
 
   describe "run/3 — ambiguous match" do
     test "a response whose Body matches more than one way is :ambiguous_match" do
-      response = "greeted(<urn:test:riptide>, Target) :- pendingDeploy(<urn:test:riptide>, Target)."
+      response =
+        "greeted(<urn:test:riptide>, Target) :- pendingDeploy(<urn:test:riptide>, Target)."
 
       graph =
         RDF.Graph.new([
@@ -213,6 +221,17 @@ defmodule Riptide.Derivation.LLMFallbackTest do
 
       with_fake_client({:ok, response}, fn ->
         assert LLMFallback.run("deploy riptide", graph, ctx) == {:error, :ambiguous_match}
+      end)
+    end
+  end
+
+  describe "run/3 — LLM call failure" do
+    test "a failing Client.complete/1 call surfaces as {:llm_error, reason}" do
+      ctx = context()
+
+      with_fake_client({:error, :timeout}, fn ->
+        assert LLMFallback.run("greet Alice", RDF.Graph.new(), ctx) ==
+                 {:error, {:llm_error, :timeout}}
       end)
     end
   end

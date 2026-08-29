@@ -18,8 +18,8 @@ defmodule Riptide.Derivation.LLMFallback do
   `docs/superpowers/specs/2026-08-29-phase-6f-llm-fallback-loop-design.md`.
   """
 
-  alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.{AntiUnifier, ExecuteInterpreter, Parser, Rule}
+  alias Riptide.Derivation.ExecuteInterpreter.Context
 
   @spec run(String.t(), RDF.Graph.t(), Context.t()) ::
           {:ok, Rule.t()}
@@ -32,7 +32,11 @@ defmodule Riptide.Derivation.LLMFallback do
              | {:unsupported_arity, RDF.IRI.t()}}
   def run(task_description, %RDF.Graph{} = graph, %Context{} = context) do
     client =
-      Application.get_env(:riptide, :llm_fallback_client, Riptide.Derivation.LLMFallback.Client.Anthropic)
+      Application.get_env(
+        :riptide,
+        :llm_fallback_client,
+        Riptide.Derivation.LLMFallback.Client.Anthropic
+      )
 
     with {:ok, response_text} <- call_client(client, task_description, context),
          {:ok, candidate_rule} <- parse_response(response_text),
