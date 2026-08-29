@@ -33,6 +33,7 @@ defmodule Riptide.Application do
         Riptide.NewStreamRateLimit,
         {Plug.Cowboy, scheme: :http, plug: RiptideWeb.MetricsEndpoint, options: [port: 9090]},
         Riptide.Stream.Placement,
+        Riptide.SupervisedProcess.SessionTracker,
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++
