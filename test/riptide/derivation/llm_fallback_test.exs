@@ -2,8 +2,8 @@ defmodule Riptide.Derivation.LLMFallbackTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
+  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, LLMFallback}
   alias Riptide.Derivation.ExecuteInterpreter.Context
-  alias Riptide.Derivation.LLMFallback
 
   defp t(name), do: RDF.iri("urn:test:" <> name)
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
@@ -233,6 +233,57 @@ defmodule Riptide.Derivation.LLMFallbackTest do
         assert LLMFallback.run("greet Alice", RDF.Graph.new(), ctx) ==
                  {:error, {:llm_error, :timeout}}
       end)
+    end
+  end
+
+  describe "exit criterion (issue #67) — the full walking skeleton" do
+    test "a Task with no Catalog match, run through LLMFallback twice, anti-unifies, passes DedupGate's Admit path, and becomes a live CatalogEntry" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = {:tenant, "acme-#{System.unique_integer([:positive])}"}
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      ctx = context(%{capabilities: %{cap("greetPerson") => greet_definition("greetPerson")}})
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      response1 =
+        "greeted(<urn:test:alice>, Result) :- pendingDeploy(<urn:test:alice>, Target), capability(greetPerson, \"Alice\", Result)."
+
+      response2 =
+        "greeted(<urn:test:bob>, Result) :- pendingDeploy(<urn:test:bob>, Target), capability(greetPerson, \"Bob\", Result)."
+
+      trace1 =
+        with_fake_client({:ok, response1}, fn ->
+          assert {:ok, trace1} = LLMFallback.run("greet Alice", graph, ctx)
+          trace1
+        end)
+
+      trace2 =
+        with_fake_client({:ok, response2}, fn ->
+          assert {:ok, trace2} = LLMFallback.run("greet Bob", graph, ctx)
+          trace2
+        end)
+
+      assert {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+
+      assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+
+      assert :ok == DedupGate.approve_review(scope, node)
+
+      assert {:ok, [{_entry_node, _rule}]} = Catalog.list_entries(scope)
     end
   end
 end
