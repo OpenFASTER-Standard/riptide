@@ -2,8 +2,28 @@ defmodule Riptide.Derivation.CatalogTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Derivation.Catalog
+  alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{Rule, Signature}
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
+
+  defp t(name), do: RDF.iri("urn:test:" <> name)
+  defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
+
+  defp sample_rule(subject_name) do
+    head = %FactPattern{predicate: rel("greeted"), args: [t(subject_name), RDF.literal("hi")]}
+
+    %Rule{
+      signature: %Signature{
+        name: head.predicate,
+        parameters: [],
+        reads: [],
+        produces: [head.predicate]
+      },
+      head: head,
+      body: []
+    }
+  end
 
   describe "stream_id helpers" do
     test "catalog_stream_id/1 for a Tenant scope" do
@@ -28,6 +48,32 @@ defmodule Riptide.Derivation.CatalogTest do
 
     test "list_pending_reviews/1 returns {:ok, []} for a Tenant with no pending reviews yet" do
       assert Catalog.list_pending_reviews(unique_tenant()) == {:ok, []}
+    end
+  end
+
+  describe "admit_entry/3 + list_entries/1 — real round-trip" do
+    test "an admitted entry (replaces: nil) is found live by list_entries/1" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      rule = sample_rule("alice")
+
+      assert :ok == Catalog.admit_entry(scope, rule, nil)
+      assert {:ok, [{_node, ^rule}]} = Catalog.list_entries(scope)
+    end
+
+    test "admitting two entries returns both, in either order" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      rule1 = sample_rule("alice")
+      rule2 = sample_rule("bob")
+
+      :ok = Catalog.admit_entry(scope, rule1, nil)
+      :ok = Catalog.admit_entry(scope, rule2, nil)
+
+      assert {:ok, entries} = Catalog.list_entries(scope)
+      assert MapSet.new(Enum.map(entries, &elem(&1, 1))) == MapSet.new([rule1, rule2])
     end
   end
 end
