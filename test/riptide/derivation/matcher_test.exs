@@ -185,7 +185,7 @@ defmodule Riptide.Derivation.MatcherTest do
   describe "bindings/3 — seeded joins" do
     test "a variable already in the seed is substituted as a constant, not left free" do
       {:ok, rule} = Parser.decode("colleague(X, Y) :- worksAt(X, Y).")
-      [worksAt_literal] = rule.body
+      [works_at_literal] = rule.body
 
       graph =
         RDF.Graph.new([
@@ -195,7 +195,7 @@ defmodule Riptide.Derivation.MatcherTest do
 
       seed = %{%Var{name: "X"} => t("alice")}
 
-      assert {:ok, results} = Matcher.bindings([worksAt_literal], graph, seed)
+      assert {:ok, results} = Matcher.bindings([works_at_literal], graph, seed)
       assert Enum.map(results, &plain/1) == [%{"X" => t("alice"), "Y" => t("acme")}]
     end
 

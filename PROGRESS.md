@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate) — 18 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring) — 17 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -559,3 +559,25 @@ this project uses, and no current Capability needs it.
 
 **Status**: Phase 6b-i shipped 2026-08-29. 18 phases remaining across the primary spine and the
 three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6d-i — Mechanical wiring
+
+Third link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → 6e-i → ...`), the
+first phase exercising 6b-i's `Riptide.Capability.invoke/4` and 6c-i-b's
+`Riptide.Derivation.Matcher` together in one real end-to-end path. **Shipped 2026-08-29**
+— see `docs/superpowers/specs/2026-08-29-phase-6d-i-mechanical-wiring-design.md`.
+
+`Riptide.Derivation.ExecuteInterpreter.call_template/3` is a direct generalization of
+`Matcher.evaluate/2`: a Rule's Body resolves left-to-right, with maximal runs of
+`FactPattern` literals resolved via a new `Matcher.bindings/3` (a backward-compatible
+seeded-join extension) and `CapabilityReference`/`RuleReference` literals invoked once per
+active branch — a `RuleReference` backtracks over its (possibly multiple) nested Outcomes,
+a `CapabilityReference` never does, since `Capability.invoke/4` is always single-valued.
+`NativeTemplate`/`Template` stay pure structural predicates over `Rule`, not new types, per
+the parent spec's own framing. A real inconsistency found during design between the parent
+spec's original worked example and the 2-arity Head invariant (established later, during
+6c-i-a's own implementation) was resolved by scoping `RuleReference` to exactly one input
+argument for this phase — documented explicitly, not silently papered over.
+
+**Status**: Phase 6d-i shipped 2026-08-29. 17 phases remaining across the primary spine and
+the three parallel tracks — see the design spec's §7 for the full roadmap.
