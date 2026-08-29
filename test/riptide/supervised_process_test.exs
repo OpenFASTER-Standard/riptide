@@ -2,6 +2,7 @@ defmodule Riptide.SupervisedProcessTest do
   use ExUnit.Case, async: false
 
   alias Riptide.SupervisedProcess
+  alias Riptide.SupervisedProcess.SessionTracker
 
   defmodule Fixture do
     @behaviour Riptide.SupervisedProcess
@@ -19,12 +20,12 @@ defmodule Riptide.SupervisedProcessTest do
     end
 
     def handle_call(:mark_active, _from, state) do
-      Riptide.SupervisedProcess.SessionTracker.mark_session_active(state.id)
+      SessionTracker.mark_session_active(state.id)
       {:reply, :ok, state}
     end
 
     def handle_call(:mark_idle, _from, state) do
-      Riptide.SupervisedProcess.SessionTracker.mark_session_idle(state.id)
+      SessionTracker.mark_session_idle(state.id)
       {:reply, :ok, state}
     end
 
@@ -138,7 +139,7 @@ defmodule Riptide.SupervisedProcessTest do
       Process.exit(pid, :kill)
       refute Process.alive?(pid)
 
-      assert Riptide.SupervisedProcess.SessionTracker.was_active_at_crash?(id)
+      assert SessionTracker.was_active_at_crash?(id)
     end
 
     test "a process that marks itself idle before exiting normally reports no trace" do
@@ -150,7 +151,7 @@ defmodule Riptide.SupervisedProcessTest do
       Process.exit(pid, :kill)
       refute Process.alive?(pid)
 
-      refute Riptide.SupervisedProcess.SessionTracker.was_active_at_crash?(id)
+      refute SessionTracker.was_active_at_crash?(id)
     end
   end
 

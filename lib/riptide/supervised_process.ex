@@ -79,8 +79,11 @@ defmodule Riptide.SupervisedProcess do
 
   defp control(id, reason) do
     case Registry.lookup(@registry, id) do
-      [{pid, _module}] -> GenServer.call(pid, {:riptide_supervised_process, :stop_if_idle, reason})
-      [] -> {:error, :not_found}
+      [{pid, _module}] ->
+        GenServer.call(pid, {:riptide_supervised_process, :stop_if_idle, reason})
+
+      [] ->
+        {:error, :not_found}
     end
   end
 end
