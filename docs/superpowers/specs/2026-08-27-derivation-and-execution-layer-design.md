@@ -68,12 +68,16 @@ something this spec reconciles with.
 
 **"OpenFASTER-Standard" naming note.** This repo (`riptide`) lives in the
 `OpenFASTER-Standard` GitHub org — an aspirational name chosen early, not
-evidence of an active, independently-governed standards body today. §10's
-governance resolution ("Riptide-internal for now") means decision
-authority over what gets admitted to the Catalog/Hub rests with Riptide's
-own maintainers, regardless of which org hosts the repo. If OpenFASTER-
-Standard ever becomes a real multi-stakeholder governance body, that's a
-distinct future decision, not something this spec's org placement implies.
+evidence of an active, independently-governed standards body today. This
+is independent of §6's own governance model: **Tenant is the sovereign
+unit** — each Tenant governs what it admits to its own Catalog and what
+it chooses to publish/share, with no central Riptide-internal reviewer
+standing between a Tenant and its own content (§10's earlier
+"Riptide-internal for now" resolution is corrected by this revision — see
+§11). If OpenFASTER-Standard ever becomes a real multi-stakeholder
+governance body, that would govern the *standard itself* (the spec/
+protocol) — a distinct question from who curates any one deployment's
+shared content, not something this spec's org placement implies.
 
 **Still open** (§10 has the full list, kept in one place — not duplicated
 here or in a separate changelog): concurrent-effectful-execution
@@ -280,16 +284,24 @@ persistent/resumable component instance that could simplify this.
 ## 6. Catalog, DedupGate, Discovery, Task, LLMFallback, Pattern
 
 **Catalog is parameterized by scope: `Tenant` or `Hub`.** One mechanism,
-two scopes:
+two scopes — but **Tenant is the sovereign unit governing both.** `Hub`
+scope is not a separate, centrally-administered repository with its own
+reviewer: it's where a Tenant makes a CatalogEntry broadly discoverable,
+reviewed and admitted by that *same* Tenant's own DedupGate authority it
+already exercises over its Tenant-scope Catalog. Publishing to Hub scope
+is an explicit, Tenant-initiated action — never automatic promotion from
+Tenant-scope content, and never gated by a third-party curator.
 
 - **DedupGate** — anti-unifies a freshly-generalized candidate against its
   Catalog and yields `Reject`, `Merge`, or `Admit`. Both `Admit` and
-  `Merge` require human review before the result is live — `Admit` per
-  `scratch-command-bar`'s existing propose/review precedent; `Merge`
+  `Merge` require human review before the result is live — that review is
+  performed by the *originating Tenant*, at either scope, per
+  `scratch-command-bar`'s existing propose/review precedent (`Merge`
   additionally because graph three-way merge is provably weaker than
-  git's. `Reject` skips review. **Must also handle multiple candidates**:
-  Rule expressiveness is not constrained to the bisimilar-term-graph
-  fragment (§8.2), so anti-unifying two Rules can yield several
+  git's); there is no additional Riptide-internal reviewer layer.
+  `Reject` skips review. **Must also handle multiple candidates**: Rule
+  expressiveness is not constrained to the bisimilar-term-graph fragment
+  (§8.2), so anti-unifying two Rules can yield several
   mutually-incomparable generalizations rather than one canonical answer —
   DedupGate's arbitration mechanism for that case is Sub-project 6e-i's own
   design work, not specified here. One concrete, well-precedented tool
@@ -300,10 +312,10 @@ two scopes:
   not invented for this spec (full grounding: research log Part 1, Pass 3).
 - **CatalogEntry** — `⊑ Rule`, admitted or merged by DedupGate, subject to
   §5's admission consequence.
-- **Pattern is not a separate type.** It's the name for a CatalogEntry at
-  **Hub** scope — a published, human-validated, publicly-installable unit,
-  generalizing to *any* computer-doable action, not an administrative-only
-  subset.
+- **Pattern is not a separate type.** It's the name for a CatalogEntry a
+  Tenant has published at **Hub** scope — a Tenant-curated,
+  publicly-installable unit, generalizing to *any* computer-doable action,
+  not an administrative-only subset.
 - **Discovery** — search over CatalogEntry (either scope). Exact/keyword
   lookup (viable as soon as any CatalogEntry exists) and, later, hybrid
   keyword+embedding progressive disclosure. Conflict resolution: recency,
@@ -313,9 +325,26 @@ two scopes:
   triggers **LLMFallback**, whose resulting Trace feeds Generalization →
   DedupGate (Tenant scope) → possibly a new local CatalogEntry.
 - **Install** — `CatalogEntry(Hub) × Tenant → CatalogEntry(Tenant)` (§6.5),
-  going through the same DedupGate as any tenant-local candidate, with a
-  narrower review scope (confirming field bindings, not re-reviewing
-  already-curated content).
+  going through the *installing* Tenant's own DedupGate, with a narrower
+  review scope (confirming field bindings, not re-reviewing
+  already-curated content) — the installing Tenant exercises its own
+  sovereignty over what enters its own Catalog here, exactly as it would
+  for a Tenant-scope candidate.
+
+**Cross-deployment federation is a stated design goal, not (yet) a build
+target.** Because curation authority is per-Tenant rather than
+per-deployment, sharing between two Tenants should work identically
+whether they're on the same Riptide instance or on two
+independently-operated ones — a company can host a single Riptide
+instance with each of its own users as a Tenant, fully isolated from each
+other by default (§3.1, Sub-project 4), except where a Tenant actively
+chooses to share something, at which point it should not matter whether
+the receiving Tenant lives on the same instance or a different one. This
+follows the same "never front-load a bridge" discipline §1 already states
+for Traces/CatalogEntries/Crosswalks: 6h-ii/6i build the network-reachable
+protocol shape now (HTTP, not same-BEAM-node-only), but actual
+cross-instance trust/identity verification is explicitly deferred until a
+real cross-instance use case exists (§10).
 
 ### 6.5 Crosswalk
 
@@ -333,11 +362,13 @@ two scopes:
   claim of model-theoretic equivalence, per SSSOM's own specification),
   available for later optional strengthening into a formally-checked
   morphism, never a prerequisite for use.
-- **Detection of overlap is human-only, by design, for now.** A curator
-  proposes a Crosswalk entry; it goes through the same Hub-scope DedupGate
-  as any other Hub content.
-- **Crosswalks are Hub-scope content**; a Tenant's actual vocabulary
-  commitment (§3.1) is the one genuinely tenant-local fact.
+- **Detection of overlap is human-only, by design, for now.** A Tenant
+  proposes a Crosswalk entry through its own DedupGate authority — the
+  same one it already exercises over any other Hub-scope publication
+  (§6), not a separate curator role.
+- **Crosswalks are Hub-scope content**, published by whichever Tenant
+  needs or creates them and discoverable by any Tenant; a Tenant's actual
+  vocabulary commitment (§3.1) is the one genuinely tenant-local fact.
 - **Installation with partial coverage**: per Signature field, look up an
   existing Crosswalk against the Tenant's established vocabulary. Matched
   fields bind through it. **Unmatched fields — the Tenant supplies those
@@ -555,17 +586,19 @@ Discovery, the Hub, and Crosswalks.
   **Depends on:** 6g-i.
   **Exit criterion:** not yet defined — deferred with the phase.
 - **6h-ii — Pattern Hub deployment.** Stand up Hub-scope Catalog as a
-  distinct, network-publicly-reachable deployment of 6e-iii's
+  network-publicly-reachable extension of 6e-iii's
   already-scope-parameterized DedupGate mechanism plus 6g-i's Discovery.
-  **"Publicly-reachable" is a network-exposure fact, independent of §2's
-  governance clarification** — the Hub can be reachable by any Tenant
-  (including future external ones) while curation/admission authority
-  stays Riptide-internal; these are orthogonal axes, not in tension.
+  **"Publicly-reachable" and "who curates" are orthogonal axes, not in
+  tension** — the Hub is reachable by any Tenant (including, eventually,
+  Tenants on other independently-operated Riptide deployments — §6's
+  federation goal), while admission authority for any given CatalogEntry
+  stays with the Tenant that published it, never a separate
+  Riptide-internal reviewer (§6, corrected this revision — see §11).
   **Depends on:** 6e-iii, 6g-i, and 6h-i (the threat model this
   implementation must be gated by).
-  **Exit criterion:** a CatalogEntry can be published to Hub scope and
-  installed into a different Tenant via 6i, over a network-reachable
-  endpoint gated by 6h-i's auth/rate-limit model.
+  **Exit criterion:** a CatalogEntry can be published to Hub scope by its
+  own Tenant and installed into a different Tenant via 6i, over a
+  network-reachable endpoint gated by 6h-i's auth/rate-limit model.
 - **6i — Ontology Crosswalks and Installation.** SSSOM-shaped Hub-scope
   Crosswalk content, the Install operation, human-curation workflow.
   **Depends on:** 6h-ii.
@@ -784,8 +817,15 @@ example caught.
 
 **Resolved:**
 - Final Tenant name: **"Tenant"**, no rename.
-- OpenFASTER-Standard public governance status: **Riptide-internal for
-  now** (§2 disambiguates this from the org name itself).
+- OpenFASTER-Standard public governance status: a distinct question from
+  Hub curation (§2 disambiguates the org name from the governance model).
+  If OpenFASTER-Standard ever becomes a real multi-stakeholder body, that
+  governs the *standard itself*, not any one deployment's own content.
+- Pattern Hub curation authority: **per-Tenant, not Riptide-internal** —
+  corrected this revision (was "Riptide-internal for now" through
+  revision ten; see §11 and §6). Each Tenant governs what it publishes/
+  shares at Hub scope through its own DedupGate authority; there is no
+  central curator role for 6h-i to design authorization around.
 - Whether this engine is a separate deployable from Riptide's LDP
   surface: **same OS process**, one deployable (§1).
 - Whether the Rule/workflow-graph representation can be constrained to
@@ -819,7 +859,10 @@ example caught.
 - A threat model for the Pattern Hub's public network surface — now its
   own phase, **6h-i**, decoupled from 6h-ii's implementation (§7). Still
   open in the sense that 6h-i's content hasn't been written yet, not in
-  the sense that it might get skipped.
+  the sense that it might get skipped. Its scope is now the per-Tenant
+  publish/share/discover surface (§6, corrected this revision), not a
+  central-curator-authorization design — auth/rate-limiting for a
+  Tenant's own publish and install actions, not "who is Riptide-internal."
 
 ## 11. Changelog
 
@@ -918,3 +961,40 @@ that a top-down pass over the same content would tend to miss:
   the rule schema is actually authored — a residual imprecision from the
   ninth revision's fix, corrected while already restructuring this
   section).
+
+**This revision (eleventh) — corrected the Pattern Hub's governance model
+from centralized to per-Tenant**, found while brainstorming 6h-i's own
+threat model: every prior revision (through the tenth) described Hub
+scope as a single, centrally-administered repository with admission
+authority "Riptide-internal for now" (§2, §10) — but no design work had
+ever concretely defined who "Riptide-internal" referred to, and pressure-
+testing candidate authorization mechanisms against that undefined role
+kept producing implementations that didn't actually fit the intended
+model. The real model: **Tenant is the sovereign unit**, not a central
+Riptide-operated authority and not the deployment. A single Riptide
+instance can host many Tenants, fully isolated from each other by default
+(Sub-project 4, unchanged); any Tenant may choose to publish/share
+specific content, reviewed and admitted through that same Tenant's own
+already-shipped DedupGate authority (6e-iii) — never a separate
+third-party reviewer. Sharing is designed to work identically whether the
+receiving Tenant is on the same Riptide deployment or a different,
+independently-operated one (federation) — a stated design goal 6h-ii/6i
+build the network-reachable protocol shape for now, with actual
+cross-instance trust/identity verification explicitly deferred (§10),
+following the same "never front-load a bridge" discipline §1 already
+states for Traces/CatalogEntries/Crosswalks.
+- §2: replaced the OpenFASTER-Standard naming note's governance claim.
+- §6: `DedupGate` review, `Pattern`, and `Install` now explicit about
+  Tenant-originated curation authority; added the federation-goal
+  paragraph.
+- §6.5: Crosswalk proposal is Tenant-originated, not a separate curator
+  role.
+- §7: 6h-ii's entry corrected to match.
+- §10: "Riptide-internal for now" moved from Resolved-as-was to
+  corrected-and-Resolved as per-Tenant; the Pattern Hub threat model's
+  scope note updated to match (auth/rate-limiting for a Tenant's own
+  publish/install actions, not central-curator-authorization design).
+- No shipped code changes as a result of this revision: 6e-iii's already-
+  shipped `scope :: {:tenant, String.t()} | :hub` type and DedupGate
+  mechanism are unaffected — this correction is about *who* has authority
+  to admit into either scope, not the storage/mechanism shape itself.
