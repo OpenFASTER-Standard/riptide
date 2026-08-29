@@ -206,7 +206,8 @@ defmodule Riptide.CapabilityTest do
           }
         })
 
-      assert Capability.invoke(definition, "acme", nil, ["Riptide"]) == {:error, :resource_exhausted}
+      assert Capability.invoke(definition, "acme", nil, ["Riptide"]) ==
+               {:error, :resource_exhausted}
     end
   end
 end
