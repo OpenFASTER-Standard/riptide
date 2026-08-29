@@ -91,8 +91,8 @@ defmodule Riptide.Derivation.AntiUnifierTest do
 
     # The two recovering substitutions must reconstruct each original Rule
     # exactly when applied to the generalization.
-    assert substitute_rule(generalization, sub1) == rule1
-    assert substitute_rule(generalization, sub2) == rule2
+    assert AntiUnifier.substitute(generalization, sub1) == rule1
+    assert AntiUnifier.substitute(generalization, sub2) == rule2
   end
 
   test "different Head predicates have no common structure" do
@@ -178,31 +178,4 @@ defmodule Riptide.Derivation.AntiUnifierTest do
     [{gen1, _, _}, {gen2, _, _}] = candidates
     refute gen1.body == gen2.body
   end
-
-  defp substitute_rule(%Rule{head: head, body: body, signature: signature} = rule, substitution) do
-    %{
-      rule
-      | head: substitute_literal(head, substitution),
-        body: Enum.map(body, &substitute_literal(&1, substitution)),
-        signature: %{
-          signature
-          | parameters: Enum.map(signature.parameters, &substitute_term(&1, substitution))
-        }
-    }
-  end
-
-  defp substitute_literal(%FactPattern{} = lit, substitution) do
-    %{lit | args: Enum.map(lit.args, &substitute_term(&1, substitution))}
-  end
-
-  defp substitute_literal(%CapabilityReference{} = lit, substitution) do
-    %{
-      lit
-      | args: Enum.map(lit.args, &substitute_term(&1, substitution)),
-        result: substitute_term(lit.result, substitution)
-    }
-  end
-
-  defp substitute_term(%Var{} = var, substitution), do: Map.fetch!(substitution, var)
-  defp substitute_term(term, _substitution), do: term
 end

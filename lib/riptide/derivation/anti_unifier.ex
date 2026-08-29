@@ -244,4 +244,45 @@ defmodule Riptide.Derivation.AntiUnifier do
     |> Enum.filter(fn {_rule, count, _sub1, _sub2} -> count == min_count end)
     |> Enum.map(fn {rule, _count, sub1, sub2} -> {rule, sub1, sub2} end)
   end
+
+  @doc """
+  Reconstructs a ground Trace from `generalization` and one of `generalize/2`'s
+  own recovering substitutions — the inverse operation, applied by a caller
+  (never internally by `generalize/2` itself).
+  """
+  @spec substitute(Rule.t(), substitution()) :: Rule.t()
+  def substitute(%Rule{head: head, body: body, signature: signature} = rule, substitution) do
+    %{
+      rule
+      | head: substitute_literal(head, substitution),
+        body: Enum.map(body, &substitute_literal(&1, substitution)),
+        signature: %{
+          signature
+          | parameters: Enum.map(signature.parameters, &substitute_term(&1, substitution))
+        }
+    }
+  end
+
+  defp substitute_literal(%FactPattern{} = lit, substitution) do
+    %{lit | args: Enum.map(lit.args, &substitute_term(&1, substitution))}
+  end
+
+  defp substitute_literal(%CapabilityReference{} = lit, substitution) do
+    %{
+      lit
+      | args: Enum.map(lit.args, &substitute_term(&1, substitution)),
+        result: substitute_term(lit.result, substitution)
+    }
+  end
+
+  defp substitute_literal(%RuleReference{} = lit, substitution) do
+    %{
+      lit
+      | args: Enum.map(lit.args, &substitute_term(&1, substitution)),
+        result: substitute_term(lit.result, substitution)
+    }
+  end
+
+  defp substitute_term(%Var{} = var, substitution), do: Map.fetch!(substitution, var)
+  defp substitute_term(term, _substitution), do: term
 end
