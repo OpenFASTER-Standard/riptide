@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm) — 16 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness) — 15 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -609,4 +609,39 @@ free from `Matcher.evaluate/2`'s existing `check_safety/2` for whoever evaluates
 generalization later, most plausibly 6e-ii.
 
 **Status**: Phase 6e-i shipped 2026-08-29. 16 phases remaining across the primary spine and
+the three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6e-ii — Generalization Fidelity replay harness
+
+Fifth link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → 6e-i → 6e-ii → ...`),
+unblocked by 6e-i (needs a Generalization to test against) and 6b-i (needs the WASI sandbox
+to replay into). **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6e-ii-generalization-fidelity-design.md`.
+
+`Riptide.Derivation.GeneralizationFidelity.check/3` checks whether a ground Trace (a
+`Rule.t()` whose Signature has no free parameters, per parent spec §5) replays faithfully.
+The key insight: a ground Trace's `CapabilityReference.result` field, once ground, already
+*is* that invocation's recorded output — no new Provenance/recording type was needed, and
+the harness never touches `AntiUnifier`/Generalization/substitution at all, reusing
+`ExecuteInterpreter.Context` and the real, unmodified `Capability.invoke/4` as-is. Replay is
+a straight-line recursive walk over the Body (no join search — everything's already
+concrete): FactPattern literals check graph membership via `RDF.Graph.include?/2`;
+`:effect`-kind Capabilities are re-invoked (real `wasmtime`) and compared against the
+recorded result; `:observe`-kind Capabilities are always trusted from the recorded result and
+never invoked, matching parent spec §4's literal wording that the external world isn't
+expected to be frozen between runs; `RuleReference` literals recurse through
+`context.rules`, reusing the same map `ExecuteInterpreter` already uses for live execution,
+with a nested fidelity failure wrapped as `{:nested, iri, inner_reason}` while a nested
+structural error propagates unwrapped (matching `ExecuteInterpreter`'s own convention). A
+pre-existing quirk was documented, not fixed: `ExecuteInterpreter.bind_result/3` binds a
+Capability's raw invoke output as a plain Elixir string rather than an `RDF.Term.t()`, as its
+declared type implies — fixing it would mean touching already-shipped, tested 6d-i code, and
+both sides of the fidelity check's `==` comparison come from the same `Capability.invoke/4`
+path regardless, so they stay mutually consistent. A round-trip integration test composes
+`AntiUnifier.generalize/2` → reconstruct each candidate via its own recovering substitution →
+`check/3` on each reconstructed Trace, satisfying the exit criterion's literal wording ("given
+a Generalization and its source Traces...") end-to-end via test composition rather than the
+module's own signature.
+
+**Status**: Phase 6e-ii shipped 2026-08-29. 15 phases remaining across the primary spine and
 the three parallel tracks — see the design spec's §7 for the full roadmap.
