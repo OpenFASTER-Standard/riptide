@@ -510,4 +510,110 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
                  {:nested, nested_iri, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}}
     end
   end
+
+  alias Riptide.Derivation.AntiUnifier
+
+  describe "check/3 — round-trip with AntiUnifier.generalize/2" do
+    test "each source Trace, reconstructed from the generalization via its own recovering substitution, replays faithfully" do
+      cap_iri = RDF.iri("urn:riptide:capability:greetPerson")
+
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      trace1 =
+        %Rule{
+          signature: %Signature{
+            name: rel("greeted"),
+            parameters: [t("alice"), "\"Hello, Alice!\""],
+            reads: [rel("pendingDeploy")],
+            produces: [rel("greeted")]
+          },
+          head: %FactPattern{predicate: rel("greeted"), args: [t("alice"), "\"Hello, Alice!\""]},
+          body: [
+            %FactPattern{predicate: rel("pendingDeploy"), args: [t("alice"), RDF.literal("v1")]},
+            %CapabilityReference{
+              capability: cap_iri,
+              args: [RDF.literal("Alice")],
+              result: "\"Hello, Alice!\""
+            }
+          ]
+        }
+
+      trace2 =
+        %Rule{
+          signature: %Signature{
+            name: rel("greeted"),
+            parameters: [t("bob"), "\"Hello, Bob!\""],
+            reads: [rel("pendingDeploy")],
+            produces: [rel("greeted")]
+          },
+          head: %FactPattern{predicate: rel("greeted"), args: [t("bob"), "\"Hello, Bob!\""]},
+          body: [
+            %FactPattern{predicate: rel("pendingDeploy"), args: [t("bob"), RDF.literal("v2")]},
+            %CapabilityReference{
+              capability: cap_iri,
+              args: [RDF.literal("Bob")],
+              result: "\"Hello, Bob!\""
+            }
+          ]
+        }
+
+      assert {:ok, [{generalization, sub1, sub2}]} = AntiUnifier.generalize(trace1, trace2)
+
+      reconstructed1 = substitute_rule(generalization, sub1)
+      reconstructed2 = substitute_rule(generalization, sub2)
+
+      assert reconstructed1 == trace1
+      assert reconstructed2 == trace2
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v2")}
+        ])
+
+      ctx = context(%{capabilities: %{cap_iri => greet_definition("greetPerson")}})
+
+      assert GeneralizationFidelity.check(reconstructed1, graph, ctx) == {:ok, :fidelity_pass}
+      assert GeneralizationFidelity.check(reconstructed2, graph, ctx) == {:ok, :fidelity_pass}
+    end
+  end
+
+  defp substitute_rule(%Rule{head: head, body: body, signature: signature} = rule, substitution) do
+    %{
+      rule
+      | head: substitute_literal(head, substitution),
+        body: Enum.map(body, &substitute_literal(&1, substitution)),
+        signature: %{
+          signature
+          | parameters: Enum.map(signature.parameters, &substitute_term(&1, substitution))
+        }
+    }
+  end
+
+  defp substitute_literal(%FactPattern{} = lit, substitution) do
+    %{lit | args: Enum.map(lit.args, &substitute_term(&1, substitution))}
+  end
+
+  defp substitute_literal(%CapabilityReference{} = lit, substitution) do
+    %{
+      lit
+      | args: Enum.map(lit.args, &substitute_term(&1, substitution)),
+        result: substitute_term(lit.result, substitution)
+    }
+  end
+
+  defp substitute_literal(%RuleReference{} = lit, substitution) do
+    %{
+      lit
+      | args: Enum.map(lit.args, &substitute_term(&1, substitution)),
+        result: substitute_term(lit.result, substitution)
+    }
+  end
+
+  defp substitute_term(%Var{} = var, substitution), do: Map.fetch!(substitution, var)
+  defp substitute_term(term, _substitution), do: term
 end
