@@ -26,8 +26,19 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-      libstdc++6 openssl libncurses6 locales ca-certificates curl && \
+      libstdc++6 openssl libncurses6 locales ca-certificates curl xz-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) WASMTIME_ARCH=x86_64 ;; \
+      arm64) WASMTIME_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -sSL "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.1/wasmtime-v48.0.1-${WASMTIME_ARCH}-linux.tar.xz" | tar xJ -C /tmp && \
+    mv "/tmp/wasmtime-v48.0.1-${WASMTIME_ARCH}-linux/wasmtime" /usr/local/bin/wasmtime && \
+    rm -rf "/tmp/wasmtime-v48.0.1-${WASMTIME_ARCH}-linux" && \
+    wasmtime --version
 
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 ENV LANG=en_US.UTF-8

@@ -8,7 +8,7 @@ defmodule Riptide.Authz.Policy do
   """
 
   @type effect :: :allow | :deny
-  @type mode :: :read | :write
+  @type mode :: :read | :write | :invoke
   @type matcher :: :public | :authenticated | {:agent, String.t()}
 
   @type t :: %__MODULE__{effect: effect(), modes: [mode()], matcher: matcher()}
