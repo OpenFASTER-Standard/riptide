@@ -141,9 +141,9 @@ defmodule Riptide.Derivation.DedupGate do
   `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
   """
 
+  alias Riptide.Derivation.{AntiUnifier, Catalog, GeneralizationFidelity, Rule, Var}
   alias Riptide.Derivation.DedupGate.PendingReview
   alias Riptide.Derivation.ExecuteInterpreter.Context
-  alias Riptide.Derivation.{AntiUnifier, Catalog, GeneralizationFidelity, Rule}
 
   @type candidates :: [{Rule.t(), AntiUnifier.substitution(), AntiUnifier.substitution()}]
   @type outcome ::
@@ -190,8 +190,35 @@ defmodule Riptide.Derivation.DedupGate do
     end
   end
 
-  defp classify(_candidate, []), do: {:admit, nil}
-  defp classify(_candidate, _entries), do: {:admit, nil}
+  defp classify(candidate, entries) do
+    matching =
+      Enum.filter(entries, fn {_node, entry} ->
+        entry.head.predicate == candidate.head.predicate
+      end)
+
+    case Enum.find(matching, fn {_node, entry} -> entry_unchanged?(candidate, entry) end) do
+      {_node, _entry} ->
+        {:reject, :already_covered}
+
+      nil ->
+        case matching do
+          [] -> {:admit, nil}
+          [{node, _entry} | _rest] -> {:merge, node}
+        end
+    end
+  end
+
+  defp entry_unchanged?(candidate, entry) do
+    case AntiUnifier.generalize(candidate, entry) do
+      {:ok, results} ->
+        Enum.any?(results, fn {_generalization, _sub_candidate, sub_entry} ->
+          Enum.all?(Map.values(sub_entry), &match?(%Var{}, &1))
+        end)
+
+      {:error, :body_too_large} ->
+        false
+    end
+  end
 
   defp fidelity_evidence(trace1, trace2, graph, context) do
     evidence =

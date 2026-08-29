@@ -2,9 +2,9 @@ defmodule Riptide.Derivation.DedupGateTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
+  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, Signature}
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
-  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, Signature}
 
   defp t(name), do: RDF.iri("urn:test:" <> name)
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
@@ -120,11 +120,98 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       ctx =
         context(%{
-          capabilities: %{RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")}
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
         })
 
       assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
       assert {:ok, [{^node, _pending_review}]} = Catalog.list_pending_reviews(scope)
+    end
+  end
+
+  describe "propose/4 — Reject/Merge classification against a non-empty Catalog" do
+    test "a candidate already covered by an existing entry is Rejected, no review queued" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      # The existing entry is already the exact lgg of trace1/trace2 below —
+      # anti-unifying the same candidate against it a second time must find
+      # nothing new (entry_unchanged?).
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+      {:ok, [{existing_entry, _sub1, _sub2}]} = AntiUnifier.generalize(trace1, trace2)
+      :ok = Catalog.admit_entry(scope, existing_entry, nil)
+
+      trace3 = ground_greet_trace("carol", "Carol")
+      {:ok, candidates} = AntiUnifier.generalize(trace1, trace3)
+
+      graph = RDF.Graph.new()
+      ctx = context()
+
+      assert {:ok, [{:rejected, _reason}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
+    end
+
+    test "a candidate broader than an existing entry is queued as :merge, replaces the existing node" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      # A narrower existing entry: a single ground fact, no variables at all
+      # (trivially still a valid Rule — an empty Body, a ground Head).
+      # A proper RDF.Literal (not a raw Elixir string) — a raw string is what
+      # a real CapabilityReference.result value looks like (a known,
+      # documented 6d-i/6e-ii quirk), but raw strings get coerced into
+      # RDF.Literal by real RDF.Graph storage on write, so a hand-built
+      # fixture asserting round-trip equality needs to already be in the
+      # form real storage will hand back.
+      existing_entry = %Rule{
+        signature: %Signature{
+          name: rel("greeted"),
+          parameters: [t("alice"), RDF.literal("Hello, Alice!")],
+          reads: [],
+          produces: [rel("greeted")]
+        },
+        head: %FactPattern{
+          predicate: rel("greeted"),
+          args: [t("alice"), RDF.literal("Hello, Alice!")]
+        },
+        body: []
+      }
+
+      :ok = Catalog.admit_entry(scope, existing_entry, nil)
+      {:ok, [{existing_node, ^existing_entry}]} = Catalog.list_entries(scope)
+
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+      {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx =
+        context(%{
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
+        })
+
+      assert {:ok, [{:queued, node, :merge}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(scope)
+      assert pending_review.replaces == existing_node
     end
   end
 end
