@@ -18,6 +18,16 @@ defmodule Riptide.SupervisedProcessTest do
       Riptide.SupervisedProcess.handle_stop_if_idle(__MODULE__, state, reason, from)
     end
 
+    def handle_call(:mark_active, _from, state) do
+      Riptide.SupervisedProcess.SessionTracker.mark_session_active(state.id)
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:mark_idle, _from, state) do
+      Riptide.SupervisedProcess.SessionTracker.mark_session_idle(state.id)
+      {:reply, :ok, state}
+    end
+
     @impl Riptide.SupervisedProcess
     def session_active?(state), do: state.active
   end
@@ -116,6 +126,31 @@ defmodule Riptide.SupervisedProcessTest do
   describe "request_revoke/1 — unregistered id" do
     test "returns {:error, :not_found}" do
       assert {:error, :not_found} = SupervisedProcess.request_revoke(unique_id())
+    end
+  end
+
+  describe "crash-session legibility" do
+    test "a process killed uncleanly while marked active leaves a detectable trace" do
+      id = unique_id()
+      {:ok, pid} = SupervisedProcess.start(id, Fixture, {id, false})
+      :ok = GenServer.call(pid, :mark_active)
+
+      Process.exit(pid, :kill)
+      refute Process.alive?(pid)
+
+      assert Riptide.SupervisedProcess.SessionTracker.was_active_at_crash?(id)
+    end
+
+    test "a process that marks itself idle before exiting normally reports no trace" do
+      id = unique_id()
+      {:ok, pid} = SupervisedProcess.start(id, Fixture, {id, false})
+      :ok = GenServer.call(pid, :mark_active)
+      :ok = GenServer.call(pid, :mark_idle)
+
+      Process.exit(pid, :kill)
+      refute Process.alive?(pid)
+
+      refute Riptide.SupervisedProcess.SessionTracker.was_active_at_crash?(id)
     end
   end
 
