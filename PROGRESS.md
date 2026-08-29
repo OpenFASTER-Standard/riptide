@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop) — 13 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery) — 12 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -699,4 +699,32 @@ today, so no Capability can reach the network at all yet). The capstone test —
 sub-project to exercise the entire walking skeleton end-to-end in one place.
 
 **Status**: Phase 6f shipped 2026-08-29. 13 phases remaining across the primary spine and the
+three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6g-i — Exact/keyword Discovery
+
+Eighth link in the walking skeleton, and its own final step (`6b-i → 6c-i-a → 6c-i-b → 6d-i →
+6e-i → 6e-ii → 6e-iii → {6f, 6g-i}`), unblocked by 6e-iii (#66). **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6g-i-exact-keyword-discovery-design.md`.
+
+`Riptide.Derivation.Discovery.find/2`: exact/keyword lookup over CatalogEntry. Tokenizes the
+query and each found entry's predicate local name (camelCase-aware), ranks word-set-equal
+entries above any partial-overlap keyword match, and breaks ties within either tier by
+specificity (free-variable count) — the same idea 6e-i/6e-iii already established for
+anti-unification scoring. `recency` and `StabilityClass` conflict-resolution tiers were both
+investigated and explicitly deferred, for two different concrete reasons: `recency` isn't
+actually free (`Catalog.list_entries/1` folds the event log into an unordered `RDF.Graph`,
+discarding admission order — a blank-node-counter proxy was considered and rejected as unsound
+for a distributed, Ra-replicated system); `StabilityClass` doesn't exist as a field anywhere in
+shipped code and would mean retrofitting `Capability.Definition` for something issue #68 never
+asked for. `ExecuteInterpreter.call_template/4` — an already-implemented private clause used
+internally by `invoke_rule/4` — became public (pure visibility widening, zero behavior change),
+letting a caller seed a found template's free variables against a new Task's own concrete
+arguments. The capstone test closes the walking skeleton's own `{6f, 6g-i}` branch end-to-end
+for the first time with **zero** LLM calls: two `LLMFallback.run/3` calls admit a CatalogEntry
+via the full `AntiUnifier.generalize/2` → `DedupGate.propose/4` → `approve_review/2` path, a
+third task is found by `Discovery.find/2`'s keyword tier, and invoked directly via
+`ExecuteInterpreter.call_template/4`.
+
+**Status**: Phase 6g-i shipped 2026-08-29. 12 phases remaining across the primary spine and the
 three parallel tracks — see the design spec's §7 for the full roadmap.
