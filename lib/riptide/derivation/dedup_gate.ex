@@ -68,7 +68,9 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
 
   defp encode_one_evidence(:fidelity_pass) do
     node = RDF.BlankNode.new()
-    {node, RDF.Graph.new() |> RDF.Graph.add({node, @riptide_fidelity_status, RDF.literal("pass")})}
+
+    {node,
+     RDF.Graph.new() |> RDF.Graph.add({node, @riptide_fidelity_status, RDF.literal("pass")})}
   end
 
   defp encode_one_evidence({:fidelity_fail, reason}) do
@@ -124,7 +126,9 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
         :fidelity_pass
 
       "fail" ->
-        reason = description |> RDF.Description.first(@riptide_fidelity_reason) |> RDF.Literal.value()
+        reason =
+          description |> RDF.Description.first(@riptide_fidelity_reason) |> RDF.Literal.value()
+
         {:fidelity_fail, reason}
     end
   end
@@ -136,4 +140,73 @@ defmodule Riptide.Derivation.DedupGate do
   review workflow. See design spec
   `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
   """
+
+  alias Riptide.Derivation.DedupGate.PendingReview
+  alias Riptide.Derivation.ExecuteInterpreter.Context
+  alias Riptide.Derivation.{AntiUnifier, Catalog, GeneralizationFidelity, Rule}
+
+  @type candidates :: [{Rule.t(), AntiUnifier.substitution(), AntiUnifier.substitution()}]
+  @type outcome ::
+          {:rejected, reason :: term()}
+          | {:fidelity_failed, [PendingReview.fidelity_evidence()]}
+          | {:queued, RDF.BlankNode.t(), PendingReview.kind()}
+
+  @spec propose(Catalog.scope(), candidates(), RDF.Graph.t(), Context.t()) ::
+          {:ok, [outcome()]} | {:error, term()}
+  def propose(scope, candidates, graph, context) do
+    with {:ok, entries} <- Catalog.list_entries(scope) do
+      {:ok, Enum.map(candidates, &propose_one(scope, &1, entries, graph, context))}
+    end
+  end
+
+  defp propose_one(scope, {generalization, sub1, sub2}, entries, graph, context) do
+    trace1 = AntiUnifier.substitute(generalization, sub1)
+    trace2 = AntiUnifier.substitute(generalization, sub2)
+
+    case classify(generalization, entries) do
+      {:reject, reason} ->
+        {:rejected, reason}
+
+      {kind, replaces} ->
+        finish_proposal(scope, generalization, kind, replaces, trace1, trace2, graph, context)
+    end
+  end
+
+  defp finish_proposal(scope, generalization, kind, replaces, trace1, trace2, graph, context) do
+    case fidelity_evidence(trace1, trace2, graph, context) do
+      {:ok, evidence} ->
+        pending_review = %PendingReview{
+          kind: kind,
+          candidate: generalization,
+          fidelity_evidence: evidence,
+          replaces: replaces
+        }
+
+        {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+        {:queued, node, kind}
+
+      {:error, evidence} ->
+        {:fidelity_failed, evidence}
+    end
+  end
+
+  defp classify(_candidate, []), do: {:admit, nil}
+  defp classify(_candidate, _entries), do: {:admit, nil}
+
+  defp fidelity_evidence(trace1, trace2, graph, context) do
+    evidence =
+      Enum.map([trace1, trace2], fn trace ->
+        trace |> GeneralizationFidelity.check(graph, context) |> normalize_fidelity_result()
+      end)
+
+    if Enum.all?(evidence, &(&1 == :fidelity_pass)) do
+      {:ok, evidence}
+    else
+      {:error, evidence}
+    end
+  end
+
+  defp normalize_fidelity_result({:ok, :fidelity_pass}), do: :fidelity_pass
+  defp normalize_fidelity_result({:ok, {:fidelity_fail, reason}}), do: {:fidelity_fail, reason}
+  defp normalize_fidelity_result({:error, reason}), do: {:fidelity_fail, reason}
 end
