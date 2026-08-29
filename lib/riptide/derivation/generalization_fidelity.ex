@@ -11,6 +11,8 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
   ground `Rule.t()` + graph + `ExecuteInterpreter.Context.t()`, reused as-is.
   """
 
+  alias Riptide.Capability
+  alias Riptide.Capability.Definition
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
   alias Riptide.Derivation.{Rule, Var}
@@ -65,4 +67,39 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
       {:ok, {:fidelity_fail, {:fact_not_present, {subject, predicate, object}}}}
     end
   end
+
+  defp check_body(
+         [%CapabilityReference{capability: iri, args: args, result: result} | rest],
+         graph,
+         context
+       ) do
+    case Map.fetch(context.capabilities, iri) do
+      {:ok, %Definition{kind: :effect} = definition} ->
+        resolved_args = Enum.map(args, &term_to_arg/1)
+
+        case Capability.invoke(definition, context.tenant_id, context.current_subject, resolved_args) do
+          {:ok, ^result} ->
+            check_body(rest, graph, context)
+
+          {:ok, actual} ->
+            {:ok, {:fidelity_fail, {:capability_mismatch, iri, result, actual}}}
+
+          {:error, reason} ->
+            {:ok, {:fidelity_fail, {:capability_error, iri, reason}}}
+        end
+
+      :error ->
+        {:error, {:unresolvable, iri}}
+    end
+  end
+
+  # Capability.invoke/4 requires plain Elixir strings — a ground literal's
+  # arg is an RDF.Term.t() (an IRI or Literal), never a bare string on its
+  # own. Deliberate small duplication of ExecuteInterpreter's own private
+  # helper of the same name/shape (lib/riptide/derivation/execute_interpreter.ex)
+  # rather than exporting it across modules — matches this project's
+  # established tolerance for that.
+  defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
+  defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
+  defp term_to_arg(string) when is_binary(string), do: string
 end

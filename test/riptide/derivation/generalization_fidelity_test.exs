@@ -1,9 +1,10 @@
 defmodule Riptide.Derivation.GeneralizationFidelityTest do
   use ExUnit.Case, async: true
 
+  alias Riptide.Capability.Definition
   alias Riptide.Derivation.GeneralizationFidelity
   alias Riptide.Derivation.ExecuteInterpreter.Context
-  alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
   alias Riptide.Derivation.{Rule, Signature, Var}
 
   defp t(name), do: RDF.iri("urn:test:" <> name)
@@ -14,6 +15,61 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       %Context{capabilities: %{}, rules: %{}, tenant_id: "acme", current_subject: nil},
       overrides
     )
+  end
+
+  defmodule FakeStore do
+    @behaviour Riptide.Authz.Store
+
+    @impl true
+    def list_policies(tenant_id, path_prefix) do
+      Agent.get(__MODULE__, &Map.get(&1, {tenant_id, path_prefix}, []))
+    end
+
+    @impl true
+    def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
+
+    @impl true
+    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
+
+    def start(policies_by_prefix) do
+      case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, pid}} -> pid
+      end
+    end
+  end
+
+  setup do
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :authz_store, FakeStore)
+
+    on_exit(fn ->
+      if pid = Process.whereis(FakeStore) do
+        try do
+          Agent.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+    end)
+
+    :ok
+  end
+
+  defp greet_definition(name, kind \\ :effect) do
+    %Definition{
+      name: RDF.iri("urn:riptide:capability:" <> name),
+      kind: kind,
+      component: "test/fixtures/riptide_capability/fixture.wasm",
+      function: "greet",
+      fuel_limit: 100_000_000,
+      timeout_ms: 5_000,
+      memory_limits: %{
+        max_memory_size: nil,
+        max_table_elements: nil,
+        max_instances: nil,
+        max_tables: nil
+      }
+    }
   end
 
   describe "check/3 — groundness precondition" do
@@ -137,6 +193,142 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       # *first* literal's reason, proving Body order is respected.
       assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
                {:ok, {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
+    end
+  end
+
+  describe "check/3 — CapabilityReference, :effect kind" do
+    test "passes when the fresh invocation matches the recorded result" do
+      cap_iri = RDF.iri("urn:riptide:capability:greetAlice")
+
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetAlice"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      head = %FactPattern{predicate: rel("greeted"), args: [t("riptide"), "\"Hello, Alice!\""]}
+
+      body = [
+        %CapabilityReference{
+          capability: cap_iri,
+          args: [RDF.literal("Alice")],
+          result: "\"Hello, Alice!\""
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      ctx = context(%{capabilities: %{cap_iri => greet_definition("greetAlice")}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) == {:ok, :fidelity_pass}
+    end
+
+    test "fails with :capability_mismatch when the fresh invocation differs from the recorded result" do
+      cap_iri = RDF.iri("urn:riptide:capability:greetAlice")
+
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetAlice"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      head = %FactPattern{
+        predicate: rel("greeted"),
+        args: [t("riptide"), "\"stale recorded value\""]
+      }
+
+      body = [
+        %CapabilityReference{
+          capability: cap_iri,
+          args: [RDF.literal("Alice")],
+          result: "\"stale recorded value\""
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      ctx = context(%{capabilities: %{cap_iri => greet_definition("greetAlice")}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) ==
+               {:ok,
+                {:fidelity_fail,
+                 {:capability_mismatch, cap_iri, "\"stale recorded value\"", "\"Hello, Alice!\""}}}
+    end
+
+    test "fails with :capability_error when the invocation itself errors (unauthorized)" do
+      cap_iri = RDF.iri("urn:riptide:capability:notGranted")
+      FakeStore.start(%{})
+
+      head = %FactPattern{predicate: rel("greeted"), args: [t("riptide"), "\"Hello, Alice!\""]}
+
+      body = [
+        %CapabilityReference{
+          capability: cap_iri,
+          args: [RDF.literal("Alice")],
+          result: "\"Hello, Alice!\""
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      ctx = context(%{capabilities: %{cap_iri => greet_definition("notGranted")}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) ==
+               {:ok, {:fidelity_fail, {:capability_error, cap_iri, :unauthorized}}}
+    end
+
+    test "an unresolvable capability IRI is rejected as a structural error" do
+      cap_iri = RDF.iri("urn:riptide:capability:notRegistered")
+      head = %FactPattern{predicate: rel("greeted"), args: [t("riptide"), "\"Hello, Alice!\""]}
+
+      body = [
+        %CapabilityReference{
+          capability: cap_iri,
+          args: [RDF.literal("Alice")],
+          result: "\"Hello, Alice!\""
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
+               {:error, {:unresolvable, cap_iri}}
     end
   end
 end
