@@ -161,4 +161,15 @@ defmodule Riptide.Derivation.LLMFallbackTest do
       end)
     end
   end
+
+  describe "run/3 — unparseable response" do
+    test "a response that isn't valid rule text is a real, surfaced error" do
+      ctx = context()
+
+      with_fake_client({:ok, "this is not a rule clause at all"}, fn ->
+        assert {:error, {:unparseable_response, _reason}} =
+                 LLMFallback.run("do something", RDF.Graph.new(), ctx)
+      end)
+    end
+  end
 end
