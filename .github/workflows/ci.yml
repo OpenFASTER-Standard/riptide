@@ -12,6 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install wasmtime
+        run: |
+          curl -sL https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.1/wasmtime-v48.0.1-x86_64-linux.tar.xz | tar xJ -C /tmp
+          sudo mv /tmp/wasmtime-v48.0.1-x86_64-linux/wasmtime /usr/local/bin/wasmtime
+          wasmtime --version
+
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.18.4"

@@ -92,7 +92,7 @@ defmodule Riptide.Capability do
   end
 
   defp invoke_expr(%Definition{function: function}, args) do
-    encoded_args = args |> Enum.map(&inspect/1) |> Enum.join(", ")
+    encoded_args = Enum.map_join(args, ", ", &inspect/1)
     "#{function}(#{encoded_args})"
   end
 

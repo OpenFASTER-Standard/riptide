@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b shipped** (Rule/Signature representation and parser; fact-pattern matching and joins) — 19 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate) — 18 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -535,4 +535,27 @@ Body) and rejects Bodies containing capability-reference/rule-reference literals
 until 6b-i's WASI substrate exists).
 
 **Status**: Phase 6c-i-b shipped 2026-08-28. 19 phases remaining across the primary spine and the
+three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6b-i — WASI execution substrate
+
+Foundation-track phase (§7 of the design spec), independent of every other Sub-project 6
+phase. **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-28-phase-6b-i-wasi-execution-substrate-design.md` (Revision 2).
+
+`Riptide.Capability.authorized?/3`/`invoke/4` authorize and invoke a tenant-scoped WASI
+Preview 2 component. Authorization reuses the existing `Riptide.Authz` ACP machinery via a
+synthetic `["capabilities", name]` path and a new `:invoke` mode, rather than a parallel grant
+mechanism. Invocation shells out to the `wasmtime` CLI as a separate OS process — not `wasmex`,
+which was proven during design to be unable to bound a WASI Preview 2 component's execution
+time at all (its Components API's fuel accounting operates on a different native resource type
+than its Components store, and its `call_function/4` timeout is checked only before/after
+execution, never during; a real infinite-loop fixture component demonstrated the Elixir process
+can be killed while the native computation keeps consuming CPU indefinitely). The external
+`wasmtime` CLI's own `-W fuel=`/`-W timeout=`/`-W max-memory-size=` flags all verified to trap
+deterministically, with OS-process-level resource reclaim on exit. WASIX (subprocess spawning)
+is dropped entirely — it's a Wasmer-specific technology with no path on the wasmtime-based stack
+this project uses, and no current Capability needs it.
+
+**Status**: Phase 6b-i shipped 2026-08-29. 18 phases remaining across the primary spine and the
 three parallel tracks — see the design spec's §7 for the full roadmap.
