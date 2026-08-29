@@ -250,6 +250,26 @@ defmodule Riptide.RaCluster do
     :ok
   end
 
+  # Recovers a crashed member IN PLACE from its own durable log on disk —
+  # distinct from `start_or_join_replicated/3` (forms a BRAND NEW cluster)
+  # and from `replace_member/5` (needs surviving OTHER members to agree to
+  # an add/remove membership change). Confirmed live (2026-08-29, building
+  # 6h-ii's Pattern Hub HTTP surface): `:ra`'s own `apply_consistent_queries_effects/2`
+  # can fail an internal assertion and crash a server's `gen_statem` process
+  # outright — for a single-member stream, `Riptide.Stream.ReplicaHealer`'s
+  # replace-based repair can't help (`pick_replacement/2` always excludes
+  # the dead member's own node from candidacy, so a lone member dying on
+  # its only node yields no replacement candidate and repair is a no-op).
+  # `:ra.restart_server/2` is the correct recovery for exactly this case:
+  # the underlying durable log survives the crash (Ra's whole point), so
+  # restarting the SAME server_id recovers the SAME state and — being the
+  # only member — trivially re-elects itself leader.
+  @spec restart_server(:ra.server_id()) :: :ok | {:error, term()}
+  def restart_server(server_id) do
+    ensure_system_started()
+    :ra.restart_server(@system, server_id)
+  end
+
   # Starting the `:ra` OTP application (which happens automatically as a
   # regular dependency of `:riptide`) does NOT start the `:default` Ra
   # system that `server_id/1`'s `@system` refers to — `ra_sup`'s supervision

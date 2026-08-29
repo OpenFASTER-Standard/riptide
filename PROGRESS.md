@@ -847,7 +847,7 @@ caller-supplied `Capability.Definition.component` would be an arbitrary-file-exe
 Full Install (Crosswalk-aware field binding) stays explicitly deferred to 6i, per the exit
 criterion's own literal wording.
 
-Two real, pre-existing bugs found and fixed along the way, both invisible until this phase made
+Three real, pre-existing bugs found and fixed along the way, all invisible until this phase made
 `:hub` a genuinely long-lived, repeatedly-read/written stream for the first time (every prior use
 of `:hub` — including 6e-iii's own Catalog tests — created and destroyed it within one isolated
 test, never exercising it the way a real, growing Hub Catalog behaves):
@@ -868,34 +868,37 @@ test, never exercising it the way a real, growing Hub Catalog behaves):
    `{:error, reason}` still raises immediately, unretried. General `RaCluster` fix, not
    Hub-specific — protects every caller of these three functions.
 
-**Known residual flake (not fully resolved, tracked as follow-up):** the retry above does not
-fully eliminate `:hub`-touching test failures. Root-caused precisely via the actual crash reports
-in a failing run's log (`gen_statem ... terminating`, `** (stop) {:EXIT, {{:badmatch, false},
-...}}`): `:ra` 2.15.4's own `apply_consistent_queries_effects/2` (`true = LastApplied >=
-ReadCommitIndex`) can fail its internal assertion and crash the *entire* `gen_statem` process
-backing a stream's Ra server — not a caller-visible transient error a retry can ride out, but the
-server itself dying, confirmed to happen asynchronously inside `ra_server_proc`'s own
-leader-loop processing, independent of any specific caller. Once that happens:
-- `Riptide.Stream.Placement`'s cache (`server_ids!/1`) is a pure ETS read, never invalidated —
-  every subsequent caller keeps being handed the now-dead registration, forever, for the rest of
-  that `mix test` process's lifetime.
-- `Riptide.Stream.ReplicaHealer`'s repair is replace-based (swap a dead member for a *different*
-  live node) — it cannot help a single-member (`RF=1`, this test environment's `:hub`) cluster's
-  own only member dying; there's no spare node to promote.
-No caller-side retry budget, however large, can fix this — a full fix needs `StreamServer` to
-detect a permanently-dead server and re-trigger `Placement.ensure_started/2` to re-form it
-(self-healing re-creation), which is materially bigger than a retry wrapper and not specific to
-the Pattern Hub — every stream is exposed to this crash class, `:hub` just made it visible first
-by being the first stream kept alive and repeatedly read/written across a whole realistic test
-session (every prior use of `:hub`, and every other stream in the existing suite, was always
-short-lived/isolated per test, so a mid-session server crash had no chance to matter before).
-Evidence: 7 consecutive full-suite runs during this phase — 0, 2, 4, 11, 0, 0, 11 Hub-related
-failures respectively (the two 0-failure runs immediately followed a manual wipe of `:hub`'s
-disk-persisted Ra log, which is not itself a fix — the crash's cause is independent of prior
-state, confirmed by run 7 crashing again from a freshly-wiped `:hub`). Filed as a genuine,
-pre-existing gap in `Riptide.Stream.Placement`/`Riptide.Stream.StreamServer`'s crash-recovery
-story, out of 6h-ii's own scope (Pattern Hub HTTP endpoints) to fix here — needs its own
-brainstorm/spec/plan cycle, not a same-branch patch.
+3. A third, deeper bug the retry above did *not* fix on its own: `:ra` 2.15.4's own
+   `apply_consistent_queries_effects/2` (`true = LastApplied >= ReadCommitIndex`) can fail its
+   internal assertion and crash the *entire* `gen_statem` process backing a stream's Ra server —
+   root-caused precisely via the actual crash reports in a failing CI run's log
+   (`gen_statem ... terminating`, `** (stop) {:EXIT, {{:badmatch, false}, ...}}`), confirmed to
+   happen asynchronously inside `ra_server_proc`'s own leader-loop processing, independent of any
+   specific caller — not something a caller-side retry, however large, can ride out. Once that
+   happens, nothing else recovers it on its own: `Riptide.Stream.Placement`'s cache
+   (`server_ids!/1`) is a pure ETS read, never invalidated, so every subsequent caller keeps being
+   handed the now-dead registration; `Riptide.Stream.ReplicaHealer`'s repair is replace-based
+   (swap a dead member for a *different* live node) and `pick_replacement/2` always excludes the
+   dead member's own node from candidacy, so it's a no-op for a single-member (`RF=1`, this test
+   environment's `:hub`) cluster's own only member dying — there's no spare node to promote.
+   Fixed with a new `RaCluster.restart_server/1` (`:ra.restart_server/2` — recovers a crashed
+   server in place from its own durable log, unlike `start_or_join_replicated/3` which forms a
+   brand-new cluster or `replace_member/5` which needs surviving *other* members to agree to a
+   membership change) wired into `StreamServer`'s existing last-replica fallback: once every
+   replica in a stream's list has been tried and the last one's failure survives
+   `RaCluster`'s own transient retry, attempt a same-node restart-in-place once, then retry the
+   original call once more (itself get its own full retry budget, covering the brief window a
+   freshly-restarted server needs to re-elect itself leader) before finally letting a genuine
+   failure propagate uncaught. Not Hub-specific — every stream was exposed to this crash class,
+   `:hub` just made it visible first by being the first stream kept alive and repeatedly
+   read/written across a whole realistic session (every prior use of `:hub`, and every other
+   stream in the existing suite, was always short-lived/isolated per test, so a mid-session server
+   crash had no chance to matter before). Evidence: reproduced live via 2 of 3 consecutive CI runs
+   on this PR failing with exactly this crash before the fix, then 3 consecutive full local-suite
+   runs with zero Hub-related failures after it (the only failures across those 3 runs were
+   different, already-flaky, unrelated pre-existing tests — `SseControllerTest`/
+   `ReplicationChannelTest`'s own documented rate-limit boundary flake, and one `ResourceControllerTest`
+   placement-assignment flake).
 
 **Status**: Phase 6h-ii shipped 2026-08-29. 8 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
