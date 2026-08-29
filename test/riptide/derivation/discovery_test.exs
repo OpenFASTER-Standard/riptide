@@ -74,4 +74,20 @@ defmodule Riptide.Derivation.DiscoveryTest do
       assert Discovery.find(scope, "unrelated task") == {:ok, []}
     end
   end
+
+  describe "find/2 — specificity tiebreak" do
+    test "within the same tier, fewer free variables ranks first" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      specific_rule = sample_rule("greeted", 0)
+      general_rule = sample_rule("greeted", 1)
+
+      :ok = Catalog.admit_entry(scope, general_rule, nil)
+      :ok = Catalog.admit_entry(scope, specific_rule, nil)
+
+      assert {:ok, [{_node1, ^specific_rule}, {_node2, ^general_rule}]} =
+               Discovery.find(scope, "greeted")
+    end
+  end
 end
