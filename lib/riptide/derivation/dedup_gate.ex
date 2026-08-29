@@ -236,4 +236,29 @@ defmodule Riptide.Derivation.DedupGate do
   defp normalize_fidelity_result({:ok, :fidelity_pass}), do: :fidelity_pass
   defp normalize_fidelity_result({:ok, {:fidelity_fail, reason}}), do: {:fidelity_fail, reason}
   defp normalize_fidelity_result({:error, reason}), do: {:fidelity_fail, reason}
+
+  @spec approve_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def approve_review(scope, node) do
+    with {:ok, pending_reviews} <- Catalog.list_pending_reviews(scope),
+         {_node, pending_review} <- List.keyfind(pending_reviews, node, 0, :not_found) do
+      apply_approved(scope, node, pending_review)
+    else
+      :not_found -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp apply_approved(scope, node, %PendingReview{kind: :admit} = pending_review) do
+    :ok = Catalog.admit_entry(scope, pending_review.candidate, nil)
+    Catalog.resolve_pending_review(scope, node, :approved)
+  end
+
+  defp apply_approved(scope, node, %PendingReview{kind: :merge} = pending_review) do
+    :ok = Catalog.admit_entry(scope, pending_review.candidate, pending_review.replaces)
+    :ok = Catalog.supersede_entry(scope, pending_review.replaces)
+    Catalog.resolve_pending_review(scope, node, :approved)
+  end
+
+  @spec decline_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def decline_review(scope, node), do: Catalog.resolve_pending_review(scope, node, :declined)
 end

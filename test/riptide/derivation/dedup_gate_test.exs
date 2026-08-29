@@ -364,4 +364,84 @@ defmodule Riptide.Derivation.DedupGateTest do
       refute candidate_a == candidate_b
     end
   end
+
+  describe "approve_review/2 — :admit" do
+    test "approving an :admit proposal writes a live CatalogEntry and resolves the pending item" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+      {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx =
+        context(%{
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
+        })
+
+      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+
+      assert :ok == DedupGate.approve_review(scope, node)
+      assert {:ok, [{_entry_node, _rule}]} = Catalog.list_entries(scope)
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
+    end
+  end
+
+  describe "decline_review/2" do
+    test "declining a proposal writes nothing to the Catalog and resolves the pending item" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+      {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx =
+        context(%{
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
+        })
+
+      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+
+      assert :ok == DedupGate.decline_review(scope, node)
+      assert {:ok, []} = Catalog.list_entries(scope)
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
+    end
+  end
 end
