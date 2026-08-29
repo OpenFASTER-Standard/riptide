@@ -59,6 +59,25 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
     end
   end
 
+  @doc """
+  Like `call_template/3`, but returns the raw bindings list produced by
+  matching/invoking `rule`'s Body instead of concluding each one into a
+  Head triple. `LLMFallback` (design spec
+  `docs/superpowers/specs/2026-08-29-phase-6f-llm-fallback-loop-design.md`
+  §5) needs the full bindings — including Body-only variables that never
+  appear in the Head — to reconstruct a ground Trace via
+  `AntiUnifier.substitute/2`, which `call_template/3`'s own concluded-triple
+  return discards.
+  """
+  @spec resolve_bindings(Rule.t(), RDF.Graph.t(), Context.t()) ::
+          {:ok, [%{Var.t() => RDF.Term.t()}]}
+          | {:error, {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+  def resolve_bindings(%Rule{} = rule, %RDF.Graph{} = graph, %Context{} = context) do
+    with :ok <- check_resolvable(rule.body, context) do
+      {:ok, execute_body(rule.body, %{}, graph, context)}
+    end
+  end
+
   defp check_resolvable(body, context) do
     Enum.reduce_while(body, :ok, fn literal, :ok ->
       case check_literal_resolvable(literal, context) do
