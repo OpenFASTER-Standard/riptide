@@ -79,4 +79,35 @@ defmodule Riptide.RDF.PatchTest do
       end
     end
   end
+
+  describe "encode/1 and decode/1 — RDF-star (phase 6a)" do
+    test "a Patch containing a quoted-triple addition round-trips through encode/1 and decode/1, still at wire version 1" do
+      alice = RDF.iri("urn:test:alice")
+      works_at = RDF.iri("urn:riptide:relation:worksAt")
+      acme = RDF.iri("urn:test:acme")
+      valid_from = RDF.iri("urn:riptide:relation:validFrom")
+
+      base_triple = {alice, works_at, acme}
+      annotation_triple = {base_triple, valid_from, RDF.literal(~U[2026-01-01 00:00:00Z])}
+
+      patch = %Patch{additions: [base_triple, annotation_triple], removals: []}
+
+      assert Patch.encode(patch) == %{
+               v: 1,
+               additions: [base_triple, annotation_triple],
+               removals: []
+             }
+
+      assert Patch.decode(Patch.encode(patch)) == patch
+    end
+
+    test "an old-shape v1 wire map with no RDF-star anywhere still decodes via the same clause" do
+      old_wire = %{v: 1, additions: [{@alice, @name, RDF.literal("Alice")}], removals: []}
+
+      assert Patch.decode(old_wire) == %Patch{
+               additions: [{@alice, @name, RDF.literal("Alice")}],
+               removals: []
+             }
+    end
+  end
 end

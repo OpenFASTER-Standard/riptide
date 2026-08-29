@@ -7,7 +7,8 @@ defmodule Riptide.RDF.Patch do
   @enforce_keys [:additions, :removals]
   defstruct [:additions, :removals]
 
-  @type triple :: {RDF.IRI.t(), RDF.IRI.t(), RDF.Term.t()}
+  @type triple ::
+          {RDF.IRI.t() | RDF.Star.Triple.t(), RDF.IRI.t(), RDF.Term.t() | RDF.Star.Triple.t()}
   @type t :: %__MODULE__{additions: [triple()], removals: [triple()]}
 
   @spec apply(RDF.Graph.t(), t()) :: RDF.Graph.t()
