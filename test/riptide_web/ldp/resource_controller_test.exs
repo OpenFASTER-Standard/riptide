@@ -198,6 +198,37 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     assert put_conn.status == 400
   end
 
+  test "PUT with a Turtle-star ValidTime annotation round-trips both the base fact and the annotation" do
+    path = unique_path()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(path)) end)
+
+    turtle = """
+    @prefix ex: <https://pod.example/> .
+    @prefix rel: <urn:riptide:relation:> .
+    ex:x ex:y "z" {| rel:validFrom "2026-01-01T00:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> |} .
+    """
+
+    put_conn =
+      :put
+      |> conn(path, turtle)
+      |> put_req_header("content-type", "text/turtle")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert put_conn.status == 201
+
+    get_conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+    assert get_conn.status == 200
+    # The base fact stays independently present (unaffected by the
+    # annotation, matching every other un-annotated PUT/GET test in this
+    # file — proving zero behavior change for callers that never set a
+    # ValidTime) ...
+    assert get_conn.resp_body =~ "ex:y \"z\""
+    # ... and the annotation itself survived the full write/read path.
+    assert get_conn.resp_body =~ "validFrom"
+    assert get_conn.resp_body =~ "2026-01-01"
+  end
+
   test "PATCH with malformed Turtle in additions returns 400 instead of crashing" do
     path = unique_path()
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(path)) end)
