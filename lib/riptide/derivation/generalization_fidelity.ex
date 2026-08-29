@@ -32,7 +32,8 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
   @spec check(Rule.t(), RDF.Graph.t(), Context.t()) ::
           {:ok, :fidelity_pass}
           | {:ok, {:fidelity_fail, reason()}}
-          | {:error, :not_ground | {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+          | {:error,
+             :not_ground | {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
   def check(%Rule{} = rule, %RDF.Graph{} = graph, %Context{} = context) do
     if ground?(rule) do
       check_body(rule.body, graph, context)
@@ -80,7 +81,12 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
       {:ok, %Definition{kind: :effect} = definition} ->
         resolved_args = Enum.map(args, &term_to_arg/1)
 
-        case Capability.invoke(definition, context.tenant_id, context.current_subject, resolved_args) do
+        case Capability.invoke(
+               definition,
+               context.tenant_id,
+               context.current_subject,
+               resolved_args
+             ) do
           {:ok, ^result} ->
             check_body(rest, graph, context)
 
@@ -95,16 +101,6 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
         {:error, {:unresolvable, iri}}
     end
   end
-
-  # Capability.invoke/4 requires plain Elixir strings — a ground literal's
-  # arg is an RDF.Term.t() (an IRI or Literal), never a bare string on its
-  # own. Deliberate small duplication of ExecuteInterpreter's own private
-  # helper of the same name/shape (lib/riptide/derivation/execute_interpreter.ex)
-  # rather than exporting it across modules — matches this project's
-  # established tolerance for that.
-  defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
-  defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
-  defp term_to_arg(string) when is_binary(string), do: string
 
   defp check_body([%RuleReference{rule: iri, args: args} | rest], graph, context) do
     cond do
@@ -124,4 +120,14 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
         end
     end
   end
+
+  # Capability.invoke/4 requires plain Elixir strings — a ground literal's
+  # arg is an RDF.Term.t() (an IRI or Literal), never a bare string on its
+  # own. Deliberate small duplication of ExecuteInterpreter's own private
+  # helper of the same name/shape (lib/riptide/derivation/execute_interpreter.ex)
+  # rather than exporting it across modules — matches this project's
+  # established tolerance for that.
+  defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
+  defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
+  defp term_to_arg(string) when is_binary(string), do: string
 end

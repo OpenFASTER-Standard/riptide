@@ -2,8 +2,8 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
   use ExUnit.Case, async: true
 
   alias Riptide.Capability.Definition
-  alias Riptide.Derivation.GeneralizationFidelity
   alias Riptide.Derivation.ExecuteInterpreter.Context
+  alias Riptide.Derivation.GeneralizationFidelity
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
   alias Riptide.Derivation.{Rule, Signature, Var}
 
@@ -166,7 +166,8 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       }
 
       assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
-               {:ok, {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
+               {:ok,
+                {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
     end
 
     test "short-circuits: a failing first literal is reported without evaluating the second" do
@@ -192,7 +193,8 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       # or the walk didn't short-circuit, this assertion still pins the
       # *first* literal's reason, proving Body order is respected.
       assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
-               {:ok, {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
+               {:ok,
+                {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
     end
   end
 
@@ -356,7 +358,10 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
         }
       }
 
-      head = %FactPattern{predicate: rel("observed"), args: [t("riptide"), "\"stale but trusted\""]}
+      head = %FactPattern{
+        predicate: rel("observed"),
+        args: [t("riptide"), "\"stale but trusted\""]
+      }
 
       body = [
         %CapabilityReference{
@@ -507,7 +512,8 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) ==
                {:ok,
                 {:fidelity_fail,
-                 {:nested, nested_iri, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}}
+                 {:nested, nested_iri,
+                  {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}}
     end
   end
 
