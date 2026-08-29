@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive) — 10 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model) — 9 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -784,6 +784,37 @@ session-active check runs inside the target process's own serialized mailbox
 (`:sys.get_state/1` then a separate stop call) would have had. Restart and revoke share one
 supervisor mechanism (`:transient` restart type, differing only in exit reason — abnormal vs.
 `:normal`) rather than needing special-cased logic.
+
+### 6h-i — Pattern Hub threat model
+
+Foundation-track phase (§7 of the design spec, `depends on: nothing`), independent of every
+other Sub-project 6 phase. **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6h-i-pattern-hub-threat-model-design.md`. Unlike every
+other Sub-project 6 phase, this one's deliverable *is* the design document — its exit criterion
+("a written auth/rate-limit threat model exists and is reviewed") has no code component.
+
+Brainstorming this phase found and corrected a real gap in the parent design spec itself: every
+prior revision described Pattern Hub curation as "Riptide-internal," but no design work had ever
+concretely defined who that was. Corrected first, separately, in the parent spec's own eleventh
+revision: **Tenant is the sovereign unit** — any Tenant may publish/share content, reviewed
+through that Tenant's own already-shipped DedupGate authority (6e-iii), never a separate
+third-party reviewer; sharing is designed to work identically whether the receiving Tenant is on
+the same Riptide deployment or a different, independently-operated one (federation, a stated
+design goal with cross-instance trust verification explicitly deferred). Once grounded against
+the corrected model, 6h-i's own threat model simplified substantially: every write action on the
+Hub surface (propose, approve/decline-review, install, Crosswalk-propose) is always performed as
+some real, already-existing Tenant using its own already-shipped `Authz.evaluate/4` — no new
+authorization primitive needed anywhere, and two threats from an earlier draft (privilege
+escalation on a central review gate; a structural mismatch in `Authz.evaluate/4`'s signature)
+were retired as no longer applicable rather than silently dropped. The most important residual
+risk became tenant-data leakage via incomplete generalization (anti-unification only turns a
+position into a variable where source Traces actually disagreed, so a literal constant across
+every Trace a Tenant has seen so far can ship into a publicly-installable Pattern verbatim) —
+with no central reviewer as a safety net, a Tenant's own mandatory human review before
+`Admit`/`Merge` is the sole line of defense, called out explicitly rather than assumed safe.
+
+**Status**: Phase 6h-i shipped 2026-08-29. 9 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
 
 **Status**: Phase 6b-ii shipped 2026-08-29. 10 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
