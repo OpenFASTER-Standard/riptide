@@ -34,14 +34,28 @@ defmodule Riptide.Derivation.Matcher do
           {:ok, [%{Var.t() => RDF.Term.t()}]}
           | {:error, :too_many_variables | {:unsupported_literal, Rule.literal()}}
   def bindings(%Rule{body: body}, %RDF.Graph{} = graph) do
+    bindings(body, graph, %{})
+  end
+
+  @doc """
+  Like `bindings/2`, but takes a literal list directly plus a seed-bindings
+  map — any `Var` already present in `seed` is substituted as its bound
+  constant before building BGP triple patterns for the remaining free
+  variables, reusing the same fixed-atom-pool translation for whatever
+  stays unbound. `bindings/2` is `bindings(rule.body, graph, %{})`.
+  """
+  @spec bindings([Rule.literal()], RDF.Graph.t(), %{Var.t() => RDF.Term.t()}) ::
+          {:ok, [%{Var.t() => RDF.Term.t()}]}
+          | {:error, :too_many_variables | {:unsupported_literal, Rule.literal()}}
+  def bindings(body, %RDF.Graph{} = graph, seed) when is_list(body) and is_map(seed) do
     with :ok <- check_literal_kinds(body),
-         {:ok, var_to_atom} <- assign_variable_pool(body) do
-      triple_patterns = Enum.map(body, &to_triple_pattern(&1, var_to_atom))
+         {:ok, var_to_atom} <- assign_variable_pool(body, seed) do
+      triple_patterns = Enum.map(body, &to_triple_pattern(&1, var_to_atom, seed))
       bgp = %RDF.Query.BGP{triple_patterns: triple_patterns}
       {:ok, results} = RDF.Query.execute(bgp, graph)
 
       atom_to_var = Map.new(var_to_atom, fn {var, atom} -> {atom, var} end)
-      {:ok, Enum.map(results, &translate_binding(&1, atom_to_var))}
+      {:ok, Enum.map(results, &Map.merge(seed, translate_binding(&1, atom_to_var)))}
     end
   end
 
@@ -97,11 +111,12 @@ defmodule Riptide.Derivation.Matcher do
     end
   end
 
-  defp assign_variable_pool(body) do
+  defp assign_variable_pool(body, seed) do
     vars =
       body
       |> Enum.flat_map(fn %FactPattern{args: args} -> args end)
       |> Enum.filter(&match?(%Var{}, &1))
+      |> Enum.reject(&Map.has_key?(seed, &1))
       |> Enum.uniq()
 
     if length(vars) > @max_variables do
@@ -111,12 +126,23 @@ defmodule Riptide.Derivation.Matcher do
     end
   end
 
-  defp to_triple_pattern(%FactPattern{predicate: predicate, args: [subject, object]}, var_to_atom) do
-    {to_pattern_term(subject, var_to_atom), predicate, to_pattern_term(object, var_to_atom)}
+  defp to_triple_pattern(
+         %FactPattern{predicate: predicate, args: [subject, object]},
+         var_to_atom,
+         seed
+       ) do
+    {to_pattern_term(subject, var_to_atom, seed), predicate,
+     to_pattern_term(object, var_to_atom, seed)}
   end
 
-  defp to_pattern_term(%Var{} = var, var_to_atom), do: Map.fetch!(var_to_atom, var)
-  defp to_pattern_term(term, _var_to_atom), do: term
+  defp to_pattern_term(%Var{} = var, var_to_atom, seed) do
+    case Map.fetch(seed, var) do
+      {:ok, term} -> term
+      :error -> Map.fetch!(var_to_atom, var)
+    end
+  end
+
+  defp to_pattern_term(term, _var_to_atom, _seed), do: term
 
   defp translate_binding(binding, atom_to_var) do
     Map.new(binding, fn {atom, term} -> {Map.fetch!(atom_to_var, atom), term} end)
