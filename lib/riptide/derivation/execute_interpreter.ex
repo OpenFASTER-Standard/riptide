@@ -52,7 +52,19 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
     call_template(rule, %{}, graph, context)
   end
 
-  defp call_template(%Rule{} = rule, seed, %RDF.Graph{} = graph, %Context{} = context) do
+  @doc """
+  Like `call_template/3`, but starts execution from a caller-supplied
+  `seed` instead of an empty binding map. `invoke_rule/4` already used
+  this internally to seed a nested Rule's Head variable before this
+  became a public entry point; a found Discovery result (`Riptide.Derivation.Discovery`
+  design spec `docs/superpowers/specs/2026-08-29-phase-6g-i-exact-keyword-discovery-design.md`
+  §2) is the same shape of caller — a template still needs its own free
+  variables bound to a new Task's concrete arguments before invocation.
+  """
+  @spec call_template(Rule.t(), %{Var.t() => RDF.Term.t()}, RDF.Graph.t(), Context.t()) ::
+          {:ok, [RDF.Triple.t()]}
+          | {:error, {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+  def call_template(%Rule{} = rule, seed, %RDF.Graph{} = graph, %Context{} = context) do
     with :ok <- check_resolvable(rule.body, context) do
       bindings_list = execute_body(rule.body, seed, graph, context)
       {:ok, Enum.map(bindings_list, &conclude(rule.head, &1))}

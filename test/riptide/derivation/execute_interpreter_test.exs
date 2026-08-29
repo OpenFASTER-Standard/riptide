@@ -505,4 +505,26 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       assert ExecuteInterpreter.resolve_bindings(rule, RDF.Graph.new(), context()) == {:ok, []}
     end
   end
+
+  describe "call_template/4 — caller-supplied seed" do
+    test "a Head variable bound only via the seed (no Body literal touches it) still concludes" do
+      head = %FactPattern{predicate: rel("greeted"), args: [%Var{name: "X"}, RDF.literal("hi")]}
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [%Var{name: "X"}],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: []
+      }
+
+      seed = %{%Var{name: "X"} => t("alice")}
+
+      assert ExecuteInterpreter.call_template(rule, seed, RDF.Graph.new(), context()) ==
+               {:ok, [{t("alice"), rel("greeted"), RDF.literal("hi")}]}
+    end
+  end
 end
