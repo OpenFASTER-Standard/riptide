@@ -74,6 +74,9 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
          context
        ) do
     case Map.fetch(context.capabilities, iri) do
+      {:ok, %Definition{kind: :observe}} ->
+        check_body(rest, graph, context)
+
       {:ok, %Definition{kind: :effect} = definition} ->
         resolved_args = Enum.map(args, &term_to_arg/1)
 

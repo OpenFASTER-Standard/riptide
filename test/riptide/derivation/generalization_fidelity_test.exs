@@ -331,4 +331,58 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
                {:error, {:unresolvable, cap_iri}}
     end
   end
+
+  describe "check/3 — CapabilityReference, :observe kind" do
+    test "never invokes — trusts the recorded result even with a Definition that would error if invoked" do
+      cap_iri = RDF.iri("urn:riptide:capability:externalPriceFeed")
+
+      # component intentionally points at a nonexistent file. If check/3
+      # ever actually invoked this (a regression), Capability.invoke/4
+      # would return {:error, {:trap, _}} and this test would fail on the
+      # {:ok, :fidelity_pass} assertion below — proving non-invocation
+      # rather than merely asserting it.
+      definition = %Definition{
+        name: cap_iri,
+        kind: :observe,
+        component: "test/fixtures/riptide_capability/does_not_exist.wasm",
+        function: "greet",
+        fuel_limit: 100_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      head = %FactPattern{predicate: rel("observed"), args: [t("riptide"), "\"stale but trusted\""]}
+
+      body = [
+        %CapabilityReference{
+          capability: cap_iri,
+          args: [RDF.literal("Alice")],
+          result: "\"stale but trusted\""
+        }
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      # No FakeStore policy is registered at all — an :effect invocation
+      # would also fail authorization first, doubling the proof that this
+      # path never reaches Capability.invoke/4.
+      ctx = context(%{capabilities: %{cap_iri => definition}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) == {:ok, :fidelity_pass}
+    end
+  end
 end
