@@ -155,19 +155,11 @@ defmodule Riptide.Derivation.DedupGate do
           {:ok, [outcome()]} | {:error, term()}
   def propose(target_scope, review_scope, candidates, graph, context) do
     with {:ok, entries} <- Catalog.list_entries(target_scope) do
-      {:ok,
-       Enum.map(candidates, &propose_one(target_scope, review_scope, &1, entries, graph, context))}
+      {:ok, Enum.map(candidates, &propose_one(review_scope, &1, entries, graph, context))}
     end
   end
 
-  defp propose_one(
-         target_scope,
-         review_scope,
-         {generalization, sub1, sub2},
-         entries,
-         graph,
-         context
-       ) do
+  defp propose_one(review_scope, {generalization, sub1, sub2}, entries, graph, context) do
     trace1 = AntiUnifier.substitute(generalization, sub1)
     trace2 = AntiUnifier.substitute(generalization, sub2)
 
@@ -177,7 +169,6 @@ defmodule Riptide.Derivation.DedupGate do
 
       {kind, replaces} ->
         finish_proposal(
-          target_scope,
           review_scope,
           generalization,
           kind,
@@ -191,7 +182,6 @@ defmodule Riptide.Derivation.DedupGate do
   end
 
   defp finish_proposal(
-         _target_scope,
          review_scope,
          generalization,
          kind,

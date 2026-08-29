@@ -26,21 +26,23 @@ defmodule RiptideWeb.Hub.DiscoveryController do
 
   def show(conn, %{"node_id" => node_id}) do
     case conn |> rate_limit_key() |> Riptide.HubRateLimit.check_read() do
-      :deny ->
-        send_resp(conn, 429, "")
+      :deny -> send_resp(conn, 429, "")
+      :allow -> send_entry(conn, node_id)
+    end
+  end
 
-      :allow ->
-        {:ok, entries} = Catalog.list_entries(:hub)
+  defp send_entry(conn, node_id) do
+    {:ok, entries} = Catalog.list_entries(:hub)
+    found = Enum.find(entries, fn {node, _rule} -> RDF.BlankNode.value(node) == node_id end)
 
-        case Enum.find(entries, fn {node, _rule} -> RDF.BlankNode.value(node) == node_id end) do
-          nil ->
-            send_resp(conn, 404, "")
+    case found do
+      nil ->
+        send_resp(conn, 404, "")
 
-          {_node, rule} ->
-            {_node, graph} = RuleRDFCodec.to_rdf(rule)
-            {:ok, turtle} = TurtleCodec.encode(graph)
-            send_resp(conn, 200, turtle)
-        end
+      {_node, rule} ->
+        {_node, graph} = RuleRDFCodec.to_rdf(rule)
+        {:ok, turtle} = TurtleCodec.encode(graph)
+        send_resp(conn, 200, turtle)
     end
   end
 

@@ -11,8 +11,8 @@ defmodule RiptideWeb.Hub.ProposeController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.{AntiUnifier, DedupGate, Parser}
+  alias Riptide.Derivation.ExecuteInterpreter.Context
 
   def propose(conn, params) do
     tenant_id = conn.assigns.tenant_id

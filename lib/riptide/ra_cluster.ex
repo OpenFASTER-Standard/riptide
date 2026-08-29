@@ -96,35 +96,76 @@ defmodule Riptide.RaCluster do
     end
   end
 
-  # NOTE: raising on `{:error, _}`/`{:timeout, _}` is deliberate for the
-  # single-node Phase 1 cluster — at cluster size 1 there is no other replica
-  # to fail over to, so a command that can't reach consensus is a genuine
-  # local fault the caller should see. Once the Clustering/HA sub-project adds
-  # multi-node membership, these paths need graceful handling/retry (e.g.
-  # redirecting to the current leader on `{:error, {:redirect, _}}` or backing
-  # off and retrying a transient `{:timeout, _}`) rather than raising.
-  # Wrapped in `catch :exit` for the same reason
-  # `Riptide.RaCluster.Placement.placement_leader?/0` and `member_alive?/1`
-  # already are (see their own docs): `gen_statem_safe_call/3`
-  # only converts `timeout`/`noproc`/`nodedown`/`shutdown` exits into a
-  # return value this `case` can match — any OTHER exit (e.g. the target
-  # `ra_server_proc` crashing for an unrelated reason mid-call) propagates as
-  # a raw `exit` a plain `case` can't catch, which previously meant callers
-  # relying on "this function always raises, never exits" (e.g.
+  # Once the Clustering/HA sub-project's multi-node membership shipped (3c),
+  # a command/query genuinely can hit a *transient* failure that has nothing
+  # to do with the caller's own request: a leader election in progress, or a
+  # server that hasn't finished catching up after a restart/replacement. Two
+  # concrete failure shapes confirmed live (2026-08-29, while building the
+  # Pattern Hub's HTTP surface — the first feature to keep one stream, `:hub`,
+  # alive and repeatedly read/written across an entire realistic usage
+  # session rather than one isolated call):
+  #   1. `{:error, :noproc}` — `gen_statem_safe_call/3` normalizes a
+  #      `:noproc`/`:nodedown`/`:shutdown` exit into this shape (see below);
+  #      transient right after a server restart/replacement before the new
+  #      process is registered.
+  #   2. A raw `:exit` from `ra_server.erl`'s own
+  #      `apply_consistent_queries_effects/2` (`true = LastApplied >=
+  #      ReadCommitIndex`) — a consistent query queued under one leader term
+  #      whose expected read-commit index hasn't been re-established by the
+  #      time a subsequent term/leadership change applies it. A textbook
+  #      "query submitted right as leadership transitions" Raft condition,
+  #      not a data-integrity bug — retrying resubmits against whatever is
+  #      now the current leader under the current term.
+  # Both retry the *same* call, bounded, with a short backoff — mirroring
+  # `retry_cluster_change/2` below, this file's own established pattern for
+  # exactly this class of problem. `{:timeout, _}` was already flagged for
+  # the same treatment in this comment before 3c shipped. Any OTHER
+  # `{:error, reason}` (a genuine, non-transient failure) still raises
+  # immediately, unretried — retrying those would just delay a real error.
+  #
+  # `catch :exit` also still needs to exist independent of retry, for the
+  # same reason `Riptide.RaCluster.Placement.placement_leader?/0` and
+  # `member_alive?/1` already document: `gen_statem_safe_call/3` only
+  # converts `timeout`/`noproc`/`nodedown`/`shutdown` exits into a return
+  # value a `case` can match — any OTHER exit propagates as a raw `exit` a
+  # plain `case` can't catch, which previously meant callers relying on
+  # "this function always raises, never exits" (e.g.
   # `Riptide.Placement.with_current_members/1`'s `rescue`-based member
   # fallback) could still crash outright on that one failure class. Uniformly
-  # `raise`ing here — whether the underlying failure came back as an
-  # `{:error, _}`/`{:timeout, _}` tuple or a raw `exit` — restores that
-  # "always raises" contract for every caller.
+  # `raise`ing once retries are exhausted — whether the underlying failure
+  # came back as an `{:error, _}`/`{:timeout, _}` tuple or a raw `exit` —
+  # restores that "always raises" contract for every caller.
+  @transient_ra_errors [:noproc, :nodedown, :shutdown]
+  @transient_retry_attempts 50
+  @transient_retry_backoff_ms 100
+
   @spec process_command(:ra.server_id(), term()) :: term()
-  def process_command(server_id, command) do
+  def process_command(server_id, command, attempts_left \\ @transient_retry_attempts) do
     case :ra.process_command(server_id, command) do
-      {:ok, reply, _leader} -> reply
-      {:error, reason} -> raise "Ra command failed for #{inspect(server_id)}: #{inspect(reason)}"
-      {:timeout, _} -> raise "Ra command timed out for #{inspect(server_id)}"
+      {:ok, reply, _leader} ->
+        reply
+
+      {:error, reason} when reason in @transient_ra_errors and attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        process_command(server_id, command, attempts_left - 1)
+
+      {:error, reason} ->
+        raise "Ra command failed for #{inspect(server_id)}: #{inspect(reason)}"
+
+      {:timeout, _} when attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        process_command(server_id, command, attempts_left - 1)
+
+      {:timeout, _} ->
+        raise "Ra command timed out for #{inspect(server_id)}"
     end
   catch
-    :exit, reason -> raise "Ra command exited for #{inspect(server_id)}: #{inspect(reason)}"
+    :exit, _reason when attempts_left > 1 ->
+      Process.sleep(@transient_retry_backoff_ms)
+      process_command(server_id, command, attempts_left - 1)
+
+    :exit, reason ->
+      raise "Ra command exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
 
   # A fast, *possibly stale* read of the local server's already-applied
@@ -134,18 +175,35 @@ defmodule Riptide.RaCluster do
   # `local_query` can briefly observe a not-yet-fully-caught-up state. Use
   # `consistent_query/2` when you need a linearizable read that reflects
   # everything committed so far (e.g. asserting durability right after a
-  # crash-restart). Same single-node error-handling caveat as
-  # `process_command/2` above applies.
-  # See `process_command/2`'s own `catch :exit` for why this is needed.
+  # crash-restart). Same transient-retry treatment as `process_command/2`
+  # above.
   @spec local_query(:ra.server_id(), (term() -> term())) :: term()
-  def local_query(server_id, query_fun) do
+  def local_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
     case :ra.local_query(server_id, query_fun) do
-      {:ok, {_index_term, result}, _leader} -> result
-      {:error, reason} -> raise "Ra query failed for #{inspect(server_id)}: #{inspect(reason)}"
-      {:timeout, _} -> raise "Ra query timed out for #{inspect(server_id)}"
+      {:ok, {_index_term, result}, _leader} ->
+        result
+
+      {:error, reason} when reason in @transient_ra_errors and attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        local_query(server_id, query_fun, attempts_left - 1)
+
+      {:error, reason} ->
+        raise "Ra query failed for #{inspect(server_id)}: #{inspect(reason)}"
+
+      {:timeout, _} when attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        local_query(server_id, query_fun, attempts_left - 1)
+
+      {:timeout, _} ->
+        raise "Ra query timed out for #{inspect(server_id)}"
     end
   catch
-    :exit, reason -> raise "Ra query exited for #{inspect(server_id)}: #{inspect(reason)}"
+    :exit, _reason when attempts_left > 1 ->
+      Process.sleep(@transient_retry_backoff_ms)
+      local_query(server_id, query_fun, attempts_left - 1)
+
+    :exit, reason ->
+      raise "Ra query exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
 
   # Linearizable read: unlike `local_query/2` this goes through the leader and,
@@ -153,20 +211,33 @@ defmodule Riptide.RaCluster do
   # committed as of the query — so it deterministically observes the fully
   # recovered log even immediately after a restart. Reply shape is
   # `{:ok, Reply, Leader}` (no index/term wrapper, unlike `local_query`).
-  # See `process_command/2`'s own `catch :exit` for why this is needed.
+  # Same transient-retry treatment as `process_command/2` above — this is
+  # specifically the call that hit failure shape 2 in that comment.
   @spec consistent_query(:ra.server_id(), (term() -> term())) :: term()
-  def consistent_query(server_id, query_fun) do
+  def consistent_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
     case :ra.consistent_query(server_id, query_fun) do
       {:ok, result, _leader} ->
         result
 
+      {:error, reason} when reason in @transient_ra_errors and attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        consistent_query(server_id, query_fun, attempts_left - 1)
+
       {:error, reason} ->
         raise "Ra consistent query failed for #{inspect(server_id)}: #{inspect(reason)}"
+
+      {:timeout, _} when attempts_left > 1 ->
+        Process.sleep(@transient_retry_backoff_ms)
+        consistent_query(server_id, query_fun, attempts_left - 1)
 
       {:timeout, _} ->
         raise "Ra consistent query timed out for #{inspect(server_id)}"
     end
   catch
+    :exit, _reason when attempts_left > 1 ->
+      Process.sleep(@transient_retry_backoff_ms)
+      consistent_query(server_id, query_fun, attempts_left - 1)
+
     :exit, reason ->
       raise "Ra consistent query exited for #{inspect(server_id)}: #{inspect(reason)}"
   end
