@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery) — 12 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape) — 11 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -728,3 +728,34 @@ third task is found by `Discovery.find/2`'s keyword tier, and invoked directly v
 
 **Status**: Phase 6g-i shipped 2026-08-29. 12 phases remaining across the primary spine and the
 three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6a — Bitemporal fact shape
+
+Foundation-track phase (§7 of the design spec, `depends on: nothing`), independent of every
+other Sub-project 6 phase. **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6a-bitemporal-fact-shape-design.md`.
+
+Lets a Fact carry a ValidTime interval (RDF-star `validFrom`/`validTo` annotations, simple
+`xsd:dateTime` literal values) distinct from its TransactionTime, via the existing LDP write
+path's Turtle body (annotation-sugar syntax `s p o {| pred obj |}`) — no new write API. Two
+findings, both verified empirically rather than assumed, collapsed this phase's scope well
+below the parent spec's own framing: (1) the vendored `rdf` dependency's `RDF.Query.BGP` engine
+already treats RDF-star quoted-triple patterns as first-class, variable-bindable pattern
+elements — no duplication into a parallel plain-triple form is needed for the derivation layer
+to reason over ValidTime, contrary to the parent spec's §8.4 assumption; that duplication
+concern becomes 6c-iii-b's (much smaller than assumed) job of widening `FactPattern.args` to
+admit quoted-triple patterns, not a storage-layer mechanism. (2) The existing write/read/storage
+path — `TurtleCodec`, `RiptideWeb.LDP.ResourceController`, `Event`/`Patch`'s `%{v: 1, ...}`
+envelope, and real Ra-backed `StreamServer` persistence — already round-trips RDF-star content
+correctly with **zero** code changes beyond widening `Patch.triple`'s Dialyzer type (a
+type-only change; runtime behavior needed no fix). Also found and documented: Turtle-star's bare
+`<<s p o>> pred obj .` form only asserts the annotation triple, not the base fact — the
+annotation-sugar form `s p o {| pred obj |}` is the one this phase's spec designates as correct,
+asserting both. Full OWL-Time reified `Instant`/`Interval` individuals were considered and ruled
+out in favor of simple literal-valued annotations, since nothing implements Allen-relation
+comparison yet; the Allen-relation vocabulary subset (`before`/`after`/`meets`/`overlaps`/
+`during`/`starts`/`finishes`/`equals`) is named in the spec for a future querying phase to
+implement against, not built here.
+
+**Status**: Phase 6a shipped 2026-08-29. 11 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
