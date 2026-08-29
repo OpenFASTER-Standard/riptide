@@ -130,7 +130,7 @@ namespace entirely:
 
 ```elixir
 @spec list_entries(scope()) :: {:ok, [{RDF.BlankNode.t(), Rule.t()}]} | {:error, :not_ready}
-@spec admit_entry(scope(), Rule.t()) :: :ok | {:error, :not_ready}
+@spec admit_entry(scope(), Rule.t(), RDF.BlankNode.t() | nil) :: :ok | {:error, :not_ready}
 @spec supersede_entry(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
 
 @spec queue_pending_review(scope(), DedupGate.PendingReview.t()) ::
@@ -311,23 +311,33 @@ tied candidates can land in different dispositions):
 `approve_review/2`: loads the `PendingReview` by node from the pending
 stream, then —
 
-- `:admit` — `Catalog.admit_entry(scope, pending_review.candidate)`
+- `:admit` — `Catalog.admit_entry(scope, pending_review.candidate, nil)`
   (writes the `RuleRDFCodec`-reified candidate + `rdf:type
-  riptide:CatalogEntry` into the catalog stream), then
+  riptide:CatalogEntry` into the catalog stream — a fresh blank node for
+  this call, `admit_entry/3` mints it via `RuleRDFCodec.to_rdf/1`
+  internally, same as any other reification in this design), then
   `Catalog.resolve_pending_review(scope, node, :approved)` (retags it —
   §4).
-- `:merge` — same `admit_entry/2` call, **plus** a deliberately simple
-  supersede: `Catalog.supersede_entry(scope, pending_review.replaces)`
-  retags the *old* entry — retracts only its `rdf:type
-  riptide:CatalogEntry` triple and asserts `rdf:type
-  riptide:SupersededCatalogEntry` in its place, plus a
-  `riptide:supersedes` triple (new entry's node → old entry's node) —
-  **no transitive graph surgery**, matching §2's "graph three-way merge is
-  weaker than git's" caution. The old entry's own triples are left
-  untouched (Discovery's future type-tag query naturally stops surfacing
-  it once retagged; the data remains for provenance/audit, reusing §6.5's
-  own Provenance framing — `riptide:supersedes` *is* a Provenance edge).
-  Then `resolve_pending_review/3` with `:approved`, as above.
+- `:merge` — `Catalog.admit_entry(scope, pending_review.candidate,
+  pending_review.replaces)`: **one** `:patch` write covers both the new
+  entry's triples and a `riptide:supersedes` triple (the new entry's own
+  freshly-minted node → `pending_review.replaces`) in the same additions
+  list — a single atomic append rather than two separate ones, so there's
+  no window where the new entry exists without its Provenance link back
+  to what it replaced (`admit_entry/3`'s third argument, `nil` for a plain
+  `Admit`, is exactly this — the function needs the new node to write the
+  link, so the link can only be built where the new node is actually
+  minted, not by a separate call that only ever receives the *old* node).
+  Then, as its own separate write, `Catalog.supersede_entry(scope,
+  pending_review.replaces)` retags the *old* entry — retracts only its
+  `rdf:type riptide:CatalogEntry` triple and asserts `rdf:type
+  riptide:SupersededCatalogEntry` in its place. **No transitive graph
+  surgery**, matching §2's "graph three-way merge is weaker than git's"
+  caution — the old entry's own triples are left untouched (Discovery's
+  future type-tag query naturally stops surfacing it once retagged; the
+  data remains for provenance/audit, reusing §6.5's own Provenance framing
+  — `riptide:supersedes` *is* a Provenance edge). Then
+  `resolve_pending_review/3` with `:approved`, as above.
 
 `decline_review/2`: `Catalog.resolve_pending_review(scope, node, :declined)`
 only — nothing else is written. The declined item stays in the pending
