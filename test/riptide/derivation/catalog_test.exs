@@ -154,4 +154,26 @@ defmodule Riptide.Derivation.CatalogTest do
       assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
   end
+
+  describe "Hub vs. Tenant scope isolation" do
+    test "admitting into :hub never surfaces in a Tenant's list_entries/1, and vice versa" do
+      tenant_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(tenant_scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(:hub))
+      end)
+
+      hub_rule = sample_rule("hub-pattern")
+      tenant_rule = sample_rule("tenant-pattern")
+
+      :ok = Catalog.admit_entry(:hub, hub_rule, nil)
+      :ok = Catalog.admit_entry(tenant_scope, tenant_rule, nil)
+
+      assert {:ok, [{_node, ^tenant_rule}]} = Catalog.list_entries(tenant_scope)
+      assert {:ok, hub_entries} = Catalog.list_entries(:hub)
+      assert Enum.any?(hub_entries, fn {_node, rule} -> rule == hub_rule end)
+      refute Enum.any?(hub_entries, fn {_node, rule} -> rule == tenant_rule end)
+    end
+  end
 end
