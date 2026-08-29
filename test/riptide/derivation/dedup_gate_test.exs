@@ -270,4 +270,98 @@ defmodule Riptide.Derivation.DedupGateTest do
       assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
   end
+
+  describe "propose/4 — multiple tied AntiUnifier candidates" do
+    test "tied candidates are classified independently and land in different dispositions" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      # Three same-predicate Body literals with ASYMMETRIC structure, ground
+      # (real IRIs, not Vars — GeneralizationFidelity.check/3 requires
+      # ground input, so trace1/trace2 here must already be real Traces).
+      # Not 6e-i's own 2-literal swap test — that scenario's two tied
+      # candidates turn out to be alpha-equivalent to each other, i.e. mere
+      # renamings of each other (verified empirically); "tied on minimum
+      # variable count" only means equally economical, not equivalent, and a
+      # symmetric swap happens to produce isomorphic alignments. Here p1
+      # recurs across body positions 1 and 3 in trace1 (asymmetric — p2
+      # appears only once), and q1 recurs the same way in trace2, which
+      # makes the two resulting alignments genuinely different in shape, not
+      # just in variable naming — verified directly: with `candidate_a`/
+      # `candidate_b` bound to the two candidates below,
+      # `entry_unchanged?(candidate_a, candidate_a)` is (trivially) `true`,
+      # but `entry_unchanged?(candidate_b, candidate_a)` is `false` —
+      # candidate_b is NOT a mere renaming of candidate_a, it reveals genuine
+      # broadening.
+      trace1 = %Rule{
+        signature: %Signature{
+          name: rel("pair"),
+          parameters: [t("p1"), t("p2")],
+          reads: [rel("likes")],
+          produces: [rel("pair")]
+        },
+        head: %FactPattern{predicate: rel("pair"), args: [t("p1"), t("p2")]},
+        body: [
+          %FactPattern{predicate: rel("likes"), args: [t("p1"), RDF.literal("a")]},
+          %FactPattern{predicate: rel("likes"), args: [t("p2"), RDF.literal("b")]},
+          %FactPattern{predicate: rel("likes"), args: [t("p1"), RDF.literal("c")]}
+        ]
+      }
+
+      trace2 = %Rule{
+        signature: %Signature{
+          name: rel("pair"),
+          parameters: [t("q1"), t("q2")],
+          reads: [rel("likes")],
+          produces: [rel("pair")]
+        },
+        head: %FactPattern{predicate: rel("pair"), args: [t("q1"), t("q2")]},
+        body: [
+          %FactPattern{predicate: rel("likes"), args: [t("q1"), RDF.literal("b")]},
+          %FactPattern{predicate: rel("likes"), args: [t("q2"), RDF.literal("c")]},
+          %FactPattern{predicate: rel("likes"), args: [t("q1"), RDF.literal("a")]}
+        ]
+      }
+
+      {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+      assert length(candidates) == 2
+      [{candidate_a, _, _}, {candidate_b, _, _}] = candidates
+
+      # Seed the Catalog with candidate_a itself, verbatim — per the proof
+      # above, candidate_b is NOT a mere renaming of candidate_a, so
+      # re-proposing candidate_a is Reject (trivially unchanged) while
+      # candidate_b reveals genuine broadening (Merge).
+      :ok = Catalog.admit_entry(scope, candidate_a, nil)
+
+      # All six ground facts trace1/trace2 depend on — candidate_b's own
+      # reconstructed traces don't necessarily preserve trace1/trace2's
+      # exact Body order (AntiUnifier.generalize/2 orders a candidate's Body
+      # by its first input's own literal order, so a candidate built via a
+      # "crossed" alignment can reconstruct a same-content-different-order
+      # permutation of the second input — verified directly, harmless here
+      # since FactPattern fidelity checking is a graph membership test, not
+      # an order-sensitive one) — so the graph includes every fact either
+      # trace needs, not just in whichever order each was originally written.
+      graph =
+        RDF.Graph.new([
+          {t("p1"), rel("likes"), RDF.literal("a")},
+          {t("p2"), rel("likes"), RDF.literal("b")},
+          {t("p1"), rel("likes"), RDF.literal("c")},
+          {t("q1"), rel("likes"), RDF.literal("b")},
+          {t("q2"), rel("likes"), RDF.literal("c")},
+          {t("q1"), rel("likes"), RDF.literal("a")}
+        ])
+
+      ctx = context()
+
+      assert {:ok, outcomes} = DedupGate.propose(scope, candidates, graph, ctx)
+
+      assert [{:rejected, _reason}, {:queued, _node, :merge}] = outcomes
+      refute candidate_a == candidate_b
+    end
+  end
 end
