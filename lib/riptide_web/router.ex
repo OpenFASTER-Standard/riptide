@@ -55,5 +55,7 @@ defmodule RiptideWeb.Router do
 
     post "/policies", RiptideWeb.Authz.PolicyController, :create
     get "/policies", RiptideWeb.Authz.PolicyController, :index
+
+    post "/hub/propose", RiptideWeb.Hub.ProposeController, :propose
   end
 end
