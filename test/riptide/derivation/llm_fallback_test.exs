@@ -186,4 +186,16 @@ defmodule Riptide.Derivation.LLMFallbackTest do
       end)
     end
   end
+
+  describe "run/3 — no match" do
+    test "a response whose Body matches nothing in the graph is :no_match" do
+      response = "greeted(<urn:test:riptide>, Result) :- pendingDeploy(<urn:test:riptide>, Result)."
+
+      ctx = context()
+
+      with_fake_client({:ok, response}, fn ->
+        assert LLMFallback.run("greet Alice", RDF.Graph.new(), ctx) == {:error, :no_match}
+      end)
+    end
+  end
 end
