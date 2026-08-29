@@ -72,4 +72,71 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
                {:error, :not_ground}
     end
   end
+
+  describe "check/3 — FactPattern" do
+    test "passes when the fact is present in the graph" do
+      head = %FactPattern{predicate: rel("greeted"), args: [t("alice"), RDF.literal("hi")]}
+      body = [%FactPattern{predicate: rel("worksAt"), args: [t("alice"), t("acme")]}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [rel("worksAt")],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      graph = RDF.Graph.new([{t("alice"), rel("worksAt"), t("acme")}])
+
+      assert GeneralizationFidelity.check(rule, graph, context()) == {:ok, :fidelity_pass}
+    end
+
+    test "fails with :fact_not_present when the fact is missing from the graph" do
+      head = %FactPattern{predicate: rel("greeted"), args: [t("alice"), RDF.literal("hi")]}
+      body = [%FactPattern{predicate: rel("worksAt"), args: [t("alice"), t("acme")]}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [rel("worksAt")],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
+               {:ok, {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
+    end
+
+    test "short-circuits: a failing first literal is reported without evaluating the second" do
+      head = %FactPattern{predicate: rel("greeted"), args: [t("alice"), RDF.literal("hi")]}
+
+      body = [
+        %FactPattern{predicate: rel("worksAt"), args: [t("alice"), t("acme")]},
+        %FactPattern{predicate: rel("approved"), args: [t("acme"), t("bob")]}
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [rel("worksAt"), rel("approved")],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      # Neither fact is present — if the second literal were evaluated first
+      # or the walk didn't short-circuit, this assertion still pins the
+      # *first* literal's reason, proving Body order is respected.
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
+               {:ok, {:fidelity_fail, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}
+    end
+  end
 end

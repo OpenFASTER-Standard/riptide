@@ -53,4 +53,16 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
   defp term_ground?(_term), do: true
 
   defp check_body([], _graph, _context), do: {:ok, :fidelity_pass}
+
+  defp check_body(
+         [%FactPattern{predicate: predicate, args: [subject, object]} | rest],
+         graph,
+         context
+       ) do
+    if RDF.Graph.include?(graph, {subject, predicate, object}) do
+      check_body(rest, graph, context)
+    else
+      {:ok, {:fidelity_fail, {:fact_not_present, {subject, predicate, object}}}}
+    end
+  end
 end
