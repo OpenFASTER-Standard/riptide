@@ -62,4 +62,16 @@ defmodule Riptide.Derivation.DiscoveryTest do
       assert {:ok, [{_node, ^rule}]} = Discovery.find(scope, "deploy the service")
     end
   end
+
+  describe "find/2 — no match" do
+    test "a query with zero word overlap returns {:ok, []}, not an error" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      rule = sample_rule("pendingDeploy", 0)
+      :ok = Catalog.admit_entry(scope, rule, nil)
+
+      assert Discovery.find(scope, "unrelated task") == {:ok, []}
+    end
+  end
 end
