@@ -57,5 +57,7 @@ defmodule RiptideWeb.Router do
     get "/policies", RiptideWeb.Authz.PolicyController, :index
 
     post "/hub/propose", RiptideWeb.Hub.ProposeController, :propose
+    post "/hub/pending-reviews/:node_id/approve", RiptideWeb.Hub.ReviewController, :approve
+    post "/hub/pending-reviews/:node_id/decline", RiptideWeb.Hub.ReviewController, :decline
   end
 end
