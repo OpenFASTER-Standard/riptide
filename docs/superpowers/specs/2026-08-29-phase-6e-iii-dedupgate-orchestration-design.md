@@ -137,7 +137,8 @@ namespace entirely:
         {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
 @spec list_pending_reviews(scope()) ::
         {:ok, [{RDF.BlankNode.t(), DedupGate.PendingReview.t()}]} | {:error, :not_ready}
-@spec resolve_pending_review(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+@spec resolve_pending_review(scope(), RDF.BlankNode.t(), :approved | :declined) ::
+        :ok | {:error, :not_ready}
 ```
 
 Every read/write goes through the exact same sequence
@@ -160,6 +161,26 @@ into an `RDF.Graph.t()`, then use `Matcher.bindings/2` with a
 `riptide:PendingReview`) fact-pattern to enumerate root nodes, decoding
 each via `RuleRDFCodec.from_rdf/2` (respectively this phase's own small
 `PendingReview` codec, §6).
+
+**`resolve_pending_review/3` retags rather than deletes — found during
+implementation-plan grounding, not the original intent.** Removing a
+`PendingReview` item outright would need retracting every triple reachable
+from its root node (the `RuleRDFCodec`-reified candidate it owns, the
+`RDF.List` nodes for `fidelityEvidence`, etc.) — a transitive-closure walk
+nothing else in this design needs or defines, and `RDF.Graph` has no such
+primitive to reuse (`RDF.Graph.delete/2` only removes exact given
+triples). Rather than write new graph-traversal machinery for this one
+case, `resolve_pending_review/3` reuses the **exact same** retag mechanism
+already needed for `supersede_entry` (§7): it retracts only the item's own
+`rdf:type riptide:PendingReview` triple and asserts
+`rdf:type riptide:ApprovedPendingReview` or
+`rdf:type riptide:DeclinedPendingReview` in its place (chosen by the
+`:approved | :declined` argument). `list_pending_reviews/1`'s type-tag
+query naturally stops surfacing it either way; the rest of its data stays
+in the stream. This is a strict improvement on the original "no audit
+record for a decline" framing (§7, since revised) — a two-triple patch is
+no more expensive than a bare retraction would have been, and it comes
+with a small amount of audit history for free.
 
 ## 5. `AntiUnifier` gets one promoted function
 
@@ -217,6 +238,12 @@ simplification, not a rich structured encoding: the reviewer needs to
 already tolerates `inspect/1`-based encoding where a richer schema isn't
 yet justified), and `riptide:replaces` (the existing entry's node,
 `:merge` only).
+
+Three more type IRIs, all used only as a node's `rdf:type` for filtering
+(never structurally decoded beyond that): `riptide:ApprovedPendingReview`
+and `riptide:DeclinedPendingReview` (§4's `resolve_pending_review/3`
+retag targets) and `riptide:SupersededCatalogEntry` (§7's `Merge`-commit
+retag target, alongside `riptide:supersedes`).
 
 ## 7. `Riptide.Derivation.DedupGate` — the pipeline
 
@@ -287,8 +314,8 @@ stream, then —
 - `:admit` — `Catalog.admit_entry(scope, pending_review.candidate)`
   (writes the `RuleRDFCodec`-reified candidate + `rdf:type
   riptide:CatalogEntry` into the catalog stream), then
-  `Catalog.resolve_pending_review(scope, node)` (retracts it from
-  pending).
+  `Catalog.resolve_pending_review(scope, node, :approved)` (retags it —
+  §4).
 - `:merge` — same `admit_entry/2` call, **plus** a deliberately simple
   supersede: `Catalog.supersede_entry(scope, pending_review.replaces)`
   retags the *old* entry — retracts only its `rdf:type
@@ -300,14 +327,14 @@ stream, then —
   untouched (Discovery's future type-tag query naturally stops surfacing
   it once retagged; the data remains for provenance/audit, reusing §6.5's
   own Provenance framing — `riptide:supersedes` *is* a Provenance edge).
-  Then `resolve_pending_review/2` as above.
+  Then `resolve_pending_review/3` with `:approved`, as above.
 
-`decline_review/2`: `Catalog.resolve_pending_review(scope, node)` only —
-nothing else is written. A declined proposal leaves no trace beyond
-having briefly existed in the pending stream (already retracted); no
-audit record is kept for v1 — a deliberate scope line, consistent with
-`Reject`'s own "skips review, nothing persisted" treatment above, not an
-oversight.
+`decline_review/2`: `Catalog.resolve_pending_review(scope, node, :declined)`
+only — nothing else is written. The declined item stays in the pending
+stream retagged `riptide:DeclinedPendingReview` (§4) rather than being
+retracted — a small amount of audit history that falls out of §4's retag
+mechanism at no extra cost, not something this phase had to build
+separately.
 
 ## 8. Testing
 
@@ -340,8 +367,9 @@ CatalogEntry."
   §7 runs per-candidate, not once for the whole batch.
 - `Hub` vs. `{:tenant, _}` scope write to genuinely separate streams —
   admitting into one never surfaces in `list_entries/1` for the other.
-- `decline_review/2` — a queued proposal is removed from
-  `list_pending_reviews/1` and never appears in `list_entries/1`.
+- `decline_review/2` — a queued proposal stops appearing in
+  `list_pending_reviews/1` (retagged `riptide:DeclinedPendingReview`, §4)
+  and never appears in `list_entries/1`.
 
 ## 9. Exit criterion (from issue #66, restated)
 
@@ -364,8 +392,10 @@ invocation.
   specifically is explicitly 6h-ii's own job ("a distinct,
   network-publicly-reachable deployment," parent spec §7) — nothing in
   Track A between 6e-iii and 6h-ii touches `RiptideWeb`.
-- An audit trail for declined proposals or `Reject`ed candidates — both
-  are deliberately left with no persisted record (§7).
+- An audit trail for `Reject`ed candidates — never queued at all, so
+  genuinely nothing is persisted (§7); unlike a declined *queued* proposal
+  (§4), which does leave a retagged trace as a side effect of the retag
+  mechanism, not a feature built for it.
 - Aggregating a whole Tenant's EDB across multiple resource streams into
   one graph for fidelity-checking purposes — `propose/4` takes a
   caller-supplied `graph`, exactly matching every prior phase in this
