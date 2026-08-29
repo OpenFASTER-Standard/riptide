@@ -8,8 +8,8 @@ defmodule Riptide.Derivation.Discovery do
   (specificity) breaks ties within either tier.
   """
 
-  alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
   alias Riptide.Derivation.{Catalog, Rule, Var}
+  alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
 
   @spec find(Catalog.scope(), String.t()) ::
           {:ok, [{RDF.BlankNode.t(), Rule.t()}]} | {:error, :not_ready}

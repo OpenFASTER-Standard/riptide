@@ -2,10 +2,11 @@ defmodule Riptide.Derivation.DiscoveryTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
+  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Discovery}
   alias Riptide.Derivation.ExecuteInterpreter
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.FactPattern
-  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Discovery, LLMFallback}
+  alias Riptide.Derivation.LLMFallback
   alias Riptide.Derivation.{Rule, Signature, Var}
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
@@ -163,8 +164,12 @@ defmodule Riptide.Derivation.DiscoveryTest do
 
     def start(result) do
       case Agent.start_link(fn -> result end, name: __MODULE__) do
-        {:ok, pid} -> pid
-        {:error, {:already_started, pid}} -> Agent.update(pid, fn _ -> result end); pid
+        {:ok, pid} ->
+          pid
+
+        {:error, {:already_started, pid}} ->
+          Agent.update(pid, fn _ -> result end)
+          pid
       end
     end
   end
