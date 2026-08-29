@@ -181,4 +181,41 @@ defmodule Riptide.Derivation.MatcherTest do
       assert {:error, {:unsupported_literal, _}} = Matcher.evaluate(rule, RDF.Graph.new())
     end
   end
+
+  describe "bindings/3 — seeded joins" do
+    test "a variable already in the seed is substituted as a constant, not left free" do
+      {:ok, rule} = Parser.decode("colleague(X, Y) :- worksAt(X, Y).")
+      [worksAt_literal] = rule.body
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("worksAt"), t("acme")},
+          {t("bob"), rel("worksAt"), t("acme")}
+        ])
+
+      seed = %{%Var{name: "X"} => t("alice")}
+
+      assert {:ok, results} = Matcher.bindings([worksAt_literal], graph, seed)
+      assert Enum.map(results, &plain/1) == [%{"X" => t("alice"), "Y" => t("acme")}]
+    end
+
+    test "an empty seed behaves exactly like bindings/2" do
+      {:ok, rule} = Parser.decode("colleague(X, Y) :- worksAt(X, Y).")
+
+      graph = RDF.Graph.new([{t("alice"), rel("worksAt"), t("acme")}])
+
+      assert Matcher.bindings(rule.body, graph, %{}) == Matcher.bindings(rule, graph)
+    end
+
+    test "seeded variables don't count against the 64-variable cap" do
+      body =
+        for i <- 1..33 do
+          %FactPattern{predicate: rel("f"), args: [%Var{name: "V#{i}"}, %Var{name: "W#{i}"}]}
+        end
+
+      seed = Map.new(1..33, fn i -> {%Var{name: "V#{i}"}, t("bound")} end)
+
+      assert {:ok, []} = Matcher.bindings(body, RDF.Graph.new(), seed)
+    end
+  end
 end
