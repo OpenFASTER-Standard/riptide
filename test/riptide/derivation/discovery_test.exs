@@ -1,15 +1,18 @@
 defmodule Riptide.Derivation.DiscoveryTest do
   use ExUnit.Case, async: false
 
-  alias Riptide.Derivation.Catalog
-  alias Riptide.Derivation.Discovery
+  alias Riptide.Capability.Definition
+  alias Riptide.Derivation.ExecuteInterpreter
+  alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.FactPattern
+  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Discovery, LLMFallback}
   alias Riptide.Derivation.{Rule, Signature, Var}
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
 
   defp t(name), do: RDF.iri("urn:test:" <> name)
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
+  defp cap(name), do: RDF.iri("urn:riptide:capability:" <> name)
 
   # free_var_count: 0, 1, or 2 — controls how many of the Head's two
   # FactPattern args are free `Var`s (a FactPattern always has exactly 2
@@ -110,6 +113,132 @@ defmodule Riptide.Derivation.DiscoveryTest do
   describe "find/2 — empty Catalog" do
     test "a Tenant scope with no CatalogEntry admitted yet returns {:ok, []}" do
       assert Discovery.find(unique_tenant(), "anything") == {:ok, []}
+    end
+  end
+
+  defp context(overrides) do
+    Map.merge(
+      %Context{capabilities: %{}, rules: %{}, tenant_id: "acme", current_subject: nil},
+      overrides
+    )
+  end
+
+  defp greet_definition(name) do
+    %Definition{
+      name: cap(name),
+      kind: :effect,
+      component: "test/fixtures/riptide_capability/fixture.wasm",
+      function: "greet",
+      fuel_limit: 100_000_000,
+      timeout_ms: 5_000,
+      memory_limits: %{
+        max_memory_size: nil,
+        max_table_elements: nil,
+        max_instances: nil,
+        max_tables: nil
+      }
+    }
+  end
+
+  defmodule FakeStore do
+    @behaviour Riptide.Authz.Store
+
+    @impl true
+    def list_policies(_tenant_id, _path_prefix) do
+      [%Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}]
+    end
+
+    @impl true
+    def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
+
+    @impl true
+    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
+  end
+
+  defmodule FakeClient do
+    @behaviour Riptide.Derivation.LLMFallback.Client
+
+    @impl true
+    def complete(_prompt), do: Agent.get(__MODULE__, & &1)
+
+    def start(result) do
+      case Agent.start_link(fn -> result end, name: __MODULE__) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, pid}} -> Agent.update(pid, fn _ -> result end); pid
+      end
+    end
+  end
+
+  setup do
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :authz_store, FakeStore)
+
+    on_exit(fn ->
+      if pid = Process.whereis(FakeClient) do
+        try do
+          Agent.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+    end)
+
+    :ok
+  end
+
+  describe "exit criterion (issue #68) — the full walking skeleton, third occurrence" do
+    test "a CatalogEntry admitted by DedupGate is found by Discovery and invoked without an LLM call" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      ctx = context(%{capabilities: %{cap("greetPerson") => greet_definition("greetPerson")}})
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("alice"), rel("hasName"), RDF.literal("Alice")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("hasName"), RDF.literal("Bob")}
+        ])
+
+      response1 =
+        "greet(<urn:test:alice>, Result) :- pendingDeploy(<urn:test:alice>, Target), hasName(<urn:test:alice>, Name), capability(greetPerson, Name, Result)."
+
+      response2 =
+        "greet(<urn:test:bob>, Result) :- pendingDeploy(<urn:test:bob>, Target), hasName(<urn:test:bob>, Name), capability(greetPerson, Name, Result)."
+
+      FakeClient.start({:ok, response1})
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :llm_fallback_client, FakeClient)
+      assert {:ok, trace1} = LLMFallback.run("greet Alice", graph, ctx)
+
+      FakeClient.start({:ok, response2})
+      assert {:ok, trace2} = LLMFallback.run("greet Bob", graph, ctx)
+
+      assert {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
+      assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert :ok == DedupGate.approve_review(scope, node)
+
+      # Third occurrence: found via Discovery's keyword path ("greet" is not
+      # among the found entry's own predicate words — pending/deploy/has/name
+      # — so this is genuinely a keyword match, not exact), then invoked
+      # directly — no LLMFallback.run/3 call anywhere below this line.
+      assert {:ok, [{_found_node, found_rule}]} = Discovery.find(scope, "greet Carol")
+
+      [subject_var | _] = found_rule.signature.parameters
+
+      carol_graph =
+        RDF.Graph.new([
+          {t("carol"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("carol"), rel("hasName"), RDF.literal("Carol")}
+        ])
+
+      seed = %{subject_var => t("carol")}
+
+      assert ExecuteInterpreter.call_template(found_rule, seed, carol_graph, ctx) ==
+               {:ok, [{t("carol"), rel("greet"), "\"Hello, Carol!\""}]}
     end
   end
 end
