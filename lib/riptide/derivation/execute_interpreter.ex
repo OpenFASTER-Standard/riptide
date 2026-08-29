@@ -121,7 +121,11 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
   defp substitute(%Var{} = var, bindings), do: Map.fetch!(bindings, var)
   defp substitute(term, _bindings), do: term
 
-  defp invoke_capability(%CapabilityReference{capability: iri, args: args, result: result}, bindings, context) do
+  defp invoke_capability(
+         %CapabilityReference{capability: iri, args: args, result: result},
+         bindings,
+         context
+       ) do
     definition = Map.fetch!(context.capabilities, iri)
     resolved_args = args |> Enum.map(&substitute(&1, bindings)) |> Enum.map(&term_to_arg/1)
 
@@ -130,12 +134,20 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
         {:ok, bind_result(bindings, result, value)}
 
       {:error, reason} ->
-        Logger.warning("ExecuteInterpreter: capability #{inspect(iri)} invocation failed: #{inspect(reason)}")
+        Logger.warning(
+          "ExecuteInterpreter: capability #{inspect(iri)} invocation failed: #{inspect(reason)}"
+        )
+
         :drop
     end
   end
 
-  defp invoke_rule(%RuleReference{rule: iri, args: [input_arg], result: result}, bindings, graph, context) do
+  defp invoke_rule(
+         %RuleReference{rule: iri, args: [input_arg], result: result},
+         bindings,
+         graph,
+         context
+       ) do
     nested_rule = Map.fetch!(context.rules, iri)
     input_value = substitute(input_arg, bindings)
     [head_subject | _] = nested_rule.head.args

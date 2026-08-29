@@ -130,7 +130,12 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       ]
 
       rule = %Rule{
-        signature: %Signature{name: head.predicate, parameters: [], reads: [], produces: [head.predicate]},
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
         head: head,
         body: body
       }
@@ -151,7 +156,12 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       ]
 
       rule = %Rule{
-        signature: %Signature{name: head.predicate, parameters: [], reads: [], produces: [head.predicate]},
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
         head: head,
         body: body
       }
@@ -173,7 +183,12 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       ]
 
       rule = %Rule{
-        signature: %Signature{name: head.predicate, parameters: [], reads: [], produces: [head.predicate]},
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
         head: head,
         body: body
       }
@@ -212,7 +227,12 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       ]
 
       rule = %Rule{
-        signature: %Signature{name: head.predicate, parameters: [], reads: [], produces: [head.predicate]},
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
         head: head,
         body: body
       }
@@ -240,7 +260,12 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       ]
 
       rule = %Rule{
-        signature: %Signature{name: head.predicate, parameters: [], reads: [], produces: [head.predicate]},
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
         head: head,
         body: body
       }
@@ -268,10 +293,15 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
           produces: [nested_iri]
         },
         head: %FactPattern{predicate: nested_iri, args: [%Var{name: "Person"}, %Var{name: "Org"}]},
-        body: [%FactPattern{predicate: rel("worksAt"), args: [%Var{name: "Person"}, %Var{name: "Org"}]}]
+        body: [
+          %FactPattern{predicate: rel("worksAt"), args: [%Var{name: "Person"}, %Var{name: "Org"}]}
+        ]
       }
 
-      outer_head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), %Var{name: "Result"}]}
+      outer_head = %FactPattern{
+        predicate: rel("lookup"),
+        args: [t("alice"), %Var{name: "Result"}]
+      }
 
       outer_body = [
         %RuleReference{rule: nested_iri, args: [t("alice")], result: %Var{name: "Result"}}
@@ -326,7 +356,10 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
           reads: [],
           produces: [notify_team_iri]
         },
-        head: %FactPattern{predicate: notify_team_iri, args: [%Var{name: "Outcome"}, %Var{name: "Result"}]},
+        head: %FactPattern{
+          predicate: notify_team_iri,
+          args: [%Var{name: "Outcome"}, %Var{name: "Result"}]
+        },
         body: [
           %CapabilityReference{
             capability: notify_cap_iri,
@@ -340,17 +373,30 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       # literals sharing `Target`, assembled from separately-constructed
       # graphs merged together (matching 6c-i-b's own multi-stream-join
       # golden case style, per this phase's exit criterion).
-      deployed_head = %FactPattern{predicate: rel("deployed"), args: [%Var{name: "Svc"}, %Var{name: "Result"}]}
+      deployed_head = %FactPattern{
+        predicate: rel("deployed"),
+        args: [%Var{name: "Svc"}, %Var{name: "Result"}]
+      }
 
       deployed_body = [
-        %FactPattern{predicate: rel("pendingDeploy"), args: [%Var{name: "Svc"}, %Var{name: "Target"}]},
-        %FactPattern{predicate: rel("approved"), args: [%Var{name: "Target"}, %Var{name: "Owner"}]},
+        %FactPattern{
+          predicate: rel("pendingDeploy"),
+          args: [%Var{name: "Svc"}, %Var{name: "Target"}]
+        },
+        %FactPattern{
+          predicate: rel("approved"),
+          args: [%Var{name: "Target"}, %Var{name: "Owner"}]
+        },
         %CapabilityReference{
           capability: deploy_cap_iri,
           args: [%Var{name: "Owner"}],
           result: %Var{name: "Outcome"}
         },
-        %RuleReference{rule: notify_team_iri, args: [%Var{name: "Outcome"}], result: %Var{name: "Result"}}
+        %RuleReference{
+          rule: notify_team_iri,
+          args: [%Var{name: "Outcome"}],
+          result: %Var{name: "Result"}
+        }
       ]
 
       deployed_rule = %Rule{
@@ -366,7 +412,9 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
 
       pending_deploy_graph = RDF.Graph.new([{t("billing-svc"), rel("pendingDeploy"), t("v2")}])
       approved_graph = RDF.Graph.new([{t("v2"), rel("approved"), t("alice")}])
-      graph = RDF.Graph.new() |> RDF.Graph.add(pending_deploy_graph) |> RDF.Graph.add(approved_graph)
+
+      graph =
+        RDF.Graph.new() |> RDF.Graph.add(pending_deploy_graph) |> RDF.Graph.add(approved_graph)
 
       ctx =
         context(%{

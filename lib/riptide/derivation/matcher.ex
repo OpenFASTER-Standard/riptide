@@ -126,8 +126,13 @@ defmodule Riptide.Derivation.Matcher do
     end
   end
 
-  defp to_triple_pattern(%FactPattern{predicate: predicate, args: [subject, object]}, var_to_atom, seed) do
-    {to_pattern_term(subject, var_to_atom, seed), predicate, to_pattern_term(object, var_to_atom, seed)}
+  defp to_triple_pattern(
+         %FactPattern{predicate: predicate, args: [subject, object]},
+         var_to_atom,
+         seed
+       ) do
+    {to_pattern_term(subject, var_to_atom, seed), predicate,
+     to_pattern_term(object, var_to_atom, seed)}
   end
 
   defp to_pattern_term(%Var{} = var, var_to_atom, seed) do
