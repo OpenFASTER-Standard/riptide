@@ -172,4 +172,18 @@ defmodule Riptide.Derivation.LLMFallbackTest do
       end)
     end
   end
+
+  describe "run/3 — unresolvable capability reference" do
+    test "a response naming a capability the tenant doesn't have registered is a real, surfaced error" do
+      response =
+        "greeted(<urn:test:riptide>, Greeting) :- capability(notRegistered, \"Alice\", Greeting)."
+
+      ctx = context()
+
+      with_fake_client({:ok, response}, fn ->
+        assert {:error, {:unresolvable, iri}} = LLMFallback.run("greet Alice", RDF.Graph.new(), ctx)
+        assert iri == cap("notRegistered")
+      end)
+    end
+  end
 end
