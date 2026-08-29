@@ -159,9 +159,16 @@ defmodule Riptide.Derivation.CatalogTest do
     test "admitting into :hub never surfaces in a Tenant's list_entries/1, and vice versa" do
       tenant_scope = unique_tenant()
 
+      # :hub is a single, shared, non-unique stream across the whole test
+      # suite (unlike unique_tenant()'s per-test isolation) — force-deleting
+      # it here would race any other test concurrently or subsequently
+      # writing to :hub (confirmed live: :ra.force_delete_server/2 on a
+      # shared stream_id can leave the very next admit_entry/1 against that
+      # same stream_id hitting :noproc before the lazy re-create catches
+      # up). Tolerate accumulation instead — that's why this test already
+      # asserts via Enum.any?/refute Enum.any? rather than an exact list.
       on_exit(fn ->
         Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(tenant_scope))
-        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(:hub))
       end)
 
       hub_rule = sample_rule("hub-pattern")

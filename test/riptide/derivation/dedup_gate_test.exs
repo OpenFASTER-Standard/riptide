@@ -73,18 +73,19 @@ defmodule Riptide.Derivation.DedupGateTest do
     }
   end
 
-  defp ground_greet_trace(subject_name, arg_name) do
+  defp ground_greet_trace(subject_name, arg_name, predicate_local_name \\ "greeted") do
     cap_iri = RDF.iri("urn:riptide:capability:greetPerson")
     result = "\"Hello, #{arg_name}!\""
+    predicate = rel(predicate_local_name)
 
     %Rule{
       signature: %Signature{
-        name: rel("greeted"),
+        name: predicate,
         parameters: [t(subject_name), result],
         reads: [rel("pendingDeploy")],
-        produces: [rel("greeted")]
+        produces: [predicate]
       },
-      head: %FactPattern{predicate: rel("greeted"), args: [t(subject_name), result]},
+      head: %FactPattern{predicate: predicate, args: [t(subject_name), result]},
       body: [
         %FactPattern{predicate: rel("pendingDeploy"), args: [t(subject_name), RDF.literal("v1")]},
         %CapabilityReference{capability: cap_iri, args: [RDF.literal(arg_name)], result: result}
@@ -511,14 +512,19 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       target_scope = :hub
       review_scope = unique_tenant()
+      # :hub is shared and disk-persisted across every test run in this
+      # suite (never force-deleted — see catalog_test.exs's own "Hub vs.
+      # Tenant scope isolation" test for why). A unique predicate per test
+      # run keeps classify/2 from ever seeing a stale entry left behind by
+      # an earlier run and misclassifying this as :merge instead of :admit.
+      predicate_local_name = "propose5admit#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
-        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(target_scope))
         Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
       end)
 
-      trace1 = ground_greet_trace("alice", "Alice")
-      trace2 = ground_greet_trace("bob", "Bob")
+      trace1 = ground_greet_trace("alice", "Alice", predicate_local_name)
+      trace2 = ground_greet_trace("bob", "Bob", predicate_local_name)
 
       assert {:ok, [{generalization, _sub1, _sub2}] = candidates} =
                AntiUnifier.generalize(trace1, trace2)
