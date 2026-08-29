@@ -32,6 +32,7 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
 
   require Logger
 
+  alias Riptide.Capability
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
   alias Riptide.Derivation.{Matcher, Rule, Var}
@@ -100,10 +101,45 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
     end
   end
 
+  defp execute_body([%CapabilityReference{} = literal | rest], bindings, graph, context) do
+    case invoke_capability(literal, bindings, context) do
+      {:ok, new_bindings} -> execute_body(rest, new_bindings, graph, context)
+      :drop -> []
+    end
+  end
+
   defp conclude(%FactPattern{predicate: predicate, args: [subject, object]}, bindings) do
     {substitute(subject, bindings), predicate, substitute(object, bindings)}
   end
 
   defp substitute(%Var{} = var, bindings), do: Map.fetch!(bindings, var)
   defp substitute(term, _bindings), do: term
+
+  defp invoke_capability(%CapabilityReference{capability: iri, args: args, result: result}, bindings, context) do
+    definition = Map.fetch!(context.capabilities, iri)
+    resolved_args = args |> Enum.map(&substitute(&1, bindings)) |> Enum.map(&term_to_arg/1)
+
+    case Capability.invoke(definition, context.tenant_id, context.current_subject, resolved_args) do
+      {:ok, value} ->
+        {:ok, bind_result(bindings, result, value)}
+
+      {:error, reason} ->
+        Logger.warning("ExecuteInterpreter: capability #{inspect(iri)} invocation failed: #{inspect(reason)}")
+        :drop
+    end
+  end
+
+  # Capability.invoke/4 requires plain Elixir strings (they get inspect/1'd
+  # into wasmtime's --invoke wave-syntax call) — a bound Var's value is an
+  # RDF.Term.t() (an IRI or Literal from a fact-pattern match, or a literal
+  # constant straight from the Rule text), never a bare string on its own,
+  # so this conversion is mandatory, not a convenience. Passing an
+  # unconverted %RDF.IRI{}/%RDF.Literal{} through inspect/1 would produce
+  # invalid wave syntax (e.g. `~I<urn:test:alice>`), not a string literal.
+  defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
+  defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
+  defp term_to_arg(string) when is_binary(string), do: string
+
+  defp bind_result(bindings, %Var{} = var, value), do: Map.put(bindings, var, value)
+  defp bind_result(bindings, _constant, _value), do: bindings
 end
