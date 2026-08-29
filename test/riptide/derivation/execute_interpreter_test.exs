@@ -255,4 +255,139 @@ defmodule Riptide.Derivation.ExecuteInterpreterTest do
       assert log =~ "notGranted"
     end
   end
+
+  describe "call_template/3 — RuleReference" do
+    test "a RuleReference to a nested Rule whose own fact-pattern run yields multiple bindings" do
+      nested_iri = RDF.iri("urn:riptide:rule:colleagueOf")
+
+      nested_rule = %Rule{
+        signature: %Signature{
+          name: nested_iri,
+          parameters: [%Var{name: "Person"}, %Var{name: "Org"}],
+          reads: [rel("worksAt")],
+          produces: [nested_iri]
+        },
+        head: %FactPattern{predicate: nested_iri, args: [%Var{name: "Person"}, %Var{name: "Org"}]},
+        body: [%FactPattern{predicate: rel("worksAt"), args: [%Var{name: "Person"}, %Var{name: "Org"}]}]
+      }
+
+      outer_head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), %Var{name: "Result"}]}
+
+      outer_body = [
+        %RuleReference{rule: nested_iri, args: [t("alice")], result: %Var{name: "Result"}}
+      ]
+
+      outer_rule = %Rule{
+        signature: %Signature{
+          name: outer_head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [outer_head.predicate]
+        },
+        head: outer_head,
+        body: outer_body
+      }
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("worksAt"), t("acme")},
+          {t("alice"), rel("worksAt"), t("contractorco")}
+        ])
+
+      ctx = context(%{rules: %{nested_iri => nested_rule}})
+
+      assert {:ok, results} = ExecuteInterpreter.call_template(outer_rule, graph, ctx)
+
+      assert MapSet.new(results) ==
+               MapSet.new([
+                 {t("alice"), rel("lookup"), t("acme")},
+                 {t("alice"), rel("lookup"), t("contractorco")}
+               ])
+    end
+
+    test "the walking-skeleton shape: a multi-stream join feeding a Capability feeding a RuleReference" do
+      deploy_cap_iri = RDF.iri("urn:riptide:capability:deployService")
+      notify_cap_iri = RDF.iri("urn:riptide:capability:sendNotification")
+      notify_team_iri = RDF.iri("urn:riptide:rule:notifyTeam")
+
+      FakeStore.start(%{
+        {"acme", ["capabilities", "deployService"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ],
+        {"acme", ["capabilities", "sendNotification"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      notify_team_rule = %Rule{
+        signature: %Signature{
+          name: notify_team_iri,
+          parameters: [%Var{name: "Outcome"}, %Var{name: "Result"}],
+          reads: [],
+          produces: [notify_team_iri]
+        },
+        head: %FactPattern{predicate: notify_team_iri, args: [%Var{name: "Outcome"}, %Var{name: "Result"}]},
+        body: [
+          %CapabilityReference{
+            capability: notify_cap_iri,
+            args: [%Var{name: "Outcome"}],
+            result: %Var{name: "Result"}
+          }
+        ]
+      }
+
+      # pendingDeploy(Svc, Target), approved(Target, Owner) — two fact-pattern
+      # literals sharing `Target`, assembled from separately-constructed
+      # graphs merged together (matching 6c-i-b's own multi-stream-join
+      # golden case style, per this phase's exit criterion).
+      deployed_head = %FactPattern{predicate: rel("deployed"), args: [%Var{name: "Svc"}, %Var{name: "Result"}]}
+
+      deployed_body = [
+        %FactPattern{predicate: rel("pendingDeploy"), args: [%Var{name: "Svc"}, %Var{name: "Target"}]},
+        %FactPattern{predicate: rel("approved"), args: [%Var{name: "Target"}, %Var{name: "Owner"}]},
+        %CapabilityReference{
+          capability: deploy_cap_iri,
+          args: [%Var{name: "Owner"}],
+          result: %Var{name: "Outcome"}
+        },
+        %RuleReference{rule: notify_team_iri, args: [%Var{name: "Outcome"}], result: %Var{name: "Result"}}
+      ]
+
+      deployed_rule = %Rule{
+        signature: %Signature{
+          name: deployed_head.predicate,
+          parameters: deployed_head.args,
+          reads: [rel("pendingDeploy"), rel("approved")],
+          produces: [deployed_head.predicate]
+        },
+        head: deployed_head,
+        body: deployed_body
+      }
+
+      pending_deploy_graph = RDF.Graph.new([{t("billing-svc"), rel("pendingDeploy"), t("v2")}])
+      approved_graph = RDF.Graph.new([{t("v2"), rel("approved"), t("alice")}])
+      graph = RDF.Graph.new() |> RDF.Graph.add(pending_deploy_graph) |> RDF.Graph.add(approved_graph)
+
+      ctx =
+        context(%{
+          capabilities: %{
+            deploy_cap_iri => greet_capability_definition("deployService"),
+            notify_cap_iri => greet_capability_definition("sendNotification")
+          },
+          rules: %{notify_team_iri => notify_team_rule}
+        })
+
+      assert {:ok, [{subject, predicate, object}]} =
+               ExecuteInterpreter.call_template(deployed_rule, graph, ctx)
+
+      assert subject == t("billing-svc")
+      assert predicate == rel("deployed")
+      # object is notifyTeam's own concluded result — the wave-encoded
+      # greet() output, chained through both capability invocations and
+      # the RuleReference. The exact value matters less than proving both
+      # 6b-i's substrate (two real Capability invocations) and 6c-i-b's
+      # matching (the two-literal join) were genuinely exercised together.
+      assert is_binary(object) or match?(%RDF.Literal{}, object)
+    end
+  end
 end

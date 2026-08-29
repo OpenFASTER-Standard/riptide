@@ -108,6 +108,12 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
     end
   end
 
+  defp execute_body([%RuleReference{} = literal | rest], bindings, graph, context) do
+    literal
+    |> invoke_rule(bindings, graph, context)
+    |> Enum.flat_map(&execute_body(rest, &1, graph, context))
+  end
+
   defp conclude(%FactPattern{predicate: predicate, args: [subject, object]}, bindings) do
     {substitute(subject, bindings), predicate, substitute(object, bindings)}
   end
@@ -126,6 +132,28 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
       {:error, reason} ->
         Logger.warning("ExecuteInterpreter: capability #{inspect(iri)} invocation failed: #{inspect(reason)}")
         :drop
+    end
+  end
+
+  defp invoke_rule(%RuleReference{rule: iri, args: [input_arg], result: result}, bindings, graph, context) do
+    nested_rule = Map.fetch!(context.rules, iri)
+    input_value = substitute(input_arg, bindings)
+    [head_subject | _] = nested_rule.head.args
+
+    seed =
+      case head_subject do
+        %Var{} = var -> %{var => input_value}
+        _constant -> %{}
+      end
+
+    case call_template(nested_rule, seed, graph, context) do
+      {:ok, triples} ->
+        Enum.map(triples, fn {_subject, _predicate, object} ->
+          bind_result(bindings, result, object)
+        end)
+
+      {:error, _reason} ->
+        []
     end
   end
 
