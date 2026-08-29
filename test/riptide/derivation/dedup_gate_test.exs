@@ -444,4 +444,54 @@ defmodule Riptide.Derivation.DedupGateTest do
       assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
   end
+
+  describe "exit criterion (issue #66)" do
+    test "two independently-produced real Traces anti-unify, pass Admit with fidelity evidence and human review, and become a live CatalogEntry" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      # Two independently-produced real Traces (real wasmtime invocation via
+      # the fixture Capability, standing in for 6d-i's own NativeTemplate
+      # instances producing real Traces).
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+
+      assert {:ok, [{generalization, sub1, sub2}]} = AntiUnifier.generalize(trace1, trace2)
+      assert AntiUnifier.substitute(generalization, sub1) == trace1
+      assert AntiUnifier.substitute(generalization, sub2) == trace2
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx =
+        context(%{
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
+        })
+
+      assert {:ok, [{:queued, node, :admit}]} =
+               DedupGate.propose(scope, [{generalization, sub1, sub2}], graph, ctx)
+
+      assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(scope)
+      assert pending_review.fidelity_evidence == [:fidelity_pass, :fidelity_pass]
+
+      assert :ok == DedupGate.approve_review(scope, node)
+
+      assert {:ok, [{_entry_node, ^generalization}]} = Catalog.list_entries(scope)
+    end
+  end
 end
