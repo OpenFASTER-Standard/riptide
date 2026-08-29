@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration) — 14 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop) — 13 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -674,3 +674,29 @@ verified directly rather than assumed, after an initial proof attempt turned out
 
 **Status**: Phase 6e-iii shipped 2026-08-29. 14 phases remaining across the primary spine and
 the three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6f — LLM fallback loop
+
+Seventh link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → 6e-i → 6e-ii → 6e-iii →
+{6f, 6g-i}`), unblocked by 6e-iii (#66). **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6f-llm-fallback-loop-design.md`.
+
+`Riptide.Derivation.LLMFallback.run/3`: Task with no Catalog match → LLM-guided Capability
+invocation → ground Trace. The LLM authors Rule text directly, reusing `Parser.decode/1`
+completely unmodified — `Matcher`'s and `Parser`'s own doc comments already called Rule Body
+text "untrusted/LLM-authorable" before this phase existed. `ExecuteInterpreter` gained one
+small, purely additive `resolve_bindings/3`, exposing the bindings a live run needs to become
+a ground Trace via `AntiUnifier.substitute/2` (its fourth real production caller) — zero risk
+to `call_template/3`'s own shipped, tested behavior. The LLM call itself is Elixir-level
+platform infrastructure — a small injectable `Client` behaviour (real Anthropic-backed
+implementation + fake for tests), configured via `Application.get_env/3` exactly like
+`Riptide.Authz`'s own `authz_store` pattern. Investigated and ruled out modeling it as a
+Capability instead (conceptual mismatch — Riptide's own reasoning step, not a tenant-granted
+external-system integration — plus `Capability.invoke/4` hardcodes `-S inherit-network=n`
+today, so no Capability can reach the network at all yet). The capstone test — two
+`LLMFallback.run/3` calls → `AntiUnifier.generalize/2` → `DedupGate.propose/4` →
+`approve_review/2` → live in `Catalog.list_entries/1` — is the first test in this whole
+sub-project to exercise the entire walking skeleton end-to-end in one place.
+
+**Status**: Phase 6f shipped 2026-08-29. 13 phases remaining across the primary spine and the
+three parallel tracks — see the design spec's §7 for the full roadmap.
