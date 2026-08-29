@@ -87,6 +87,23 @@ the identical blank-node label every time. Safe to use directly as the
 Hub entry identifier in Discovery results and entry-fetch requests — no
 new stable-IRI scheme needed.
 
+**No Capability registry exists anywhere in this codebase — verified via
+grep, zero hits.** `DedupGate.propose/5`'s `GeneralizationFidelity`
+replay-testing needs a real `Context.capabilities` to re-invoke any
+`CapabilityReference` literal in a candidate's Body. A network caller
+can't safely supply a `Capability.Definition` inline — its `component`
+field is a server-local WASM file path, and accepting one from an
+untrusted request is an arbitrary-file-execution risk. Capabilities are
+clearly meant to be pre-registered server-side and looked up by name,
+but no such registry exists yet anywhere in this project — a real,
+separate infrastructure gap, not specific to 6h-ii. `ProposeController`
+(§6) is therefore scoped to fact-pattern-only candidates (no
+`CapabilityReference`/`RuleReference` literals in the Body) — fidelity
+replay-testing for those needs no real Capability context at all,
+sidestepping the registry gap entirely rather than inventing one.
+EffectCapability-bearing Hub proposals over HTTP are explicitly deferred
+(§9), the same way full Install was deferred to 6i.
+
 ## 3. Approaches considered
 
 - **A — Adopted.** Split Hub routes by read/write shape (tenant-less
@@ -169,9 +186,13 @@ already-shipped caller.
   /tenants/:tenant_id/hub/propose`. Request body carries the two ground
   Traces (Rule text via the existing `Parser.decode/1`, matching how a
   Tenant's own LLMFallback-produced Trace is already represented) plus
-  the graph/context needed for `AntiUnifier.generalize/2` +
+  the RDF graph needed for `AntiUnifier.generalize/2` +
   `DedupGate.propose/5`'s `target_scope: :hub, review_scope: {:tenant,
-  tenant_id}`.
+  tenant_id}`. Scoped to fact-pattern-only Traces (no
+  `CapabilityReference`/`RuleReference` literals) per §2's Capability-
+  registry finding — `context.capabilities`/`context.rules` are built as
+  empty maps server-side, never accepted from the request body, so there
+  is no arbitrary-file-execution surface here at all.
 - `RiptideWeb.Hub.ReviewController` — `POST .../approve`, `POST
   .../decline`. Thin wrappers over `DedupGate.approve_review/3`/
   `decline_review/2` with the split scopes.
@@ -216,6 +237,11 @@ model (§4's route table, §7's testing plan). Satisfied by §7 end-to-end.
   workflow) — explicitly 6i's own job (§1, §3 Approach C ruled out).
   6h-ii ships the one primitive 6i needs (`GET /hub/entries/:node_id`),
   nothing more.
+- **EffectCapability-bearing Hub proposals over HTTP** — blocked on a
+  Capability registry/lookup-by-name mechanism that doesn't exist
+  anywhere in this project yet (§2's finding), not something 6h-ii
+  invents. `ProposeController` accepts fact-pattern-only candidates
+  only, for now.
 - **Cross-instance federation** — 6h-i §10's own deferral carries over
   unchanged; every route/limiter here is subject/IP-keyed, already
   extending sensibly to a future cross-instance caller without redesign.
