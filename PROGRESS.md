@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring) — 17 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm) — 16 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -580,4 +580,33 @@ spec's original worked example and the 2-arity Head invariant (established later
 argument for this phase — documented explicitly, not silently papered over.
 
 **Status**: Phase 6d-i shipped 2026-08-29. 17 phases remaining across the primary spine and
+the three parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6e-i — Anti-unification algorithm
+
+Fourth link in the walking skeleton (`6b-i → 6c-i-a → 6c-i-b → 6d-i → 6e-i → 6e-ii → ...`),
+unblocked by 6c-i-a alone. **Shipped 2026-08-29** — see
+`docs/superpowers/specs/2026-08-29-phase-6e-i-anti-unification-design.md`.
+
+`Riptide.Derivation.AntiUnifier.generalize/2` computes a Rule × Rule least-general-
+generalization (Plotkin 1970) plus the two recovering substitutions, operating purely over
+6c-i-a's in-memory representation — no execution substrate, no real Capability. A Rule's
+Body is a logical conjunction, so anti-unifying two Bodies is a search over which literal in
+one corresponds to which in the other (an alignment), pruned by the existing structural
+constraint that `FactPattern.predicate`/`CapabilityReference.capability`/`RuleReference.rule`
+are always fixed IRIs, never `Var.t()` — two literals can only pair if they share the same
+identifying IRI, kind, and arity. Multiple mutually-incomparable alignments are arbitrated
+via bottom-clause-style bounding, concretely read as: keep only the candidates introducing
+the fewest fresh variables, returning all ties (`generalize/2`'s own return type is a list
+for exactly this reason) rather than collapsing to one answer — a still-tied result is
+DedupGate's (6e-iii) concern, not this phase's. A real correctness point found during design,
+not obvious from Plotkin's classical statement: a `Var.t()` never short-circuits the
+"already the same" fast path via string-name equality, since two different Rules' same-named
+variables are unrelated (variable names are rule-local and arbitrary) — every `Var.t()`
+comparison goes through the shared, injective memo map unconditionally. Generalization safety
+(a Head variable absent from a possibly-shrunk Body) is deliberately not checked here — it's
+free from `Matcher.evaluate/2`'s existing `check_safety/2` for whoever evaluates a
+generalization later, most plausibly 6e-ii.
+
+**Status**: Phase 6e-i shipped 2026-08-29. 16 phases remaining across the primary spine and
 the three parallel tracks — see the design spec's §7 for the full roadmap.
