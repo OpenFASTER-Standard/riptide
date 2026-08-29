@@ -68,6 +68,25 @@ defmodule Riptide.SupervisedProcessTest do
     end
   end
 
+  describe "request_restart/1 — active session" do
+    test "is refused, and the original process is confirmed still running unchanged" do
+      id = unique_id()
+      {:ok, pid} = SupervisedProcess.start(id, Fixture, {id, false})
+      :ok = GenServer.call(pid, :set_active)
+
+      assert {:error, :session_active} = SupervisedProcess.request_restart(id)
+
+      assert Process.alive?(pid)
+      assert [{^pid, Fixture}] = Registry.lookup(Riptide.SupervisedProcess.Registry, id)
+    end
+  end
+
+  describe "request_restart/1 — unregistered id" do
+    test "returns {:error, :not_found}" do
+      assert {:error, :not_found} = SupervisedProcess.request_restart(unique_id())
+    end
+  end
+
   defp wait_until(fun, attempts \\ 50) do
     if fun.() do
       :ok
