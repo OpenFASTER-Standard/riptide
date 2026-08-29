@@ -214,4 +214,60 @@ defmodule Riptide.Derivation.DedupGateTest do
       assert pending_review.replaces == existing_node
     end
   end
+
+  describe "propose/4 — fidelity-failure path" do
+    test "a candidate whose recorded Capability result doesn't match a fresh invocation never reaches pending-review" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      cap_iri = RDF.iri("urn:riptide:capability:greetPerson")
+
+      # trace2's own recorded result is deliberately stale/wrong — a fresh
+      # invocation of greet("Bob") always produces "Hello, Bob!", never this.
+      stale_trace2 = %Rule{
+        signature: %Signature{
+          name: rel("greeted"),
+          parameters: [t("bob"), "\"stale value\""],
+          reads: [rel("pendingDeploy")],
+          produces: [rel("greeted")]
+        },
+        head: %FactPattern{predicate: rel("greeted"), args: [t("bob"), "\"stale value\""]},
+        body: [
+          %FactPattern{predicate: rel("pendingDeploy"), args: [t("bob"), RDF.literal("v1")]},
+          %CapabilityReference{
+            capability: cap_iri,
+            args: [RDF.literal("Bob")],
+            result: "\"stale value\""
+          }
+        ]
+      }
+
+      trace1 = ground_greet_trace("alice", "Alice")
+      {:ok, candidates} = AntiUnifier.generalize(trace1, stale_trace2)
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx = context(%{capabilities: %{cap_iri => greet_definition("greetPerson")}})
+
+      assert {:ok, [{:fidelity_failed, evidence}]} =
+               DedupGate.propose(scope, candidates, graph, ctx)
+
+      assert :fidelity_pass in evidence
+      assert Enum.any?(evidence, &match?({:fidelity_fail, _}, &1))
+      assert {:ok, []} = Catalog.list_pending_reviews(scope)
+    end
+  end
 end
