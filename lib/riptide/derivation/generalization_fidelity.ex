@@ -105,4 +105,23 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
   defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
   defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
   defp term_to_arg(string) when is_binary(string), do: string
+
+  defp check_body([%RuleReference{rule: iri, args: args} | rest], graph, context) do
+    cond do
+      not Map.has_key?(context.rules, iri) ->
+        {:error, {:unresolvable, iri}}
+
+      length(args) != 1 ->
+        {:error, {:unsupported_arity, iri}}
+
+      true ->
+        nested_rule = Map.fetch!(context.rules, iri)
+
+        case check(nested_rule, graph, context) do
+          {:ok, :fidelity_pass} -> check_body(rest, graph, context)
+          {:ok, {:fidelity_fail, reason}} -> {:ok, {:fidelity_fail, {:nested, iri, reason}}}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
 end

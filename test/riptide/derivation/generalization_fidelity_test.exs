@@ -385,4 +385,129 @@ defmodule Riptide.Derivation.GeneralizationFidelityTest do
       assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) == {:ok, :fidelity_pass}
     end
   end
+
+  describe "check/3 — RuleReference" do
+    test "an unresolvable rule IRI is rejected as a structural error" do
+      rule_iri = RDF.iri("urn:riptide:rule:notRegistered")
+      head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), "\"result\""]}
+
+      body = [%RuleReference{rule: rule_iri, args: [t("alice")], result: "\"result\""}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), context()) ==
+               {:error, {:unresolvable, rule_iri}}
+    end
+
+    test "a RuleReference with more than one arg is rejected as unsupported arity" do
+      rule_iri = RDF.iri("urn:riptide:rule:nested")
+      head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), "\"result\""]}
+
+      body = [
+        %RuleReference{rule: rule_iri, args: [t("alice"), t("bob")], result: "\"result\""}
+      ]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      nested_rule = %Rule{
+        signature: %Signature{name: rule_iri, parameters: [], reads: [], produces: [rule_iri]},
+        head: %FactPattern{predicate: rule_iri, args: [t("alice"), "\"result\""]},
+        body: []
+      }
+
+      ctx = context(%{rules: %{rule_iri => nested_rule}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) ==
+               {:error, {:unsupported_arity, rule_iri}}
+    end
+
+    test "recurses into a nested ground Rule and passes when it replays faithfully" do
+      nested_iri = RDF.iri("urn:riptide:rule:colleagueOf")
+
+      nested_rule = %Rule{
+        signature: %Signature{
+          name: nested_iri,
+          parameters: [],
+          reads: [rel("worksAt")],
+          produces: [nested_iri]
+        },
+        head: %FactPattern{predicate: nested_iri, args: [t("alice"), t("acme")]},
+        body: [%FactPattern{predicate: rel("worksAt"), args: [t("alice"), t("acme")]}]
+      }
+
+      head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), t("acme")]}
+      body = [%RuleReference{rule: nested_iri, args: [t("alice")], result: t("acme")}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      graph = RDF.Graph.new([{t("alice"), rel("worksAt"), t("acme")}])
+      ctx = context(%{rules: %{nested_iri => nested_rule}})
+
+      assert GeneralizationFidelity.check(rule, graph, ctx) == {:ok, :fidelity_pass}
+    end
+
+    test "wraps a nested fidelity failure as {:nested, iri, inner_reason}" do
+      nested_iri = RDF.iri("urn:riptide:rule:colleagueOf")
+
+      nested_rule = %Rule{
+        signature: %Signature{
+          name: nested_iri,
+          parameters: [],
+          reads: [rel("worksAt")],
+          produces: [nested_iri]
+        },
+        head: %FactPattern{predicate: nested_iri, args: [t("alice"), t("acme")]},
+        body: [%FactPattern{predicate: rel("worksAt"), args: [t("alice"), t("acme")]}]
+      }
+
+      head = %FactPattern{predicate: rel("lookup"), args: [t("alice"), t("acme")]}
+      body = [%RuleReference{rule: nested_iri, args: [t("alice")], result: t("acme")}]
+
+      rule = %Rule{
+        signature: %Signature{
+          name: head.predicate,
+          parameters: [],
+          reads: [],
+          produces: [head.predicate]
+        },
+        head: head,
+        body: body
+      }
+
+      # graph deliberately empty — the nested Rule's own worksAt fact is missing.
+      ctx = context(%{rules: %{nested_iri => nested_rule}})
+
+      assert GeneralizationFidelity.check(rule, RDF.Graph.new(), ctx) ==
+               {:ok,
+                {:fidelity_fail,
+                 {:nested, nested_iri, {:fact_not_present, {t("alice"), rel("worksAt"), t("acme")}}}}}
+    end
+  end
 end
