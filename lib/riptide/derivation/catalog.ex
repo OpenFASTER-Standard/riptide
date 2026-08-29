@@ -19,6 +19,7 @@ defmodule Riptide.Derivation.Catalog do
   @stream_id_prefix "https://riptide.example/"
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @riptide_catalog_entry RDF.iri("urn:riptide:vocab:CatalogEntry")
+  @riptide_superseded_catalog_entry RDF.iri("urn:riptide:vocab:SupersededCatalogEntry")
   @riptide_supersedes RDF.iri("urn:riptide:vocab:supersedes")
 
   @type scope :: {:tenant, String.t()} | :hub
@@ -56,6 +57,15 @@ defmodule Riptide.Derivation.Catalog do
 
   defp maybe_add_supersedes(graph, node, replaces),
     do: RDF.Graph.add(graph, {node, @riptide_supersedes, replaces})
+
+  @spec supersede_entry(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def supersede_entry(scope, node) do
+    write_patch(
+      catalog_stream_id(scope),
+      [{node, @rdf_type, @riptide_superseded_catalog_entry}],
+      [{node, @rdf_type, @riptide_catalog_entry}]
+    )
+  end
 
   defp nodes_of_type(graph, type_iri) do
     fact_pattern = %FactPattern{predicate: @rdf_type, args: [%Var{name: "Node"}, type_iri]}

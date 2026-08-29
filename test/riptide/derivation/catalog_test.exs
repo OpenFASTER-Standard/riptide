@@ -76,4 +76,21 @@ defmodule Riptide.Derivation.CatalogTest do
       assert MapSet.new(Enum.map(entries, &elem(&1, 1))) == MapSet.new([rule1, rule2])
     end
   end
+
+  describe "supersede_entry/2" do
+    test "a superseded entry disappears from list_entries/1; admitting with replaces: writes the supersedes link" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+
+      old_rule = sample_rule("alice")
+      :ok = Catalog.admit_entry(scope, old_rule, nil)
+      {:ok, [{old_node, ^old_rule}]} = Catalog.list_entries(scope)
+
+      new_rule = sample_rule("bob")
+      :ok = Catalog.admit_entry(scope, new_rule, old_node)
+      :ok = Catalog.supersede_entry(scope, old_node)
+
+      assert {:ok, [{_node, ^new_rule}]} = Catalog.list_entries(scope)
+    end
+  end
 end
