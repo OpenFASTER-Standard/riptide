@@ -87,6 +87,38 @@ defmodule Riptide.SupervisedProcessTest do
     end
   end
 
+  describe "request_revoke/1 — idle process" do
+    test "succeeds, and the process does not come back (:transient doesn't restart on :normal)" do
+      id = unique_id()
+      {:ok, pid} = SupervisedProcess.start(id, Fixture, {id, false})
+
+      assert :ok = SupervisedProcess.request_revoke(id)
+
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1000
+
+      wait_until(fn -> Registry.lookup(Riptide.SupervisedProcess.Registry, id) == [] end)
+    end
+  end
+
+  describe "request_revoke/1 — active session" do
+    test "is refused, and the original process is confirmed still running unchanged" do
+      id = unique_id()
+      {:ok, pid} = SupervisedProcess.start(id, Fixture, {id, false})
+      :ok = GenServer.call(pid, :set_active)
+
+      assert {:error, :session_active} = SupervisedProcess.request_revoke(id)
+
+      assert Process.alive?(pid)
+    end
+  end
+
+  describe "request_revoke/1 — unregistered id" do
+    test "returns {:error, :not_found}" do
+      assert {:error, :not_found} = SupervisedProcess.request_revoke(unique_id())
+    end
+  end
+
   defp wait_until(fun, attempts \\ 50) do
     if fun.() do
       :ok
