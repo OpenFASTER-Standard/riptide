@@ -43,9 +43,15 @@ defmodule Riptide.Derivation.AntiUnifierTest do
   test "a simple unique lgg shares one generalization variable for a value recurring across head and body" do
     rule1 =
       rule(
-        %FactPattern{predicate: rel("greeted"), args: [RDF.literal("alice"), %Var{name: "Result"}]},
+        %FactPattern{
+          predicate: rel("greeted"),
+          args: [RDF.literal("alice"), %Var{name: "Result"}]
+        },
         [
-          %FactPattern{predicate: rel("pendingDeploy"), args: [RDF.literal("alice"), RDF.literal("v1")]},
+          %FactPattern{
+            predicate: rel("pendingDeploy"),
+            args: [RDF.literal("alice"), RDF.literal("v1")]
+          },
           %CapabilityReference{
             capability: cap("deployService"),
             args: [RDF.literal("alice"), RDF.literal("v1")],
@@ -58,7 +64,10 @@ defmodule Riptide.Derivation.AntiUnifierTest do
       rule(
         %FactPattern{predicate: rel("greeted"), args: [RDF.literal("bob"), %Var{name: "Result"}]},
         [
-          %FactPattern{predicate: rel("pendingDeploy"), args: [RDF.literal("bob"), RDF.literal("v2")]},
+          %FactPattern{
+            predicate: rel("pendingDeploy"),
+            args: [RDF.literal("bob"), RDF.literal("v2")]
+          },
           %CapabilityReference{
             capability: cap("deployService"),
             args: [RDF.literal("bob"), RDF.literal("v2")],
@@ -99,8 +108,11 @@ defmodule Riptide.Derivation.AntiUnifierTest do
         %FactPattern{predicate: rel("f#{i}"), args: [%Var{name: "A#{i}"}, %Var{name: "B#{i}"}]}
       end
 
-    big_rule = rule(%FactPattern{predicate: rel("out"), args: [%Var{name: "X"}, %Var{name: "Y"}]}, body)
-    small_rule = rule(%FactPattern{predicate: rel("out"), args: [%Var{name: "X"}, %Var{name: "Y"}]}, [])
+    big_rule =
+      rule(%FactPattern{predicate: rel("out"), args: [%Var{name: "X"}, %Var{name: "Y"}]}, body)
+
+    small_rule =
+      rule(%FactPattern{predicate: rel("out"), args: [%Var{name: "X"}, %Var{name: "Y"}]}, [])
 
     assert AntiUnifier.generalize(big_rule, small_rule) == {:error, :body_too_large}
     assert AntiUnifier.generalize(small_rule, big_rule) == {:error, :body_too_large}

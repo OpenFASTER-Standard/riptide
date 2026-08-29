@@ -50,7 +50,9 @@ defmodule Riptide.Derivation.AntiUnifier do
     indexed_body1 = Enum.with_index(body1)
     groups1 = Enum.group_by(indexed_body1, fn {lit, _idx} -> literal_key(lit) end)
     groups2 = Enum.group_by(body2, &literal_key/1)
-    shared_keys = MapSet.intersection(MapSet.new(Map.keys(groups1)), MapSet.new(Map.keys(groups2)))
+
+    shared_keys =
+      MapSet.intersection(MapSet.new(Map.keys(groups1)), MapSet.new(Map.keys(groups2)))
 
     shared_keys
     |> Enum.map(fn key -> all_bijections(Map.fetch!(groups1, key), Map.fetch!(groups2, key)) end)
@@ -165,10 +167,14 @@ defmodule Riptide.Derivation.AntiUnifier do
          state
        ) do
     {generalized_args, state1} =
-      Enum.map_reduce(Enum.zip(args1, args2), state, fn {a1, a2}, s -> anti_unify_term(a1, a2, s) end)
+      Enum.map_reduce(Enum.zip(args1, args2), state, fn {a1, a2}, s ->
+        anti_unify_term(a1, a2, s)
+      end)
 
     {generalized_result, state2} = anti_unify_term(result1, result2, state1)
-    {%CapabilityReference{capability: c, args: generalized_args, result: generalized_result}, state2}
+
+    {%CapabilityReference{capability: c, args: generalized_args, result: generalized_result},
+     state2}
   end
 
   defp anti_unify_literal_pair(
@@ -177,7 +183,9 @@ defmodule Riptide.Derivation.AntiUnifier do
          state
        ) do
     {generalized_args, state1} =
-      Enum.map_reduce(Enum.zip(args1, args2), state, fn {a1, a2}, s -> anti_unify_term(a1, a2, s) end)
+      Enum.map_reduce(Enum.zip(args1, args2), state, fn {a1, a2}, s ->
+        anti_unify_term(a1, a2, s)
+      end)
 
     {generalized_result, state2} = anti_unify_term(result1, result2, state1)
     {%RuleReference{rule: r, args: generalized_args, result: generalized_result}, state2}
