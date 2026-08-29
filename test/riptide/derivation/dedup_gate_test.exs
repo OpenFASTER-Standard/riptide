@@ -125,7 +125,9 @@ defmodule Riptide.Derivation.DedupGateTest do
           }
         })
 
-      assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, [{:queued, node, :admit}]} =
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
+
       assert {:ok, [{^node, _pending_review}]} = Catalog.list_pending_reviews(scope)
     end
   end
@@ -149,7 +151,9 @@ defmodule Riptide.Derivation.DedupGateTest do
       graph = RDF.Graph.new()
       ctx = context()
 
-      assert {:ok, [{:rejected, _reason}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, [{:rejected, _reason}]} =
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
+
       assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
 
@@ -209,7 +213,9 @@ defmodule Riptide.Derivation.DedupGateTest do
           }
         })
 
-      assert {:ok, [{:queued, node, :merge}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, [{:queued, node, :merge}]} =
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
+
       assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(scope)
       assert pending_review.replaces == existing_node
     end
@@ -263,7 +269,7 @@ defmodule Riptide.Derivation.DedupGateTest do
       ctx = context(%{capabilities: %{cap_iri => greet_definition("greetPerson")}})
 
       assert {:ok, [{:fidelity_failed, evidence}]} =
-               DedupGate.propose(scope, candidates, graph, ctx)
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
 
       assert :fidelity_pass in evidence
       assert Enum.any?(evidence, &match?({:fidelity_fail, _}, &1))
@@ -358,7 +364,7 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       ctx = context()
 
-      assert {:ok, outcomes} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, outcomes} = DedupGate.propose(scope, scope, candidates, graph, ctx)
 
       assert [{:rejected, _reason}, {:queued, _node, :merge}] = outcomes
       refute candidate_a == candidate_b
@@ -397,9 +403,9 @@ defmodule Riptide.Derivation.DedupGateTest do
           }
         })
 
-      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, scope, candidates, graph, ctx)
 
-      assert :ok == DedupGate.approve_review(scope, node)
+      assert :ok == DedupGate.approve_review(scope, scope, node)
       assert {:ok, [{_entry_node, _rule}]} = Catalog.list_entries(scope)
       assert {:ok, []} = Catalog.list_pending_reviews(scope)
     end
@@ -437,7 +443,7 @@ defmodule Riptide.Derivation.DedupGateTest do
           }
         })
 
-      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, scope, candidates, graph, ctx)
 
       assert :ok == DedupGate.decline_review(scope, node)
       assert {:ok, []} = Catalog.list_entries(scope)
@@ -484,14 +490,71 @@ defmodule Riptide.Derivation.DedupGateTest do
         })
 
       assert {:ok, [{:queued, node, :admit}]} =
-               DedupGate.propose(scope, [{generalization, sub1, sub2}], graph, ctx)
+               DedupGate.propose(scope, scope, [{generalization, sub1, sub2}], graph, ctx)
 
       assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(scope)
       assert pending_review.fidelity_evidence == [:fidelity_pass, :fidelity_pass]
 
-      assert :ok == DedupGate.approve_review(scope, node)
+      assert :ok == DedupGate.approve_review(scope, scope, node)
 
       assert {:ok, [{_entry_node, ^generalization}]} = Catalog.list_entries(scope)
+    end
+  end
+
+  describe "propose/5 — target_scope and review_scope differ" do
+    test "a Hub-targeted proposal is classified/admitted against target_scope but reviewed in review_scope's own queue" do
+      FakeStore.start(%{
+        {"acme", ["capabilities", "greetPerson"]} => [
+          %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+        ]
+      })
+
+      target_scope = :hub
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(target_scope))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      trace1 = ground_greet_trace("alice", "Alice")
+      trace2 = ground_greet_trace("bob", "Bob")
+
+      assert {:ok, [{generalization, _sub1, _sub2}] = candidates} =
+               AntiUnifier.generalize(trace1, trace2)
+
+      graph =
+        RDF.Graph.new([
+          {t("alice"), rel("pendingDeploy"), RDF.literal("v1")},
+          {t("bob"), rel("pendingDeploy"), RDF.literal("v1")}
+        ])
+
+      ctx =
+        context(%{
+          capabilities: %{
+            RDF.iri("urn:riptide:capability:greetPerson") => greet_definition("greetPerson")
+          }
+        })
+
+      assert {:ok, [{:queued, node, :admit}]} =
+               DedupGate.propose(target_scope, review_scope, candidates, graph, ctx)
+
+      # Reviewed in review_scope's own queue, not target_scope's.
+      assert {:ok, review_entries} = Catalog.list_pending_reviews(review_scope)
+      assert Enum.any?(review_entries, fn {n, _} -> n == node end)
+
+      # Not yet admitted into target_scope.
+      assert {:ok, target_entries_before} = Catalog.list_entries(target_scope)
+      refute Enum.any?(target_entries_before, fn {_n, rule} -> rule == generalization end)
+
+      assert :ok == DedupGate.approve_review(target_scope, review_scope, node)
+
+      # Admitted into target_scope's Catalog...
+      assert {:ok, target_entries_after} = Catalog.list_entries(target_scope)
+      assert Enum.any?(target_entries_after, fn {_n, rule} -> rule == generalization end)
+
+      # ...and the review resolved in review_scope, not target_scope.
+      assert {:ok, []} = Catalog.list_pending_reviews(review_scope)
     end
   end
 end
