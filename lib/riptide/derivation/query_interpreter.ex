@@ -17,7 +17,7 @@ defmodule Riptide.Derivation.QueryInterpreter do
   @default_max_iterations 10_000
   @default_max_fact_count 1_000_000
 
-  @spec evaluate([Rule.t()], RDF.Graph.t()) ::
+  @spec evaluate([Rule.t()], RDF.Graph.t(), keyword()) ::
           {:ok, RDF.Graph.t()}
           | {:error,
              :too_many_variables
@@ -25,8 +25,22 @@ defmodule Riptide.Derivation.QueryInterpreter do
              | {:unsafe_rule, Var.t()}
              | :iteration_limit_exceeded
              | :fact_limit_exceeded}
-  def evaluate(rules, %RDF.Graph{} = graph) when is_list(rules) do
-    loop(rules, graph, 0, @default_max_iterations, @default_max_fact_count)
+  def evaluate(rules, %RDF.Graph{} = graph, opts \\ []) when is_list(rules) do
+    max_iterations =
+      Keyword.get(
+        opts,
+        :max_iterations,
+        Application.get_env(:riptide, :query_interpreter_max_iterations, @default_max_iterations)
+      )
+
+    max_fact_count =
+      Keyword.get(
+        opts,
+        :max_fact_count,
+        Application.get_env(:riptide, :query_interpreter_max_fact_count, @default_max_fact_count)
+      )
+
+    loop(rules, graph, 0, max_iterations, max_fact_count)
   end
 
   defp loop(_rules, _graph, round, max_iterations, _max_fact_count)
