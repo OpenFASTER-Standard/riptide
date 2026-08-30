@@ -1,7 +1,7 @@
 defmodule Riptide.Derivation.RuleRDFCodecTest do
   use ExUnit.Case, async: true
 
-  alias Riptide.Derivation.{Parser, RuleRDFCodec}
+  alias Riptide.Derivation.{Parser, Provenance, RuleRDFCodec}
 
   @sp_triple_pattern RDF.iri("http://spinrdf.org/sp#TriplePattern")
   @sp_subject RDF.iri("http://spinrdf.org/sp#subject")
@@ -204,6 +204,51 @@ defmodule Riptide.Derivation.RuleRDFCodecTest do
 
       assert decoded.signature.reads == rule.signature.reads
       assert decoded == rule
+    end
+  end
+
+  describe "provenance round-trip" do
+    test "a Rule with nil provenance round-trips with nil provenance" do
+      {:ok, rule} = Parser.decode("deployed(Svc, Result) :- pendingDeploy(Svc, Result).")
+      assert rule.provenance == nil
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "a Rule with :generalized_from provenance round-trips, including its embedded sources" do
+      {:ok, source1} = Parser.decode("a(X, Y) :- f(X, Y).")
+      {:ok, source2} = Parser.decode("a(X, Y) :- g(X, Y).")
+      {:ok, base_rule} = Parser.decode("deployed(Svc, Result) :- pendingDeploy(Svc, Result).")
+
+      rule = %{base_rule | provenance: %Provenance{origin: {:generalized_from, source1, source2}}}
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
+    end
+
+    test "a Rule with :installed_from provenance round-trips, including field bindings" do
+      {:ok, base_rule} = Parser.decode("deployed(Svc, Result) :- pendingDeploy(Svc, Result).")
+      source_entry = RDF.BlankNode.new("hub-entry-1")
+      crosswalk_node = RDF.BlankNode.new("crosswalk-1")
+
+      rule = %{
+        base_rule
+        | provenance: %Provenance{
+            origin:
+              {:installed_from, source_entry,
+               [
+                 %{
+                   predicate: RDF.iri("urn:riptide:relation:pendingDeploy"),
+                   binding: {:crosswalk, crosswalk_node}
+                 },
+                 %{predicate: RDF.iri("urn:riptide:relation:notifyChannel"), binding: :manual}
+               ]}
+          }
+      }
+
+      {node, graph} = RuleRDFCodec.to_rdf(rule)
+      assert RuleRDFCodec.from_rdf(node, graph) == rule
     end
   end
 end

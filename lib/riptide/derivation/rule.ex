@@ -7,16 +7,17 @@ defmodule Riptide.Derivation.Rule do
   """
 
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
-  alias Riptide.Derivation.Signature
+  alias Riptide.Derivation.{Provenance, Signature}
 
   @enforce_keys [:signature, :head, :body]
-  defstruct [:signature, :head, :body]
+  defstruct [:signature, :head, :body, :provenance]
 
   @type literal :: FactPattern.t() | CapabilityReference.t() | RuleReference.t()
 
   @type t :: %__MODULE__{
           signature: Signature.t(),
           head: FactPattern.t(),
-          body: [literal()]
+          body: [literal()],
+          provenance: Provenance.t() | nil
         }
 end
