@@ -299,10 +299,23 @@ pipeline, same JSON response conventions as `ProposeController`):
 | Method | Path | Operation |
 |---|---|---|
 | POST | `/tenants/:tenant_id/hub/install` | Fetch the named Hub entry, run `install/3`, `propose_install/3` |
+| POST | `/tenants/:tenant_id/hub/install-reviews/:node_id/approve` | `approve_review({:tenant, id}, {:tenant, id}, node)` |
+| POST | `/tenants/:tenant_id/hub/install-reviews/:node_id/decline` | `decline_review({:tenant, id}, node)` |
 | POST | `/tenants/:tenant_id/hub/crosswalks` | Build a `Crosswalk`, `propose_crosswalk/2` |
+| POST | `/tenants/:tenant_id/hub/crosswalk-reviews/:node_id/approve` | `approve_crosswalk_review/2` |
+| POST | `/tenants/:tenant_id/hub/crosswalk-reviews/:node_id/decline` | `decline_crosswalk_review/2` |
 
-Existing `/tenants/:tenant_id/hub/pending-reviews/:node_id/approve`/`decline` reused unchanged for
-both new proposal kinds.
+**Not** the existing `/tenants/:tenant_id/hub/pending-reviews/:node_id/approve`/`decline`
+(`ReviewController`) — that controller hardcodes `target_scope: :hub`, correct for 6h-ii's
+propose-to-Hub flow (`target_scope` is always `:hub` there, regardless of `review_scope`) but
+wrong for Install, whose `target_scope` is always `{:tenant, installing_tenant_id}` (§9, above):
+reusing it unchanged would silently admit an installed — possibly Crosswalk-rewritten,
+Tenant-specific — Rule into the *global* Hub Catalog instead of the installing Tenant's own.
+Install therefore gets its own `approve`/`decline` actions (on `InstallController`, reusing
+`DedupGate.approve_review/3`/`decline_review/2` directly, just with both scope arguments fixed to
+`{:tenant, id}`) under a distinct `/hub/install-reviews/...` path, exactly as Crosswalk already
+needed its own `/hub/crosswalk-reviews/...` path for its own different resolution mechanism
+(`resolve_crosswalk_review/2`, not `resolve_pending_review/3`).
 
 ## 10. Testing
 
