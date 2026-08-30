@@ -3,7 +3,7 @@ defmodule Riptide.Derivation.AntiUnifierTest do
 
   alias Riptide.Derivation.AntiUnifier
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
-  alias Riptide.Derivation.{Rule, Signature, Var}
+  alias Riptide.Derivation.{Provenance, Rule, Signature, Var}
 
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
   defp cap(name), do: RDF.iri("urn:riptide:capability:" <> name)
@@ -177,5 +177,27 @@ defmodule Riptide.Derivation.AntiUnifierTest do
     # each other (not two copies of the same generalization).
     [{gen1, _, _}, {gen2, _, _}] = candidates
     refute gen1.body == gen2.body
+  end
+
+  describe "provenance" do
+    test "every generalized candidate carries :generalized_from provenance pointing at both sources" do
+      rule1 =
+        rule(
+          %FactPattern{
+            predicate: rel("greeted"),
+            args: [RDF.literal("alice"), RDF.literal("hi")]
+          },
+          []
+        )
+
+      rule2 =
+        rule(
+          %FactPattern{predicate: rel("greeted"), args: [RDF.literal("bob"), RDF.literal("hi")]},
+          []
+        )
+
+      assert {:ok, [{generalization, _sub1, _sub2}]} = AntiUnifier.generalize(rule1, rule2)
+      assert generalization.provenance == %Provenance{origin: {:generalized_from, rule1, rule2}}
+    end
   end
 end

@@ -2,7 +2,7 @@ defmodule Riptide.Derivation.DedupGateTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
-  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, Signature}
+  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, RuleRDFCodec, Signature}
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
 
@@ -10,6 +10,20 @@ defmodule Riptide.Derivation.DedupGateTest do
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
+
+  # A ground CapabilityReference's `result` is a raw Elixir string by this
+  # codebase's own established convention (matches `Capability.invoke/4`'s
+  # real return type — see `generalization_fidelity_test.exs`'s identical
+  # fixtures). RDF has no primitive distinct from Literal, so once such a
+  # raw string is embedded (via Provenance) in a Rule admitted through the
+  # RDF-backed Catalog, it comes back out as an `RDF.Literal`. Comparing a
+  # post-admission entry against the exact pre-admission in-memory struct
+  # therefore requires round-tripping the expectation through the same
+  # codec Catalog itself uses, not comparing raw structs directly.
+  defp rdf_round_trip(%Rule{} = rule) do
+    {node, graph} = RuleRDFCodec.to_rdf(rule)
+    RuleRDFCodec.from_rdf(node, graph)
+  end
 
   defp context(overrides \\ %{}) do
     Map.merge(
@@ -498,7 +512,8 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       assert :ok == DedupGate.approve_review(scope, scope, node)
 
-      assert {:ok, [{_entry_node, ^generalization}]} = Catalog.list_entries(scope)
+      assert {:ok, [{_entry_node, entry}]} = Catalog.list_entries(scope)
+      assert entry == rdf_round_trip(generalization)
     end
   end
 
@@ -556,8 +571,9 @@ defmodule Riptide.Derivation.DedupGateTest do
       assert :ok == DedupGate.approve_review(target_scope, review_scope, node)
 
       # Admitted into target_scope's Catalog...
+      expected_entry = rdf_round_trip(generalization)
       assert {:ok, target_entries_after} = Catalog.list_entries(target_scope)
-      assert Enum.any?(target_entries_after, fn {_n, rule} -> rule == generalization end)
+      assert Enum.any?(target_entries_after, fn {_n, rule} -> rule == expected_entry end)
 
       # ...and the review resolved in review_scope, not target_scope.
       assert {:ok, []} = Catalog.list_pending_reviews(review_scope)
