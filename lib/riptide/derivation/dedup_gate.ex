@@ -151,15 +151,15 @@ defmodule Riptide.Derivation.DedupGate do
           | {:fidelity_failed, [PendingReview.fidelity_evidence()]}
           | {:queued, RDF.BlankNode.t(), PendingReview.kind()}
 
-  @spec propose(Catalog.scope(), candidates(), RDF.Graph.t(), Context.t()) ::
+  @spec propose(Catalog.scope(), Catalog.scope(), candidates(), RDF.Graph.t(), Context.t()) ::
           {:ok, [outcome()]} | {:error, term()}
-  def propose(scope, candidates, graph, context) do
-    with {:ok, entries} <- Catalog.list_entries(scope) do
-      {:ok, Enum.map(candidates, &propose_one(scope, &1, entries, graph, context))}
+  def propose(target_scope, review_scope, candidates, graph, context) do
+    with {:ok, entries} <- Catalog.list_entries(target_scope) do
+      {:ok, Enum.map(candidates, &propose_one(review_scope, &1, entries, graph, context))}
     end
   end
 
-  defp propose_one(scope, {generalization, sub1, sub2}, entries, graph, context) do
+  defp propose_one(review_scope, {generalization, sub1, sub2}, entries, graph, context) do
     trace1 = AntiUnifier.substitute(generalization, sub1)
     trace2 = AntiUnifier.substitute(generalization, sub2)
 
@@ -168,11 +168,29 @@ defmodule Riptide.Derivation.DedupGate do
         {:rejected, reason}
 
       {kind, replaces} ->
-        finish_proposal(scope, generalization, kind, replaces, trace1, trace2, graph, context)
+        finish_proposal(
+          review_scope,
+          generalization,
+          kind,
+          replaces,
+          trace1,
+          trace2,
+          graph,
+          context
+        )
     end
   end
 
-  defp finish_proposal(scope, generalization, kind, replaces, trace1, trace2, graph, context) do
+  defp finish_proposal(
+         review_scope,
+         generalization,
+         kind,
+         replaces,
+         trace1,
+         trace2,
+         graph,
+         context
+       ) do
     case fidelity_evidence(trace1, trace2, graph, context) do
       {:ok, evidence} ->
         pending_review = %PendingReview{
@@ -182,7 +200,7 @@ defmodule Riptide.Derivation.DedupGate do
           replaces: replaces
         }
 
-        {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+        {:ok, node} = Catalog.queue_pending_review(review_scope, pending_review)
         {:queued, node, kind}
 
       {:error, evidence} ->
@@ -237,26 +255,37 @@ defmodule Riptide.Derivation.DedupGate do
   defp normalize_fidelity_result({:ok, {:fidelity_fail, reason}}), do: {:fidelity_fail, reason}
   defp normalize_fidelity_result({:error, reason}), do: {:fidelity_fail, reason}
 
-  @spec approve_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
-  def approve_review(scope, node) do
-    with {:ok, pending_reviews} <- Catalog.list_pending_reviews(scope),
+  @spec approve_review(Catalog.scope(), Catalog.scope(), RDF.BlankNode.t()) ::
+          :ok | {:error, term()}
+  def approve_review(target_scope, review_scope, node) do
+    with {:ok, pending_reviews} <- Catalog.list_pending_reviews(review_scope),
          {_node, pending_review} <- List.keyfind(pending_reviews, node, 0, :not_found) do
-      apply_approved(scope, node, pending_review)
+      apply_approved(target_scope, review_scope, node, pending_review)
     else
       :not_found -> {:error, :not_found}
       error -> error
     end
   end
 
-  defp apply_approved(scope, node, %PendingReview{kind: :admit} = pending_review) do
-    :ok = Catalog.admit_entry(scope, pending_review.candidate, nil)
-    Catalog.resolve_pending_review(scope, node, :approved)
+  defp apply_approved(
+         target_scope,
+         review_scope,
+         node,
+         %PendingReview{kind: :admit} = pending_review
+       ) do
+    :ok = Catalog.admit_entry(target_scope, pending_review.candidate, nil)
+    Catalog.resolve_pending_review(review_scope, node, :approved)
   end
 
-  defp apply_approved(scope, node, %PendingReview{kind: :merge} = pending_review) do
-    :ok = Catalog.admit_entry(scope, pending_review.candidate, pending_review.replaces)
-    :ok = Catalog.supersede_entry(scope, pending_review.replaces)
-    Catalog.resolve_pending_review(scope, node, :approved)
+  defp apply_approved(
+         target_scope,
+         review_scope,
+         node,
+         %PendingReview{kind: :merge} = pending_review
+       ) do
+    :ok = Catalog.admit_entry(target_scope, pending_review.candidate, pending_review.replaces)
+    :ok = Catalog.supersede_entry(target_scope, pending_review.replaces)
+    Catalog.resolve_pending_review(review_scope, node, :approved)
   end
 
   @spec decline_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}

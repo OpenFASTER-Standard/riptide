@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6c-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; recursion and fixpoint evaluation) — 8 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation) — 7 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -819,6 +819,90 @@ with no central reviewer as a safety net, a Tenant's own mandatory human review 
 **Status**: Phase 6h-i shipped 2026-08-29. 9 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
 
+### 6h-ii — Pattern Hub deployment
+
+Consumes 6h-i's threat model plus 6e-iii's DedupGate and 6g-i's Discovery; unblocks 6i. **Shipped
+2026-08-29** — see `docs/superpowers/specs/2026-08-29-phase-6h-ii-pattern-hub-deployment-design.md`.
+Stands up the Pattern Hub as a real, network-publicly-reachable HTTP surface for the first time.
+
+Route topology splits by shape rather than by a single top-level namespace: tenant-less reads
+(`GET /hub/search`, `GET /hub/entries/:node_id`, optional auth via the existing `Authenticate`
+plug unmodified) and tenant-scoped writes (`POST /tenants/:tenant_id/hub/propose`,
+`.../pending-reviews/:node_id/approve`, `.../decline`), the latter reusing the exact existing
+`[:api, :tenant, :auth, :authz]` pipeline unchanged — zero new auth-plug logic anywhere, matching
+6h-i's own requirement. `DedupGate.propose/4`/`approve_review/2` widened to `propose/5`/
+`approve_review/3`, splitting the single `scope` argument into `target_scope` (which Catalog to
+classify/admit against) and `review_scope` (whose pending-review stream owns the review) — a
+pure, backward-compatible signature widening; every pre-existing caller has
+`target_scope == review_scope`. Publishing to Hub is the *same* `propose/5` call as a Tenant's
+own Tenant-scope proposal, made at the same moment with the same fresh candidates
+(`target_scope: :hub`, `review_scope: {:tenant, tenant_id}`) — not a later "share my already-
+admitted entry" action, which would have needed retaining substitutions `PendingReview` doesn't
+carry. `decline_review/2`'s own signature stayed unchanged (it only ever touched the review
+scope, never the Catalog target). `ProposeController` is scoped to fact-pattern-only candidates
+(no `CapabilityReference`/`RuleReference` literals) — a real, previously-unaddressed gap surfaced
+during design: no Capability registry exists anywhere in the project, so `DedupGate`'s fidelity
+replay-testing has no safe way to resolve `context.capabilities` from a network request (a
+caller-supplied `Capability.Definition.component` would be an arbitrary-file-execution risk).
+Full Install (Crosswalk-aware field binding) stays explicitly deferred to 6i, per the exit
+criterion's own literal wording.
+
+Three real, pre-existing bugs found and fixed along the way, all invisible until this phase made
+`:hub` a genuinely long-lived, repeatedly-read/written stream for the first time (every prior use
+of `:hub` — including 6e-iii's own Catalog tests — created and destroyed it within one isolated
+test, never exercising it the way a real, growing Hub Catalog behaves):
+
+1. `Riptide.RaTestHelpers.cleanup_stream/1` (`RaCluster.force_delete/1`) force-deletes the entire
+   underlying Ra server for a stream_id — safe for a `unique_tenant()`-scoped stream nobody else
+   touches, but confirmed live to race a subsequent write against the *same* stream_id (a
+   `:noproc` before the lazily-recreated server catches up) when called on `:hub`, which is
+   shared and non-unique. Fixed by no longer force-deleting `:hub` from any test (it already
+   tolerates accumulation — that's why `catalog_test.exs`'s own "Hub vs. Tenant scope isolation"
+   test asserts via `Enum.any?`/`refute Enum.any?` rather than an exact list).
+2. `Riptide.RaCluster.process_command/2`/`consistent_query/2`/`local_query/2` raised immediately
+   on any transient failure — a gap the code's own comment had flagged as needed "once the
+   Clustering/HA sub-project adds multi-node membership" (already shipped, phase 3c) but never
+   implemented. Fixed with a bounded retry (50 attempts, 100ms backoff, matching this file's own
+   `retry_cluster_change/2` precedent) on `{:error, :noproc}`/`:nodedown`/`:shutdown`, the
+   already-flagged `{:timeout, _}`, and the raw `:exit` `catch` clause; any other, non-transient
+   `{:error, reason}` still raises immediately, unretried. General `RaCluster` fix, not
+   Hub-specific — protects every caller of these three functions.
+
+3. A third, deeper bug the retry above did *not* fix on its own: `:ra` 2.15.4's own
+   `apply_consistent_queries_effects/2` (`true = LastApplied >= ReadCommitIndex`) can fail its
+   internal assertion and crash the *entire* `gen_statem` process backing a stream's Ra server —
+   root-caused precisely via the actual crash reports in a failing CI run's log
+   (`gen_statem ... terminating`, `** (stop) {:EXIT, {{:badmatch, false}, ...}}`), confirmed to
+   happen asynchronously inside `ra_server_proc`'s own leader-loop processing, independent of any
+   specific caller — not something a caller-side retry, however large, can ride out. Once that
+   happens, nothing else recovers it on its own: `Riptide.Stream.Placement`'s cache
+   (`server_ids!/1`) is a pure ETS read, never invalidated, so every subsequent caller keeps being
+   handed the now-dead registration; `Riptide.Stream.ReplicaHealer`'s repair is replace-based
+   (swap a dead member for a *different* live node) and `pick_replacement/2` always excludes the
+   dead member's own node from candidacy, so it's a no-op for a single-member (`RF=1`, this test
+   environment's `:hub`) cluster's own only member dying — there's no spare node to promote.
+   Fixed with a new `RaCluster.restart_server/1` (`:ra.restart_server/2` — recovers a crashed
+   server in place from its own durable log, unlike `start_or_join_replicated/3` which forms a
+   brand-new cluster or `replace_member/5` which needs surviving *other* members to agree to a
+   membership change) wired into `StreamServer`'s existing last-replica fallback: once every
+   replica in a stream's list has been tried and the last one's failure survives
+   `RaCluster`'s own transient retry, attempt a same-node restart-in-place once, then retry the
+   original call once more (itself get its own full retry budget, covering the brief window a
+   freshly-restarted server needs to re-elect itself leader) before finally letting a genuine
+   failure propagate uncaught. Not Hub-specific — every stream was exposed to this crash class,
+   `:hub` just made it visible first by being the first stream kept alive and repeatedly
+   read/written across a whole realistic session (every prior use of `:hub`, and every other
+   stream in the existing suite, was always short-lived/isolated per test, so a mid-session server
+   crash had no chance to matter before). Evidence: reproduced live via 2 of 3 consecutive CI runs
+   on this PR failing with exactly this crash before the fix, then 3 consecutive full local-suite
+   runs with zero Hub-related failures after it (the only failures across those 3 runs were
+   different, already-flaky, unrelated pre-existing tests — `SseControllerTest`/
+   `ReplicationChannelTest`'s own documented rate-limit boundary flake, and one `ResourceControllerTest`
+   placement-assignment flake).
+
+**Status**: Phase 6h-ii shipped 2026-08-29. 8 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
 ### 6c-ii — Recursion and fixpoint evaluation
 
 Track B's first link (§7 of the design spec) — pure query capability, parallel to Track A's
@@ -850,5 +934,5 @@ proving the algorithm generalizes to any ruleset shape rather than just single-p
 self-recursion — both non-trivial numeric traces confirmed directly via real evaluation before
 being written into the test suite, not just reasoned about.
 
-**Status**: Phase 6c-ii shipped 2026-08-30. 8 phases remaining across the primary spine, the
+**Status**: Phase 6c-ii shipped 2026-08-30. 7 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.

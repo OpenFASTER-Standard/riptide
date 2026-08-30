@@ -97,7 +97,7 @@ defmodule Riptide.Stream.StreamServer do
     try_server_ids(Placement.server_ids!(stream_id), fun)
   end
 
-  defp try_server_ids([server_id], fun), do: fun.(server_id)
+  defp try_server_ids([server_id], fun), do: try_last_server_id(server_id, fun)
 
   defp try_server_ids([server_id | rest], fun) do
     fun.(server_id)
@@ -105,6 +105,38 @@ defmodule Riptide.Stream.StreamServer do
     _ -> try_server_ids(rest, fun)
   catch
     :exit, _ -> try_server_ids(rest, fun)
+  end
+
+  # By the time RaCluster.process_command/2's own transient-retry budget
+  # (50 attempts, 100ms backoff) is exhausted, a failure here is genuinely
+  # persistent — not a quick blip. For a stream's LAST remaining replica
+  # (the only case reached, since every earlier replica in the list already
+  # falls through to the next one on any failure), that can mean the
+  # server's own `gen_statem` process crashed outright and unregistered
+  # (confirmed live: `:ra`'s own `apply_consistent_queries_effects/2` can
+  # fail an internal assertion and take the whole process down) — with no
+  # automatic recovery otherwise: `Riptide.Stream.Placement`'s cache is
+  # never invalidated, and `Riptide.Stream.ReplicaHealer`'s replace-based
+  # repair can't help a lone replica dying on its own (only) node
+  # (`pick_replacement/2` always excludes the dead member's own node from
+  # candidacy). `RaCluster.restart_server/1` recovers the crashed process
+  # in place from its own durable log — safe to attempt unconditionally
+  # here even if the real cause was something else, since restarting an
+  # already-running server is a documented no-op. One retry after that,
+  # then genuinely give up (uncaught) — matching try_server_ids/2's own
+  # "a fully-down stream cluster is not something to paper over" contract.
+  @spec try_last_server_id(:ra.server_id(), (:ra.server_id() -> term())) :: term()
+  defp try_last_server_id(server_id, fun) do
+    fun.(server_id)
+  rescue
+    _ -> restart_and_retry(server_id, fun)
+  catch
+    :exit, _ -> restart_and_retry(server_id, fun)
+  end
+
+  defp restart_and_retry(server_id, fun) do
+    _ = RaCluster.restart_server(server_id)
+    fun.(server_id)
   end
 
   # Bridges a liveness gap that only exists because `Placement.ensure_started/2`

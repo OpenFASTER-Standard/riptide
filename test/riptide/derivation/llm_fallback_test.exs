@@ -279,9 +279,10 @@ defmodule Riptide.Derivation.LLMFallbackTest do
 
       assert {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
 
-      assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
+      assert {:ok, [{:queued, node, :admit}]} =
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
 
-      assert :ok == DedupGate.approve_review(scope, node)
+      assert :ok == DedupGate.approve_review(scope, scope, node)
 
       assert {:ok, [{_entry_node, _rule}]} = Catalog.list_entries(scope)
     end
