@@ -8,7 +8,16 @@ defmodule Riptide.Derivation.Catalog do
   §4.
   """
 
-  alias Riptide.Derivation.{DedupGate, Matcher, Rule, RuleRDFCodec, Var}
+  alias Riptide.Derivation.{
+    Crosswalk,
+    CrosswalkRDFCodec,
+    DedupGate,
+    Matcher,
+    Rule,
+    RuleRDFCodec,
+    Var
+  }
+
   alias Riptide.Derivation.Literal.FactPattern
   alias Riptide.Event
   alias Riptide.Placement
@@ -20,6 +29,7 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_catalog_entry RDF.iri("urn:riptide:vocab:CatalogEntry")
   @riptide_superseded_catalog_entry RDF.iri("urn:riptide:vocab:SupersededCatalogEntry")
   @riptide_supersedes RDF.iri("urn:riptide:vocab:supersedes")
+  @riptide_crosswalk RDF.iri("urn:riptide:vocab:Crosswalk")
 
   @type scope :: {:tenant, String.t()} | :hub
 
@@ -31,6 +41,9 @@ defmodule Riptide.Derivation.Catalog do
 
   @spec pending_review_stream_id(scope()) :: String.t()
   def pending_review_stream_id(scope), do: catalog_stream_id(scope) <> "/pending-review"
+
+  @spec crosswalk_stream_id() :: String.t()
+  def crosswalk_stream_id, do: catalog_stream_id(:hub) <> "/crosswalks"
 
   @spec list_entries(scope()) :: {:ok, [{RDF.BlankNode.t(), Rule.t()}]} | {:error, :not_ready}
   def list_entries(scope) do
@@ -64,6 +77,20 @@ defmodule Riptide.Derivation.Catalog do
       [{node, @rdf_type, @riptide_superseded_catalog_entry}],
       [{node, @rdf_type, @riptide_catalog_entry}]
     )
+  end
+
+  @spec admit_crosswalk(Crosswalk.t()) :: :ok | {:error, :not_ready}
+  def admit_crosswalk(%Crosswalk{} = crosswalk) do
+    {_node, crosswalk_graph} = CrosswalkRDFCodec.to_rdf(crosswalk)
+    write_patch(crosswalk_stream_id(), RDF.Graph.triples(crosswalk_graph), [])
+  end
+
+  @spec list_crosswalks() :: {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
+  def list_crosswalks do
+    with {:ok, graph} <- read_graph(crosswalk_stream_id()) do
+      nodes = nodes_of_type(graph, @riptide_crosswalk)
+      {:ok, Enum.map(nodes, &{&1, CrosswalkRDFCodec.from_rdf(&1, graph)})}
+    end
   end
 
   defp nodes_of_type(graph, type_iri) do

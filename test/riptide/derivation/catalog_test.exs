@@ -2,6 +2,7 @@ defmodule Riptide.Derivation.CatalogTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Derivation.Catalog
+  alias Riptide.Derivation.Crosswalk
   alias Riptide.Derivation.DedupGate.PendingReview
   alias Riptide.Derivation.Literal.FactPattern
   alias Riptide.Derivation.{Rule, Signature}
@@ -181,6 +182,23 @@ defmodule Riptide.Derivation.CatalogTest do
       assert {:ok, hub_entries} = Catalog.list_entries(:hub)
       assert Enum.any?(hub_entries, fn {_node, rule} -> rule == hub_rule end)
       refute Enum.any?(hub_entries, fn {_node, rule} -> rule == tenant_rule end)
+    end
+  end
+
+  describe "admit_crosswalk/1 + list_crosswalks/0 — real round-trip" do
+    test "an admitted Crosswalk is found live by list_crosswalks/0" do
+      crosswalk = %Crosswalk{
+        subject_predicate:
+          rel("crosswalktest-pendingDeploy#{System.unique_integer([:positive])}"),
+        object_predicate:
+          rel("crosswalktest-deploymentQueued#{System.unique_integer([:positive])}"),
+        match_type: :exact_match
+      }
+
+      :ok = Catalog.admit_crosswalk(crosswalk)
+
+      assert {:ok, entries} = Catalog.list_crosswalks()
+      assert Enum.any?(entries, fn {_node, entry} -> entry == crosswalk end)
     end
   end
 end
