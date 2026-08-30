@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-29
+**Last updated:** 2026-08-30
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment) — 8 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation) — 7 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -901,4 +901,38 @@ test, never exercising it the way a real, growing Hub Catalog behaves):
    placement-assignment flake).
 
 **Status**: Phase 6h-ii shipped 2026-08-29. 8 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6c-ii — Recursion and fixpoint evaluation
+
+Track B's first link (§7 of the design spec) — pure query capability, parallel to Track A's
+spine and left completely untouched until this phase. **Shipped 2026-08-30** — see
+`docs/superpowers/specs/2026-08-30-phase-6c-ii-recursion-fixpoint-design.md`.
+
+New `Riptide.Derivation.QueryInterpreter.evaluate/3` — naive bottom-up fixpoint evaluation over
+a ruleset (a list of Rules, e.g. a base clause plus a recursive clause sharing one head
+predicate), the first piece of "QueryInterpretation proper" beyond `Matcher` (whose own
+moduledoc already called itself "the fact-pattern-only fragment of QueryInterpretation").
+`Matcher.evaluate/2` stays completely unchanged; `QueryInterpreter` composes it once per round,
+merging newly-derived triples into the graph until a round adds nothing new. Semi-naive
+evaluation (Soufflé's delta-restricted-join technique, design spec §8.8) was explicitly deferred
+as a future optimization — naive evaluation is simpler, more directly provably correct via the
+classical Van Emden–Kowalski least-fixpoint construction, and sufficient for this phase's own
+correctness-focused exit criterion. The exit criterion's own "documented stratification/
+termination discipline" turned out to be mostly a documentation exercise rather than new code:
+no literal type in this codebase expresses negation (`FactPattern`, `CapabilityReference`,
+`RuleReference` — none of them), so every rule is monotonic by construction and a single
+evaluation stratum always suffices, with nothing to validate at runtime; termination is
+guaranteed by a finite Herbrand universe, since fact-pattern-only rules never synthesize new
+constants. A configurable `max_iterations`/`max_fact_count` safety bound (via
+`Application.get_env(:riptide, :query_interpreter_max_iterations/:query_interpreter_max_fact_count, ...)`,
+mirroring `Riptide.NewStreamRateLimit`'s own config-with-default-fallback shape) guards against a
+large or adversarial ruleset as defense-in-depth on top of that classical guarantee. Verified
+against a transitive-closure ruleset (the exit criterion's own example) and, separately, a
+mutual-recursion ruleset across two distinct head predicates (even/odd via a successor chain),
+proving the algorithm generalizes to any ruleset shape rather than just single-predicate
+self-recursion — both non-trivial numeric traces confirmed directly via real evaluation before
+being written into the test suite, not just reasoned about.
+
+**Status**: Phase 6c-ii shipped 2026-08-30. 7 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
