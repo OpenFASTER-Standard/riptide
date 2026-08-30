@@ -31,6 +31,7 @@ defmodule Riptide.Application do
         {Phoenix.PubSub, name: Riptide.PubSub},
         Riptide.Telemetry,
         Riptide.NewStreamRateLimit,
+        Riptide.HubRateLimit,
         {Plug.Cowboy, scheme: :http, plug: RiptideWeb.MetricsEndpoint, options: [port: 9090]},
         Riptide.Stream.Placement,
         Riptide.SupervisedProcess.SessionTracker,

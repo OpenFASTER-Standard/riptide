@@ -223,8 +223,11 @@ defmodule Riptide.Derivation.DiscoveryTest do
       assert {:ok, trace2} = LLMFallback.run("greet Bob", graph, ctx)
 
       assert {:ok, candidates} = AntiUnifier.generalize(trace1, trace2)
-      assert {:ok, [{:queued, node, :admit}]} = DedupGate.propose(scope, candidates, graph, ctx)
-      assert :ok == DedupGate.approve_review(scope, node)
+
+      assert {:ok, [{:queued, node, :admit}]} =
+               DedupGate.propose(scope, scope, candidates, graph, ctx)
+
+      assert :ok == DedupGate.approve_review(scope, scope, node)
 
       # Third occurrence: found via Discovery's keyword path ("greet" is not
       # among the found entry's own predicate words — pending/deploy/has/name

@@ -37,6 +37,13 @@ defmodule RiptideWeb.Router do
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end
 
+  scope "/hub" do
+    pipe_through [:api, :auth]
+
+    get "/search", RiptideWeb.Hub.DiscoveryController, :search
+    get "/entries/:node_id", RiptideWeb.Hub.DiscoveryController, :show
+  end
+
   scope "/tenants/:tenant_id" do
     pipe_through [:api, :tenant, :auth, :authz]
 
@@ -48,5 +55,9 @@ defmodule RiptideWeb.Router do
 
     post "/policies", RiptideWeb.Authz.PolicyController, :create
     get "/policies", RiptideWeb.Authz.PolicyController, :index
+
+    post "/hub/propose", RiptideWeb.Hub.ProposeController, :propose
+    post "/hub/pending-reviews/:node_id/approve", RiptideWeb.Hub.ReviewController, :approve
+    post "/hub/pending-reviews/:node_id/decline", RiptideWeb.Hub.ReviewController, :decline
   end
 end
