@@ -30,6 +30,10 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_superseded_catalog_entry RDF.iri("urn:riptide:vocab:SupersededCatalogEntry")
   @riptide_supersedes RDF.iri("urn:riptide:vocab:supersedes")
   @riptide_crosswalk RDF.iri("urn:riptide:vocab:Crosswalk")
+  @riptide_pending_crosswalk_review RDF.iri("urn:riptide:vocab:PendingCrosswalkReview")
+  @riptide_resolved_pending_crosswalk_review RDF.iri(
+                                               "urn:riptide:vocab:ResolvedPendingCrosswalkReview"
+                                             )
 
   @type scope :: {:tenant, String.t()} | :hub
 
@@ -91,6 +95,36 @@ defmodule Riptide.Derivation.Catalog do
       nodes = nodes_of_type(graph, @riptide_crosswalk)
       {:ok, Enum.map(nodes, &{&1, CrosswalkRDFCodec.from_rdf(&1, graph)})}
     end
+  end
+
+  @spec queue_crosswalk_review(scope(), DedupGate.PendingCrosswalkReview.t()) ::
+          {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
+  def queue_crosswalk_review(scope, %DedupGate.PendingCrosswalkReview{} = pending) do
+    {node, graph} = DedupGate.PendingCrosswalkReview.to_rdf(pending)
+
+    case write_patch(pending_review_stream_id(scope), RDF.Graph.triples(graph), []) do
+      :ok -> {:ok, node}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec list_crosswalk_pending_reviews(scope()) ::
+          {:ok, [{RDF.BlankNode.t(), DedupGate.PendingCrosswalkReview.t()}]}
+          | {:error, :not_ready}
+  def list_crosswalk_pending_reviews(scope) do
+    with {:ok, graph} <- read_graph(pending_review_stream_id(scope)) do
+      nodes = nodes_of_type(graph, @riptide_pending_crosswalk_review)
+      {:ok, Enum.map(nodes, &{&1, DedupGate.PendingCrosswalkReview.from_rdf(&1, graph)})}
+    end
+  end
+
+  @spec resolve_crosswalk_review(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def resolve_crosswalk_review(scope, node) do
+    write_patch(
+      pending_review_stream_id(scope),
+      [{node, @rdf_type, @riptide_resolved_pending_crosswalk_review}],
+      [{node, @rdf_type, @riptide_pending_crosswalk_review}]
+    )
   end
 
   defp nodes_of_type(graph, type_iri) do

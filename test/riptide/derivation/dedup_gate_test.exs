@@ -6,6 +6,7 @@ defmodule Riptide.Derivation.DedupGateTest do
   alias Riptide.Derivation.{
     AntiUnifier,
     Catalog,
+    Crosswalk,
     DedupGate,
     Provenance,
     Rule,
@@ -13,7 +14,7 @@ defmodule Riptide.Derivation.DedupGateTest do
     Signature
   }
 
-  alias Riptide.Derivation.DedupGate.PendingReview
+  alias Riptide.Derivation.DedupGate.{PendingCrosswalkReview, PendingReview}
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
 
@@ -656,6 +657,72 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       assert {:ok, {:rejected, :already_covered}} =
                DedupGate.propose_install(target_scope, target_scope, installed_rule)
+    end
+  end
+
+  describe "PendingCrosswalkReview round-trip" do
+    test "round-trips through Catalog.queue_crosswalk_review/1 + list_crosswalk_pending_reviews/0" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      pending = %PendingCrosswalkReview{
+        candidate: %Crosswalk{
+          subject_predicate: rel("crosswalkreview-a#{System.unique_integer([:positive])}"),
+          object_predicate: rel("crosswalkreview-b#{System.unique_integer([:positive])}"),
+          match_type: :exact_match
+        }
+      }
+
+      {:ok, node} = Catalog.queue_crosswalk_review(review_scope, pending)
+      assert {:ok, entries} = Catalog.list_crosswalk_pending_reviews(review_scope)
+      assert Enum.any?(entries, fn {n, p} -> n == node and p == pending end)
+    end
+  end
+
+  describe "propose_crosswalk/2 + approve_crosswalk_review/1 + decline_crosswalk_review/1" do
+    test "a proposed Crosswalk is queued, then approval admits it to the Hub crosswalk catalog" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      crosswalk = %Crosswalk{
+        subject_predicate: rel("crosswalkpropose-a#{System.unique_integer([:positive])}"),
+        object_predicate: rel("crosswalkpropose-b#{System.unique_integer([:positive])}"),
+        match_type: :close_match
+      }
+
+      assert {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      assert :ok == DedupGate.approve_crosswalk_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_crosswalks()
+      assert Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
+
+      assert {:ok, []} = Catalog.list_crosswalk_pending_reviews(review_scope)
+    end
+
+    test "declining a proposed Crosswalk resolves the review and admits nothing" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      crosswalk = %Crosswalk{
+        subject_predicate: rel("crosswalkdecline-a#{System.unique_integer([:positive])}"),
+        object_predicate: rel("crosswalkdecline-b#{System.unique_integer([:positive])}"),
+        match_type: :broad_match
+      }
+
+      {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      assert :ok == DedupGate.decline_crosswalk_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_crosswalks()
+      refute Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
     end
   end
 end
