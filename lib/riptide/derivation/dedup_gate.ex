@@ -17,7 +17,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
   @type t :: %__MODULE__{
           kind: kind(),
           candidate: Rule.t(),
-          fidelity_evidence: [fidelity_evidence()],
+          fidelity_evidence: [fidelity_evidence()] | :not_applicable,
           replaces: RDF.BlankNode.t() | nil
         }
 
@@ -26,6 +26,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
   @riptide_kind RDF.iri("urn:riptide:vocab:kind")
   @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
   @riptide_fidelity_evidence RDF.iri("urn:riptide:vocab:fidelityEvidence")
+  @riptide_fidelity_not_applicable RDF.iri("urn:riptide:vocab:FidelityNotApplicable")
   @riptide_fidelity_status RDF.iri("urn:riptide:vocab:fidelityStatus")
   @riptide_fidelity_reason RDF.iri("urn:riptide:vocab:fidelityReason")
   @riptide_replaces RDF.iri("urn:riptide:vocab:replaces")
@@ -54,6 +55,11 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
 
   defp maybe_add_replaces(graph, node, replaces),
     do: RDF.Graph.add(graph, {node, @riptide_replaces, replaces})
+
+  defp encode_evidence(:not_applicable) do
+    node = RDF.BlankNode.new()
+    {node, RDF.Graph.new() |> RDF.Graph.add({node, @rdf_type, @riptide_fidelity_not_applicable})}
+  end
 
   defp encode_evidence(evidence_list) do
     {nodes, graph} =
@@ -101,11 +107,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
     candidate_node = RDF.Description.first(description, @riptide_candidate)
     candidate = RuleRDFCodec.from_rdf(candidate_node, graph)
     evidence_head = RDF.Description.first(description, @riptide_fidelity_evidence)
-
-    fidelity_evidence =
-      RDF.List.new(evidence_head, graph)
-      |> RDF.List.values()
-      |> Enum.map(&decode_one_evidence(&1, graph))
+    fidelity_evidence = decode_evidence(evidence_head, graph)
 
     replaces = RDF.Description.first(description, @riptide_replaces)
 
@@ -115,6 +117,20 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
       fidelity_evidence: fidelity_evidence,
       replaces: replaces
     }
+  end
+
+  defp decode_evidence(node, graph) do
+    description = RDF.Graph.get(graph, node)
+
+    case RDF.Description.first(description, @rdf_type) do
+      @riptide_fidelity_not_applicable ->
+        :not_applicable
+
+      _other ->
+        RDF.List.new(node, graph)
+        |> RDF.List.values()
+        |> Enum.map(&decode_one_evidence(&1, graph))
+    end
   end
 
   defp decode_one_evidence(node, graph) do
@@ -134,6 +150,49 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
   end
 end
 
+defmodule Riptide.Derivation.DedupGate.PendingCrosswalkReview do
+  @moduledoc """
+  A proposed Crosswalk awaiting the proposing Tenant's own review (design
+  spec `docs/superpowers/specs/2026-08-30-phase-6i-crosswalks-and-installation-design.md`
+  §6). Deliberately much simpler than `PendingReview` — a Crosswalk has no
+  `kind`/`replaces` (no Reject/Merge/Admit classification against existing
+  Crosswalks; out of scope, spec §3) and no fidelity evidence (never
+  applicable to a Crosswalk in the first place, same reasoning as
+  `PendingReview.fidelity_evidence`'s own `:not_applicable` case).
+  """
+
+  alias Riptide.Derivation.{Crosswalk, CrosswalkRDFCodec}
+
+  @enforce_keys [:candidate]
+  defstruct [:candidate]
+
+  @type t :: %__MODULE__{candidate: Crosswalk.t()}
+
+  @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+  @riptide_pending_crosswalk_review RDF.iri("urn:riptide:vocab:PendingCrosswalkReview")
+  @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
+
+  @spec to_rdf(t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
+  def to_rdf(%__MODULE__{candidate: candidate}) do
+    node = RDF.BlankNode.new()
+    {candidate_node, candidate_graph} = CrosswalkRDFCodec.to_rdf(candidate)
+
+    graph =
+      candidate_graph
+      |> RDF.Graph.add({node, @rdf_type, @riptide_pending_crosswalk_review})
+      |> RDF.Graph.add({node, @riptide_candidate, candidate_node})
+
+    {node, graph}
+  end
+
+  @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: t()
+  def from_rdf(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    candidate_node = RDF.Description.first(description, @riptide_candidate)
+    %__MODULE__{candidate: CrosswalkRDFCodec.from_rdf(candidate_node, graph)}
+  end
+end
+
 defmodule Riptide.Derivation.DedupGate do
   @moduledoc """
   Catalog lookup, the `Reject`/`Merge`/`Admit` decision, and the human
@@ -141,8 +200,8 @@ defmodule Riptide.Derivation.DedupGate do
   `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
   """
 
-  alias Riptide.Derivation.{AntiUnifier, Catalog, GeneralizationFidelity, Rule, Var}
-  alias Riptide.Derivation.DedupGate.PendingReview
+  alias Riptide.Derivation.{AntiUnifier, Catalog, Crosswalk, GeneralizationFidelity, Rule, Var}
+  alias Riptide.Derivation.DedupGate.{PendingCrosswalkReview, PendingReview}
   alias Riptide.Derivation.ExecuteInterpreter.Context
 
   @type candidates :: [{Rule.t(), AntiUnifier.substitution(), AntiUnifier.substitution()}]
@@ -207,6 +266,50 @@ defmodule Riptide.Derivation.DedupGate do
         {:fidelity_failed, evidence}
     end
   end
+
+  @spec propose_install(Catalog.scope(), Catalog.scope(), Rule.t()) ::
+          {:ok, outcome()} | {:error, term()}
+  def propose_install(target_scope, review_scope, %Rule{} = installed_rule) do
+    with {:ok, entries} <- Catalog.list_entries(target_scope) do
+      case classify(installed_rule, entries) do
+        {:reject, reason} ->
+          {:ok, {:rejected, reason}}
+
+        {kind, replaces} ->
+          pending_review = %PendingReview{
+            kind: kind,
+            candidate: installed_rule,
+            fidelity_evidence: :not_applicable,
+            replaces: replaces
+          }
+
+          {:ok, node} = Catalog.queue_pending_review(review_scope, pending_review)
+          {:ok, {:queued, node, kind}}
+      end
+    end
+  end
+
+  @spec propose_crosswalk(Catalog.scope(), Crosswalk.t()) ::
+          {:ok, RDF.BlankNode.t()} | {:error, term()}
+  def propose_crosswalk(review_scope, %Crosswalk{} = crosswalk) do
+    Catalog.queue_crosswalk_review(review_scope, %PendingCrosswalkReview{candidate: crosswalk})
+  end
+
+  @spec approve_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def approve_crosswalk_review(review_scope, node) do
+    with {:ok, pending_reviews} <- Catalog.list_crosswalk_pending_reviews(review_scope),
+         {_node, pending} <- List.keyfind(pending_reviews, node, 0, :not_found) do
+      :ok = Catalog.admit_crosswalk(pending.candidate)
+      Catalog.resolve_crosswalk_review(review_scope, node)
+    else
+      :not_found -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  @spec decline_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def decline_crosswalk_review(review_scope, node),
+    do: Catalog.resolve_crosswalk_review(review_scope, node)
 
   defp classify(candidate, entries) do
     matching =

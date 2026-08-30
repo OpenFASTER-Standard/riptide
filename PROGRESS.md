@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation) — 7 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation) — 6 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -935,4 +935,67 @@ self-recursion — both non-trivial numeric traces confirmed directly via real e
 being written into the test suite, not just reasoned about.
 
 **Status**: Phase 6c-ii shipped 2026-08-30. 7 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6i — Ontology Crosswalks and Installation
+
+Track A's final link — completes the walking-skeleton-to-Hub arc (6h-i → 6h-ii → 6i). **Shipped
+2026-08-30** — see
+`docs/superpowers/specs/2026-08-30-phase-6i-crosswalks-and-installation-design.md`.
+
+Brainstorming for this phase surfaced a genuine, previously-unaddressed gap: the parent spec's §5
+calls `Provenance` "mandatory" for every Generalization, but no shipped phase (6e-i's
+`AntiUnifier`, 6e-ii's fidelity harness, 6e-iii's DedupGate, 6f's LLM fallback, 6g-i's Discovery)
+had ever actually implemented it as concrete data — closed here generally, not narrowly scoped to
+Install: new `Riptide.Derivation.Provenance` (`origin :: {:generalized_from, Rule.t(), Rule.t()}
+| {:installed_from, source_entry, field_bindings}`), threaded through `Rule.t()` and
+`RuleRDFCodec`, retrofitted into `AntiUnifier.generalize/2` (stamps `:generalized_from`) with a
+matching fix to `substitute/2` (now explicitly clears `provenance: nil` on its reconstructed
+output — the struct-update syntax would otherwise have silently carried the *generalization's*
+own provenance onto the *reconstructed trace*).
+
+New `Riptide.Derivation.Crosswalk` — an SSSOM-shaped `{subject_predicate, object_predicate,
+match_type}` mapping between two predicate IRIs, always Hub-scope, reviewed through the exact same
+`DedupGate`/`PendingCrosswalkReview` authority as any other Hub content (a deliberately simpler
+sibling of `PendingReview` — no Reject/Merge/Admit classification, no fidelity evidence).
+
+`Riptide.Derivation.Install.tenant_vocabulary/1` observes (never declares) a Tenant's vocabulary
+as the union of `reads`/`produces` across that Tenant's own admitted Catalog entries.
+`Install.install/3` rewrites a Hub pattern's `FactPattern` predicates through existing Crosswalks
+into the target Tenant's vocabulary where a mapping exists, leaves anything unmatched in the
+pattern's own native form, and stamps `:installed_from` Provenance recording exactly which fields
+were bound how. `DedupGate.propose_install/3` reuses `classify/2` (Reject/Merge/Admit, unchanged)
+but skips fidelity-replay-testing entirely — not an optimization or a redundancy call, but the
+correct behavior for a structural reason found during brainstorming: 6e-ii's fidelity testing only
+ever re-invokes `CapabilityReference` literals or trusts an `ObserveCapability`'s own recorded
+result; it never inspects `FactPattern` predicates, which is the *only* thing Crosswalk rewriting
+touches. Fidelity-replay-testing was never the right tool for this risk in the first place — the
+installing Tenant's own human review (already mandatory for every Admit/Merge) is the correct and
+sufficient safeguard, so `PendingReview.fidelity_evidence` widens to `[fidelity_evidence()] |
+:not_applicable` rather than gaining a parallel, redundant check.
+
+New HTTP surface mirrors 6h-ii's exact `[:api, :tenant, :auth, :authz]` pipeline and JSON response
+shape: `POST /hub/install`, `POST /hub/crosswalks`, plus **dedicated** approve/decline routes for
+both (`/hub/install-reviews/...`, `/hub/crosswalk-reviews/...`) rather than reusing the existing
+`/hub/pending-reviews/...` routes — a design correction made mid-implementation, after the
+capstone test caught that `ReviewController.approve/2` hardcodes `target_scope: :hub` (correct for
+6h-ii's propose-to-Hub, where target_scope is always `:hub`), which would have silently admitted
+an installed, possibly Crosswalk-rewritten, per-Tenant Rule into the *global* Hub Catalog instead
+of the installing Tenant's own; the spec's own §9 was corrected to match before merging.
+
+Two other latent bugs found and fixed along the way, both exposed only because Provenance now
+makes previously-unreachable data shapes reachable: (1) `CrosswalkRDFCodec`'s match-type
+encode/decode relied on `Atom.to_string/1`/`String.to_existing_atom/1` against atoms that appeared
+nowhere as literals in `lib/` (only in `Crosswalk`'s own `@type`, which typespecs don't reliably
+intern at runtime) — a process that never happened to load a test file mentioning those atoms
+would have hit `not_an_existing_atom` on its very first real decode; fixed with explicit
+case-based encode/decode instead, matching `PendingReview`'s own established pattern. (2) A
+pre-existing `dedup_gate_test.exs` fixture (`ground_greet_trace/3`) stored a `CapabilityReference`
+result as a raw Elixir binary rather than an `RDF.Literal` — harmless while Traces were only ever
+compared in-memory, but once Provenance embeds real ground Traces into Catalog-admitted Rules,
+RDF's lack of a distinct "raw string" primitive meant the round-tripped entry no longer matched
+the original by `==`; fixed by round-tripping the test's own expectation through the same codec
+Catalog itself uses, rather than comparing against the pre-storage struct.
+
+**Status**: Phase 6i shipped 2026-08-30. 6 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.

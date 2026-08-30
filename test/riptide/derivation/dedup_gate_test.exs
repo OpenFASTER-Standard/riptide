@@ -2,7 +2,19 @@ defmodule Riptide.Derivation.DedupGateTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
-  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, Signature}
+
+  alias Riptide.Derivation.{
+    AntiUnifier,
+    Catalog,
+    Crosswalk,
+    DedupGate,
+    Provenance,
+    Rule,
+    RuleRDFCodec,
+    Signature
+  }
+
+  alias Riptide.Derivation.DedupGate.{PendingCrosswalkReview, PendingReview}
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
 
@@ -10,6 +22,20 @@ defmodule Riptide.Derivation.DedupGateTest do
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
+
+  # A ground CapabilityReference's `result` is a raw Elixir string by this
+  # codebase's own established convention (matches `Capability.invoke/4`'s
+  # real return type — see `generalization_fidelity_test.exs`'s identical
+  # fixtures). RDF has no primitive distinct from Literal, so once such a
+  # raw string is embedded (via Provenance) in a Rule admitted through the
+  # RDF-backed Catalog, it comes back out as an `RDF.Literal`. Comparing a
+  # post-admission entry against the exact pre-admission in-memory struct
+  # therefore requires round-tripping the expectation through the same
+  # codec Catalog itself uses, not comparing raw structs directly.
+  defp rdf_round_trip(%Rule{} = rule) do
+    {node, graph} = RuleRDFCodec.to_rdf(rule)
+    RuleRDFCodec.from_rdf(node, graph)
+  end
 
   defp context(overrides \\ %{}) do
     Map.merge(
@@ -70,6 +96,20 @@ defmodule Riptide.Derivation.DedupGateTest do
         max_instances: nil,
         max_tables: nil
       }
+    }
+  end
+
+  defp sample_install_candidate do
+    %Rule{
+      signature: %Signature{
+        name: rel("installed"),
+        parameters: [],
+        reads: [],
+        produces: [rel("installed")]
+      },
+      head: %FactPattern{predicate: rel("installed"), args: [t("alice"), RDF.literal("hi")]},
+      body: [],
+      provenance: %Provenance{origin: {:installed_from, RDF.BlankNode.new("hub-entry"), []}}
     }
   end
 
@@ -498,7 +538,8 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       assert :ok == DedupGate.approve_review(scope, scope, node)
 
-      assert {:ok, [{_entry_node, ^generalization}]} = Catalog.list_entries(scope)
+      assert {:ok, [{_entry_node, entry}]} = Catalog.list_entries(scope)
+      assert entry == rdf_round_trip(generalization)
     end
   end
 
@@ -556,11 +597,132 @@ defmodule Riptide.Derivation.DedupGateTest do
       assert :ok == DedupGate.approve_review(target_scope, review_scope, node)
 
       # Admitted into target_scope's Catalog...
+      expected_entry = rdf_round_trip(generalization)
       assert {:ok, target_entries_after} = Catalog.list_entries(target_scope)
-      assert Enum.any?(target_entries_after, fn {_n, rule} -> rule == generalization end)
+      assert Enum.any?(target_entries_after, fn {_n, rule} -> rule == expected_entry end)
 
       # ...and the review resolved in review_scope, not target_scope.
       assert {:ok, []} = Catalog.list_pending_reviews(review_scope)
+    end
+  end
+
+  describe "PendingReview — :not_applicable fidelity_evidence" do
+    test "round-trips through Catalog.queue_pending_review/2 + list_pending_reviews/1" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      pending_review = %PendingReview{
+        kind: :admit,
+        candidate: sample_install_candidate(),
+        fidelity_evidence: :not_applicable,
+        replaces: nil
+      }
+
+      {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+      assert {:ok, [{^node, ^pending_review}]} = Catalog.list_pending_reviews(scope)
+    end
+  end
+
+  describe "propose_install/3" do
+    test "an install candidate against an empty target Catalog is queued as :admit with :not_applicable evidence" do
+      target_scope = unique_tenant()
+      review_scope = target_scope
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      installed_rule = sample_install_candidate()
+
+      assert {:ok, {:queued, node, :admit}} =
+               DedupGate.propose_install(target_scope, review_scope, installed_rule)
+
+      assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(review_scope)
+      assert pending_review.fidelity_evidence == :not_applicable
+      assert pending_review.candidate == installed_rule
+    end
+
+    test "an install candidate already covered by an existing entry is Rejected, no review queued" do
+      target_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(target_scope))
+      end)
+
+      installed_rule = sample_install_candidate()
+      :ok = Catalog.admit_entry(target_scope, installed_rule, nil)
+
+      assert {:ok, {:rejected, :already_covered}} =
+               DedupGate.propose_install(target_scope, target_scope, installed_rule)
+    end
+  end
+
+  describe "PendingCrosswalkReview round-trip" do
+    test "round-trips through Catalog.queue_crosswalk_review/1 + list_crosswalk_pending_reviews/0" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      pending = %PendingCrosswalkReview{
+        candidate: %Crosswalk{
+          subject_predicate: rel("crosswalkreview-a#{System.unique_integer([:positive])}"),
+          object_predicate: rel("crosswalkreview-b#{System.unique_integer([:positive])}"),
+          match_type: :exact_match
+        }
+      }
+
+      {:ok, node} = Catalog.queue_crosswalk_review(review_scope, pending)
+      assert {:ok, entries} = Catalog.list_crosswalk_pending_reviews(review_scope)
+      assert Enum.any?(entries, fn {n, p} -> n == node and p == pending end)
+    end
+  end
+
+  describe "propose_crosswalk/2 + approve_crosswalk_review/1 + decline_crosswalk_review/1" do
+    test "a proposed Crosswalk is queued, then approval admits it to the Hub crosswalk catalog" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      crosswalk = %Crosswalk{
+        subject_predicate: rel("crosswalkpropose-a#{System.unique_integer([:positive])}"),
+        object_predicate: rel("crosswalkpropose-b#{System.unique_integer([:positive])}"),
+        match_type: :close_match
+      }
+
+      assert {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      assert :ok == DedupGate.approve_crosswalk_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_crosswalks()
+      assert Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
+
+      assert {:ok, []} = Catalog.list_crosswalk_pending_reviews(review_scope)
+    end
+
+    test "declining a proposed Crosswalk resolves the review and admits nothing" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      crosswalk = %Crosswalk{
+        subject_predicate: rel("crosswalkdecline-a#{System.unique_integer([:positive])}"),
+        object_predicate: rel("crosswalkdecline-b#{System.unique_integer([:positive])}"),
+        match_type: :broad_match
+      }
+
+      {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      assert :ok == DedupGate.decline_crosswalk_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_crosswalks()
+      refute Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
     end
   end
 end

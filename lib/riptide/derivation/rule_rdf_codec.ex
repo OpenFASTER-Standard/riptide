@@ -13,7 +13,7 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   """
 
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
-  alias Riptide.Derivation.{Rule, Signature, Var}
+  alias Riptide.Derivation.{Provenance, Rule, Signature, Var}
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @sp_triple_pattern RDF.iri("http://spinrdf.org/sp#TriplePattern")
@@ -43,6 +43,18 @@ defmodule Riptide.Derivation.RuleRDFCodec do
   @riptide_name RDF.iri("urn:riptide:vocab:name")
   @riptide_parameters RDF.iri("urn:riptide:vocab:parameters")
 
+  @riptide_provenance RDF.iri("urn:riptide:vocab:provenance")
+  @riptide_generalized_from RDF.iri("urn:riptide:vocab:GeneralizedFrom")
+  @riptide_installed_from RDF.iri("urn:riptide:vocab:InstalledFrom")
+  @riptide_source1 RDF.iri("urn:riptide:vocab:source1")
+  @riptide_source2 RDF.iri("urn:riptide:vocab:source2")
+  @riptide_source_entry RDF.iri("urn:riptide:vocab:sourceEntry")
+  @riptide_field_bindings RDF.iri("urn:riptide:vocab:fieldBindings")
+  @riptide_field_binding RDF.iri("urn:riptide:vocab:FieldBinding")
+  @riptide_binding_predicate RDF.iri("urn:riptide:vocab:bindingPredicate")
+  @riptide_binding_kind RDF.iri("urn:riptide:vocab:bindingKind")
+  @riptide_binding_crosswalk RDF.iri("urn:riptide:vocab:bindingCrosswalk")
+
   @doc "See moduledoc. Returns the Rule's own (blank) node plus the graph fragment reifying it."
   @spec to_rdf(Rule.t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
   def to_rdf(%Rule{} = rule) do
@@ -60,6 +72,80 @@ defmodule Riptide.Derivation.RuleRDFCodec do
       |> RDF.Graph.add({node, @riptide_signature, sig_node})
       |> RDF.Graph.add({node, @riptide_head, head_node})
       |> RDF.Graph.add({node, @riptide_body, body_head})
+      |> maybe_add_provenance(node, rule.provenance)
+
+    {node, graph}
+  end
+
+  defp maybe_add_provenance(graph, _node, nil), do: graph
+
+  defp maybe_add_provenance(graph, node, %Provenance{} = provenance) do
+    {prov_node, prov_graph} = encode_provenance(provenance)
+    graph |> RDF.Graph.add(prov_graph) |> RDF.Graph.add({node, @riptide_provenance, prov_node})
+  end
+
+  defp encode_provenance(%Provenance{origin: {:generalized_from, source1, source2}}) do
+    node = RDF.BlankNode.new()
+    {source1_node, source1_graph} = to_rdf(source1)
+    {source2_node, source2_graph} = to_rdf(source2)
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add(source1_graph)
+      |> RDF.Graph.add(source2_graph)
+      |> RDF.Graph.add({node, @rdf_type, @riptide_generalized_from})
+      |> RDF.Graph.add({node, @riptide_source1, source1_node})
+      |> RDF.Graph.add({node, @riptide_source2, source2_node})
+
+    {node, graph}
+  end
+
+  defp encode_provenance(%Provenance{origin: {:installed_from, source_entry, field_bindings}}) do
+    node = RDF.BlankNode.new()
+    {bindings_head, bindings_graph} = encode_field_bindings(field_bindings)
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add(bindings_graph)
+      |> RDF.Graph.add({node, @rdf_type, @riptide_installed_from})
+      |> RDF.Graph.add({node, @riptide_source_entry, source_entry})
+      |> RDF.Graph.add({node, @riptide_field_bindings, bindings_head})
+
+    {node, graph}
+  end
+
+  defp encode_field_bindings(field_bindings) do
+    {nodes, graph} =
+      Enum.reduce(field_bindings, {[], RDF.Graph.new()}, fn binding, {acc, graph} ->
+        {node, binding_graph} = encode_field_binding(binding)
+        {[node | acc], RDF.Graph.add(graph, binding_graph)}
+      end)
+
+    list = RDF.List.from(Enum.reverse(nodes))
+    {list.head, RDF.Graph.add(graph, list.graph)}
+  end
+
+  defp encode_field_binding(%{predicate: predicate, binding: :manual}) do
+    node = RDF.BlankNode.new()
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add({node, @rdf_type, @riptide_field_binding})
+      |> RDF.Graph.add({node, @riptide_binding_predicate, predicate})
+      |> RDF.Graph.add({node, @riptide_binding_kind, RDF.literal("manual")})
+
+    {node, graph}
+  end
+
+  defp encode_field_binding(%{predicate: predicate, binding: {:crosswalk, crosswalk_node}}) do
+    node = RDF.BlankNode.new()
+
+    graph =
+      RDF.Graph.new()
+      |> RDF.Graph.add({node, @rdf_type, @riptide_field_binding})
+      |> RDF.Graph.add({node, @riptide_binding_predicate, predicate})
+      |> RDF.Graph.add({node, @riptide_binding_kind, RDF.literal("crosswalk")})
+      |> RDF.Graph.add({node, @riptide_binding_crosswalk, crosswalk_node})
 
     {node, graph}
   end
@@ -221,8 +307,54 @@ defmodule Riptide.Derivation.RuleRDFCodec do
     %Rule{
       signature: decode_signature(sig_node, graph, head, body),
       head: head,
-      body: body
+      body: body,
+      provenance:
+        decode_provenance(RDF.Description.first(description, @riptide_provenance), graph)
     }
+  end
+
+  defp decode_provenance(nil, _graph), do: nil
+
+  defp decode_provenance(prov_node, graph) do
+    description = RDF.Graph.get(graph, prov_node)
+
+    origin =
+      case RDF.Description.first(description, @rdf_type) do
+        @riptide_generalized_from ->
+          source1 = from_rdf(RDF.Description.first(description, @riptide_source1), graph)
+          source2 = from_rdf(RDF.Description.first(description, @riptide_source2), graph)
+          {:generalized_from, source1, source2}
+
+        @riptide_installed_from ->
+          source_entry = RDF.Description.first(description, @riptide_source_entry)
+          bindings_head = RDF.Description.first(description, @riptide_field_bindings)
+
+          field_bindings =
+            RDF.List.new(bindings_head, graph)
+            |> RDF.List.values()
+            |> Enum.map(&decode_field_binding(&1, graph))
+
+          {:installed_from, source_entry, field_bindings}
+      end
+
+    %Provenance{origin: origin}
+  end
+
+  defp decode_field_binding(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    predicate = RDF.Description.first(description, @riptide_binding_predicate)
+    kind = description |> RDF.Description.first(@riptide_binding_kind) |> RDF.Literal.value()
+
+    binding =
+      case kind do
+        "manual" ->
+          :manual
+
+        "crosswalk" ->
+          {:crosswalk, RDF.Description.first(description, @riptide_binding_crosswalk)}
+      end
+
+    %{predicate: predicate, binding: binding}
   end
 
   # `reads`/`produces` are re-derived from the already-decoded `head`/`body`

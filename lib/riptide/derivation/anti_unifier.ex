@@ -12,7 +12,7 @@ defmodule Riptide.Derivation.AntiUnifier do
   """
 
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern, RuleReference}
-  alias Riptide.Derivation.{Rule, Signature, Var}
+  alias Riptide.Derivation.{Provenance, Rule, Signature, Var}
 
   @max_body_length 32
 
@@ -32,7 +32,12 @@ defmodule Riptide.Derivation.AntiUnifier do
         |> alignments(rule2.body)
         |> Enum.map(&build_candidate(rule1.head, rule2.head, &1, existing_var_names))
 
-      {:ok, narrow_by_variable_count(candidates)}
+      provenance = %Provenance{origin: {:generalized_from, rule1, rule2}}
+
+      {:ok,
+       candidates
+       |> narrow_by_variable_count()
+       |> Enum.map(fn {rule, sub1, sub2} -> {%{rule | provenance: provenance}, sub1, sub2} end)}
     end
   end
 
@@ -259,7 +264,8 @@ defmodule Riptide.Derivation.AntiUnifier do
         signature: %{
           signature
           | parameters: Enum.map(signature.parameters, &substitute_term(&1, substitution))
-        }
+        },
+        provenance: nil
     }
   end
 
