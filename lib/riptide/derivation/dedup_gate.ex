@@ -17,7 +17,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
   @type t :: %__MODULE__{
           kind: kind(),
           candidate: Rule.t(),
-          fidelity_evidence: [fidelity_evidence()],
+          fidelity_evidence: [fidelity_evidence()] | :not_applicable,
           replaces: RDF.BlankNode.t() | nil
         }
 
@@ -26,6 +26,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
   @riptide_kind RDF.iri("urn:riptide:vocab:kind")
   @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
   @riptide_fidelity_evidence RDF.iri("urn:riptide:vocab:fidelityEvidence")
+  @riptide_fidelity_not_applicable RDF.iri("urn:riptide:vocab:FidelityNotApplicable")
   @riptide_fidelity_status RDF.iri("urn:riptide:vocab:fidelityStatus")
   @riptide_fidelity_reason RDF.iri("urn:riptide:vocab:fidelityReason")
   @riptide_replaces RDF.iri("urn:riptide:vocab:replaces")
@@ -54,6 +55,11 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
 
   defp maybe_add_replaces(graph, node, replaces),
     do: RDF.Graph.add(graph, {node, @riptide_replaces, replaces})
+
+  defp encode_evidence(:not_applicable) do
+    node = RDF.BlankNode.new()
+    {node, RDF.Graph.new() |> RDF.Graph.add({node, @rdf_type, @riptide_fidelity_not_applicable})}
+  end
 
   defp encode_evidence(evidence_list) do
     {nodes, graph} =
@@ -101,11 +107,7 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
     candidate_node = RDF.Description.first(description, @riptide_candidate)
     candidate = RuleRDFCodec.from_rdf(candidate_node, graph)
     evidence_head = RDF.Description.first(description, @riptide_fidelity_evidence)
-
-    fidelity_evidence =
-      RDF.List.new(evidence_head, graph)
-      |> RDF.List.values()
-      |> Enum.map(&decode_one_evidence(&1, graph))
+    fidelity_evidence = decode_evidence(evidence_head, graph)
 
     replaces = RDF.Description.first(description, @riptide_replaces)
 
@@ -115,6 +117,20 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
       fidelity_evidence: fidelity_evidence,
       replaces: replaces
     }
+  end
+
+  defp decode_evidence(node, graph) do
+    description = RDF.Graph.get(graph, node)
+
+    case RDF.Description.first(description, @rdf_type) do
+      @riptide_fidelity_not_applicable ->
+        :not_applicable
+
+      _other ->
+        RDF.List.new(node, graph)
+        |> RDF.List.values()
+        |> Enum.map(&decode_one_evidence(&1, graph))
+    end
   end
 
   defp decode_one_evidence(node, graph) do
@@ -205,6 +221,28 @@ defmodule Riptide.Derivation.DedupGate do
 
       {:error, evidence} ->
         {:fidelity_failed, evidence}
+    end
+  end
+
+  @spec propose_install(Catalog.scope(), Catalog.scope(), Rule.t()) ::
+          {:ok, outcome()} | {:error, term()}
+  def propose_install(target_scope, review_scope, %Rule{} = installed_rule) do
+    with {:ok, entries} <- Catalog.list_entries(target_scope) do
+      case classify(installed_rule, entries) do
+        {:reject, reason} ->
+          {:ok, {:rejected, reason}}
+
+        {kind, replaces} ->
+          pending_review = %PendingReview{
+            kind: kind,
+            candidate: installed_rule,
+            fidelity_evidence: :not_applicable,
+            replaces: replaces
+          }
+
+          {:ok, node} = Catalog.queue_pending_review(review_scope, pending_review)
+          {:ok, {:queued, node, kind}}
+      end
     end
   end
 

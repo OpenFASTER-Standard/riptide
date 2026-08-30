@@ -2,7 +2,18 @@ defmodule Riptide.Derivation.DedupGateTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Capability.Definition
-  alias Riptide.Derivation.{AntiUnifier, Catalog, DedupGate, Rule, RuleRDFCodec, Signature}
+
+  alias Riptide.Derivation.{
+    AntiUnifier,
+    Catalog,
+    DedupGate,
+    Provenance,
+    Rule,
+    RuleRDFCodec,
+    Signature
+  }
+
+  alias Riptide.Derivation.DedupGate.PendingReview
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
 
@@ -84,6 +95,20 @@ defmodule Riptide.Derivation.DedupGateTest do
         max_instances: nil,
         max_tables: nil
       }
+    }
+  end
+
+  defp sample_install_candidate do
+    %Rule{
+      signature: %Signature{
+        name: rel("installed"),
+        parameters: [],
+        reads: [],
+        produces: [rel("installed")]
+      },
+      head: %FactPattern{predicate: rel("installed"), args: [t("alice"), RDF.literal("hi")]},
+      body: [],
+      provenance: %Provenance{origin: {:installed_from, RDF.BlankNode.new("hub-entry"), []}}
     }
   end
 
@@ -577,6 +602,60 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       # ...and the review resolved in review_scope, not target_scope.
       assert {:ok, []} = Catalog.list_pending_reviews(review_scope)
+    end
+  end
+
+  describe "PendingReview — :not_applicable fidelity_evidence" do
+    test "round-trips through Catalog.queue_pending_review/2 + list_pending_reviews/1" do
+      scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(scope))
+      end)
+
+      pending_review = %PendingReview{
+        kind: :admit,
+        candidate: sample_install_candidate(),
+        fidelity_evidence: :not_applicable,
+        replaces: nil
+      }
+
+      {:ok, node} = Catalog.queue_pending_review(scope, pending_review)
+      assert {:ok, [{^node, ^pending_review}]} = Catalog.list_pending_reviews(scope)
+    end
+  end
+
+  describe "propose_install/3" do
+    test "an install candidate against an empty target Catalog is queued as :admit with :not_applicable evidence" do
+      target_scope = unique_tenant()
+      review_scope = target_scope
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      installed_rule = sample_install_candidate()
+
+      assert {:ok, {:queued, node, :admit}} =
+               DedupGate.propose_install(target_scope, review_scope, installed_rule)
+
+      assert {:ok, [{^node, pending_review}]} = Catalog.list_pending_reviews(review_scope)
+      assert pending_review.fidelity_evidence == :not_applicable
+      assert pending_review.candidate == installed_rule
+    end
+
+    test "an install candidate already covered by an existing entry is Rejected, no review queued" do
+      target_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(target_scope))
+      end)
+
+      installed_rule = sample_install_candidate()
+      :ok = Catalog.admit_entry(target_scope, installed_rule, nil)
+
+      assert {:ok, {:rejected, :already_covered}} =
+               DedupGate.propose_install(target_scope, target_scope, installed_rule)
     end
   end
 end
