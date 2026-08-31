@@ -15,6 +15,21 @@ defmodule Riptide.PeriodicSweep do
   owns none of who's allowed to act on a given tick (a global leader-gate,
   no gate, a per-stream leader-gate all vary by consumer) — that stays
   entirely inside each consumer's own `periodic_sweep/0`.
+
+  `handle_sweep/2` is a shared helper each consumer's own `handle_info(:sweep,
+  state)` clause delegates to — mirroring `Riptide.SupervisedProcess.
+  handle_stop_if_idle/4`'s exact established pattern in this same codebase —
+  rather than the macro injecting a competing `def handle_info(:sweep, state)`
+  clause directly. That first design was tried and found broken live: `use
+  GenServer` marks `handle_info/2` `defoverridable`, and any consumer that
+  ALSO needs its own separate `handle_info/2` clause for a different message
+  (as `JobTrigger` does, for `{:job_written, stream_id}`) would have that
+  later `def` silently REPLACE the whole function — discarding the
+  macro-injected `:sweep` clause entirely, not adding to it — confirmed via
+  an isolated repro before this fix. `init/1` doesn't have this problem
+  (a GenServer's `init/1` is naturally single-clause, so `defoverridable`'s
+  own full-replacement semantics are exactly what's wanted there) and stays
+  macro-injected with `defoverridable`.
   """
   require Logger
 
@@ -48,15 +63,24 @@ defmodule Riptide.PeriodicSweep do
         {:ok, %{}}
       end
 
-      @impl GenServer
-      def handle_info(:sweep, state) do
-        Riptide.PeriodicSweep.safe_sweep(__MODULE__)
-        schedule_sweep()
-        {:noreply, state}
-      end
-
       defoverridable init: 1
     end
+  end
+
+  @doc """
+  Shared `handle_info(:sweep, state)` body — each consumer's own boilerplate
+  clause delegates here, the same way `Riptide.SupervisedProcess`'s own
+  consumers delegate their `handle_call({:riptide_supervised_process,
+  :stop_if_idle, reason}, from, state)` clause to `handle_stop_if_idle/4`:
+
+      @impl GenServer
+      def handle_info(:sweep, state), do: Riptide.PeriodicSweep.handle_sweep(__MODULE__, state)
+  """
+  @spec handle_sweep(module(), term()) :: {:noreply, term()}
+  def handle_sweep(module, state) do
+    safe_sweep(module)
+    module.schedule_sweep()
+    {:noreply, state}
   end
 
   @doc false

@@ -23,6 +23,9 @@ defmodule Riptide.BlobStore.Healer do
   @spec start_link(term()) :: GenServer.on_start()
   def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
+  @impl GenServer
+  def handle_info(:sweep, state), do: Riptide.PeriodicSweep.handle_sweep(__MODULE__, state)
+
   # No gate — every node sweeps unconditionally (§7: over-replicating a
   # blob briefly is harmless, unlike a Ra cluster's own membership).
   @impl Riptide.PeriodicSweep

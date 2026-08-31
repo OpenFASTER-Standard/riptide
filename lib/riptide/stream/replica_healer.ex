@@ -26,6 +26,9 @@ defmodule Riptide.Stream.ReplicaHealer do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
+  @impl GenServer
+  def handle_info(:sweep, state), do: Riptide.PeriodicSweep.handle_sweep(__MODULE__, state)
+
   # Only the placement cluster's actual leader ever performs a real repair
   # (`RaCluster.Placement.placement_leader?/0`) — `sweep/0` below stays
   # public and ungated on purpose: existing tests
