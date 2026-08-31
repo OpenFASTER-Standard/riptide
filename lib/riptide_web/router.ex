@@ -66,5 +66,9 @@ defmodule RiptideWeb.Router do
     post "/hub/crosswalks", RiptideWeb.Hub.CrosswalkController, :propose
     post "/hub/crosswalk-reviews/:node_id/approve", RiptideWeb.Hub.CrosswalkController, :approve
     post "/hub/crosswalk-reviews/:node_id/decline", RiptideWeb.Hub.CrosswalkController, :decline
+
+    post "/hub/capabilities", RiptideWeb.Hub.CapabilityController, :propose
+    post "/hub/capability-reviews/:node_id/approve", RiptideWeb.Hub.CapabilityController, :approve
+    post "/hub/capability-reviews/:node_id/decline", RiptideWeb.Hub.CapabilityController, :decline
   end
 end

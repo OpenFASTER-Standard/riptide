@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage) — 5 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration) — 4 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1046,4 +1046,56 @@ replication doesn't need it to: RF-replication and the healer both work over pla
 connectivity (`Node.list()`), entirely independent of placement-cluster membership.
 
 **Status**: Phase 6j shipped 2026-08-31. 5 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6k — Dynamic Capability Registration
+
+**Shipped 2026-08-31** — see
+`docs/superpowers/specs/2026-08-31-phase-6k-dynamic-capability-registration-design.md`.
+
+Closes the concrete gap 6j's own spec named but left out of scope: `Riptide.Capability.invoke/4`
+shells out to `wasmtime` against a literal local filesystem path, and
+`Riptide.Derivation.ExecuteInterpreter.Context` has no catalog of its own — every caller must
+hand-build its `capabilities`/`rules` maps. This phase gives Capabilities a real, reviewed, Hub-scope
+catalog addressable by IRI. Wiring that catalog into `Context` resolution and reactively triggering
+invocation from a Fact write is 6l, a separate, dependent phase not yet started.
+
+New `Riptide.Derivation.CapabilityCatalogEntry` mirrors `Capability.Definition`'s own field set
+exactly, except `component` (a literal local path, meaningless outside the node that received it) is
+replaced by `component_hash` — a `BlobStore` content hash. Storage/review mirror 6i's `Crosswalk`/
+`PendingCrosswalkReview` precedent exactly: a sibling stream off the Hub catalog, a
+`PendingCapabilityReview` with no anti-unification or fidelity-replay (a Capability isn't a
+generalization of anything, so there's nothing to replay-test), reviewed through the same
+`DedupGate` authority as any other Hub content.
+
+New `Riptide.Derivation.CapabilityCatalog.materialize/1` resolves a catalog entry into a real,
+invokable `Definition` — reusing a local `BlobStore` replica if this node already holds one (checked
+via `BlobStore.path_for/1`, zero extra copy), otherwise fetching via `BlobStore.get/1` and caching the
+bytes in a *private* local directory, deliberately not registered with `BlobStore`'s own
+`LocationIndex` (a materialize-only optimization cache, not an official replica other nodes should be
+routed to). Zero changes to `Riptide.Capability`/`Definition`/`invoke/4` themselves — this phase is
+purely additive.
+
+`POST /tenants/:tenant_id/hub/capabilities` accepts both the Definition metadata and the WASM bytes
+(base64-encoded, in the same JSON body every other Hub controller already uses) in one request,
+calling `BlobStore.put/1` internally — without giving `BlobStore` itself a general-purpose upload
+endpoint, respecting 6j's own stated scope boundary.
+
+Catalog admission ("this Capability is vetted") and invoke authorization ("this tenant may invoke
+it") stay the cleanly separate concerns they already are: approving a Capability into the Hub catalog
+does not itself authorize anyone to invoke it — a tenant still needs its own `Policy` granting
+`:invoke`, exactly as today for any caller-supplied Capability.
+
+Two real bugs found and fixed during implementation, both caught by the tests that were supposed to
+catch them: (1) `CapabilityCatalogRDFCodec`'s memory-limits sub-node crashed decoding a
+fully-`nil` `memory_limits` — `encode_memory_limits/1` adds zero triples when every field is nil, so
+`RDF.Graph.get/2` returns `nil` rather than an empty `%RDF.Description{}`, and
+`RDF.Description.first/2` doesn't accept `nil`; fixed with an explicit case on the graph lookup
+result. (2) The real multi-node `materialize/1` test initially used only 3 peers, but with the
+default replication factor also 3, `BlobStore.put/1`'s own replication always reaches every connected
+node deterministically in a 3-node cluster — leaving no node to prove a genuine remote fetch from;
+fixed with a 4th, alphabetically-last spare peer `other_nodes/0`'s own sort always excludes, mirroring
+`blob_store_cluster_test.exs`'s own identical fix for the identical class of problem.
+
+**Status**: Phase 6k shipped 2026-08-31. 4 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.

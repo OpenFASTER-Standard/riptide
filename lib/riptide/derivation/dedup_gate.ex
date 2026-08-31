@@ -193,6 +193,48 @@ defmodule Riptide.Derivation.DedupGate.PendingCrosswalkReview do
   end
 end
 
+defmodule Riptide.Derivation.DedupGate.PendingCapabilityReview do
+  @moduledoc """
+  A proposed Capability awaiting the proposing Tenant's own review (design
+  spec
+  `docs/superpowers/specs/2026-08-31-phase-6k-dynamic-capability-registration-design.md`
+  §6). Deliberately as simple as `PendingCrosswalkReview` — a
+  `CapabilityCatalogEntry` isn't a generalization of anything, so there's
+  nothing to anti-unify or replay-test.
+  """
+
+  alias Riptide.Derivation.{CapabilityCatalogEntry, CapabilityCatalogRDFCodec}
+
+  @enforce_keys [:candidate]
+  defstruct [:candidate]
+
+  @type t :: %__MODULE__{candidate: CapabilityCatalogEntry.t()}
+
+  @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+  @riptide_pending_capability_review RDF.iri("urn:riptide:vocab:PendingCapabilityReview")
+  @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
+
+  @spec to_rdf(t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
+  def to_rdf(%__MODULE__{candidate: candidate}) do
+    node = RDF.BlankNode.new()
+    {candidate_node, candidate_graph} = CapabilityCatalogRDFCodec.to_rdf(candidate)
+
+    graph =
+      candidate_graph
+      |> RDF.Graph.add({node, @rdf_type, @riptide_pending_capability_review})
+      |> RDF.Graph.add({node, @riptide_candidate, candidate_node})
+
+    {node, graph}
+  end
+
+  @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: t()
+  def from_rdf(node, graph) do
+    description = RDF.Graph.get(graph, node)
+    candidate_node = RDF.Description.first(description, @riptide_candidate)
+    %__MODULE__{candidate: CapabilityCatalogRDFCodec.from_rdf(candidate_node, graph)}
+  end
+end
+
 defmodule Riptide.Derivation.DedupGate do
   @moduledoc """
   Catalog lookup, the `Reject`/`Merge`/`Admit` decision, and the human
@@ -200,8 +242,22 @@ defmodule Riptide.Derivation.DedupGate do
   `docs/superpowers/specs/2026-08-29-phase-6e-iii-dedupgate-orchestration-design.md`.
   """
 
-  alias Riptide.Derivation.{AntiUnifier, Catalog, Crosswalk, GeneralizationFidelity, Rule, Var}
-  alias Riptide.Derivation.DedupGate.{PendingCrosswalkReview, PendingReview}
+  alias Riptide.Derivation.{
+    AntiUnifier,
+    CapabilityCatalogEntry,
+    Catalog,
+    Crosswalk,
+    GeneralizationFidelity,
+    Rule,
+    Var
+  }
+
+  alias Riptide.Derivation.DedupGate.{
+    PendingCapabilityReview,
+    PendingCrosswalkReview,
+    PendingReview
+  }
+
   alias Riptide.Derivation.ExecuteInterpreter.Context
 
   @type candidates :: [{Rule.t(), AntiUnifier.substitution(), AntiUnifier.substitution()}]
@@ -310,6 +366,28 @@ defmodule Riptide.Derivation.DedupGate do
   @spec decline_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def decline_crosswalk_review(review_scope, node),
     do: Catalog.resolve_crosswalk_review(review_scope, node)
+
+  @spec propose_capability(Catalog.scope(), CapabilityCatalogEntry.t()) ::
+          {:ok, RDF.BlankNode.t()} | {:error, term()}
+  def propose_capability(review_scope, %CapabilityCatalogEntry{} = entry) do
+    Catalog.queue_capability_review(review_scope, %PendingCapabilityReview{candidate: entry})
+  end
+
+  @spec approve_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def approve_capability_review(review_scope, node) do
+    with {:ok, pending_reviews} <- Catalog.list_capability_pending_reviews(review_scope),
+         {_node, pending} <- List.keyfind(pending_reviews, node, 0, :not_found) do
+      :ok = Catalog.admit_capability(pending.candidate)
+      Catalog.resolve_capability_review(review_scope, node)
+    else
+      :not_found -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  @spec decline_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
+  def decline_capability_review(review_scope, node),
+    do: Catalog.resolve_capability_review(review_scope, node)
 
   defp classify(candidate, entries) do
     matching =

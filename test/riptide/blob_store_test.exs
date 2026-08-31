@@ -69,17 +69,27 @@ defmodule Riptide.BlobStoreTest do
     # test/riptide/supervised_process_test.exs's own established two-step
     # pattern (deterministic :DOWN wait for the old process's actual exit,
     # then poll for re-registration) rather than polling a single window
-    # for both at once — a single combined window measurably under-budgets
-    # a slower CI runner's real restart latency, caught live via CI
-    # (passed consistently locally, failed on CI's own hardware).
-    assert_receive {:DOWN, ^ref, :process, ^old_pid, _reason}, 5_000
+    # for both at once.
+    #
+    # Budget widened a second time (5s + 1s -> 20s + 10s), caught live via
+    # CI again: this phase's own new real multi-node tests
+    # (capability_catalog_cluster_test.exs) add real concurrent BEAM-node
+    # load to the whole suite, and CI logs showed BlobStore's registry
+    # entry still absent a full 8+ seconds after termination — a genuine
+    # increase in real restart latency under heavier load, not a logic
+    # bug, so the fix is a bigger, evidence-backed margin, not a new
+    # mechanism.
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, _reason}, 20_000
 
-    assert eventually(fn ->
-             case Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store") do
-               [{new_pid, Riptide.BlobStore}] -> Process.alive?(new_pid)
-               [] -> false
-             end
-           end)
+    assert eventually(
+             fn ->
+               case Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store") do
+                 [{new_pid, Riptide.BlobStore}] -> Process.alive?(new_pid)
+                 [] -> false
+               end
+             end,
+             500
+           )
   end
 
   defp eventually(fun, attempts_left \\ 50) do
