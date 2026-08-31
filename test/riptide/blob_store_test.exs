@@ -55,6 +55,7 @@ defmodule Riptide.BlobStoreTest do
     # needs a deliberately slow/blocking write to interleave a concurrent
     # restart request against, which isn't worth the complexity here — the
     # wiring itself (this test) is what's load-bearing to verify.
+    ref = Process.monitor(old_pid)
     assert :ok = Riptide.SupervisedProcess.request_restart("blob_store")
 
     # Riptide.BlobStore is a single, application-wide singleton (not a
@@ -64,10 +65,17 @@ defmodule Riptide.BlobStoreTest do
     # genuinely new pid to appear, a later test's own BlobStore.put/1 call
     # can race the still-dying old process and hit a spurious
     # :restart_requested exit — wait here so every subsequent test starts
-    # from a fully-settled state.
+    # from a fully-settled state. Mirrors
+    # test/riptide/supervised_process_test.exs's own established two-step
+    # pattern (deterministic :DOWN wait for the old process's actual exit,
+    # then poll for re-registration) rather than polling a single window
+    # for both at once — a single combined window measurably under-budgets
+    # a slower CI runner's real restart latency, caught live via CI
+    # (passed consistently locally, failed on CI's own hardware).
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, _reason}, 5_000
+
     assert eventually(fn ->
              case Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store") do
-               [{^old_pid, Riptide.BlobStore}] -> false
                [{new_pid, Riptide.BlobStore}] -> Process.alive?(new_pid)
                [] -> false
              end
