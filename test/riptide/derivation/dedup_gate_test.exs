@@ -5,6 +5,7 @@ defmodule Riptide.Derivation.DedupGateTest do
 
   alias Riptide.Derivation.{
     AntiUnifier,
+    CapabilityCatalogEntry,
     Catalog,
     Crosswalk,
     DedupGate,
@@ -14,7 +15,12 @@ defmodule Riptide.Derivation.DedupGateTest do
     Signature
   }
 
-  alias Riptide.Derivation.DedupGate.{PendingCrosswalkReview, PendingReview}
+  alias Riptide.Derivation.DedupGate.{
+    PendingCapabilityReview,
+    PendingCrosswalkReview,
+    PendingReview
+  }
+
   alias Riptide.Derivation.ExecuteInterpreter.Context
   alias Riptide.Derivation.Literal.{CapabilityReference, FactPattern}
 
@@ -22,6 +28,26 @@ defmodule Riptide.Derivation.DedupGateTest do
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
 
   defp unique_tenant, do: {:tenant, "acme-#{System.unique_integer([:positive])}"}
+
+  defp sample_capability(overrides) do
+    Map.merge(
+      %CapabilityCatalogEntry{
+        name: RDF.iri("urn:riptide:capability:ddg-#{System.unique_integer([:positive])}"),
+        kind: :effect,
+        component_hash: String.duplicate("b", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      },
+      overrides
+    )
+  end
 
   # A ground CapabilityReference's `result` is a raw Elixir string by this
   # codebase's own established convention (matches `Capability.invoke/4`'s
@@ -723,6 +749,58 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       assert {:ok, entries} = Catalog.list_crosswalks()
       refute Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
+    end
+  end
+
+  describe "PendingCapabilityReview round-trip" do
+    test "round-trips through Catalog.queue_capability_review/2 + list_capability_pending_reviews/1" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      pending = %PendingCapabilityReview{candidate: sample_capability(%{})}
+
+      {:ok, node} = Catalog.queue_capability_review(review_scope, pending)
+      assert {:ok, entries} = Catalog.list_capability_pending_reviews(review_scope)
+      assert Enum.any?(entries, fn {n, p} -> n == node and p == pending end)
+    end
+  end
+
+  describe "propose_capability/2 + approve_capability_review/2 + decline_capability_review/2" do
+    test "a proposed Capability is queued, then approval admits it to the Hub capability catalog" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      entry = sample_capability(%{})
+
+      assert {:ok, node} = DedupGate.propose_capability(review_scope, entry)
+      assert :ok == DedupGate.approve_capability_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_capabilities()
+      assert Enum.any?(entries, fn {_n, e} -> e == entry end)
+
+      assert {:ok, []} = Catalog.list_capability_pending_reviews(review_scope)
+    end
+
+    test "declining a proposed Capability resolves the review and admits nothing" do
+      review_scope = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id(review_scope))
+      end)
+
+      entry = sample_capability(%{})
+
+      {:ok, node} = DedupGate.propose_capability(review_scope, entry)
+      assert :ok == DedupGate.decline_capability_review(review_scope, node)
+
+      assert {:ok, entries} = Catalog.list_capabilities()
+      refute Enum.any?(entries, fn {_n, e} -> e == entry end)
     end
   end
 end
