@@ -142,7 +142,12 @@ defmodule Riptide.BlobStore do
 
   # Two-level directory prefix (matching git's own object-store layout) so a
   # single directory never accumulates an unbounded number of entries.
-  defp path_for(hash) do
+  # Public (not private) solely so the multi-node corruption test can reach
+  # it via :erpc.call/4 — effectively private in spirit, just not enforced
+  # by the compiler, matching receive_replica/2's own @doc false treatment.
+  @doc false
+  @spec path_for(String.t()) :: String.t()
+  def path_for(hash) do
     <<prefix::binary-size(2), rest::binary>> = hash
     Path.join([data_dir(), prefix, rest])
   end

@@ -2,6 +2,7 @@ defmodule Riptide.BlobStoreTest do
   use ExUnit.Case, async: false
 
   alias Riptide.BlobStore
+  alias Riptide.BlobStore.LocationIndex
 
   setup do
     dir = Path.join(System.tmp_dir!(), "blob_store_test_#{System.unique_integer([:positive])}")
@@ -85,12 +86,12 @@ defmodule Riptide.BlobStoreTest do
     bytes = :crypto.strong_rand_bytes(1024)
     assert {:ok, hash} = BlobStore.put(bytes)
 
-    assert {:ok, [node()]} == Riptide.BlobStore.LocationIndex.list_locations(hash)
+    assert {:ok, [node()]} == LocationIndex.list_locations(hash)
   end
 
   test "get/1 falls back to the location index on a local miss, still returns :not_found if no listed node has it either" do
     hash = String.duplicate("a", 64)
-    :ok = Riptide.BlobStore.LocationIndex.add_location(hash, node())
+    :ok = LocationIndex.add_location(hash, node())
 
     # node() itself is listed but has no local file for this hash — the
     # fallback path must terminate cleanly rather than loop or crash when
@@ -107,7 +108,7 @@ defmodule Riptide.BlobStoreTest do
     # force-delete, since LocationIndex's stream is shared across the whole
     # suite and force-deleting it races any other test/process writing to
     # it) so this hash now has no location index entry at all.
-    :ok = Riptide.BlobStore.LocationIndex.remove_location(hash, node())
+    :ok = LocationIndex.remove_location(hash, node())
 
     # If get/1 incorrectly consulted the (now hash-less) location index
     # before checking local disk, this would fail.
