@@ -46,11 +46,45 @@ defmodule Riptide.BlobStoreTest do
     bytes = :crypto.strong_rand_bytes(1024)
     assert {:ok, _hash} = BlobStore.put(bytes)
 
+    [{old_pid, Riptide.BlobStore}] =
+      Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store")
+
     # Proves session_active?/1 and handle_stop_if_idle/4 are wired correctly
     # for the idle case; genuinely proving a restart is *refused* mid-write
     # needs a deliberately slow/blocking write to interleave a concurrent
     # restart request against, which isn't worth the complexity here — the
     # wiring itself (this test) is what's load-bearing to verify.
     assert :ok = Riptide.SupervisedProcess.request_restart("blob_store")
+
+    # Riptide.BlobStore is a single, application-wide singleton (not a
+    # fresh process per test) — request_restart/1 returning :ok only means
+    # the restart was *accepted*, not that the old process has finished
+    # exiting and a new one has finished starting. Without waiting for a
+    # genuinely new pid to appear, a later test's own BlobStore.put/1 call
+    # can race the still-dying old process and hit a spurious
+    # :restart_requested exit — wait here so every subsequent test starts
+    # from a fully-settled state.
+    assert eventually(fn ->
+             case Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store") do
+               [{^old_pid, Riptide.BlobStore}] -> false
+               [{new_pid, Riptide.BlobStore}] -> Process.alive?(new_pid)
+               [] -> false
+             end
+           end)
+  end
+
+  defp eventually(fun, attempts_left \\ 50) do
+    cond do
+      fun.() -> true
+      attempts_left <= 1 -> false
+      true -> Process.sleep(20) && eventually(fun, attempts_left - 1)
+    end
+  end
+
+  test "put/1 on a single connected node records exactly that node in the location index" do
+    bytes = :crypto.strong_rand_bytes(1024)
+    assert {:ok, hash} = BlobStore.put(bytes)
+
+    assert {:ok, [node()]} == Riptide.BlobStore.LocationIndex.list_locations(hash)
   end
 end

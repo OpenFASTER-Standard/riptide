@@ -12,6 +12,8 @@ defmodule Riptide.BlobStore do
   @behaviour Riptide.SupervisedProcess
   use GenServer
 
+  alias Riptide.BlobStore.LocationIndex
+
   @id "blob_store"
 
   @spec start_link(term()) :: GenServer.on_start()
@@ -37,7 +39,8 @@ defmodule Riptide.BlobStore do
 
   @impl GenServer
   def handle_call({:put, bytes}, _from, state) do
-    {:reply, do_put(bytes), state}
+    result = do_put(%{state | writing: true}, bytes)
+    {:reply, result, %{state | writing: false}}
   end
 
   def handle_call({:get, hash}, _from, state) do
@@ -51,13 +54,48 @@ defmodule Riptide.BlobStore do
   @impl Riptide.SupervisedProcess
   def session_active?(state), do: state.writing
 
-  defp do_put(bytes) do
+  defp do_put(_state, bytes) do
     hash = hash_of(bytes)
     path = path_for(hash)
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- File.write(path, bytes) do
+      LocationIndex.add_location(hash, node())
+      replicate(hash, bytes, other_nodes())
       {:ok, hash}
+    end
+  end
+
+  # RF - 1 other nodes, deterministically picked (sorted, first N) so a
+  # concurrent put/1 for the same content from a different caller converges
+  # on the same replica set rather than scattering copies unnecessarily —
+  # mirrors Riptide.Stream.ReplicaHealer.pick_replacement/2's own
+  # determinism rationale.
+  defp other_nodes do
+    rf = Application.get_env(:riptide, :blob_replication_factor, 3)
+    Node.list() |> Enum.sort() |> Enum.take(rf - 1)
+  end
+
+  defp replicate(hash, bytes, nodes) do
+    Enum.each(nodes, fn n ->
+      case :rpc.call(n, __MODULE__, :receive_replica, [hash, bytes], 30_000) do
+        :ok -> LocationIndex.add_location(hash, n)
+        _other -> :ok
+      end
+    end)
+  end
+
+  @doc false
+  @spec receive_replica(String.t(), binary()) :: :ok | {:error, term()}
+  def receive_replica(hash, bytes) do
+    if hash_of(bytes) == hash do
+      path = path_for(hash)
+
+      with :ok <- File.mkdir_p(Path.dirname(path)) do
+        File.write(path, bytes)
+      end
+    else
+      {:error, :hash_mismatch}
     end
   end
 
