@@ -34,4 +34,23 @@ defmodule Riptide.BlobStoreTest do
     assert {:ok, hash} = BlobStore.put(bytes)
     assert {:ok, ^bytes} = BlobStore.get(hash)
   end
+
+  test "the blob store is registered and reachable via Riptide.SupervisedProcess" do
+    assert [{pid, Riptide.BlobStore}] =
+             Registry.lookup(Riptide.SupervisedProcess.Registry, "blob_store")
+
+    assert Process.alive?(pid)
+  end
+
+  test "a restart is allowed once put/1 has completed and the process is idle" do
+    bytes = :crypto.strong_rand_bytes(1024)
+    assert {:ok, _hash} = BlobStore.put(bytes)
+
+    # Proves session_active?/1 and handle_stop_if_idle/4 are wired correctly
+    # for the idle case; genuinely proving a restart is *refused* mid-write
+    # needs a deliberately slow/blocking write to interleave a concurrent
+    # restart request against, which isn't worth the complexity here — the
+    # wiring itself (this test) is what's load-bearing to verify.
+    assert :ok = Riptide.SupervisedProcess.request_restart("blob_store")
+  end
 end

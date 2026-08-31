@@ -38,6 +38,7 @@ defmodule Riptide.Application do
         {Registry, keys: :unique, name: Riptide.SupervisedProcess.Registry},
         {DynamicSupervisor,
          strategy: :one_for_one, name: Riptide.SupervisedProcess.DynamicSupervisor},
+        Riptide.BlobStore,
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++
