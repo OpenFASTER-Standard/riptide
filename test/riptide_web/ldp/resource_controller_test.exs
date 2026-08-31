@@ -1,6 +1,7 @@
 defmodule RiptideWeb.LDP.ResourceControllerTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
+  import Plug.Conn
 
   import ExUnit.CaptureLog
 

@@ -1,6 +1,6 @@
 defmodule RiptideWeb.Plugs.ResolveTenantTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
 
   alias RiptideWeb.Plugs.ResolveTenant
 

@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Plugs.AuthorizeTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
+  import Plug.Conn
 
   alias RiptideWeb.Plugs.Authorize
 

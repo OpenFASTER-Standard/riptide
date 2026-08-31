@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Authz.PolicyControllerTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
+  import Plug.Conn
 
   alias Riptide.Authz.Store
   alias RiptideWeb.LDP.ResourceController

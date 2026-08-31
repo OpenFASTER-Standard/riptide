@@ -167,9 +167,28 @@ defmodule Riptide.RaCluster do
   @transient_retry_attempts 50
   @transient_retry_backoff_ms 100
 
+  # `:ra`'s own default per-call timeout (`?DEFAULT_TIMEOUT` in ra.hrl) is
+  # 5000ms — fine as a one-shot call, but disproportionate as the inner step
+  # of a retry loop built around a 100ms backoff: at 50 attempts, a run of
+  # genuine (not just error-tuple) `{:timeout, _}` results could legitimately
+  # take up to 50 * 5000ms ≈ 4m15s, silently, with nothing surfacing until
+  # whatever ExUnit/caller-level deadline eventually fires. Root-caused via a
+  # real CI failure: `stream_server_test.exs`'s issue-8 regression test
+  # (100 kill+immediate-restart+consistent_query trials) hit ExUnit's default
+  # 60s test timeout this way — not because the underlying operation was
+  # actually stuck, but because a couple of genuinely-slow-under-contention
+  # attempts each blocked the full 5000ms before the retry loop even got a
+  # chance to poll again. Passing this shorter, explicit timeout to each
+  # individual `:ra` call keeps the same total retry *count* (so genuinely
+  # transient conditions get just as many chances to clear) while making
+  # each poll proportionate to the 100ms backoff between them — a stuck
+  # leader/election is detected roughly 5x faster per cycle, and the retry
+  # loop's real worst case drops from ~4m15s to well under a minute.
+  @ra_call_timeout_ms 1_000
+
   @spec process_command(:ra.server_id(), term()) :: term()
   def process_command(server_id, command, attempts_left \\ @transient_retry_attempts) do
-    case :ra.process_command(server_id, command) do
+    case :ra.process_command(server_id, command, @ra_call_timeout_ms) do
       {:ok, reply, _leader} ->
         reply
 
@@ -207,7 +226,7 @@ defmodule Riptide.RaCluster do
   # above.
   @spec local_query(:ra.server_id(), (term() -> term())) :: term()
   def local_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
-    case :ra.local_query(server_id, query_fun) do
+    case :ra.local_query(server_id, query_fun, @ra_call_timeout_ms) do
       {:ok, {_index_term, result}, _leader} ->
         result
 
@@ -243,7 +262,7 @@ defmodule Riptide.RaCluster do
   # specifically the call that hit failure shape 2 in that comment.
   @spec consistent_query(:ra.server_id(), (term() -> term())) :: term()
   def consistent_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
-    case :ra.consistent_query(server_id, query_fun) do
+    case :ra.consistent_query(server_id, query_fun, @ra_call_timeout_ms) do
       {:ok, result, _leader} ->
         result
 

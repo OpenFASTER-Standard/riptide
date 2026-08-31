@@ -193,7 +193,7 @@ defmodule Riptide.PlacementMembershipClusterTest do
   end
 
   test "dead-member replacement: killing one member converges back to target size with the same size" do
-    {peers, nodes} = spawn_and_connect(4)
+    {peers, _nodes} = spawn_and_connect(4)
     [members_peers, spare_peer] = [Enum.take(peers, 3), Enum.at(peers, 3)]
     member_nodes = Enum.map(members_peers, fn {_pid, node} -> node end)
     {spare_pid, spare_node} = spare_peer
@@ -333,12 +333,12 @@ defmodule Riptide.PlacementMembershipClusterTest do
   end
 
   defp push_module_to_peers(peers) do
-    [{module, bytecode}] = Code.compile_file(__ENV__.file)
+    bytecode = Riptide.MultiNodeTestHelpers.own_module_bytecode(__MODULE__)
 
     for {_pid, node} <- peers do
-      assert {:module, ^module} =
+      assert {:module, __MODULE__} =
                :erpc.call(node, :code, :load_binary, [
-                 module,
+                 __MODULE__,
                  ~c"placement_membership_cluster_test.ex",
                  bytecode
                ])

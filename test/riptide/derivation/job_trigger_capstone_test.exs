@@ -1,6 +1,7 @@
 defmodule Riptide.Derivation.JobTriggerCapstoneTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
+  import Plug.Conn
 
   alias Riptide.Authz.{Policy, Store}
   alias Riptide.Derivation.{Catalog, Job}

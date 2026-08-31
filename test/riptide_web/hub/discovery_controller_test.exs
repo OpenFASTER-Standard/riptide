@@ -1,6 +1,6 @@
 defmodule RiptideWeb.Hub.DiscoveryControllerTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
 
   alias Riptide.Derivation.Catalog
   alias Riptide.Derivation.Literal.FactPattern

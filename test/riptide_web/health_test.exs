@@ -1,6 +1,6 @@
 defmodule RiptideWeb.HealthTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
 
   @opts RiptideWeb.Endpoint.init([])
 

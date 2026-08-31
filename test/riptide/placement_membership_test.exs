@@ -110,6 +110,14 @@ defmodule Riptide.PlacementMembershipTest do
     end
   end
 
+  # 50 attempts * 200ms = 10s total budget, matching the same
+  # `eventually/2` pattern's established convention everywhere else in this
+  # suite (11 other test files, all 50 * 200ms) for "wait for an
+  # already-running process to finish handling an async message" — this
+  # file's own version used to poll at 50 * 50ms = only 2.5s, a real
+  # outlier that surfaced as a genuine, if rare, flake under a busy full
+  # `mix test` run (535 tests, high scheduler contention) even though this
+  # exact test passes reliably in isolation.
   defp eventually(fun, attempts_left \\ 50) do
     cond do
       fun.() ->
@@ -119,7 +127,7 @@ defmodule Riptide.PlacementMembershipTest do
         false
 
       true ->
-        Process.sleep(50)
+        Process.sleep(200)
         eventually(fun, attempts_left - 1)
     end
   end
