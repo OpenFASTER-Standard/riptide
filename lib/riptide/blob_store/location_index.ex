@@ -57,6 +57,31 @@ defmodule Riptide.BlobStore.LocationIndex do
     end
   end
 
+  @spec list_all() :: {:ok, %{String.t() => [node()]}} | {:error, :not_ready}
+  def list_all do
+    with {:ok, graph} <- read_graph() do
+      entries =
+        graph
+        |> RDF.Graph.subjects()
+        |> Enum.filter(fn s ->
+          RDF.Graph.get(graph, s) |> RDF.Description.first(@rdf_type) == @riptide_hash_entry
+        end)
+        |> Map.new(fn hash_iri -> {hash_from_iri(hash_iri), locations_for(graph, hash_iri)} end)
+
+      {:ok, entries}
+    end
+  end
+
+  defp hash_from_iri(hash_iri),
+    do: hash_iri |> RDF.IRI.to_string() |> String.trim_leading(@hash_prefix)
+
+  defp locations_for(graph, hash_iri) do
+    graph
+    |> RDF.Graph.get(hash_iri)
+    |> RDF.Description.get(@riptide_located_on, [])
+    |> Enum.map(&iri_to_node/1)
+  end
+
   defp hash_iri(hash), do: RDF.iri(@hash_prefix <> hash)
   defp node_iri(node), do: RDF.iri(@node_prefix <> Atom.to_string(node))
 

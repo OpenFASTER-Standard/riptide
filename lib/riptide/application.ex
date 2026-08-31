@@ -77,7 +77,8 @@ defmodule Riptide.Application do
   defp placement_children do
     [
       Supervisor.child_spec(Riptide.PlacementMembership, shutdown: 10_000),
-      Riptide.Stream.ReplicaHealer
+      Riptide.Stream.ReplicaHealer,
+      Riptide.BlobStore.Healer
     ]
   end
 

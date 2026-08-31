@@ -42,4 +42,15 @@ defmodule Riptide.BlobStore.LocationIndexTest do
 
     assert {:ok, [:"node_b@127.0.0.1"]} = LocationIndex.list_locations(hash)
   end
+
+  test "list_all/0 returns every tracked hash with its current node set" do
+    hash1 = unique_hash()
+    hash2 = unique_hash()
+    :ok = LocationIndex.add_location(hash1, :"node_a@127.0.0.1")
+    :ok = LocationIndex.add_location(hash2, :"node_b@127.0.0.1")
+
+    assert {:ok, all} = LocationIndex.list_all()
+    assert all[hash1] == [:"node_a@127.0.0.1"]
+    assert all[hash2] == [:"node_b@127.0.0.1"]
+  end
 end
