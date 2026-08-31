@@ -87,4 +87,30 @@ defmodule Riptide.BlobStoreTest do
 
     assert {:ok, [node()]} == Riptide.BlobStore.LocationIndex.list_locations(hash)
   end
+
+  test "get/1 falls back to the location index on a local miss, still returns :not_found if no listed node has it either" do
+    hash = String.duplicate("a", 64)
+    :ok = Riptide.BlobStore.LocationIndex.add_location(hash, node())
+
+    # node() itself is listed but has no local file for this hash — the
+    # fallback path must terminate cleanly rather than loop or crash when
+    # every listed node comes up empty.
+    assert {:error, :not_found} = BlobStore.get(hash)
+  end
+
+  test "get/1 for a genuinely present local blob never touches the location index" do
+    bytes = :crypto.strong_rand_bytes(1024)
+    {:ok, hash} = BlobStore.put(bytes)
+
+    # put/1 already recorded node() in the location index for this hash —
+    # remove just that one entry (an ordinary write, not a stream-level
+    # force-delete, since LocationIndex's stream is shared across the whole
+    # suite and force-deleting it races any other test/process writing to
+    # it) so this hash now has no location index entry at all.
+    :ok = Riptide.BlobStore.LocationIndex.remove_location(hash, node())
+
+    # If get/1 incorrectly consulted the (now hash-less) location index
+    # before checking local disk, this would fail.
+    assert {:ok, ^bytes} = BlobStore.get(hash)
+  end
 end

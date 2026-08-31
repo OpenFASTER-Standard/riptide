@@ -102,6 +102,31 @@ defmodule Riptide.BlobStore do
   defp do_get(hash) do
     case File.read(path_for(hash)) do
       {:ok, bytes} -> verify(bytes, hash)
+      {:error, _reason} -> fetch_remote(hash)
+    end
+  end
+
+  defp fetch_remote(hash) do
+    case LocationIndex.list_locations(hash) do
+      {:ok, nodes} -> try_remote_nodes(hash, nodes -- [node()])
+      {:error, :not_ready} -> {:error, :not_found}
+    end
+  end
+
+  defp try_remote_nodes(_hash, []), do: {:error, :not_found}
+
+  defp try_remote_nodes(hash, [n | rest]) do
+    case :rpc.call(n, __MODULE__, :receive_replica_bytes, [hash], 30_000) do
+      {:ok, bytes} -> verify(bytes, hash)
+      _other -> try_remote_nodes(hash, rest)
+    end
+  end
+
+  @doc false
+  @spec receive_replica_bytes(String.t()) :: {:ok, binary()} | {:error, :not_found}
+  def receive_replica_bytes(hash) do
+    case File.read(path_for(hash)) do
+      {:ok, bytes} -> verify(bytes, hash)
       {:error, _reason} -> {:error, :not_found}
     end
   end
