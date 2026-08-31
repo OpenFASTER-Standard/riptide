@@ -29,6 +29,10 @@ riptide-*.tar
 priv/ra_data/
 priv/ra_data_test/
 
+# Riptide.BlobStore's on-disk content-addressed storage (default path when
+# RIPTIDE_BLOB_DATA_DIR/:blob_data_dir isn't overridden — see Phase 6j).
+priv/blob_data/
+
 # Ra's on-disk data directories for the real-:peer-spawned nodes in
 # multi_node_connectivity_test.exs: those bare peer nodes don't load
 # config/test.exs (no Mix config in a plain `:peer`-started node), so
