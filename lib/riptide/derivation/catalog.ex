@@ -9,6 +9,8 @@ defmodule Riptide.Derivation.Catalog do
   """
 
   alias Riptide.Derivation.{
+    CapabilityCatalogEntry,
+    CapabilityCatalogRDFCodec,
     Crosswalk,
     CrosswalkRDFCodec,
     DedupGate,
@@ -34,6 +36,11 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_resolved_pending_crosswalk_review RDF.iri(
                                                "urn:riptide:vocab:ResolvedPendingCrosswalkReview"
                                              )
+  @riptide_capability_catalog_entry RDF.iri("urn:riptide:vocab:CapabilityCatalogEntry")
+  @riptide_pending_capability_review RDF.iri("urn:riptide:vocab:PendingCapabilityReview")
+  @riptide_resolved_pending_capability_review RDF.iri(
+                                                "urn:riptide:vocab:ResolvedPendingCapabilityReview"
+                                              )
 
   @type scope :: {:tenant, String.t()} | :hub
 
@@ -124,6 +131,54 @@ defmodule Riptide.Derivation.Catalog do
       pending_review_stream_id(scope),
       [{node, @rdf_type, @riptide_resolved_pending_crosswalk_review}],
       [{node, @rdf_type, @riptide_pending_crosswalk_review}]
+    )
+  end
+
+  @spec capability_stream_id() :: String.t()
+  def capability_stream_id, do: catalog_stream_id(:hub) <> "/capabilities"
+
+  @spec admit_capability(CapabilityCatalogEntry.t()) :: :ok | {:error, :not_ready}
+  def admit_capability(%CapabilityCatalogEntry{} = entry) do
+    {_node, entry_graph} = CapabilityCatalogRDFCodec.to_rdf(entry)
+    write_patch(capability_stream_id(), RDF.Graph.triples(entry_graph), [])
+  end
+
+  @spec list_capabilities() ::
+          {:ok, [{RDF.BlankNode.t(), CapabilityCatalogEntry.t()}]} | {:error, :not_ready}
+  def list_capabilities do
+    with {:ok, graph} <- read_graph(capability_stream_id()) do
+      nodes = nodes_of_type(graph, @riptide_capability_catalog_entry)
+      {:ok, Enum.map(nodes, &{&1, CapabilityCatalogRDFCodec.from_rdf(&1, graph)})}
+    end
+  end
+
+  @spec queue_capability_review(scope(), DedupGate.PendingCapabilityReview.t()) ::
+          {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
+  def queue_capability_review(scope, %DedupGate.PendingCapabilityReview{} = pending) do
+    {node, graph} = DedupGate.PendingCapabilityReview.to_rdf(pending)
+
+    case write_patch(pending_review_stream_id(scope), RDF.Graph.triples(graph), []) do
+      :ok -> {:ok, node}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec list_capability_pending_reviews(scope()) ::
+          {:ok, [{RDF.BlankNode.t(), DedupGate.PendingCapabilityReview.t()}]}
+          | {:error, :not_ready}
+  def list_capability_pending_reviews(scope) do
+    with {:ok, graph} <- read_graph(pending_review_stream_id(scope)) do
+      nodes = nodes_of_type(graph, @riptide_pending_capability_review)
+      {:ok, Enum.map(nodes, &{&1, DedupGate.PendingCapabilityReview.from_rdf(&1, graph)})}
+    end
+  end
+
+  @spec resolve_capability_review(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def resolve_capability_review(scope, node) do
+    write_patch(
+      pending_review_stream_id(scope),
+      [{node, @rdf_type, @riptide_resolved_pending_capability_review}],
+      [{node, @rdf_type, @riptide_pending_capability_review}]
     )
   end
 
