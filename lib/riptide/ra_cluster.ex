@@ -22,6 +22,34 @@ defmodule Riptide.RaCluster do
     "riptide_" <> Base.encode16(:crypto.hash(:sha256, stream_id), case: :lower)
   end
 
+  @doc """
+  Cheap, local, best-effort check of whether this node is currently the Ra
+  leader of `stream_id`'s own cluster — generalizes
+  `RaCluster.Placement.placement_leader?/0`'s exact question to an arbitrary
+  stream. Unlike `placement_leader?/0`'s own `:ra.members/1` round-trip,
+  this is a plain ETS lookup against `:ra_leaderboard` — a table every local
+  Ra server process already keeps current on every leadership/membership
+  change, no consensus call at all. See design spec
+  `docs/superpowers/specs/2026-08-31-phase-6l-reactive-job-triggering-design.md`
+  §4 for the full rationale (this primitive replaces a would-be dedicated
+  claims machine entirely).
+  """
+  @spec stream_leader?(String.t()) :: boolean()
+  def stream_leader?(stream_id) do
+    # :ra_leaderboard is keyed by the same plain String.t() cluster_name
+    # every :ra.start_cluster/2 config already carries throughout :ra's own
+    # internals (uid <> "_cluster") — never converted to an atom anywhere
+    # in the real write path (confirmed live: :ra_leaderboard.overview/0
+    # shows the key as a quoted string). Converting it to an atom here, as
+    # a first attempt did, silently missed every real entry.
+    cluster_name = uid_for(stream_id) <> "_cluster"
+
+    case :ra_leaderboard.lookup_leader(cluster_name) do
+      {_name, leader_node} -> leader_node == node()
+      :undefined -> false
+    end
+  end
+
   @spec start_or_restart(String.t(), :ra_machine.machine()) :: :ra.server_id()
   def start_or_restart(stream_id, machine) do
     ensure_system_started()
