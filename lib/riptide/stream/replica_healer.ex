@@ -10,6 +10,10 @@ defmodule Riptide.Stream.ReplicaHealer do
   operator action is required in the steady-state case.
   """
 
+  use Riptide.PeriodicSweep,
+    default_interval_ms: 30_000,
+    interval_env_key: :replica_healer_sweep_interval_ms
+
   use GenServer
   require Logger
 
@@ -17,59 +21,19 @@ defmodule Riptide.Stream.ReplicaHealer do
   alias Riptide.RaCluster
   alias Riptide.Stream.RaMachine
 
-  @sweep_interval_ms 30_000
-
   @spec start_link(term()) :: GenServer.on_start()
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
-  @impl GenServer
-  def init(:ok) do
-    schedule_sweep()
-    {:ok, %{}}
-  end
-
-  @impl GenServer
-  def handle_info(:sweep, state) do
-    if RaCluster.Placement.placement_leader?() do
-      safe_sweep()
-    end
-
-    schedule_sweep()
-    {:noreply, state}
-  end
-
-  # `sweep/0` can raise/exit if the placement cluster is fully unreachable
-  # (`Placement.list_all/1`'s own documented total-failure behavior) — left
-  # unguarded here, that would crash this GenServer every ~30s for the
-  # duration of any placement-cluster outage. The default supervisor's
-  # restart intensity tolerates that (30s spacing is well under
-  # `max_restarts: 3, max_seconds: 5`), so it self-heals, but it's noisy and
-  # inconsistent with `discover_retention/2`'s own "skip this tick and log a
-  # warning" pattern one level down in this same module — mirroring that
-  # here instead.
-  defp safe_sweep do
-    sweep()
-  rescue
-    e ->
-      Logger.warning(
-        "ReplicaHealer sweep failed, skipping this tick (#{Exception.message(e)})",
-        reason: Exception.message(e)
-      )
-  catch
-    :exit, reason ->
-      Logger.warning(
-        "ReplicaHealer sweep failed, skipping this tick (#{inspect(reason)})",
-        reason: inspect(reason)
-      )
-  end
-
-  defp schedule_sweep do
-    interval =
-      Application.get_env(:riptide, :replica_healer_sweep_interval_ms, @sweep_interval_ms)
-
-    Process.send_after(self(), :sweep, interval)
+  # Only the placement cluster's actual leader ever performs a real repair
+  # (`RaCluster.Placement.placement_leader?/0`) — `sweep/0` below stays
+  # public and ungated on purpose: existing tests
+  # (`replica_healer_cluster_test.exs`) call it directly to exercise repair
+  # logic without needing to be the leader; the gate lives only here.
+  @impl Riptide.PeriodicSweep
+  def periodic_sweep do
+    if RaCluster.Placement.placement_leader?(), do: sweep(), else: :ok
   end
 
   @doc """
