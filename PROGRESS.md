@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation) — 6 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage) — 5 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -998,4 +998,52 @@ the original by `==`; fixed by round-tripping the test's own expectation through
 Catalog itself uses, rather than comparing against the pre-storage struct.
 
 **Status**: Phase 6i shipped 2026-08-30. 6 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6j — Large Object (Blob) Storage
+
+**Shipped 2026-08-31** — see
+`docs/superpowers/specs/2026-08-30-phase-6j-large-object-blob-storage-design.md`.
+
+Motivated by a concrete gap found while investigating what dynamic Capability registration (future
+work) would actually require: `Riptide.Capability.invoke/4` shells out to the `wasmtime` CLI
+against `definition.component`, a literal local filesystem path — there is nowhere durable and
+fleet-reachable to put a Capability's own bytes yet. This phase closes that gap generally
+(content-addressed blob storage), not narrowly for Capability bytes alone; wiring a Capability's
+own `component` field to it stays future work, out of scope here.
+
+New `Riptide.BlobStore` — a privileged, zero-authorization instance of 6b-ii's
+`Riptide.SupervisedProcess` primitive (one well-known process per node, id `"blob_store"`;
+`session_active?/1` refuses a restart mid-write). `put/1` hashes with whole-blob SHA-256 (no
+content-defined chunking — deferred, per the spec's own scope), writes to local disk under a
+git-object-style two-level directory prefix, then replicates to RF-1 (default RF 3) other live
+nodes via direct `:rpc.call/5`, never through Ra consensus — immutable content-addressed bytes need
+no consensus to replicate safely, unlike an ordered Fact log. `get/1` verifies a local copy's hash
+before serving it (a mismatch is treated as corruption, never served silently) and falls back to
+other nodes listed in the location index on a local miss.
+
+New `Riptide.BlobStore.LocationIndex` — a dedicated, fixed-stream `hash -> [nodes]` index (RDF
+triples over the existing generic `StreamServer`/`Patch` mechanism, not a bespoke `:ra_machine`),
+deliberately not folded into the shared placement-metadata cluster. New
+`Riptide.BlobStore.Healer` mirrors `Riptide.Stream.ReplicaHealer`'s own periodic-sweep shape
+exactly, applied to blob replicas instead of Ra cluster membership — dropping dead locations and
+re-replicating anything under RF onto a deterministically-picked live node. Unlike
+`ReplicaHealer`'s own repair, no claim/consensus fencing is needed: over-replicating a blob briefly
+is harmless (extra disk, never correctness), unlike a Ra cluster's own membership.
+
+Garbage collection (a reference-counted manifest state machine, adapted from Riak CS) is fully
+specified in the design doc's §8 but explicitly not implemented this phase. Cross-tenant
+deduplication at the storage layer is an accepted design decision (spec §9) — content-addressing
+means two tenants writing identical bytes share one on-disk copy, with the resulting
+same-hash-implies-you-had-the-bytes side channel named as a residual, accepted risk rather than
+mitigated.
+
+Real multi-node integration testing (`test/riptide/blob_store_cluster_test.exs`) surfaced a design
+detail worth recording: `Riptide.PlacementMembership.target_size/0` defaults to 3 (odd, by
+construction), and both genesis formation and the ambient reconcile join loop cap membership at
+exactly that many nodes — a 4th fleet node never joins the placement cluster itself. `BlobStore`
+replication doesn't need it to: RF-replication and the healer both work over plain distributed-Erlang
+connectivity (`Node.list()`), entirely independent of placement-cluster membership.
+
+**Status**: Phase 6j shipped 2026-08-31. 5 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
