@@ -1156,3 +1156,56 @@ work.
 
 **Status**: Phase 6l shipped 2026-08-31. 3 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### Post-6l CI root-cause sweep
+
+Merging PR #116 (6l spec, docs-only) hit CI failures on two consecutive runs, each on different,
+unrelated tests (`StreamServerTest`/`PlacementClusterTest`, then a rerun's `BlobStoreTest`) — the
+"known flake, just rerun" pattern this project's own instructions explicitly rule out. A full
+root-cause pass found four independent, genuine issues, all fixed rather than papered over:
+
+1. **`RaCluster.{process_command,local_query,consistent_query}/3`** relied on `:ra`'s own implicit
+   5000ms per-call timeout inside a 50-attempt/100ms-backoff retry loop — a call that genuinely times
+   out repeatedly (e.g. `stream_server_test.exs`'s issue-8 stress test, which kills and immediately
+   restarts a Ra server 100 times) could legitimately take up to 50 × 5100ms ≈ 4m15s, blowing past
+   ExUnit's 60s default long before the retry loop's own budget was exhausted. Fixed by passing an
+   explicit 1000ms per-attempt timeout — same total retry count, but each poll now proportionate to
+   the backoff between them.
+2. **`Riptide.Placement`'s member discovery** (`with_current_members_via_probe/1`) had no retry at
+   all: a member dying leaves a brief, real window where the survivors are mid re-election and
+   `:ra.members/1` has nothing authoritative to answer with yet, even though the cluster is healthy a
+   few hundred ms later. `placement_cluster_test.exs`'s own fallback test — kill a member, immediately
+   call `assign/2` — occasionally raced exactly that window. Fixed with a 5-attempt/200ms-backoff
+   retry around the whole discovery path (cache + probe), a real production condition (a request
+   arriving right as a member fails over), not just a test artifact.
+3. **`blob_store_test.exs`'s restart-wait test** had already been widened twice (6s, then 30s) without
+   becoming reliable — a `systematic-debugging` "3+ fixes failed, question the architecture" case.
+   Replaced the racy generic restart-and-recover assertion with a direct, deterministic check of
+   `BlobStore.session_active?/1`'s own state wiring via `:sys.get_state/1` — the same pattern already
+   established in `replica_healer_leadership_gate_test.exs` and `test/riptide/stream/placement_test.exs`.
+4. **A blank-node identity gap, local-box-only**: `RDF.BlankNode.new/0` uses
+   `:erlang.unique_integer/1`, unique only for one BEAM boot's lifetime — but `:hub`'s catalog stream
+   is deliberately persisted across test runs (never force-deleted, so cross-test admits stay visible
+   within one suite run). On a long-lived dev pod that's run `mix test` dozens of times, blank-node ids
+   from separate runs collide once the counter wraps back over old values, corrupting `:hub`'s folded
+   graph (`RDF.List.values/1` crashing on a `nil` head from a spliced-together node). Confirmed
+   structurally impossible in CI — `priv/ra_data_test/` is gitignored and never cached by the GitHub
+   Actions workflow, so every CI run starts with a byte-for-byte empty `:hub` — so this didn't get a
+   code fix, just local cleanup (`rm -rf priv/ra_data_test`).
+
+A broader sweep (per instruction: fix warnings and lint too, not just failures) also found and fixed:
+a `Code.compile_file(__ENV__.file)` pattern duplicated across 14 `:peer`-based multi-node test files,
+each silently emitting a "redefining module" warning (the module was already loaded once by ExUnit's
+own test-file compilation) — extracted to `MultiNodeTestHelpers.own_module_bytecode/1`, memoized via
+`:persistent_term` and scoped `Code.compiler_options(ignore_module_conflict: true)` so it compiles (and
+warns) at most once per module per suite run instead of once per test; the deprecated `use Plug.Test`
+pattern across 19 test files, replaced with `import Plug.Test` + `import Plug.Conn` (only where
+`Plug.Conn` functions are actually used, to avoid trading one warning for an unused-import one); one
+unused-variable warning; `placement_membership_test.exs`'s own `eventually/2` helper polling at
+50×50ms=2.5s where every sibling `eventually/2` in this suite uses 50×200ms=10s, a real outlier that
+surfaced as a rare flake under full-suite scheduler contention; and `authz_test.exs`'s `on_exit`
+`Agent.stop` missing the `try/catch :exit -> :ok` TOCTOU guard already present in its 6 sibling files.
+
+Verified with 8 consecutive full `mix test` / `mix test --warnings-as-errors` runs (0 failures, 0
+warnings each time), `mix format --check-formatted`, and `mix credo --strict`, before merging #116 and
+#118 (2026-08-31).
