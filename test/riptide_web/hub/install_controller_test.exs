@@ -1,6 +1,7 @@
 defmodule RiptideWeb.Hub.InstallControllerTest do
   use ExUnit.Case, async: false
-  use Plug.Test
+  import Plug.Test
+  import Plug.Conn
 
   alias Riptide.Authz.Store
   alias Riptide.Derivation.{Catalog, Parser, Provenance}

@@ -207,9 +207,17 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
   # so this conversion is mandatory, not a convenience. Passing an
   # unconverted %RDF.IRI{}/%RDF.Literal{} through inspect/1 would produce
   # invalid wave syntax (e.g. `~I<urn:test:alice>`), not a string literal.
-  defp term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
-  defp term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
-  defp term_to_arg(string) when is_binary(string), do: string
+  #
+  # Public (not `defp`) solely so a jobCapability Job can convert its own
+  # ground RDF.Term args the exact same way, without duplicating this
+  # 3-clause conversion — effectively private in spirit, just not enforced
+  # by the compiler, matching BlobStore.path_for/1's own @doc false
+  # treatment. No behavior change.
+  @doc false
+  @spec term_to_arg(RDF.Term.t() | String.t()) :: String.t()
+  def term_to_arg(%RDF.IRI{} = iri), do: RDF.IRI.to_string(iri)
+  def term_to_arg(%RDF.Literal{} = literal), do: RDF.Literal.value(literal)
+  def term_to_arg(string) when is_binary(string), do: string
 
   defp bind_result(bindings, %Var{} = var, value), do: Map.put(bindings, var, value)
   defp bind_result(bindings, _constant, _value), do: bindings

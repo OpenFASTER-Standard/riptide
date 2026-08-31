@@ -83,6 +83,14 @@ defmodule Riptide.Stream.StreamServerTest do
     assert third.sequence == 3
   end
 
+  # 100 real kill+restart+consistent_query trials (see the test body's own
+  # comment for why 100) is genuinely expensive, and each trial's
+  # `consistent_query/2` call can itself retry several times under real CI
+  # scheduler contention — even with `RaCluster`'s per-attempt `:ra` timeout
+  # now bounded to 1s (see its own comment), a documented, explicit budget
+  # here is more honest than relying on ExUnit's generic 60s default for a
+  # test whose cost is this well understood.
+  @tag timeout: 120_000
   test "get_since/2 never observes a stale/incomplete state immediately after a restart (issue #8)" do
     # `get_since/2` used to read via `RaCluster.local_query/2` — a fast but
     # possibly-stale read of the local server's already-applied state. Right

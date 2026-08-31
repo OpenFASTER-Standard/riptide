@@ -69,12 +69,12 @@ defmodule Riptide.Stream.ReplicaHealerRetentionTest do
       end)
     end)
 
-    [{module, bytecode}] = Code.compile_file(__ENV__.file)
+    bytecode = Riptide.MultiNodeTestHelpers.own_module_bytecode(__MODULE__)
 
     for {_pid, node, _ordinal} <- peers do
-      assert {:module, ^module} =
+      assert {:module, __MODULE__} =
                :erpc.call(node, :code, :load_binary, [
-                 module,
+                 __MODULE__,
                  ~c"replica_healer_retention_test.ex",
                  bytecode
                ])

@@ -10,46 +10,26 @@ defmodule Riptide.BlobStore.Healer do
   `ReplicaHealer`'s own repair, no claim/consensus fencing is needed here.
   """
 
+  use Riptide.PeriodicSweep,
+    default_interval_ms: 30_000,
+    interval_env_key: :blob_healer_sweep_interval_ms
+
   use GenServer
   require Logger
 
   alias Riptide.BlobStore
   alias Riptide.BlobStore.LocationIndex
 
-  @sweep_interval_ms 30_000
-
   @spec start_link(term()) :: GenServer.on_start()
   def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl GenServer
-  def init(:ok) do
-    schedule_sweep()
-    {:ok, %{}}
-  end
+  def handle_info(:sweep, state), do: Riptide.PeriodicSweep.handle_sweep(__MODULE__, state)
 
-  @impl GenServer
-  def handle_info(:sweep, state) do
-    safe_sweep()
-    schedule_sweep()
-    {:noreply, state}
-  end
-
-  defp safe_sweep do
-    sweep()
-  rescue
-    e ->
-      Logger.warning(
-        "BlobStore.Healer sweep failed, skipping this tick (#{Exception.message(e)})"
-      )
-  catch
-    :exit, reason ->
-      Logger.warning("BlobStore.Healer sweep failed, skipping this tick (#{inspect(reason)})")
-  end
-
-  defp schedule_sweep do
-    interval = Application.get_env(:riptide, :blob_healer_sweep_interval_ms, @sweep_interval_ms)
-    Process.send_after(self(), :sweep, interval)
-  end
+  # No gate — every node sweeps unconditionally (§7: over-replicating a
+  # blob briefly is harmless, unlike a Ra cluster's own membership).
+  @impl Riptide.PeriodicSweep
+  def periodic_sweep, do: sweep()
 
   @doc "One full pass: drop dead locations, re-replicate anything under the configured factor."
   @spec sweep() :: :ok
