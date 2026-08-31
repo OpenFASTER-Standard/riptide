@@ -39,6 +39,7 @@ defmodule Riptide.Application do
         {DynamicSupervisor,
          strategy: :one_for_one, name: Riptide.SupervisedProcess.DynamicSupervisor},
         Riptide.BlobStore,
+        {Task.Supervisor, name: Riptide.Derivation.JobTrigger.ExecutionSupervisor},
         {Cluster.Supervisor,
          [Application.get_env(:libcluster, :topologies, []), [name: Riptide.ClusterSupervisor]]}
       ] ++
@@ -78,7 +79,8 @@ defmodule Riptide.Application do
     [
       Supervisor.child_spec(Riptide.PlacementMembership, shutdown: 10_000),
       Riptide.Stream.ReplicaHealer,
-      Riptide.BlobStore.Healer
+      Riptide.BlobStore.Healer,
+      Riptide.Derivation.JobTrigger
     ]
   end
 

@@ -14,6 +14,8 @@ defmodule Riptide.Derivation.Catalog do
     Crosswalk,
     CrosswalkRDFCodec,
     DedupGate,
+    Job,
+    JobRDFCodec,
     Matcher,
     Rule,
     RuleRDFCodec,
@@ -36,6 +38,11 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_resolved_pending_crosswalk_review RDF.iri(
                                                "urn:riptide:vocab:ResolvedPendingCrosswalkReview"
                                              )
+  @jobs_topic "riptide:jobs"
+  @riptide_job RDF.iri("urn:riptide:vocab:Job")
+  @riptide_job_status RDF.iri("urn:riptide:vocab:jobStatus")
+  @riptide_job_result RDF.iri("urn:riptide:vocab:jobResult")
+  @riptide_job_error RDF.iri("urn:riptide:vocab:jobError")
   @riptide_capability_catalog_entry RDF.iri("urn:riptide:vocab:CapabilityCatalogEntry")
   @riptide_pending_capability_review RDF.iri("urn:riptide:vocab:PendingCapabilityReview")
   @riptide_resolved_pending_capability_review RDF.iri(
@@ -179,6 +186,56 @@ defmodule Riptide.Derivation.Catalog do
       pending_review_stream_id(scope),
       [{node, @rdf_type, @riptide_resolved_pending_capability_review}],
       [{node, @rdf_type, @riptide_pending_capability_review}]
+    )
+  end
+
+  @spec job_stream_id(String.t()) :: String.t()
+  def job_stream_id(tenant_id), do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/jobs"
+
+  @spec write_job(String.t(), Job.t()) :: {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
+  def write_job(tenant_id, %Job{} = job) do
+    stream_id = job_stream_id(tenant_id)
+    {node, graph} = JobRDFCodec.to_rdf(job)
+
+    case write_patch(stream_id, RDF.Graph.triples(graph), []) do
+      :ok ->
+        Phoenix.PubSub.broadcast(Riptide.PubSub, @jobs_topic, {:job_written, stream_id})
+        {:ok, node}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec list_jobs(String.t()) :: {:ok, [{RDF.BlankNode.t(), Job.t()}]} | {:error, :not_ready}
+  def list_jobs(stream_id) do
+    with {:ok, graph} <- read_graph(stream_id) do
+      nodes = nodes_of_type(graph, @riptide_job)
+      {:ok, Enum.map(nodes, &{&1, JobRDFCodec.from_rdf(&1, graph)})}
+    end
+  end
+
+  @spec mark_job_done(String.t(), RDF.BlankNode.t(), RDF.Term.t()) :: :ok | {:error, :not_ready}
+  def mark_job_done(stream_id, node, result) do
+    write_patch(
+      stream_id,
+      [
+        {node, @riptide_job_status, RDF.literal("done")},
+        {node, @riptide_job_result, result}
+      ],
+      [{node, @riptide_job_status, RDF.literal("pending")}]
+    )
+  end
+
+  @spec mark_job_failed(String.t(), RDF.BlankNode.t(), String.t()) :: :ok | {:error, :not_ready}
+  def mark_job_failed(stream_id, node, reason) do
+    write_patch(
+      stream_id,
+      [
+        {node, @riptide_job_status, RDF.literal("failed")},
+        {node, @riptide_job_error, RDF.literal(reason)}
+      ],
+      [{node, @riptide_job_status, RDF.literal("pending")}]
     )
   end
 

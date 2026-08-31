@@ -1,11 +1,10 @@
-defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
+defmodule Riptide.Derivation.JobTriggerCapstoneTest do
   use ExUnit.Case, async: false
   import Plug.Test
   import Plug.Conn
 
   alias Riptide.Authz.{Policy, Store}
-  alias Riptide.Capability
-  alias Riptide.Derivation.{CapabilityCatalog, Catalog}
+  alias Riptide.Derivation.{Catalog, Job}
 
   @opts RiptideWeb.Endpoint.init([])
 
@@ -41,21 +40,24 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
   setup do
     Riptide.AppEnvTestHelpers.put_env(:riptide, :auth_verifier, StubVerifier)
-    dir = Path.join(System.tmp_dir!(), "cap_capstone_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "job_capstone_#{System.unique_integer([:positive])}")
     Riptide.AppEnvTestHelpers.put_env(:riptide, :blob_data_dir, dir)
     on_exit(fn -> File.rm_rf!(dir) end)
     :ok
   end
 
-  test "exit criterion: register via real HTTP, approve, resolve and invoke by IRI alone" do
-    tenant_id = "capstone-" <> Uniq.UUID.uuid4()
+  test "exit criterion: register+approve a Capability via real HTTP, write a Job, watch it execute" do
+    tenant_id = "job-capstone-" <> Uniq.UUID.uuid4()
     :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
 
     on_exit(fn ->
       Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.job_stream_id(tenant_id))
     end)
 
-    name = "urn:riptide:capability:capstone-greet-#{System.unique_integer([:positive])}"
+    name =
+      "urn:riptide:capability:capstone-restart-payments-#{System.unique_integer([:positive])}"
+
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
 
     body =
@@ -92,21 +94,52 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
     assert approve_conn.status == 200
 
-    # Resolution and invocation — never a hand-built %Definition{} anywhere
-    # below this line.
     Riptide.AppEnvTestHelpers.put_env(:riptide, :authz_store, FakeStore)
-
     local_name = String.trim_leading(name, "urn:riptide:capability:")
 
     FakeStore.start(%{
-      {"acme", ["capabilities", local_name]} => [
+      {tenant_id, ["capabilities", local_name]} => [
         %Policy{effect: :allow, modes: [:invoke], matcher: :public}
       ]
     })
 
-    assert {:ok, entry} = CapabilityCatalog.find_by_name(RDF.iri(name))
-    assert {:ok, definition} = CapabilityCatalog.materialize(entry)
-    assert {:ok, result} = Capability.invoke(definition, "acme", nil, ["World"])
-    assert result == "\"Hello, World!\""
+    job = %Job{
+      tenant_id: tenant_id,
+      status: :pending,
+      reference: {:capability, RDF.iri(name)},
+      args: [RDF.literal("World")],
+      job_graph: nil,
+      result: nil,
+      error: nil
+    }
+
+    assert {:ok, job_node} = Catalog.write_job(tenant_id, job)
+    stream_id = Catalog.job_stream_id(tenant_id)
+
+    assert eventually(fn ->
+             case Catalog.list_jobs(stream_id) do
+               {:ok, jobs} ->
+                 case Enum.find(jobs, fn {n, _j} -> n == job_node end) do
+                   {_n, %{status: :done}} -> true
+                   _ -> false
+                 end
+
+               _ ->
+                 false
+             end
+           end)
+
+    {:ok, jobs} = Catalog.list_jobs(stream_id)
+    {_n, final_job} = Enum.find(jobs, fn {n, _j} -> n == job_node end)
+    assert final_job.status == :done
+    assert final_job.result == RDF.literal("\"Hello, World!\"")
+  end
+
+  defp eventually(fun, attempts_left \\ 100) do
+    cond do
+      fun.() -> true
+      attempts_left <= 1 -> false
+      true -> Process.sleep(200) && eventually(fun, attempts_left - 1)
+    end
   end
 end

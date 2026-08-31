@@ -58,8 +58,8 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
       cleanup_data_dirs(@peers)
     end)
 
-    [{module, bytecode}] = Code.compile_file(__ENV__.file)
-    push_module(original_peers, module, bytecode)
+    bytecode = Riptide.MultiNodeTestHelpers.own_module_bytecode(__MODULE__)
+    push_module(original_peers, __MODULE__, bytecode)
 
     nodes = Enum.map(original_peers, fn {_pid, node, _ordinal} -> node end)
 
@@ -94,7 +94,7 @@ defmodule Riptide.PlacementSnapshotRecoveryTest do
       Enum.each(replacement_peers, fn {pid, _node, _ordinal} -> stop_peer(pid) end)
     end)
 
-    push_module(replacement_peers, module, bytecode)
+    push_module(replacement_peers, __MODULE__, bytecode)
 
     [{_pid_a2, node_a2, _}, {_pid_b2, node_b2, _}] = replacement_peers
 

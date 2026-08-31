@@ -22,6 +22,34 @@ defmodule Riptide.RaCluster do
     "riptide_" <> Base.encode16(:crypto.hash(:sha256, stream_id), case: :lower)
   end
 
+  @doc """
+  Cheap, local, best-effort check of whether this node is currently the Ra
+  leader of `stream_id`'s own cluster — generalizes
+  `RaCluster.Placement.placement_leader?/0`'s exact question to an arbitrary
+  stream. Unlike `placement_leader?/0`'s own `:ra.members/1` round-trip,
+  this is a plain ETS lookup against `:ra_leaderboard` — a table every local
+  Ra server process already keeps current on every leadership/membership
+  change, no consensus call at all. See design spec
+  `docs/superpowers/specs/2026-08-31-phase-6l-reactive-job-triggering-design.md`
+  §4 for the full rationale (this primitive replaces a would-be dedicated
+  claims machine entirely).
+  """
+  @spec stream_leader?(String.t()) :: boolean()
+  def stream_leader?(stream_id) do
+    # :ra_leaderboard is keyed by the same plain String.t() cluster_name
+    # every :ra.start_cluster/2 config already carries throughout :ra's own
+    # internals (uid <> "_cluster") — never converted to an atom anywhere
+    # in the real write path (confirmed live: :ra_leaderboard.overview/0
+    # shows the key as a quoted string). Converting it to an atom here, as
+    # a first attempt did, silently missed every real entry.
+    cluster_name = uid_for(stream_id) <> "_cluster"
+
+    case :ra_leaderboard.lookup_leader(cluster_name) do
+      {_name, leader_node} -> leader_node == node()
+      :undefined -> false
+    end
+  end
+
   @spec start_or_restart(String.t(), :ra_machine.machine()) :: :ra.server_id()
   def start_or_restart(stream_id, machine) do
     ensure_system_started()
@@ -139,9 +167,28 @@ defmodule Riptide.RaCluster do
   @transient_retry_attempts 50
   @transient_retry_backoff_ms 100
 
+  # `:ra`'s own default per-call timeout (`?DEFAULT_TIMEOUT` in ra.hrl) is
+  # 5000ms — fine as a one-shot call, but disproportionate as the inner step
+  # of a retry loop built around a 100ms backoff: at 50 attempts, a run of
+  # genuine (not just error-tuple) `{:timeout, _}` results could legitimately
+  # take up to 50 * 5000ms ≈ 4m15s, silently, with nothing surfacing until
+  # whatever ExUnit/caller-level deadline eventually fires. Root-caused via a
+  # real CI failure: `stream_server_test.exs`'s issue-8 regression test
+  # (100 kill+immediate-restart+consistent_query trials) hit ExUnit's default
+  # 60s test timeout this way — not because the underlying operation was
+  # actually stuck, but because a couple of genuinely-slow-under-contention
+  # attempts each blocked the full 5000ms before the retry loop even got a
+  # chance to poll again. Passing this shorter, explicit timeout to each
+  # individual `:ra` call keeps the same total retry *count* (so genuinely
+  # transient conditions get just as many chances to clear) while making
+  # each poll proportionate to the 100ms backoff between them — a stuck
+  # leader/election is detected roughly 5x faster per cycle, and the retry
+  # loop's real worst case drops from ~4m15s to well under a minute.
+  @ra_call_timeout_ms 1_000
+
   @spec process_command(:ra.server_id(), term()) :: term()
   def process_command(server_id, command, attempts_left \\ @transient_retry_attempts) do
-    case :ra.process_command(server_id, command) do
+    case :ra.process_command(server_id, command, @ra_call_timeout_ms) do
       {:ok, reply, _leader} ->
         reply
 
@@ -179,7 +226,7 @@ defmodule Riptide.RaCluster do
   # above.
   @spec local_query(:ra.server_id(), (term() -> term())) :: term()
   def local_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
-    case :ra.local_query(server_id, query_fun) do
+    case :ra.local_query(server_id, query_fun, @ra_call_timeout_ms) do
       {:ok, {_index_term, result}, _leader} ->
         result
 
@@ -215,7 +262,7 @@ defmodule Riptide.RaCluster do
   # specifically the call that hit failure shape 2 in that comment.
   @spec consistent_query(:ra.server_id(), (term() -> term())) :: term()
   def consistent_query(server_id, query_fun, attempts_left \\ @transient_retry_attempts) do
-    case :ra.consistent_query(server_id, query_fun) do
+    case :ra.consistent_query(server_id, query_fun, @ra_call_timeout_ms) do
       {:ok, result, _leader} ->
         result
 

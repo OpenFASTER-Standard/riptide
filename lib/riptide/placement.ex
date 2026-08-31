@@ -141,27 +141,52 @@ defmodule Riptide.Placement do
   # without tearing down the real shared suite-wide placement cluster other
   # tests depend on — see `test/riptide_web/health_test.exs` and
   # `test/riptide_web/realtime/sse_controller_test.exs`.
+  # A member dying (the exact scenario `probe_placement_members/1` exists
+  # for) leaves a brief real window where the surviving members are mid
+  # re-election and `:ra.members/1` — a single, non-retrying local check,
+  # see `RaCluster.Placement.local_placement_members/0` — has nothing
+  # authoritative to answer with yet on ANY candidate, even though the
+  # cluster is perfectly healthy a few hundred ms later. Root-caused via a
+  # real CI failure on `placement_cluster_test.exs`'s own fallback test,
+  # which kills a member and calls `assign/2` immediately after: with zero
+  # retry here, that narrow post-kill election window occasionally raced the
+  # very call meant to test surviving-member fallback. Retrying the whole
+  # discovery (cache, then probe) a handful of times with a short backoff
+  # rides out exactly that window — a real production condition (any client
+  # request arriving right as a member fails over), not just a test
+  # artifact — while still raising promptly for a genuinely, persistently
+  # unreachable cluster.
+  @discovery_retry_attempts 5
+  @discovery_retry_backoff_ms 200
+
   @spec with_current_members((:ra.server_id() -> term())) :: term()
   defp with_current_members(fun) do
     case Application.get_env(:riptide, :placement_members_override) do
-      nil -> with_current_members_via_discovery(fun)
+      nil -> with_current_members_via_discovery(fun, @discovery_retry_attempts)
       override_members -> with_current_members_via_list(override_members, fun)
     end
   end
 
-  defp with_current_members_via_discovery(fun) do
+  defp with_current_members_via_discovery(fun, attempts_left) do
     cached = PlacementMembership.current_members()
 
     case try_members(cached, fun) do
       {:ok, result} -> result
-      :error -> with_current_members_via_probe(fun)
+      :error -> with_current_members_via_probe(fun, attempts_left)
     end
   end
 
-  defp with_current_members_via_probe(fun) do
+  defp with_current_members_via_probe(fun, attempts_left) do
     case RaCluster.Placement.probe_placement_members([node() | Node.list()]) do
-      {:ok, members} -> with_current_members_via_list(members, fun)
-      :error -> raise "Riptide.Placement: no placement-cluster members could be discovered"
+      {:ok, members} ->
+        with_current_members_via_list(members, fun)
+
+      :error when attempts_left > 1 ->
+        Process.sleep(@discovery_retry_backoff_ms)
+        with_current_members_via_discovery(fun, attempts_left - 1)
+
+      :error ->
+        raise "Riptide.Placement: no placement-cluster members could be discovered"
     end
   end
 

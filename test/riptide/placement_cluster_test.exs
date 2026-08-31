@@ -165,18 +165,19 @@ defmodule Riptide.PlacementClusterTest do
     # never see it, even though the full path list is passed. Confirmed
     # empirically: passing a closure defined in this module as an
     # `:erpc.call/4` argument fails with `{:exception, :undef, ...}` on the
-    # remote node when the closure is invoked there. Fix: explicitly compile
-    # this file and push the resulting bytecode to each peer via
+    # remote node when the closure is invoked there. Fix: push this
+    # already-loaded module's own bytecode (see
+    # `MultiNodeTestHelpers.own_module_bytecode/1`) to each peer via
     # `:code.load_binary/3` before relying on any closure from this module
     # crossing the wire — this is the documented fallback's underlying fix
     # (plain data alone isn't the issue; the module's absence is), applied
     # without needing to restructure the resolver into non-closure data.
-    [{module, bytecode}] = Code.compile_file(__ENV__.file)
+    bytecode = Riptide.MultiNodeTestHelpers.own_module_bytecode(__MODULE__)
 
     for {_pid, node, _ordinal} <- peers do
-      assert {:module, ^module} =
+      assert {:module, __MODULE__} =
                :erpc.call(node, :code, :load_binary, [
-                 module,
+                 __MODULE__,
                  ~c"placement_cluster_test.ex",
                  bytecode
                ])

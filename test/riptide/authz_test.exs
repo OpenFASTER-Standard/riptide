@@ -28,7 +28,17 @@ defmodule Riptide.AuthzTest do
 
   setup do
     Riptide.AppEnvTestHelpers.put_env(:riptide, :authz_store, FakeStore)
-    on_exit(fn -> if pid = Process.whereis(FakeStore), do: Agent.stop(pid) end)
+
+    on_exit(fn ->
+      if pid = Process.whereis(FakeStore) do
+        try do
+          Agent.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+    end)
+
     :ok
   end
 

@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration) — 4 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering) — 3 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1098,4 +1098,61 @@ fixed with a 4th, alphabetically-last spare peer `other_nodes/0`'s own sort alwa
 `blob_store_cluster_test.exs`'s own identical fix for the identical class of problem.
 
 **Status**: Phase 6k shipped 2026-08-31. 4 phases remaining across the primary spine, the
+Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
+
+### 6l — Reactive Job-Triggering
+
+**Shipped 2026-08-31** — see
+`docs/superpowers/specs/2026-08-31-phase-6l-reactive-job-triggering-design.md`.
+
+Closes "a write triggers computation": writing an explicit Job Fact — referencing a Capability or
+Rule by IRI, with concrete args — reliably causes it to execute, with the result written back as an
+ordinary Fact. Deliberately narrowed to explicit Job Facts only, not "any Fact write matching any
+Rule's own `FactPattern` auto-fires it" (a full forward-chaining engine, rejected during brainstorming
+for cascading-trigger termination/ordering/storm concerns).
+
+The core mechanism transcends the claim+poll framing this whole reactive-trigger direction started
+from: rather than a dedicated claims machine generalizing `PlacementMachine`'s own CAS+TTL claim, it
+needs none at all. `RaCluster.stream_leader?/1` (new) answers "am I currently the Ra leader of this
+Job's own stream" via `:ra_leaderboard` — a plain ETS lookup every local Ra server process already
+keeps current, previously unused anywhere in this codebase — cheaper even than
+`placement_leader?/0`'s own existing round-trip. Whichever node that is executes Jobs written to that
+stream; on a leader crash, Ra's own normal election settles a new one, whose own trigger worker
+notices the still-pending Job via its periodic sweep and re-executes it — the same at-least-once
+contract `ReplicaHealer`'s own TTL-claim already carries, not a new failure mode.
+
+New `Riptide.Derivation.ContextResolver` transitively resolves a `jobRule` Job's Rule body through
+6k's `CapabilityCatalog` and the existing Rule `Catalog`, with cycle detection — checking the
+current-path `visited` set *before* the already-resolved `rules` map, not after, since `rules`
+accumulates entries on the way down (before a subtree completes), so checking it first let a genuine
+cycle slip through as a false "already resolved" (caught live by the cycle-detection test itself). A
+`jobCapability` Job bypasses `ExecuteInterpreter` entirely — no `FactPattern` to match, so routing it
+through the full interpreter would be unnecessary machinery.
+
+`Riptide.PeriodicSweep`, extracted from `ReplicaHealer`'s and `BlobStore.Healer`'s identical,
+now-duplicated-a-third-time boilerplate and retrofitted onto both, needed a real design correction
+mid-implementation: the callback is `periodic_sweep/0`, not `sweep/0` (`ReplicaHealer`'s own public
+`sweep/0` is deliberately ungated — existing tests call it directly to bypass the leader check —
+while the gate lives only in `handle_info(:sweep, state)`; reusing the bare name would have silently
+changed its existing meaning). A second correction came from `JobTrigger` itself, the first consumer
+needing its own additional `handle_info/2` clause: `use GenServer` marks `handle_info/2`
+`defoverridable`, and a consumer's later `def handle_info(other_pattern, state)` doesn't add a clause
+to a macro-injected one — it *replaces* the whole function, silently discarding it (confirmed via an
+isolated repro). Fixed by exposing `Riptide.PeriodicSweep.handle_sweep/2` as a plain helper instead —
+the same pattern `Riptide.SupervisedProcess.handle_stop_if_idle/4` already established in this
+codebase — with every consumer, including the two already-shipped healers, writing its own one-line
+delegating clause.
+
+The multi-node integration tests surfaced two more real bugs: killing the elected leader can kill the
+very node a test was polling through, turning every subsequent check into `{:erpc, :noconnection}`
+rather than a real result — fixed by polling through a node confirmed to still be alive; and a test
+Capability needs real WASM bytes and a real authz Policy grant to actually execute, not random bytes
+and an assumed-authorized invocation.
+
+The capstone test ties 6k and 6l together end to end — register and approve a Capability through 6k's
+real HTTP flow, write a Job referencing it, watch it execute — the full `restart-payments-service`
+walking skeleton from the original `examples/` motivation that first triggered this whole line of
+work.
+
+**Status**: Phase 6l shipped 2026-08-31. 3 phases remaining across the primary spine, the
 Foundation track, and the parallel tracks — see the design spec's §7 for the full roadmap.
