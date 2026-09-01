@@ -6,7 +6,7 @@ defmodule Riptide.Derivation.JobRDFCodec do
   a Job has no nested `body` literal list the way a Rule does.
   """
 
-  alias Riptide.Derivation.Job
+  alias Riptide.Derivation.{Job, Rule, RuleRDFCodec}
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @riptide_job RDF.iri("urn:riptide:vocab:Job")
@@ -19,6 +19,9 @@ defmodule Riptide.Derivation.JobRDFCodec do
   @riptide_job_result RDF.iri("urn:riptide:vocab:jobResult")
   @riptide_job_error RDF.iri("urn:riptide:vocab:jobError")
   @riptide_job_resource_key RDF.iri("urn:riptide:vocab:jobResourceKey")
+  @riptide_job_resolved_via RDF.iri("urn:riptide:vocab:jobResolvedVia")
+  @riptide_job_original_description RDF.iri("urn:riptide:vocab:jobOriginalDescription")
+  @riptide_job_trace RDF.iri("urn:riptide:vocab:jobTrace")
 
   @spec to_rdf(Job.t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
   def to_rdf(%Job{} = job) do
@@ -41,8 +44,29 @@ defmodule Riptide.Derivation.JobRDFCodec do
         @riptide_job_resource_key,
         job.resource_key && RDF.literal(job.resource_key)
       )
+      |> maybe_add(
+        node,
+        @riptide_job_resolved_via,
+        job.resolved_via && RDF.literal(encode_resolved_via(job.resolved_via))
+      )
+      |> maybe_add(
+        node,
+        @riptide_job_original_description,
+        job.original_description && RDF.literal(job.original_description)
+      )
+      |> maybe_add_trace(node, job.trace)
 
     {node, graph}
+  end
+
+  defp maybe_add_trace(graph, _node, nil), do: graph
+
+  defp maybe_add_trace(graph, node, %Rule{} = trace) do
+    {trace_node, trace_graph} = RuleRDFCodec.to_rdf(trace)
+
+    graph
+    |> RDF.Graph.add(trace_graph)
+    |> RDF.Graph.add({node, @riptide_job_trace, trace_node})
   end
 
   defp add_reference(graph, node, {:capability, iri}),
@@ -67,6 +91,12 @@ defmodule Riptide.Derivation.JobRDFCodec do
   defp decode_status("done"), do: :done
   defp decode_status("failed"), do: :failed
 
+  defp encode_resolved_via(:discovery), do: "discovery"
+  defp encode_resolved_via(:llm_fallback), do: "llm_fallback"
+
+  defp decode_resolved_via("discovery"), do: :discovery
+  defp decode_resolved_via("llm_fallback"), do: :llm_fallback
+
   @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: Job.t()
   def from_rdf(node, graph) do
     description = RDF.Graph.get(graph, node)
@@ -84,8 +114,26 @@ defmodule Riptide.Derivation.JobRDFCodec do
       job_graph: decode_optional_string(description, @riptide_job_graph),
       result: RDF.Description.first(description, @riptide_job_result),
       error: decode_optional_string(description, @riptide_job_error),
-      resource_key: decode_optional_string(description, @riptide_job_resource_key)
+      resource_key: decode_optional_string(description, @riptide_job_resource_key),
+      resolved_via: decode_resolved_via_optional(description),
+      original_description:
+        decode_optional_string(description, @riptide_job_original_description),
+      trace: decode_trace(description, graph)
     }
+  end
+
+  defp decode_resolved_via_optional(description) do
+    case RDF.Description.first(description, @riptide_job_resolved_via) do
+      nil -> nil
+      literal -> literal |> RDF.Literal.value() |> decode_resolved_via()
+    end
+  end
+
+  defp decode_trace(description, graph) do
+    case RDF.Description.first(description, @riptide_job_trace) do
+      nil -> nil
+      trace_node -> RuleRDFCodec.from_rdf(trace_node, graph)
+    end
   end
 
   defp decode_reference(description) do

@@ -47,7 +47,10 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
   """
   @spec call_template(Rule.t(), RDF.Graph.t(), Context.t()) ::
           {:ok, [RDF.Triple.t()]}
-          | {:error, {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+          | {:error,
+             {:unresolvable, RDF.IRI.t()}
+             | {:unsupported_arity, RDF.IRI.t()}
+             | {:unbound_variable, Var.t()}}
   def call_template(%Rule{} = rule, %RDF.Graph{} = graph, %Context{} = context) do
     call_template(rule, %{}, graph, context)
   end
@@ -63,9 +66,13 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
   """
   @spec call_template(Rule.t(), %{Var.t() => RDF.Term.t()}, RDF.Graph.t(), Context.t()) ::
           {:ok, [RDF.Triple.t()]}
-          | {:error, {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+          | {:error,
+             {:unresolvable, RDF.IRI.t()}
+             | {:unsupported_arity, RDF.IRI.t()}
+             | {:unbound_variable, Var.t()}}
   def call_template(%Rule{} = rule, seed, %RDF.Graph{} = graph, %Context{} = context) do
-    with :ok <- check_resolvable(rule.body, context) do
+    with :ok <- check_resolvable(rule.body, context),
+         :ok <- check_vars_bound(rule.body, seed |> Map.keys() |> MapSet.new()) do
       bindings_list = execute_body(rule.body, seed, graph, context)
       {:ok, Enum.map(bindings_list, &conclude(rule.head, &1))}
     end
@@ -83,9 +90,13 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
   """
   @spec resolve_bindings(Rule.t(), RDF.Graph.t(), Context.t()) ::
           {:ok, [%{Var.t() => RDF.Term.t()}]}
-          | {:error, {:unresolvable, RDF.IRI.t()} | {:unsupported_arity, RDF.IRI.t()}}
+          | {:error,
+             {:unresolvable, RDF.IRI.t()}
+             | {:unsupported_arity, RDF.IRI.t()}
+             | {:unbound_variable, Var.t()}}
   def resolve_bindings(%Rule{} = rule, %RDF.Graph{} = graph, %Context{} = context) do
-    with :ok <- check_resolvable(rule.body, context) do
+    with :ok <- check_resolvable(rule.body, context),
+         :ok <- check_vars_bound(rule.body, MapSet.new()) do
       {:ok, execute_body(rule.body, %{}, graph, context)}
     end
   end
@@ -96,6 +107,60 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
         :ok -> {:cont, :ok}
         error -> {:halt, error}
       end
+    end)
+  end
+
+  # `execute_body/4` matches FactPattern runs positionally against the
+  # graph, binding every Var among their own args along the way — a Var
+  # referenced only inside a CapabilityReference/RuleReference's own args,
+  # with no preceding FactPattern binding it, can never receive a value:
+  # `Matcher.bindings/3` only ever binds Vars that appear in a FactPattern's
+  # own args, so nothing in this body would ever populate it. Left
+  # unchecked, this crashes deep inside `substitute/2`'s `Map.fetch!/2`
+  # (confirmed live: JobTrigger picking up a DedupGate-generalized Rule
+  # whose only free variable lives inside a CapabilityReference's own args
+  # crashed a supervised Task with an uncaught KeyError). Checking up front
+  # turns that into a clean `{:error, _}` instead, matching how
+  # `check_resolvable/2` already handles the sibling
+  # unresolvable-IRI/unsupported-arity cases.
+  @spec check_vars_bound(
+          [FactPattern.t() | CapabilityReference.t() | RuleReference.t()],
+          MapSet.t(Var.t())
+        ) :: :ok | {:error, {:unbound_variable, Var.t()}}
+  defp check_vars_bound([], _known), do: :ok
+
+  defp check_vars_bound([%FactPattern{args: args} | rest], known) do
+    check_vars_bound(rest, add_known_vars(known, args))
+  end
+
+  defp check_vars_bound([%CapabilityReference{args: args, result: result} | rest], known) do
+    with :ok <- check_terms_bound(args, known) do
+      check_vars_bound(rest, add_known_vars(known, [result]))
+    end
+  end
+
+  defp check_vars_bound([%RuleReference{args: args, result: result} | rest], known) do
+    with :ok <- check_terms_bound(args, known) do
+      check_vars_bound(rest, add_known_vars(known, [result]))
+    end
+  end
+
+  defp check_terms_bound(terms, known) do
+    Enum.reduce_while(terms, :ok, fn
+      %Var{} = var, :ok ->
+        if MapSet.member?(known, var),
+          do: {:cont, :ok},
+          else: {:halt, {:error, {:unbound_variable, var}}}
+
+      _term, :ok ->
+        {:cont, :ok}
+    end)
+  end
+
+  defp add_known_vars(known, terms) do
+    Enum.reduce(terms, known, fn
+      %Var{} = var, acc -> MapSet.put(acc, var)
+      _term, acc -> acc
     end)
   end
 
