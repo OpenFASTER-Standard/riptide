@@ -34,7 +34,7 @@ defmodule Riptide.Derivation.CatalogTest do
     end
 
     test "catalog_stream_id/1 for the Hub scope" do
-      assert Catalog.catalog_stream_id(:hub) == "https://riptide.example/hub/catalog"
+      assert Catalog.catalog_stream_id(:hub) == "https://riptide.example/hub/resources/catalog"
     end
 
     test "pending_review_stream_id/1 for a Tenant scope" do

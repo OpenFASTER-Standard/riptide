@@ -58,7 +58,7 @@ defmodule Riptide.Derivation.Catalog do
   # Unchanged — Hub already has its own working, separate /hub/* HTTP surface
   # and addressing model (design spec §3); this phase touches only the
   # Tenant-scoped side.
-  def catalog_stream_id(:hub), do: @stream_id_prefix <> "hub/catalog"
+  def catalog_stream_id(:hub), do: @stream_id_prefix <> "hub/resources/catalog"
 
   @spec pending_review_stream_id(scope()) :: String.t()
   def pending_review_stream_id(scope), do: catalog_stream_id(scope) <> "/pending-review"
