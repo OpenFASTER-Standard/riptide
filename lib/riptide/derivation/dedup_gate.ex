@@ -119,17 +119,26 @@ defmodule Riptide.Derivation.DedupGate.PendingReview do
     }
   end
 
+  # An empty (non-:not_applicable) fidelity_evidence list encodes via
+  # RDF.List.from([]) to rdf:nil, the well-known empty-list sentinel — it
+  # has no triples of its own describing it (RDF.Graph.get/2 returns nil),
+  # unlike every other evidence_head this function handles. Must be checked
+  # before RDF.Description.first/2, which crashes on a nil description.
   defp decode_evidence(node, graph) do
-    description = RDF.Graph.get(graph, node)
+    case RDF.Graph.get(graph, node) do
+      nil ->
+        []
 
-    case RDF.Description.first(description, @rdf_type) do
-      @riptide_fidelity_not_applicable ->
-        :not_applicable
+      description ->
+        case RDF.Description.first(description, @rdf_type) do
+          @riptide_fidelity_not_applicable ->
+            :not_applicable
 
-      _other ->
-        RDF.List.new(node, graph)
-        |> RDF.List.values()
-        |> Enum.map(&decode_one_evidence(&1, graph))
+          _other ->
+            RDF.List.new(node, graph)
+            |> RDF.List.values()
+            |> Enum.map(&decode_one_evidence(&1, graph))
+        end
     end
   end
 
