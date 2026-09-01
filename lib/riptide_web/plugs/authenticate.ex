@@ -3,8 +3,9 @@ defmodule RiptideWeb.Plugs.Authenticate do
   Extracts a bearer token (see `extract_token/1`) and verifies it via the
   configured `Riptide.Auth.Verifier`
   (`Application.get_env(:riptide, :auth_verifier)`, defaulting to
-  `Riptide.Auth.Verifier.OIDC`) — mirrors `RiptideWeb.Plugs.ResolveTenant`'s
-  config-driven swap (Phase 4a).
+  `Riptide.Auth.Verifier.Composite` (tries OIDC, then Riptide's own password
+  auth)) — mirrors `RiptideWeb.Plugs.ResolveTenant`'s config-driven swap
+  (Phase 4a).
 
   Unlike `ResolveTenant`, authentication is optional at this layer: no token
   present assigns `conn.assigns.current_subject` to `nil` and lets the
@@ -38,7 +39,7 @@ defmodule RiptideWeb.Plugs.Authenticate do
         assign(conn, :current_subject, nil)
 
       token ->
-        verifier = Application.get_env(:riptide, :auth_verifier, Riptide.Auth.Verifier.OIDC)
+        verifier = Application.get_env(:riptide, :auth_verifier, Riptide.Auth.Verifier.Composite)
 
         case verifier.verify(token) do
           {:ok, claims} ->
