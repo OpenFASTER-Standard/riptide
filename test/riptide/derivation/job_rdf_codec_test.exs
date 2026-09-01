@@ -70,4 +70,43 @@ defmodule Riptide.Derivation.JobRDFCodecTest do
 
     assert JobRDFCodec.from_rdf(node, graph) == job
   end
+
+  test "round-trips a Job with resolved_via and original_description set, no trace" do
+    job =
+      sample_job(%{
+        resolved_via: :discovery,
+        original_description: "make a QR code for this line"
+      })
+
+    {node, graph} = JobRDFCodec.to_rdf(job)
+
+    assert JobRDFCodec.from_rdf(node, graph) == job
+  end
+
+  test "round-trips a Job with a full trace (LLMFallback-resolved)" do
+    trace = %Riptide.Derivation.Rule{
+      signature: %Riptide.Derivation.Signature{
+        name: RDF.iri("urn:riptide:relation:qrCodeGenerated"),
+        parameters: [],
+        reads: [],
+        produces: [RDF.iri("urn:riptide:relation:qrCodeGenerated")]
+      },
+      head: %Riptide.Derivation.Literal.FactPattern{
+        predicate: RDF.iri("urn:riptide:relation:qrCodeGenerated"),
+        args: [RDF.iri("urn:test:line-1"), RDF.literal("done")]
+      },
+      body: []
+    }
+
+    job =
+      sample_job(%{
+        resolved_via: :llm_fallback,
+        original_description: "make a QR code for this line",
+        trace: trace
+      })
+
+    {node, graph} = JobRDFCodec.to_rdf(job)
+
+    assert JobRDFCodec.from_rdf(node, graph) == job
+  end
 end
