@@ -246,12 +246,7 @@ New functions in `Catalog`, direct mirrors of the existing Rule ones:
 @spec admit_capability(CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) :: :ok | {:error, :not_ready}
 def admit_capability(%CapabilityCatalogEntry{} = entry, replaces) do
   {node, entry_graph} = CapabilityCatalogRDFCodec.to_rdf(entry)
-
-  graph =
-    entry_graph
-    |> RDF.Graph.add({node, @rdf_type, @riptide_capability_catalog_entry})
-    |> maybe_add_supersedes(node, replaces)
-
+  graph = maybe_add_supersedes(entry_graph, node, replaces)
   write_patch(capability_stream_id(), RDF.Graph.triples(graph), [])
 end
 
@@ -265,7 +260,10 @@ def supersede_capability(node) do
 end
 ```
 
-(`admit_capability/1`'s current single-arg form becomes `admit_capability/2` with `replaces` — every
+(`CapabilityCatalogRDFCodec.to_rdf/1` already adds its own `{node, rdf:type, CapabilityCatalogEntry}`
+triple internally — confirmed by reading it directly — unlike `RuleRDFCodec.to_rdf/1`, which doesn't;
+`admit_entry/3`'s own type-triple-adding line has no equivalent needed here, only `maybe_add_supersedes/2`.
+`admit_capability/1`'s current single-arg form becomes `admit_capability/2` with `replaces` — every
 existing call site passes `nil`, matching how `admit_entry/3`'s own callers already do.)
 
 `list_capabilities/0` needs **no change** — it already filters by
