@@ -305,4 +305,44 @@ defmodule Riptide.Derivation.ContextResolverTest do
     assert {:error, {:not_found, ^missing_cap}} =
              ContextResolver.resolve(tenant_id, nil, rule_iri)
   end
+
+  describe "resolve_all/2" do
+    test "returns a Context populated with every Hub capability and every Rule in scope for the tenant" do
+      scope = {:tenant, unique_tenant()}
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(scope)) end)
+      {:tenant, tenant_id} = scope
+
+      cap_entry = admit_capability!("ctxres-resolve-all-#{System.unique_integer([:positive])}")
+
+      rule =
+        admit_rule!(scope, "ctxres-resolve-all-rule-#{System.unique_integer([:positive])}", [])
+
+      rule_iri = rule.signature.name
+
+      assert {:ok, context} = ContextResolver.resolve_all(tenant_id, nil)
+      assert Map.has_key?(context.capabilities, cap_entry.name)
+      assert Map.has_key?(context.rules, rule_iri)
+      assert context.tenant_id == tenant_id
+    end
+
+    # :hub is a single, shared, non-unique stream across the whole test suite
+    # (see the "Hub vs. Tenant scope isolation" test in catalog_test.exs) —
+    # other test files admit Rules into :hub scope too, so asserting
+    # context.rules == %{} here would be flaky depending on suite run order.
+    # Comparing against Hub's own live state instead of assuming it's empty
+    # is what actually tests "a Tenant with nothing of its own contributes
+    # nothing beyond Hub passthrough."
+    test "returns a Context whose rules are exactly Hub's own entries for a Tenant with no admitted Rules yet" do
+      tenant_id = unique_tenant()
+
+      {:ok, hub_entries} = Catalog.list_entries(:hub)
+
+      expected_hub_rules =
+        Map.new(hub_entries, fn {_node, rule} -> {rule.signature.name, rule} end)
+
+      assert {:ok, context} = ContextResolver.resolve_all(tenant_id, nil)
+      assert context.rules == expected_hub_rules
+      assert context.tenant_id == tenant_id
+    end
+  end
 end

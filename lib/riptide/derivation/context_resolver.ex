@@ -26,6 +26,57 @@ defmodule Riptide.Derivation.ContextResolver do
     end
   end
 
+  @doc """
+  Builds a Context populated with EVERY Hub Capability and every Rule visible to `tenant_id`
+  (Tenant-scope entries, then Hub-scope, matching `resolve/3`'s own Tenant-before-Hub precedent) —
+  unlike `resolve/3`, which transitively walks from one known starting Rule, this enumerates
+  everything available up front, for a caller (Task submission, 6m) that doesn't yet know what it
+  needs resolved. A Capability that fails to materialize (e.g. its blob is unreachable) is skipped,
+  not fatal — LLMFallback simply won't be told about it, the same degraded-but-available behavior
+  as if it had never been registered, rather than failing every Task submission because one
+  unrelated Capability is temporarily broken.
+  """
+  @spec resolve_all(String.t(), map() | nil) :: {:ok, Context.t()}
+  def resolve_all(tenant_id, current_subject) do
+    {:ok,
+     %Context{
+       capabilities: all_capabilities(),
+       rules: all_rules(tenant_id),
+       tenant_id: tenant_id,
+       current_subject: current_subject
+     }}
+  end
+
+  defp all_capabilities do
+    case Catalog.list_capabilities() do
+      {:ok, entries} -> Enum.reduce(entries, %{}, &materialize_into/2)
+      {:error, :not_ready} -> %{}
+    end
+  end
+
+  defp materialize_into({_node, entry}, acc) do
+    case CapabilityCatalog.materialize(entry) do
+      {:ok, definition} -> Map.put(acc, entry.name, definition)
+      {:error, _reason} -> acc
+    end
+  end
+
+  defp all_rules(tenant_id) do
+    tenant_rules = rules_by_signature_name({:tenant, tenant_id})
+    hub_rules = rules_by_signature_name(:hub)
+    Map.merge(hub_rules, tenant_rules)
+  end
+
+  defp rules_by_signature_name(scope) do
+    case Catalog.list_entries(scope) do
+      {:ok, entries} ->
+        Map.new(entries, fn {_node, rule} -> {rule.signature.name, rule} end)
+
+      {:error, :not_ready} ->
+        %{}
+    end
+  end
+
   defp walk_rule(tenant_id, iri, visited, capabilities, rules) do
     cond do
       # `rules` is added to on the way DOWN (before walking a Rule's own
