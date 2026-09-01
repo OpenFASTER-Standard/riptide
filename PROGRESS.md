@@ -1209,3 +1209,52 @@ surfaced as a rare flake under full-suite scheduler contention; and `authz_test.
 Verified with 8 consecutive full `mix test` / `mix test --warnings-as-errors` runs (0 failures, 0
 warnings each time), `mix format --check-formatted`, and `mix credo --strict`, before merging #116 and
 #118 (2026-08-31).
+
+### 6d-ii — Concurrent-Effects Coordination
+
+**Shipped 2026-09-01** — see
+`docs/superpowers/specs/2026-09-01-phase-6d-ii-concurrent-effects-design.md` and the research log's
+Part 4 (a real research pass — 24 sources, 25 claims adversarially verified — replacing the parent
+spec's own informal "checked: neither sagas nor CRDTs establish this" note).
+
+Gives `JobTrigger` a hard, load-bearing guarantee that two Jobs for the same Tenant declaring the same
+`resource_key` never execute concurrently — newly urgent once 6l shipped, since two different Job
+streams owned by two different leader nodes could otherwise invoke overlapping EffectCapabilities with
+zero coordination.
+
+The core insight: no new coordination primitive was needed at all. 6l already guarantees exactly one
+node — whichever currently leads a Tenant's Job stream — executes that Tenant's Jobs
+(`RaCluster.stream_leader?/1`). Since every Job for a Tenant, regardless of which resource it targets,
+is already funneled through that same single process, resource-key exclusion reduces to purely local,
+in-memory bookkeeping on `JobTrigger` itself: two `:ets` tables (the currently-in-flight resource-key
+set, and a monitor-ref-to-resource reverse map for crash-safe release), both created in `init/1` and
+therefore dying with the process — a crashed or handed-off leader's reservations simply cease to exist,
+the same at-least-once contract Job execution already has, not a new failure mode. No CAS, no TTL, no
+lease, no fencing token (the research log explains why fencing tokens don't apply here: there's no
+"lock holder pauses and later wakes up to act" window to defend against, since the code that invokes a
+Capability only ever runs as a direct consequence of currently being the leader).
+
+`Job` gained an optional `resource_key` field (nil by default — opt-in, not a tax on every Job). Two
+real subtleties found during implementation, both by a failing test catching a wrong assumption rather
+than by reasoning it out in advance: (1) `Process.monitor/1` inside the exclusion helper monitors from
+whichever process *calls* it — correct for the production dispatch path (already running inside
+`JobTrigger`'s own process via `handle_info`/`periodic_sweep`), but a test calling it directly would
+make the *test* process own the monitor, silently breaking crash-safe cleanup; fixed with a
+`test_run_exclusively/2` entry point that routes through a real (non-self) `GenServer.call`, letting
+`handle_call/3` execute the reservation from within `JobTrigger` itself the same way the production
+path already does — the production path can't use `GenServer.call` itself, since it already runs
+inside that same process and would deadlock calling itself. (2) A unit test asserting a locked
+resource stays locked flaked because the first task's trivial function completed and was
+monitor-cleaned-up before the test's own follow-up assertion ran — the reservation's presence *at
+return time* was correctly guaranteed, but nothing kept it present afterward for an near-instant
+function; fixed by having the first task block until the test explicitly lets it finish.
+
+Explicitly **not** covered by this phase, stated plainly rather than silently dropped: routing
+`GeneralizationFidelity`'s Capability replay (6e-ii) through this same mechanism. That call site isn't
+dispatched by `JobTrigger` at all today and may run on a different node than the Tenant's Job-stream
+leader, so closing that gap needs cross-node leader-routing — meaningfully different machinery than
+local `:ets` state — left as a tracked follow-up rather than bolted onto this plan.
+
+**Status**: Phase 6d-ii shipped 2026-09-01. 4 phases remaining — see issue #58's own restated summary
+for the current list (6g-ii deferred with no exit criterion yet; 6c-iii-a/6c-iii-b, Track B, ready to
+start; Capability grant flow/OAuth, Track A, ready to start).
