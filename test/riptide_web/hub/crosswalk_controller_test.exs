@@ -70,4 +70,73 @@ defmodule RiptideWeb.Hub.CrosswalkControllerTest do
              c.subject_predicate == RDF.iri(subject) and c.object_predicate == RDF.iri(object)
            end)
   end
+
+  test "proposing a Crosswalk with replaces: admits the new version and supersedes the old one" do
+    tenant_id = "crosswalk-replaces-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+
+    on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))
+    end)
+
+    subject = rel("crosswalkhttpreplaces-#{System.unique_integer([:positive])}")
+    object = rel("crosswalkhttpreplaces-obj#{System.unique_integer([:positive])}")
+
+    base_body = %{
+      "subject_predicate" => subject,
+      "object_predicate" => object,
+      "match_type" => "exact_match"
+    }
+
+    propose_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/crosswalks", Jason.encode!(base_body))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    old_node_id = Jason.decode!(propose_conn.resp_body)["node_id"]
+
+    approve_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/crosswalk-reviews/#{old_node_id}/approve")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert approve_conn.status == 200
+
+    {:ok, entries_before} = Catalog.list_crosswalks()
+
+    {old_hub_node, _entry} =
+      Enum.find(entries_before, fn {_n, c} -> c.subject_predicate == RDF.iri(subject) end)
+
+    replaces_body =
+      base_body
+      |> Map.put("match_type", "close_match")
+      |> Map.put("replaces", RDF.BlankNode.value(old_hub_node))
+
+    propose_replacement_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/crosswalks", Jason.encode!(replaces_body))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    new_node_id = Jason.decode!(propose_replacement_conn.resp_body)["node_id"]
+
+    approve_replacement_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/crosswalk-reviews/#{new_node_id}/approve")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert approve_replacement_conn.status == 200
+
+    {:ok, entries_after} = Catalog.list_crosswalks()
+
+    matching =
+      Enum.filter(entries_after, fn {_n, c} -> c.subject_predicate == RDF.iri(subject) end)
+
+    assert length(matching) == 1
+  end
 end

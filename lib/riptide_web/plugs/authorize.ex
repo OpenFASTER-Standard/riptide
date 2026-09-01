@@ -21,14 +21,14 @@ defmodule RiptideWeb.Plugs.Authorize do
 
   @impl true
   def call(conn, _opts) do
-    tenant_id = conn.assigns.tenant_id
+    scope = conn.assigns.scope
     current_subject = conn.assigns.current_subject
     path_segments = Map.get(conn.params, "path") || []
     mode = mode_for(conn.method)
 
-    case Riptide.Authz.evaluate(tenant_id, path_segments, current_subject, mode) do
+    case Riptide.Authz.evaluate(scope, path_segments, current_subject, mode) do
       :allow -> conn
-      :deny -> maybe_bootstrap(conn, tenant_id, current_subject, mode)
+      :deny -> maybe_bootstrap(conn, scope, current_subject, mode)
     end
   rescue
     _ -> service_unavailable(conn)
@@ -52,7 +52,7 @@ defmodule RiptideWeb.Plugs.Authorize do
   # token, so this should not be reachable in practice; kept as defense in
   # depth rather than trusting that invariant to hold from this call site
   # alone.
-  defp maybe_bootstrap(conn, tenant_id, %{"sub" => sub}, :write)
+  defp maybe_bootstrap(conn, {:tenant, tenant_id}, %{"sub" => sub}, :write)
        when not is_nil(sub) do
     store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
 
@@ -62,7 +62,9 @@ defmodule RiptideWeb.Plugs.Authorize do
     end
   end
 
-  defp maybe_bootstrap(conn, _tenant_id, _current_subject, _mode), do: reject(conn)
+  # Covers :hub (never reaches Authorize in practice — no write route exists for it) and any
+  # future non-tenant scope; keeps this function total instead of relying on that never happening.
+  defp maybe_bootstrap(conn, _scope, _current_subject, _mode), do: reject(conn)
 
   defp mode_for("GET"), do: :read
   defp mode_for(_other), do: :write

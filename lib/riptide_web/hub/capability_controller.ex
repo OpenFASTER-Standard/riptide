@@ -32,7 +32,7 @@ defmodule RiptideWeb.Hub.CapabilityController do
            "timeout_ms" => timeout_ms,
            "memory_limits" => memory_limits_params,
            "component_bytes" => component_bytes_b64
-         }
+         } = params
        ) do
     with {:ok, kind} <- parse_kind(kind_string),
          {:ok, bytes} <- Base.decode64(component_bytes_b64),
@@ -47,7 +47,9 @@ defmodule RiptideWeb.Hub.CapabilityController do
         memory_limits: parse_memory_limits(memory_limits_params)
       }
 
-      case DedupGate.propose_capability({:tenant, tenant_id}, entry) do
+      replaces = parse_replaces(params)
+
+      case DedupGate.propose_capability({:tenant, tenant_id}, entry, replaces) do
         {:ok, node} ->
           body = Jason.encode!(%{"outcome" => "queued", "node_id" => RDF.BlankNode.value(node)})
           conn |> put_resp_content_type("application/json") |> send_resp(200, body)
@@ -76,6 +78,11 @@ defmodule RiptideWeb.Hub.CapabilityController do
       max_tables: Map.get(params, "max_tables")
     }
   end
+
+  defp parse_replaces(%{"replaces" => node_id}) when is_binary(node_id),
+    do: RDF.BlankNode.new(node_id)
+
+  defp parse_replaces(_params), do: nil
 
   def approve(conn, %{"node_id" => node_id}) do
     tenant_id = conn.assigns.tenant_id

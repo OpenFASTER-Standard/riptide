@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering) — 3 phases remaining, see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle) — see issue #58 for the current remaining list (6o demo, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1344,3 +1344,72 @@ freelanced here. Also out of scope per the design spec §8: the demo itself (6n)
 surface, and background (non-Task-triggered) anti-unification discovery.
 
 **Status**: Phase 6m shipped 2026-09-01.
+
+### 6n — Hub Resource Lifecycle
+
+**Shipped 2026-09-01** — see
+`docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md` (spec PR #124). Direct
+origin: brainstorming 6n (originally scoped as "the demo") surfaced, while working out how to register
+a real `generate-qr-code` Capability into Riptide, two concrete gaps — Capability/Crosswalk had no
+supersede/update path at all (a gap 6k's own spec explicitly named and deferred), and Hub had zero
+generic read/watch surface for anything (`SseController`/`ReplicationChannel` rejected every
+Hub-shaped `stream_id` with `403`, since `ResourceController.parse_stream_id/1` only recognized the
+Tenant-shaped `/tenants/:id/resources/*path` form). The demo itself is pushed further out to 6o;
+convenient WASM-component-authoring tooling remains a separate, not-yet-scoped follow-up.
+
+**Core architectural finding**: rather than building a parallel Hub-specific addressing/authorization
+mechanism, `Riptide.Derivation.Catalog.scope()` (`:hub | {:tenant, id}` — already used pervasively
+inside `Catalog`/`Discovery`/`DedupGate`/`ContextResolver`) is generalized through the HTTP layer
+itself. `Riptide.Authz.evaluate/4` now takes a `scope()` instead of a bare `tenant_id` string, with
+`:hub`+`:read` hardcoded to always `:allow` and `:hub`+`:write` hardcoded to always `:deny`, both
+short-circuiting before ever consulting `Authz.Store` (which stays completely unmodified, still
+string-keyed — the Hub cases never reach it). `ResourceController.stream_id_for/2`/`parse_stream_id/1`
+are similarly widened to accept/return `scope()`, adding a `https://riptide.example/hub/resources/`
+prefix alongside the existing Tenant one. This worked because Hub's WRITE side was *already* unified
+with Tenant's own Authz mechanism (`CapabilityController` etc. all live under `/tenants/:tenant_id`
+scope) — only READ needed generalizing, eliminating what would otherwise have been a whole second,
+Hub-specific read/watch mechanism.
+
+New surface: `GET /hub/resources/*path`, reusing `ResourceController.show/2` verbatim (no write verbs
+wired for Hub — writes stay on the existing bespoke propose/review POST endpoints). `SseController`/
+`ReplicationChannel` both gained a `RiptideWeb.Plugs.ResolveHubScope` plug's `:hub`-scope counterpart
+to `ResolveTenant`, plus a `Riptide.HubRateLimit.check_read/1` guard at subscribe/join time — Hub-scoped
+reads are network-public with no per-tenant ownership check narrowing who can subscribe, so they get
+the same abuse-rate quota `Hub.DiscoveryController` already uses for `GET /hub/search`, applied once at
+connection-open time (not a per-message throttle).
+
+Capability and Crosswalk both gained the same supersede/`replaces` lifecycle Rules already have via
+`Catalog.supersede_entry/2`: `Catalog.admit_capability/2` (was `/1`) + `Catalog.supersede_capability/1`,
+mirrored exactly for Crosswalk. `PendingCapabilityReview`/`PendingCrosswalkReview` both gained an
+optional `:replaces` field (same `maybe_add_replaces/3` RDF encode/decode shape `PendingReview`
+established for Rules); `DedupGate.propose_capability/3`/`propose_crosswalk/3` (both were `/2`) accept
+it, and `approve_capability_review/2`/`approve_crosswalk_review/2` admit-with-replaces and supersede
+the old entry in one step. `Hub.CapabilityController.propose/2`/`Hub.CrosswalkController.propose/2`
+both accept an optional `"replaces"` body field. Full history is preserved throughout — supersession
+flips an RDF `rdf:type` triple (`CapabilityCatalogEntry` → `SupersededCapabilityCatalogEntry`, and the
+Crosswalk equivalent), never hard-deleting the old entry's underlying event.
+
+Capstone test (`test/riptide_web/hub_resource_lifecycle_capstone_test.exs`) proves the full exit
+criterion end-to-end over real HTTP: propose a Capability → approve → confirm it's live-readable via
+the new generic `GET /hub/resources/*path` surface (not just `Catalog.list_capabilities/0`, a library
+call rather than a public surface) → propose a replacement with `"replaces"` → approve → confirm only
+the new version is live in `list_capabilities/0` while the underlying stream still holds both events.
+
+**Two real regressions caught during implementation, both by running the full suite rather than just
+the touched test files**:
+1. Widening `Catalog.admit_capability/1` to `/2` broke three pre-existing
+   `test/riptide/derivation/job_trigger_cluster_test.exs` call sites invisibly to a literal-text
+   `grep "admit_capability("` sweep — they call it via `:erpc.call(node, Riptide.Derivation.Catalog,
+   :admit_capability, [entry])`, a dynamic `apply`-shaped call whose arity mismatch only surfaces at
+   runtime (`:undef`) inside the remote test node, not as a compile warning. Same risk confirmed absent
+   for the Crosswalk-side widening via a dedicated `:erpc.call`/`apply` sweep before committing.
+2. The DedupGate-level Capability-supersede test (mirrored for Crosswalk) initially passed the wrong
+   node as the second `propose_capability/3` call's `replaces` argument — `propose_capability/3`
+   returns the queued *review's* own node, not the catalog entry's node, so the old entry never actually
+   got flipped to `Superseded...`. Fixed by looking the real catalog node up via
+   `Catalog.list_capabilities/0` after the first approval (the same pattern the Catalog-level test and
+   the HTTP-level test both already used correctly).
+
+**Status**: Phase 6n shipped 2026-09-01. See issue #58's own restated summary for the current
+remaining list (6o — the demo itself, pushed out from 6n's original scope — plus 6g-ii deferred,
+6c-iii-a/6c-iii-b Track B, and Capability grant flow/OAuth Track A, all ready to start).

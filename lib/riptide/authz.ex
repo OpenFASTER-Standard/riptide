@@ -10,9 +10,28 @@ defmodule Riptide.Authz do
   """
 
   alias Riptide.Authz.Policy
+  alias Riptide.Derivation.Catalog
 
-  @spec evaluate(String.t(), [String.t()], map() | nil, Policy.mode()) :: :allow | :deny
-  def evaluate(tenant_id, path_segments, current_subject, mode) do
+  @doc """
+  `scope == :hub` is a hardcoded short-circuit, not a policy-store lookup: Hub's read-openness is a
+  structural property of what Hub *is* (`RiptideWeb.Hub.DiscoveryController`'s own moduledoc already
+  states this), not a per-scope setting that should be editable/revocable the way a Tenant's own
+  policies are. Both `:hub` clauses return before `Authz.Store` is ever consulted — its behaviour and
+  `Placement`-backed implementation are unmodified by this, and take only a raw tenant_id string, never
+  `:hub` (design spec `docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md` §4.1).
+  """
+  @spec evaluate(Catalog.scope(), [String.t()], map() | nil, Policy.mode()) :: :allow | :deny
+  def evaluate(:hub, _path_segments, _current_subject, :read) do
+    :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: :allow, mode: :read})
+    :allow
+  end
+
+  def evaluate(:hub, _path_segments, _current_subject, :write) do
+    :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: :deny, mode: :write})
+    :deny
+  end
+
+  def evaluate({:tenant, tenant_id}, path_segments, current_subject, mode) do
     store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
 
     matching_policies =

@@ -32,6 +32,7 @@ defmodule RiptideWeb.Plugs.AuthorizeTest do
     |> conn("/tenants/#{tenant_id}/resources/" <> Enum.join(path_segments, "/"))
     |> Map.update!(:params, &Map.put(&1, "path", path_segments))
     |> assign(:tenant_id, tenant_id)
+    |> assign(:scope, {:tenant, tenant_id})
     |> assign(:current_subject, current_subject)
   end
 

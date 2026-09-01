@@ -121,7 +121,7 @@ defmodule Riptide.Bench.CoreBench do
           Placement.lookup(placement_stream_id)
         end,
         "Authz.evaluate/4 (single :public policy, depth-1 path)" => fn ->
-          Authz.evaluate(authz_tenant, ["doc"], nil, :read)
+          Authz.evaluate({:tenant, authz_tenant}, ["doc"], nil, :read)
         end
       },
       time: 3,

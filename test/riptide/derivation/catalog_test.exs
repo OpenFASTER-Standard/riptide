@@ -34,7 +34,7 @@ defmodule Riptide.Derivation.CatalogTest do
     end
 
     test "catalog_stream_id/1 for the Hub scope" do
-      assert Catalog.catalog_stream_id(:hub) == "https://riptide.example/hub/catalog"
+      assert Catalog.catalog_stream_id(:hub) == "https://riptide.example/hub/resources/catalog"
     end
 
     test "pending_review_stream_id/1 for a Tenant scope" do
@@ -93,6 +93,47 @@ defmodule Riptide.Derivation.CatalogTest do
       :ok = Catalog.supersede_entry(scope, old_node)
 
       assert {:ok, [{_node, ^new_rule}]} = Catalog.list_entries(scope)
+    end
+  end
+
+  describe "admit_capability/2 + supersede_capability/1" do
+    test "a superseded capability disappears from list_capabilities/0; admitting with replaces: writes the supersedes link" do
+      name = RDF.iri("urn:riptide:capability:supersede-cap-#{System.unique_integer([:positive])}")
+
+      old_entry = %Riptide.Derivation.CapabilityCatalogEntry{
+        name: name,
+        kind: :effect,
+        component_hash: String.duplicate("b", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      # Deliberately no on_exit cleanup — Catalog.capability_stream_id/0 is a
+      # single, shared, non-unique stream across the whole test suite (like
+      # :hub's own Rule catalog); see this file's own "Hub vs. Tenant scope
+      # isolation" test for why force-deleting it here would be unsafe
+      # (races any other test concurrently or subsequently writing to the
+      # same stream). This test's own `name` is already unique-suffixed and
+      # its assertions are scoped to just that name, so accumulation from
+      # other tests doesn't affect it.
+      :ok = Catalog.admit_capability(old_entry, nil)
+      {:ok, entries} = Catalog.list_capabilities()
+      {old_node, ^old_entry} = Enum.find(entries, fn {_n, e} -> e.name == name end)
+
+      new_entry = %{old_entry | function: "run_v2"}
+      :ok = Catalog.admit_capability(new_entry, old_node)
+      :ok = Catalog.supersede_capability(old_node)
+
+      {:ok, entries_after} = Catalog.list_capabilities()
+      matching = Enum.filter(entries_after, fn {_n, e} -> e.name == name end)
+      assert [{_node, ^new_entry}] = matching
     end
   end
 
@@ -195,10 +236,48 @@ defmodule Riptide.Derivation.CatalogTest do
         match_type: :exact_match
       }
 
-      :ok = Catalog.admit_crosswalk(crosswalk)
+      :ok = Catalog.admit_crosswalk(crosswalk, nil)
 
       assert {:ok, entries} = Catalog.list_crosswalks()
       assert Enum.any?(entries, fn {_node, entry} -> entry == crosswalk end)
+    end
+  end
+
+  describe "admit_crosswalk/2 + supersede_crosswalk/1" do
+    test "a superseded crosswalk disappears from list_crosswalks/0; admitting with replaces: writes the supersedes link" do
+      subject_predicate =
+        rel("supersede-crosswalk-subject-#{System.unique_integer([:positive])}")
+
+      old_crosswalk = %Crosswalk{
+        subject_predicate: subject_predicate,
+        object_predicate:
+          rel("crosswalktest-deploymentQueued#{System.unique_integer([:positive])}"),
+        match_type: :exact_match
+      }
+
+      # Deliberately no on_exit cleanup — Catalog.crosswalk_stream_id/0 is a
+      # single, shared, non-unique stream across the whole test suite; see
+      # this file's own "Hub vs. Tenant scope isolation" test for why
+      # force-deleting it here would be unsafe. This test's own
+      # `subject_predicate` is already unique-suffixed and its assertions
+      # are scoped to just that predicate, so accumulation from other tests
+      # doesn't affect it.
+      :ok = Catalog.admit_crosswalk(old_crosswalk, nil)
+      {:ok, entries} = Catalog.list_crosswalks()
+
+      {old_node, ^old_crosswalk} =
+        Enum.find(entries, fn {_n, c} -> c.subject_predicate == subject_predicate end)
+
+      new_crosswalk = %{old_crosswalk | match_type: :close_match}
+      :ok = Catalog.admit_crosswalk(new_crosswalk, old_node)
+      :ok = Catalog.supersede_crosswalk(old_node)
+
+      {:ok, entries_after} = Catalog.list_crosswalks()
+
+      matching =
+        Enum.filter(entries_after, fn {_n, c} -> c.subject_predicate == subject_predicate end)
+
+      assert [{_node, ^new_crosswalk}] = matching
     end
   end
 end

@@ -48,7 +48,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry])
+    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
 
     # Capability.invoke/4 goes through the real, default-deny authz store
     # (Riptide.Authz.Store.Placement) unconditionally — no FakeStore swap
@@ -208,7 +208,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(node_a, Riptide.Derivation.Catalog, :admit_capability, [entry])
+    :ok = :erpc.call(node_a, Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
 
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
@@ -313,7 +313,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry])
+    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
 
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 

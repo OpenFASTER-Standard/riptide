@@ -121,4 +121,73 @@ defmodule RiptideWeb.Hub.CapabilityControllerTest do
     assert {:ok, entries} = Catalog.list_capabilities()
     refute Enum.any?(entries, fn {_n, e} -> e.name == RDF.iri(name) end)
   end
+
+  test "proposing a Capability with replaces: admits the new version and supersedes the old one" do
+    tenant_id = "capability-replaces-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+
+    on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))
+    end)
+
+    name = "urn:riptide:capability:httpcapreplaces-#{System.unique_integer([:positive])}"
+
+    base_body = %{
+      "name" => name,
+      "kind" => "effect",
+      "function" => "run",
+      "fuel_limit" => 10_000_000,
+      "timeout_ms" => 5_000,
+      "memory_limits" => %{
+        "max_memory_size" => nil,
+        "max_table_elements" => nil,
+        "max_instances" => nil,
+        "max_tables" => nil
+      },
+      "component_bytes" => Base.encode64(:crypto.strong_rand_bytes(64))
+    }
+
+    propose_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/capabilities", Jason.encode!(base_body))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    old_node_id = Jason.decode!(propose_conn.resp_body)["node_id"]
+
+    approve_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/capability-reviews/#{old_node_id}/approve")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert approve_conn.status == 200
+
+    {:ok, entries_before} = Catalog.list_capabilities()
+    {old_hub_node, _entry} = Enum.find(entries_before, fn {_n, e} -> e.name == RDF.iri(name) end)
+
+    replaces_body = Map.put(base_body, "replaces", RDF.BlankNode.value(old_hub_node))
+
+    propose_replacement_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/capabilities", Jason.encode!(replaces_body))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    new_node_id = Jason.decode!(propose_replacement_conn.resp_body)["node_id"]
+
+    approve_replacement_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/hub/capability-reviews/#{new_node_id}/approve")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert approve_replacement_conn.status == 200
+
+    {:ok, entries_after} = Catalog.list_capabilities()
+    matching = Enum.filter(entries_after, fn {_n, e} -> e.name == RDF.iri(name) end)
+    assert length(matching) == 1
+  end
 end

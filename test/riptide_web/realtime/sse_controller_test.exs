@@ -5,6 +5,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   require Logger
 
   alias Riptide.Authz.{Policy, Store}
+  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
@@ -39,7 +40,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   defp unique_stream_id,
     do:
-      ResourceController.stream_id_for("sse-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -51,7 +52,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   # "authentication" describe block's own `setup` below.
   defp unique_auth_stream_id,
     do:
-      ResourceController.stream_id_for("sse-auth-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-auth-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -86,7 +87,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
     stream_id =
-      ResourceController.stream_id_for("sse-gap-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-gap-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -183,7 +184,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     end
 
     defp new_ratelimit_stream_id do
-      ResourceController.stream_id_for("sse-ratelimit-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-ratelimit-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
     end
@@ -265,7 +266,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   describe "authorization" do
     test "subscribing to a stream_id shaped like a tenant resource with no matching policy is denied with 403" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get
@@ -277,7 +278,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "subscribing to a stream_id shaped like a tenant resource with a public read policy succeeds" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
       :ok =
@@ -308,7 +309,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "sets tenant_id in Logger metadata even when authorization denies the request" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get
@@ -329,7 +330,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       ])
 
       tenant_id = "sse-authz-down-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get
@@ -337,6 +338,50 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 503
+    end
+
+    test "subscribing to a Hub-shaped stream_id succeeds for an admitted Hub resource" do
+      name = "urn:riptide:capability:ssehub-#{System.unique_integer([:positive])}"
+
+      entry = %CapabilityCatalogEntry{
+        name: RDF.iri(name),
+        kind: :effect,
+        component_hash: String.duplicate("b", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      :ok = Catalog.admit_capability(entry, nil)
+
+      # Deliberately no on_exit cleanup — the capability stream is a single,
+      # shared, non-unique stream across the whole test suite; see
+      # catalog_test.exs's own "Hub vs. Tenant scope isolation" test for why
+      # force-deleting it here would be unsafe. This test's own name is
+      # already unique-suffixed.
+      stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
+      path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
+
+      conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "subscribing to a Hub-shaped stream_id is rate-limited" do
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :hub_read_rate_limit, 0)
+
+      stream_id = "https://riptide.example/hub/resources/catalog"
+      path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
+
+      conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 429
     end
   end
 

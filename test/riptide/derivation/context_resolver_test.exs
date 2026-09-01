@@ -43,7 +43,7 @@ defmodule Riptide.Derivation.ContextResolverTest do
     }
 
     review_scope = {:tenant, "ctxres-review-#{System.unique_integer([:positive])}"}
-    {:ok, node} = DedupGate.propose_capability(review_scope, entry)
+    {:ok, node} = DedupGate.propose_capability(review_scope, entry, nil)
     :ok = DedupGate.approve_capability_review(review_scope, node)
 
     on_exit(fn ->

@@ -124,7 +124,7 @@ defmodule Riptide.Derivation.InstallTest do
         match_type: :exact_match
       }
 
-      :ok = Catalog.admit_crosswalk(crosswalk)
+      :ok = Catalog.admit_crosswalk(crosswalk, nil)
       {:ok, crosswalks} = Catalog.list_crosswalks()
       {crosswalk_node, ^crosswalk} = Enum.find(crosswalks, fn {_node, c} -> c == crosswalk end)
 
