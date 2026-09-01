@@ -79,23 +79,7 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
         check_body(rest, graph, context)
 
       {:ok, %Definition{kind: :effect} = definition} ->
-        resolved_args = Enum.map(args, &term_to_arg/1)
-
-        case Capability.invoke(
-               definition,
-               context.tenant_id,
-               context.current_subject,
-               resolved_args
-             ) do
-          {:ok, ^result} ->
-            check_body(rest, graph, context)
-
-          {:ok, actual} ->
-            {:ok, {:fidelity_fail, {:capability_mismatch, iri, result, actual}}}
-
-          {:error, reason} ->
-            {:ok, {:fidelity_fail, {:capability_error, iri, reason}}}
-        end
+        check_effect_invocation(definition, iri, args, result, rest, graph, context)
 
       :error ->
         {:error, {:unresolvable, iri}}
@@ -118,6 +102,35 @@ defmodule Riptide.Derivation.GeneralizationFidelity do
           {:ok, {:fidelity_fail, reason}} -> {:ok, {:fidelity_fail, {:nested, iri, reason}}}
           {:error, reason} -> {:error, reason}
         end
+    end
+  end
+
+  defp check_effect_invocation(definition, iri, args, result, rest, graph, context) do
+    resolved_args = Enum.map(args, &term_to_arg/1)
+
+    case Capability.invoke(
+           definition,
+           context.tenant_id,
+           context.current_subject,
+           resolved_args
+         ) do
+      {:ok, actual} ->
+        # `Capability.invoke/4` always returns a raw Elixir string, never an
+        # RDF term. A ground `result` reconstructed via `RuleRDFCodec` (e.g.
+        # read back from a stored Job's trace) is a proper `RDF.Literal` —
+        # RDF triples can't hold a bare Elixir binary as an object, so the
+        # graph round-trip coerces it — while a `result` compared before
+        # ever touching RDF storage may still be the original raw string.
+        # `term_to_arg/1` normalizes either shape down to the same plain
+        # string for comparison.
+        if term_to_arg(result) == actual do
+          check_body(rest, graph, context)
+        else
+          {:ok, {:fidelity_fail, {:capability_mismatch, iri, result, actual}}}
+        end
+
+      {:error, reason} ->
+        {:ok, {:fidelity_fail, {:capability_error, iri, reason}}}
     end
   end
 

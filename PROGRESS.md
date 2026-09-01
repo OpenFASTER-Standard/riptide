@@ -1258,3 +1258,89 @@ local `:ets` state — left as a tracked follow-up rather than bolted onto this 
 **Status**: Phase 6d-ii shipped 2026-09-01. 4 phases remaining — see issue #58's own restated summary
 for the current list (6g-ii deferred with no exit criterion yet; 6c-iii-a/6c-iii-b, Track B, ready to
 start; Capability grant flow/OAuth, Track A, ready to start).
+
+### 6m — Tenant-Scoped Execution Surface
+
+**Shipped 2026-09-01** — see
+`docs/superpowers/specs/2026-09-01-phase-6m-tenant-execution-surface-design.md`. Direct origin:
+resuming the "tutorial of a computer game" demo idea from earlier brainstorming surfaced a third,
+previously-untracked prerequisite — every piece needed to *run* that demo already existed (Discovery,
+LLMFallback, DedupGate propose/review, Job execution) but only as a Hub-scoped or programmatic API,
+with no Tenant-scoped HTTP surface tying them into one coherent "submit a Task in plain English" flow.
+6m builds that surface; the demo itself is deferred to 6n.
+
+**Core architectural finding**: Riptide has exactly ONE stream storage mechanism — every
+`Riptide.Derivation.Catalog` write and `RiptideWeb.LDP.ResourceController`'s own writes call identical
+primitives (`Riptide.Event.new/3` + `Riptide.Stream.StreamServer.append/2`). "Job stream" and "Catalog
+stream" were never structurally different from an LDP resource — just addressed outside
+`/resources/*path`, which is why they had no read/watch story of their own. Moving
+`Catalog.job_stream_id/1` and `Catalog.catalog_stream_id({:tenant, _})` (Hub's own `/hub/*` addressing
+left untouched) under `/resources/*path` makes `GET /tenants/:id/resources/jobs` and SSE subscription
+work for free through the already-existing generic machinery — eliminating what would otherwise have
+been 2-3 new bespoke read/watch mechanisms. The one cost: a small write-guard on `ResourceController`
+(`replace/2`/`patch/2`/`delete/2`/`create_child/2`) rejecting generic writes to the now-reserved
+`jobs`/`catalog` path prefixes with `409`, since those paths' shape is owned by `Catalog`, not
+arbitrary LDP callers.
+
+`Job` gained three more optional fields (nil by default, same opt-in precedent as 6d-ii's
+`resource_key`): `resolved_via` (`:discovery | :llm_fallback`), `original_description` (the Task's own
+plain-English text), and `trace` (the full ground Rule an LLMFallback resolution produced — reified via
+the same `RuleRDFCodec` reification 6c-i-a already established, not a plain literal, since Tenant
+propose (below) needs to read a real `Rule.t()` back out).
+
+New surface, all under `/tenants/:tenant_id`:
+- `POST /tasks` — Discovery-first, LLMFallback-fallback. A Discovery match writes a `{:rule, iri}` Job
+  with `args: []` and a per-submission `job_graph` stream seeded from the Task's own submitted facts,
+  reusing 6l's already-proven jobRule execution path verbatim. An LLMFallback resolution writes a
+  `{:capability, iri}` Job instead, using the resolved trace's own already-ground `CapabilityReference`
+  args directly — these are two genuinely different reference/args shapes, not one shared helper, since
+  a Discovery-matched CatalogEntry may carry free generalization variables while an LLMFallback trace is
+  always fully ground before it's ever returned.
+- `POST /propose` — takes two Job node references and reads each Job's own recorded `trace` back (not
+  raw Turtle text), then anti-unifies and runs the same `DedupGate.propose/5` orchestration Hub's own
+  propose endpoint uses, `target_scope`/`review_scope` both `{:tenant, tenant_id}`.
+- `POST /pending-reviews/:node_id/{approve,decline}`, `GET /discovery/search` — direct Tenant-scoped
+  analogues of the existing Hub controllers.
+
+Capstone test proves the full exit criterion end-to-end over real HTTP: two Tasks with no matching
+CatalogEntry resolve via LLMFallback; their Jobs' own recorded Traces get proposed against each other
+and queued for review; approving admits the generalization into the Tenant's own Catalog; a third,
+similar Task now resolves via Discovery with zero further LLMFallback calls.
+
+**Three real, previously-latent bugs found and fixed during implementation** (each caught by a test
+actually exercising a code path for the first time, not by inspection):
+1. `DedupGate.PendingReview.decode_evidence/2` crashed on an empty (non-`:not_applicable`)
+   `fidelity_evidence` list — `RDF.List.from([])` encodes to `rdf:nil`, which (unlike every other
+   evidence-head shape this function handles) has no triples of its own describing it, so
+   `RDF.Graph.get/2` returned `nil` and the unconditional `RDF.Description.first(nil, ...)` crashed.
+   Never exercised before the Tenant review test — every prior `PendingReview` fixture in the test
+   suite used a non-empty evidence list.
+2. `GeneralizationFidelity.check_body/3`'s `CapabilityReference` fidelity re-verification compared a
+   fresh `Capability.invoke/4` call's raw Elixir string return directly against a trace's recorded
+   `result` — which is only a raw string *before* the trace ever touches RDF storage. Once a Job's
+   trace round-trips through `RuleRDFCodec` (as every Tenant-propose call does, by design), RDF triples
+   can't hold a bare Elixir binary as an object, so the graph coerces it into a proper `RDF.Literal` —
+   permanently breaking the direct comparison for any trace read back from storage. Fixed by
+   normalizing both sides through the module's own existing `term_to_arg/1` unwrapping helper before
+   comparing, rather than changing `ExecuteInterpreter`'s core binding representation (much wider blast
+   radius across 6b-i/6c-i-b/6f, all already-shipped).
+3. `ExecuteInterpreter` could crash a supervised `JobTrigger` Task with an uncaught `KeyError`: a Var
+   referenced only inside a `CapabilityReference`/`RuleReference`'s own args, with no preceding
+   `FactPattern` binding it, can never receive a value — `Matcher.bindings/3` only ever binds Vars that
+   appear in a `FactPattern`'s own args — yet nothing validated this before executing. Confirmed live:
+   a `DedupGate`-generalized Rule whose only free variable lives inside a `CapabilityReference`'s args
+   (rather than a `FactPattern`) crashed exactly this way when `JobTrigger` picked it up. Fixed with a
+   `check_vars_bound/2` pre-execution pass mirroring `check_resolvable/2`'s existing
+   halt-on-first-problem convention, turning the crash into a clean `{:error, {:unbound_variable, _}}`
+   that `JobTrigger`'s own existing `mark_job_failed` catch-all already handles gracefully.
+
+**Explicitly not covered by this phase**, stated plainly: bug 3 above only stops the crash — it does
+not give a Discovery-matched entry whose free variables live solely inside a `CapabilityReference` any
+way to actually *execute* (such a Job now fails cleanly with `{:unbound_variable, _}` instead of
+crashing a process, but still fails). Making that shape executable needs a real design decision about
+how a Task's own submitted facts should map onto a generalized entry's free Capability-argument
+positions — genuinely new scope, not a mechanical fix, and left as a tracked gap rather than
+freelanced here. Also out of scope per the design spec §8: the demo itself (6n), Hub's own equivalent
+surface, and background (non-Task-triggered) anti-unification discovery.
+
+**Status**: Phase 6m shipped 2026-09-01.
