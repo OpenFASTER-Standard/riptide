@@ -2,6 +2,7 @@ defmodule Riptide.AccountsTest do
   use ExUnit.Case, async: false
 
   alias Riptide.Accounts
+  alias Riptide.Auth.Verifier.Password
 
   setup do
     Riptide.AppEnvTestHelpers.put_env(
@@ -25,7 +26,7 @@ defmodule Riptide.AccountsTest do
       assert is_binary(token)
       assert is_binary(sub)
 
-      assert {:ok, claims} = Riptide.Auth.Verifier.Password.verify(token)
+      assert {:ok, claims} = Password.verify(token)
       assert claims["sub"] == sub
     end
 
@@ -47,7 +48,7 @@ defmodule Riptide.AccountsTest do
       {:ok, %{sub: sub}} = Accounts.sign_up(tenant_id, "alice", password_hash)
 
       assert {:ok, token} = Accounts.log_in(tenant_id, "alice", password_hash)
-      assert {:ok, claims} = Riptide.Auth.Verifier.Password.verify(token)
+      assert {:ok, claims} = Password.verify(token)
       assert claims["sub"] == sub
     end
 
