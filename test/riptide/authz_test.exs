@@ -44,7 +44,7 @@ defmodule Riptide.AuthzTest do
 
   test "denies when no policy matches at all (default-deny)" do
     FakeStore.start(%{})
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "user-1"}, :read) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "user-1"}, :read) == :deny
   end
 
   test "a :public matcher allows anyone, including anonymous, for the modes it lists" do
@@ -52,9 +52,9 @@ defmodule Riptide.AuthzTest do
       {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
     })
 
-    assert Authz.evaluate("acme", ["docs"], nil, :read) == :allow
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "someone"}, :read) == :allow
-    assert Authz.evaluate("acme", ["docs"], nil, :write) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "someone"}, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :write) == :deny
   end
 
   test "an :authenticated matcher allows any non-nil subject but not anonymous" do
@@ -62,8 +62,8 @@ defmodule Riptide.AuthzTest do
       {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :authenticated}]
     })
 
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "someone"}, :read) == :allow
-    assert Authz.evaluate("acme", ["docs"], nil, :read) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "someone"}, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :deny
   end
 
   test "an {:agent, subject} matcher only allows that exact subject" do
@@ -73,8 +73,10 @@ defmodule Riptide.AuthzTest do
       ]
     })
 
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "owner"}, :write) == :allow
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "someone-else"}, :write) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "owner"}, :write) == :allow
+
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "someone-else"}, :write) ==
+             :deny
   end
 
   test "a policy only grants the modes it explicitly lists" do
@@ -82,8 +84,8 @@ defmodule Riptide.AuthzTest do
       {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
     })
 
-    assert Authz.evaluate("acme", ["docs"], nil, :read) == :allow
-    assert Authz.evaluate("acme", ["docs"], nil, :write) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :write) == :deny
   end
 
   test "deny overrides allow when both match the same request" do
@@ -95,9 +97,9 @@ defmodule Riptide.AuthzTest do
     })
 
     # Anonymous: only the :public allow matches -> allow.
-    assert Authz.evaluate("acme", ["docs"], nil, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :allow
     # Authenticated: both the :public allow and the :authenticated deny match -> deny wins.
-    assert Authz.evaluate("acme", ["docs"], %{"sub" => "someone"}, :read) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], %{"sub" => "someone"}, :read) == :deny
   end
 
   test "a policy on an ancestor container is inherited by a deeper resource" do
@@ -105,7 +107,7 @@ defmodule Riptide.AuthzTest do
       {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
     })
 
-    assert Authz.evaluate("acme", ["docs", "sub", "deep"], nil, :read) == :allow
+    assert Authz.evaluate({:tenant, "acme"}, ["docs", "sub", "deep"], nil, :read) == :allow
   end
 
   test "a policy on a sibling path prefix does not apply to an unrelated resource" do
@@ -113,6 +115,17 @@ defmodule Riptide.AuthzTest do
       {"acme", ["other"]} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
     })
 
-    assert Authz.evaluate("acme", ["docs"], nil, :read) == :deny
+    assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :deny
+  end
+
+  test "scope :hub always allows :read regardless of any policy" do
+    FakeStore.start(%{})
+    assert Authz.evaluate(:hub, ["catalog"], nil, :read) == :allow
+    assert Authz.evaluate(:hub, ["catalog"], %{"sub" => "someone"}, :read) == :allow
+  end
+
+  test "scope :hub always denies :write, never consulting the Store" do
+    FakeStore.start(%{})
+    assert Authz.evaluate(:hub, ["catalog"], %{"sub" => "someone"}, :write) == :deny
   end
 end
