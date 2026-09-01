@@ -27,7 +27,7 @@ defmodule RiptideWeb.Hub.CrosswalkController do
            "subject_predicate" => subject_predicate,
            "object_predicate" => object_predicate,
            "match_type" => match_type_string
-         }
+         } = params
        ) do
     case parse_match_type(match_type_string) do
       nil ->
@@ -40,7 +40,9 @@ defmodule RiptideWeb.Hub.CrosswalkController do
           match_type: match_type
         }
 
-        case DedupGate.propose_crosswalk({:tenant, tenant_id}, crosswalk) do
+        replaces = parse_replaces(params)
+
+        case DedupGate.propose_crosswalk({:tenant, tenant_id}, crosswalk, replaces) do
           {:ok, node} ->
             body =
               Jason.encode!(%{"outcome" => "queued", "node_id" => RDF.BlankNode.value(node)})
@@ -66,6 +68,11 @@ defmodule RiptideWeb.Hub.CrosswalkController do
   defp parse_match_type("narrow_match"), do: :narrow_match
   defp parse_match_type("related_match"), do: :related_match
   defp parse_match_type(_other), do: nil
+
+  defp parse_replaces(%{"replaces" => node_id}) when is_binary(node_id),
+    do: RDF.BlankNode.new(node_id)
+
+  defp parse_replaces(_params), do: nil
 
   def approve(conn, %{"node_id" => node_id}) do
     tenant_id = conn.assigns.tenant_id

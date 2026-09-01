@@ -708,7 +708,7 @@ defmodule Riptide.Derivation.DedupGateTest do
     end
   end
 
-  describe "propose_crosswalk/2 + approve_crosswalk_review/1 + decline_crosswalk_review/1" do
+  describe "propose_crosswalk/3 + approve_crosswalk_review/1 + decline_crosswalk_review/1" do
     test "a proposed Crosswalk is queued, then approval admits it to the Hub crosswalk catalog" do
       review_scope = unique_tenant()
 
@@ -722,7 +722,7 @@ defmodule Riptide.Derivation.DedupGateTest do
         match_type: :close_match
       }
 
-      assert {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      assert {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk, nil)
       assert :ok == DedupGate.approve_crosswalk_review(review_scope, node)
 
       assert {:ok, entries} = Catalog.list_crosswalks()
@@ -744,12 +744,75 @@ defmodule Riptide.Derivation.DedupGateTest do
         match_type: :broad_match
       }
 
-      {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk)
+      {:ok, node} = DedupGate.propose_crosswalk(review_scope, crosswalk, nil)
       assert :ok == DedupGate.decline_crosswalk_review(review_scope, node)
 
       assert {:ok, entries} = Catalog.list_crosswalks()
       refute Enum.any?(entries, fn {_n, c} -> c == crosswalk end)
     end
+  end
+
+  test "PendingCrosswalkReview.to_rdf/1 + from_rdf/2 round-trips a nil replaces" do
+    crosswalk = %Crosswalk{
+      subject_predicate: rel("crosswalkroundtrip-a#{System.unique_integer([:positive])}"),
+      object_predicate: rel("crosswalkroundtrip-b#{System.unique_integer([:positive])}"),
+      match_type: :exact_match
+    }
+
+    pending = %PendingCrosswalkReview{candidate: crosswalk, replaces: nil}
+    {node, graph} = PendingCrosswalkReview.to_rdf(pending)
+    assert PendingCrosswalkReview.from_rdf(node, graph) == pending
+  end
+
+  test "PendingCrosswalkReview.to_rdf/1 + from_rdf/2 round-trips a non-nil replaces" do
+    crosswalk = %Crosswalk{
+      subject_predicate: rel("crosswalkroundtrip-c#{System.unique_integer([:positive])}"),
+      object_predicate: rel("crosswalkroundtrip-d#{System.unique_integer([:positive])}"),
+      match_type: :exact_match
+    }
+
+    replaces_node = RDF.BlankNode.new()
+    pending = %PendingCrosswalkReview{candidate: crosswalk, replaces: replaces_node}
+    {node, graph} = PendingCrosswalkReview.to_rdf(pending)
+    assert PendingCrosswalkReview.from_rdf(node, graph) == pending
+  end
+
+  test "propose_crosswalk/3 + approve_crosswalk_review/2 with replaces: admits the new entry and supersedes the old one" do
+    review_scope = unique_tenant()
+
+    subject_predicate = rel("crosswalksupersede-#{System.unique_integer([:positive])}")
+
+    old_crosswalk = %Crosswalk{
+      subject_predicate: subject_predicate,
+      object_predicate: rel("crosswalksupersede-obj#{System.unique_integer([:positive])}"),
+      match_type: :exact_match
+    }
+
+    {:ok, old_review_node} = DedupGate.propose_crosswalk(review_scope, old_crosswalk, nil)
+    :ok = DedupGate.approve_crosswalk_review(review_scope, old_review_node)
+
+    # propose_crosswalk/3 returns the queued *review's* own node, not the
+    # catalog entry's node — the `replaces` argument on the next propose
+    # call needs the latter, so it's looked up from the catalog itself
+    # (mirrors the equivalent Capability-level test's own fix above).
+    {:ok, entries_before} = Catalog.list_crosswalks()
+
+    {old_catalog_node, ^old_crosswalk} =
+      Enum.find(entries_before, fn {_n, c} -> c.subject_predicate == subject_predicate end)
+
+    new_crosswalk = %{old_crosswalk | match_type: :close_match}
+
+    {:ok, review_node} =
+      DedupGate.propose_crosswalk(review_scope, new_crosswalk, old_catalog_node)
+
+    :ok = DedupGate.approve_crosswalk_review(review_scope, review_node)
+
+    {:ok, entries} = Catalog.list_crosswalks()
+
+    matching =
+      Enum.filter(entries, fn {_n, c} -> c.subject_predicate == subject_predicate end)
+
+    assert [{_node, ^new_crosswalk}] = matching
   end
 
   describe "PendingCapabilityReview round-trip" do

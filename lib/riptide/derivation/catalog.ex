@@ -34,6 +34,7 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_superseded_catalog_entry RDF.iri("urn:riptide:vocab:SupersededCatalogEntry")
   @riptide_supersedes RDF.iri("urn:riptide:vocab:supersedes")
   @riptide_crosswalk RDF.iri("urn:riptide:vocab:Crosswalk")
+  @riptide_superseded_crosswalk RDF.iri("urn:riptide:vocab:SupersededCrosswalk")
   @riptide_pending_crosswalk_review RDF.iri("urn:riptide:vocab:PendingCrosswalkReview")
   @riptide_resolved_pending_crosswalk_review RDF.iri(
                                                "urn:riptide:vocab:ResolvedPendingCrosswalkReview"
@@ -103,10 +104,20 @@ defmodule Riptide.Derivation.Catalog do
     )
   end
 
-  @spec admit_crosswalk(Crosswalk.t()) :: :ok | {:error, :not_ready}
-  def admit_crosswalk(%Crosswalk{} = crosswalk) do
-    {_node, crosswalk_graph} = CrosswalkRDFCodec.to_rdf(crosswalk)
-    write_patch(crosswalk_stream_id(), RDF.Graph.triples(crosswalk_graph), [])
+  @spec admit_crosswalk(Crosswalk.t(), RDF.BlankNode.t() | nil) :: :ok | {:error, :not_ready}
+  def admit_crosswalk(%Crosswalk{} = crosswalk, replaces) do
+    {node, crosswalk_graph} = CrosswalkRDFCodec.to_rdf(crosswalk)
+    graph = maybe_add_supersedes(crosswalk_graph, node, replaces)
+    write_patch(crosswalk_stream_id(), RDF.Graph.triples(graph), [])
+  end
+
+  @spec supersede_crosswalk(RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def supersede_crosswalk(node) do
+    write_patch(
+      crosswalk_stream_id(),
+      [{node, @rdf_type, @riptide_superseded_crosswalk}],
+      [{node, @rdf_type, @riptide_crosswalk}]
+    )
   end
 
   @spec list_crosswalks() :: {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
