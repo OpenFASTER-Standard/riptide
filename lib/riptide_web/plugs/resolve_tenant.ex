@@ -21,6 +21,12 @@ defmodule RiptideWeb.Plugs.ResolveTenant do
   since none of the delimiter characters (`/`) can appear on either side of
   the join. An invalid tenant_id is treated exactly like an unresolvable
   one: halt with `400`.
+
+  Also assigns `conn.assigns.scope = {:tenant, tenant_id}` — additive alongside the existing
+  `tenant_id` assign, so callers that already read `tenant_id` directly (`TaskController`,
+  `Authz.PolicyController`, etc.) are unaffected; `RiptideWeb.Plugs.Authorize` and
+  `RiptideWeb.LDP.ResourceController` read `scope` instead, matching
+  `RiptideWeb.Plugs.ResolveHubScope`'s own shape for the Hub side.
   """
   import Plug.Conn
   require Logger
@@ -41,7 +47,10 @@ defmodule RiptideWeb.Plugs.ResolveTenant do
       {:ok, tenant_id} ->
         if Regex.match?(@safe_tenant_id, tenant_id) do
           Logger.metadata(tenant_id: tenant_id)
-          assign(conn, :tenant_id, tenant_id)
+
+          conn
+          |> assign(:tenant_id, tenant_id)
+          |> assign(:scope, {:tenant, tenant_id})
         else
           reject(conn)
         end

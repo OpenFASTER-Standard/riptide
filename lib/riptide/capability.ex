@@ -23,7 +23,7 @@ defmodule Riptide.Capability do
   @spec authorized?(Definition.t(), String.t(), map() | nil) :: boolean()
   def authorized?(%Definition{} = definition, tenant_id, current_subject) do
     path = ["capabilities", local_name(definition)]
-    Riptide.Authz.evaluate(tenant_id, path, current_subject, :invoke) == :allow
+    Riptide.Authz.evaluate({:tenant, tenant_id}, path, current_subject, :invoke) == :allow
   end
 
   defp local_name(%Definition{name: name}) do
