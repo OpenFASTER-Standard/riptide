@@ -485,7 +485,7 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     # hasn't landed yet at this point in the sequence and will change this
     # to /2 (gaining a `replaces` param); when it does, this call site needs
     # the same update every other `admit_capability/1` caller gets.
-    :ok = Catalog.admit_capability(entry)
+    :ok = Catalog.admit_capability(entry, nil)
 
     conn = :get |> conn("/hub/resources/catalog/capabilities") |> RiptideWeb.Endpoint.call(@opts)
     assert conn.status == 200

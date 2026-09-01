@@ -44,6 +44,9 @@ defmodule Riptide.Derivation.Catalog do
   @riptide_job_result RDF.iri("urn:riptide:vocab:jobResult")
   @riptide_job_error RDF.iri("urn:riptide:vocab:jobError")
   @riptide_capability_catalog_entry RDF.iri("urn:riptide:vocab:CapabilityCatalogEntry")
+  @riptide_superseded_capability_catalog_entry RDF.iri(
+                                                 "urn:riptide:vocab:SupersededCapabilityCatalogEntry"
+                                               )
   @riptide_pending_capability_review RDF.iri("urn:riptide:vocab:PendingCapabilityReview")
   @riptide_resolved_pending_capability_review RDF.iri(
                                                 "urn:riptide:vocab:ResolvedPendingCapabilityReview"
@@ -147,10 +150,21 @@ defmodule Riptide.Derivation.Catalog do
   @spec capability_stream_id() :: String.t()
   def capability_stream_id, do: catalog_stream_id(:hub) <> "/capabilities"
 
-  @spec admit_capability(CapabilityCatalogEntry.t()) :: :ok | {:error, :not_ready}
-  def admit_capability(%CapabilityCatalogEntry{} = entry) do
-    {_node, entry_graph} = CapabilityCatalogRDFCodec.to_rdf(entry)
-    write_patch(capability_stream_id(), RDF.Graph.triples(entry_graph), [])
+  @spec admit_capability(CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) ::
+          :ok | {:error, :not_ready}
+  def admit_capability(%CapabilityCatalogEntry{} = entry, replaces) do
+    {node, entry_graph} = CapabilityCatalogRDFCodec.to_rdf(entry)
+    graph = maybe_add_supersedes(entry_graph, node, replaces)
+    write_patch(capability_stream_id(), RDF.Graph.triples(graph), [])
+  end
+
+  @spec supersede_capability(RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def supersede_capability(node) do
+    write_patch(
+      capability_stream_id(),
+      [{node, @rdf_type, @riptide_superseded_capability_catalog_entry}],
+      [{node, @rdf_type, @riptide_capability_catalog_entry}]
+    )
   end
 
   @spec list_capabilities() ::

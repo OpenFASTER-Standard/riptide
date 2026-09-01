@@ -96,6 +96,47 @@ defmodule Riptide.Derivation.CatalogTest do
     end
   end
 
+  describe "admit_capability/2 + supersede_capability/1" do
+    test "a superseded capability disappears from list_capabilities/0; admitting with replaces: writes the supersedes link" do
+      name = RDF.iri("urn:riptide:capability:supersede-cap-#{System.unique_integer([:positive])}")
+
+      old_entry = %Riptide.Derivation.CapabilityCatalogEntry{
+        name: name,
+        kind: :effect,
+        component_hash: String.duplicate("b", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      # Deliberately no on_exit cleanup — Catalog.capability_stream_id/0 is a
+      # single, shared, non-unique stream across the whole test suite (like
+      # :hub's own Rule catalog); see this file's own "Hub vs. Tenant scope
+      # isolation" test for why force-deleting it here would be unsafe
+      # (races any other test concurrently or subsequently writing to the
+      # same stream). This test's own `name` is already unique-suffixed and
+      # its assertions are scoped to just that name, so accumulation from
+      # other tests doesn't affect it.
+      :ok = Catalog.admit_capability(old_entry, nil)
+      {:ok, entries} = Catalog.list_capabilities()
+      {old_node, ^old_entry} = Enum.find(entries, fn {_n, e} -> e.name == name end)
+
+      new_entry = %{old_entry | function: "run_v2"}
+      :ok = Catalog.admit_capability(new_entry, old_node)
+      :ok = Catalog.supersede_capability(old_node)
+
+      {:ok, entries_after} = Catalog.list_capabilities()
+      matching = Enum.filter(entries_after, fn {_n, e} -> e.name == name end)
+      assert [{_node, ^new_entry}] = matching
+    end
+  end
+
   describe "queue_pending_review/2 + list_pending_reviews/1 — real round-trip" do
     test "a queued PendingReview is found live by list_pending_reviews/1" do
       scope = unique_tenant()

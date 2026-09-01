@@ -59,7 +59,7 @@ defmodule RiptideWeb.TaskControllerTest do
       }
     }
 
-    :ok = Catalog.admit_capability(entry)
+    :ok = Catalog.admit_capability(entry, nil)
 
     :ok =
       Riptide.Placement.add_policy(

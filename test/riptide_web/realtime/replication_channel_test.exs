@@ -9,6 +9,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   require Logger
 
   alias Riptide.Authz.{Policy, Store}
+  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
@@ -267,7 +268,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   test "joining a Hub-shaped topic succeeds for an admitted Hub resource" do
     name = "urn:riptide:capability:wshub-#{System.unique_integer([:positive])}"
 
-    entry = %Riptide.Derivation.CapabilityCatalogEntry{
+    entry = %CapabilityCatalogEntry{
       name: RDF.iri(name),
       kind: :effect,
       component_hash: String.duplicate("b", 64),
@@ -282,12 +283,9 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
       }
     }
 
-    # `admit_capability/1` here, not `/2` — Task 6 of this same plan
-    # (docs/superpowers/plans/2026-09-01-phase-6n-hub-resource-lifecycle.md)
-    # hasn't landed yet at this point in the sequence. Deliberately no
-    # on_exit cleanup either — see sse_controller_test.exs's identical new
-    # test for why (shared, non-unique Hub stream).
-    :ok = Riptide.Derivation.Catalog.admit_capability(entry)
+    # Deliberately no on_exit cleanup — see sse_controller_test.exs's
+    # identical new test for why (shared, non-unique Hub stream).
+    :ok = Catalog.admit_capability(entry, nil)
 
     stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
     {:ok, socket} = connect(Socket, %{})

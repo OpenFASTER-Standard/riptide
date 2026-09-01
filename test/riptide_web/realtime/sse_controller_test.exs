@@ -5,6 +5,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   require Logger
 
   alias Riptide.Authz.{Policy, Store}
+  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
@@ -342,7 +343,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     test "subscribing to a Hub-shaped stream_id succeeds for an admitted Hub resource" do
       name = "urn:riptide:capability:ssehub-#{System.unique_integer([:positive])}"
 
-      entry = %Riptide.Derivation.CapabilityCatalogEntry{
+      entry = %CapabilityCatalogEntry{
         name: RDF.iri(name),
         kind: :effect,
         component_hash: String.duplicate("b", 64),
@@ -357,10 +358,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
         }
       }
 
-      # `admit_capability/1` here, not `/2` — Task 6 of this same plan
-      # (docs/superpowers/plans/2026-09-01-phase-6n-hub-resource-lifecycle.md)
-      # hasn't landed yet at this point in the sequence.
-      :ok = Riptide.Derivation.Catalog.admit_capability(entry)
+      :ok = Catalog.admit_capability(entry, nil)
 
       # Deliberately no on_exit cleanup — the capability stream is a single,
       # shared, non-unique stream across the whole test suite; see

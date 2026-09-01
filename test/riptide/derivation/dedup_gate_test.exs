@@ -768,7 +768,7 @@ defmodule Riptide.Derivation.DedupGateTest do
     end
   end
 
-  describe "propose_capability/2 + approve_capability_review/2 + decline_capability_review/2" do
+  describe "propose_capability/3 + approve_capability_review/2 + decline_capability_review/2" do
     test "a proposed Capability is queued, then approval admits it to the Hub capability catalog" do
       review_scope = unique_tenant()
 
@@ -778,7 +778,7 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       entry = sample_capability(%{})
 
-      assert {:ok, node} = DedupGate.propose_capability(review_scope, entry)
+      assert {:ok, node} = DedupGate.propose_capability(review_scope, entry, nil)
       assert :ok == DedupGate.approve_capability_review(review_scope, node)
 
       assert {:ok, entries} = Catalog.list_capabilities()
@@ -796,11 +796,52 @@ defmodule Riptide.Derivation.DedupGateTest do
 
       entry = sample_capability(%{})
 
-      {:ok, node} = DedupGate.propose_capability(review_scope, entry)
+      {:ok, node} = DedupGate.propose_capability(review_scope, entry, nil)
       assert :ok == DedupGate.decline_capability_review(review_scope, node)
 
       assert {:ok, entries} = Catalog.list_capabilities()
       refute Enum.any?(entries, fn {_n, e} -> e == entry end)
     end
+  end
+
+  test "PendingCapabilityReview.to_rdf/1 + from_rdf/2 round-trips a nil replaces" do
+    entry = sample_capability(%{})
+    pending = %PendingCapabilityReview{candidate: entry, replaces: nil}
+    {node, graph} = PendingCapabilityReview.to_rdf(pending)
+    assert PendingCapabilityReview.from_rdf(node, graph) == pending
+  end
+
+  test "PendingCapabilityReview.to_rdf/1 + from_rdf/2 round-trips a non-nil replaces" do
+    entry = sample_capability(%{})
+    replaces_node = RDF.BlankNode.new()
+    pending = %PendingCapabilityReview{candidate: entry, replaces: replaces_node}
+    {node, graph} = PendingCapabilityReview.to_rdf(pending)
+    assert PendingCapabilityReview.from_rdf(node, graph) == pending
+  end
+
+  test "propose_capability/3 + approve_capability_review/2 with replaces: admits the new entry and supersedes the old one" do
+    review_scope = unique_tenant()
+    old_entry = sample_capability(%{})
+
+    {:ok, old_review_node} = DedupGate.propose_capability(review_scope, old_entry, nil)
+    :ok = DedupGate.approve_capability_review(review_scope, old_review_node)
+
+    # `propose_capability/3` returns the queued *review's* own node, not the
+    # catalog entry's node — the `replaces` argument on the next propose
+    # call needs the latter, so it's looked up from the catalog itself, the
+    # same way the Catalog-level "admit_capability/2 + supersede_capability/1"
+    # test above does.
+    {:ok, entries_before} = Catalog.list_capabilities()
+
+    {old_catalog_node, ^old_entry} =
+      Enum.find(entries_before, fn {_n, e} -> e.name == old_entry.name end)
+
+    new_entry = %{old_entry | function: "run_v2"}
+    {:ok, review_node} = DedupGate.propose_capability(review_scope, new_entry, old_catalog_node)
+    :ok = DedupGate.approve_capability_review(review_scope, review_node)
+
+    {:ok, entries} = Catalog.list_capabilities()
+    matching = Enum.filter(entries, fn {_n, e} -> e.name == new_entry.name end)
+    assert [{_node, ^new_entry}] = matching
   end
 end

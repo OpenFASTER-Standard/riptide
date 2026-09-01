@@ -207,24 +207,31 @@ defmodule Riptide.Derivation.DedupGate.PendingCapabilityReview do
   A proposed Capability awaiting the proposing Tenant's own review (design
   spec
   `docs/superpowers/specs/2026-08-31-phase-6k-dynamic-capability-registration-design.md`
-  §6). Deliberately as simple as `PendingCrosswalkReview` — a
-  `CapabilityCatalogEntry` isn't a generalization of anything, so there's
-  nothing to anti-unify or replay-test.
+  §6). A `CapabilityCatalogEntry` isn't a generalization of anything, so
+  there's nothing to anti-unify or replay-test — but it can still supersede
+  a previous version of itself, the same `replaces` shape `PendingReview`
+  already established for Rules (design spec
+  `docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md`
+  §4.4).
   """
 
   alias Riptide.Derivation.{CapabilityCatalogEntry, CapabilityCatalogRDFCodec}
 
   @enforce_keys [:candidate]
-  defstruct [:candidate]
+  defstruct [:candidate, :replaces]
 
-  @type t :: %__MODULE__{candidate: CapabilityCatalogEntry.t()}
+  @type t :: %__MODULE__{
+          candidate: CapabilityCatalogEntry.t(),
+          replaces: RDF.BlankNode.t() | nil
+        }
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @riptide_pending_capability_review RDF.iri("urn:riptide:vocab:PendingCapabilityReview")
   @riptide_candidate RDF.iri("urn:riptide:vocab:candidate")
+  @riptide_replaces RDF.iri("urn:riptide:vocab:replaces")
 
   @spec to_rdf(t()) :: {RDF.BlankNode.t(), RDF.Graph.t()}
-  def to_rdf(%__MODULE__{candidate: candidate}) do
+  def to_rdf(%__MODULE__{candidate: candidate, replaces: replaces}) do
     node = RDF.BlankNode.new()
     {candidate_node, candidate_graph} = CapabilityCatalogRDFCodec.to_rdf(candidate)
 
@@ -232,15 +239,26 @@ defmodule Riptide.Derivation.DedupGate.PendingCapabilityReview do
       candidate_graph
       |> RDF.Graph.add({node, @rdf_type, @riptide_pending_capability_review})
       |> RDF.Graph.add({node, @riptide_candidate, candidate_node})
+      |> maybe_add_replaces(node, replaces)
 
     {node, graph}
   end
+
+  defp maybe_add_replaces(graph, _node, nil), do: graph
+
+  defp maybe_add_replaces(graph, node, replaces),
+    do: RDF.Graph.add(graph, {node, @riptide_replaces, replaces})
 
   @spec from_rdf(RDF.Resource.t(), RDF.Graph.t()) :: t()
   def from_rdf(node, graph) do
     description = RDF.Graph.get(graph, node)
     candidate_node = RDF.Description.first(description, @riptide_candidate)
-    %__MODULE__{candidate: CapabilityCatalogRDFCodec.from_rdf(candidate_node, graph)}
+    replaces = RDF.Description.first(description, @riptide_replaces)
+
+    %__MODULE__{
+      candidate: CapabilityCatalogRDFCodec.from_rdf(candidate_node, graph),
+      replaces: replaces
+    }
   end
 end
 
@@ -376,23 +394,30 @@ defmodule Riptide.Derivation.DedupGate do
   def decline_crosswalk_review(review_scope, node),
     do: Catalog.resolve_crosswalk_review(review_scope, node)
 
-  @spec propose_capability(Catalog.scope(), CapabilityCatalogEntry.t()) ::
+  @spec propose_capability(Catalog.scope(), CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) ::
           {:ok, RDF.BlankNode.t()} | {:error, term()}
-  def propose_capability(review_scope, %CapabilityCatalogEntry{} = entry) do
-    Catalog.queue_capability_review(review_scope, %PendingCapabilityReview{candidate: entry})
+  def propose_capability(review_scope, %CapabilityCatalogEntry{} = entry, replaces) do
+    Catalog.queue_capability_review(review_scope, %PendingCapabilityReview{
+      candidate: entry,
+      replaces: replaces
+    })
   end
 
   @spec approve_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def approve_capability_review(review_scope, node) do
     with {:ok, pending_reviews} <- Catalog.list_capability_pending_reviews(review_scope),
          {_node, pending} <- List.keyfind(pending_reviews, node, 0, :not_found) do
-      :ok = Catalog.admit_capability(pending.candidate)
+      :ok = Catalog.admit_capability(pending.candidate, pending.replaces)
+      maybe_supersede_capability(pending.replaces)
       Catalog.resolve_capability_review(review_scope, node)
     else
       :not_found -> {:error, :not_found}
       error -> error
     end
   end
+
+  defp maybe_supersede_capability(nil), do: :ok
+  defp maybe_supersede_capability(node), do: Catalog.supersede_capability(node)
 
   @spec decline_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def decline_capability_review(review_scope, node),
