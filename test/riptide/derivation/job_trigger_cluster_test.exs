@@ -278,6 +278,110 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
            )
   end
 
+  # Proves the mechanism doesn't lose or deadlock a Job in a real
+  # multi-node run — deliberately does NOT also try to prove strict
+  # non-overlap end-to-end here (job_trigger_test.exs's own unit tests
+  # already prove that deterministically). Two real WASM invocations
+  # against the trivial fixture.wasm complete too fast to reliably observe
+  # an overlap window one way or the other in a cluster test, so trying to
+  # assert it here would be flaky, not more rigorous.
+  test "two Jobs for the same Tenant sharing a resource_key both eventually complete" do
+    peers = bootstrap_peers(@peers)
+    tenant_id = "job-trigger-resource-#{System.unique_integer([:positive])}"
+
+    stream_id =
+      :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :job_stream_id, [tenant_id])
+
+    component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
+    {:ok, hash} = :erpc.call(hd_node(peers), Riptide.BlobStore, :put, [component_bytes])
+
+    cap_name =
+      RDF.iri("urn:riptide:capability:job-trigger-resource-#{System.unique_integer([:positive])}")
+
+    entry = %Riptide.Derivation.CapabilityCatalogEntry{
+      name: cap_name,
+      kind: :effect,
+      component_hash: hash,
+      function: "greet",
+      fuel_limit: 100_000_000,
+      timeout_ms: 5_000,
+      memory_limits: %{
+        max_memory_size: nil,
+        max_table_elements: nil,
+        max_instances: nil,
+        max_tables: nil
+      }
+    }
+
+    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry])
+
+    local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
+
+    :ok =
+      :erpc.call(hd_node(peers), Riptide.Placement, :add_policy, [
+        tenant_id,
+        ["capabilities", local_name],
+        %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
+      ])
+
+    resource_key = "shared-resource-#{System.unique_integer([:positive])}"
+
+    job = fn name ->
+      %Riptide.Derivation.Job{
+        tenant_id: tenant_id,
+        status: :pending,
+        reference: {:capability, cap_name},
+        args: [RDF.literal(name)],
+        job_graph: nil,
+        result: nil,
+        error: nil,
+        resource_key: resource_key
+      }
+    end
+
+    assert {:ok, node1} =
+             :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :write_job, [
+               tenant_id,
+               job.("Alice")
+             ])
+
+    assert {:ok, node2} =
+             :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :write_job, [
+               tenant_id,
+               job.("Bob")
+             ])
+
+    # Whichever of the two Jobs loses the resource_key race on its own
+    # {:job_written, stream_id} broadcast gets skipped that round and only
+    # retried on the next periodic_sweep — 30s in this test env too, since
+    # :job_trigger_sweep_interval_ms has no test-config override. 250 * 200ms
+    # = 50s gives that a real margin, not just this test's default 20s.
+    assert eventually(
+             fn ->
+               case :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :list_jobs, [
+                      stream_id
+                    ]) do
+                 {:ok, jobs} ->
+                   Enum.all?([node1, node2], fn n ->
+                     match?({_n, %{status: :done}}, Enum.find(jobs, fn {jn, _} -> jn == n end))
+                   end)
+
+                 _ ->
+                   false
+               end
+             end,
+             250
+           )
+
+    {:ok, jobs} = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :list_jobs, [stream_id])
+    {_n1, final1} = Enum.find(jobs, fn {n, _} -> n == node1 end)
+    {_n2, final2} = Enum.find(jobs, fn {n, _} -> n == node2 end)
+    assert final1.status == :done
+    assert final2.status == :done
+    assert final1.result == RDF.literal("\"Hello, Alice!\"")
+    assert final2.result == RDF.literal("\"Hello, Bob!\"")
+  end
+
   defp hd_node([{_pid, node, _ordinal} | _]), do: node
 
   defp bootstrap_peers(specs) do
