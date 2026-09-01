@@ -16,6 +16,10 @@ config :riptide, RiptideWeb.Endpoint,
   secret_key_base: "yC4ZYgTNRajoqvMfeUp2kBQ0op+N4b7+7GsF3gdDxTjhmf64A5mgkdNMSdsGEKDF",
   watchers: []
 
+# Fine as a fixed, checked-in value for local dev only — see config/runtime.exs for the
+# prod-required RIPTIDE_PASSWORD_AUTH_SIGNING_KEY env var this does NOT apply to.
+config :riptide, password_auth_signing_key: "dev-only-insecure-password-auth-signing-key"
+
 # ## SSL Support
 #
 # In order to use HTTPS in development, a self-signed

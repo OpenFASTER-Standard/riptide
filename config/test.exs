@@ -7,6 +7,8 @@ config :riptide, RiptideWeb.Endpoint,
   secret_key_base: "IhD3noZJFg5IDxNMm2ia8NRelsuC9FhbxwJRMzEv4hL5SS5+c/Mw5uCvgz7YSS5w",
   server: false
 
+config :riptide, password_auth_signing_key: "test-only-insecure-password-auth-signing-key"
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

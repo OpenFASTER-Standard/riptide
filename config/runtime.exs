@@ -113,6 +113,15 @@ if config_env() == :prod do
       You can generate one by calling: mix phx.gen.secret
       """
 
+  password_auth_signing_key =
+    System.get_env("RIPTIDE_PASSWORD_AUTH_SIGNING_KEY") ||
+      raise """
+      environment variable RIPTIDE_PASSWORD_AUTH_SIGNING_KEY is missing.
+      You can generate one by calling: mix phx.gen.secret
+      """
+
+  config :riptide, password_auth_signing_key: password_auth_signing_key
+
   host = System.get_env("PHX_HOST") || "example.com"
 
   config :riptide, RiptideWeb.Endpoint,
