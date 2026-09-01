@@ -347,6 +347,80 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
     refute log =~ "manual cleanup needed"
   end
 
+  describe "reserved path guard" do
+    # These requests are expected to be rejected before ever writing
+    # anything — cleanup here is defense in depth against a future
+    # regression in the guard itself leaving real writes behind on the
+    # shared "test-tenant" fixture.
+    setup do
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(
+          "https://riptide.example/tenants/test-tenant/resources/jobs"
+        )
+
+        Riptide.RaTestHelpers.cleanup_stream(
+          "https://riptide.example/tenants/test-tenant/resources/catalog"
+        )
+      end)
+
+      :ok
+    end
+
+    test "PUT /resources/jobs is rejected as a reserved path" do
+      conn =
+        :put
+        |> conn("/tenants/test-tenant/resources/jobs", "")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 409
+    end
+
+    test "PATCH /resources/catalog/pending-review is rejected as a reserved path (nested prefix)" do
+      body =
+        Jason.encode!(%{
+          "additions" => "",
+          "removals" => ""
+        })
+
+      conn =
+        :patch
+        |> conn("/tenants/test-tenant/resources/catalog/pending-review", body)
+        |> put_req_header("content-type", "application/json")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 409
+    end
+
+    test "DELETE /resources/catalog is rejected as a reserved path" do
+      conn =
+        :delete
+        |> conn("/tenants/test-tenant/resources/catalog")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 409
+    end
+
+    test "POST /resources/jobs (create_child) is rejected as a reserved path" do
+      conn =
+        :post
+        |> conn("/tenants/test-tenant/resources/jobs", "")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 409
+    end
+
+    test "GET /resources/jobs is NOT blocked by the reserved-path guard" do
+      conn =
+        :get
+        |> conn("/tenants/test-tenant/resources/jobs")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      # 404 (nothing written yet) is the correct, unblocked read outcome —
+      # 409 would mean the guard incorrectly fired on a GET.
+      assert conn.status == 404
+    end
+  end
+
   describe "stream_id_for/2 and parse_stream_id/1" do
     test "parse_stream_id/1 recovers the exact tenant_id and path_segments stream_id_for/2 was built from" do
       stream_id = ResourceController.stream_id_for("acme", ["docs", "sub"])

@@ -19,6 +19,24 @@ defmodule RiptideWeb.LDP.ResourceController do
 
   @ldp_contains RDF.iri("http://www.w3.org/ns/ldp#contains")
 
+  @reserved_path_prefixes [["jobs"], ["catalog"]]
+
+  @spec reserved_path?([String.t()]) :: boolean()
+  defp reserved_path?(path_segments) do
+    Enum.any?(@reserved_path_prefixes, &List.starts_with?(path_segments, &1))
+  end
+
+  defp reject_reserved_path(conn) do
+    body =
+      Jason.encode!(%{
+        "error" => "reserved_path",
+        "message" =>
+          "this path is reserved for Riptide's own internal data; write it via its dedicated endpoint instead"
+      })
+
+    conn |> put_resp_content_type("application/json") |> send_resp(409, body)
+  end
+
   def show(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
@@ -35,7 +53,15 @@ defmodule RiptideWeb.LDP.ResourceController do
     end
   end
 
-  def replace(conn, %{"path" => path_segments}) do
+  def replace(conn, %{"path" => path_segments} = params) do
+    if reserved_path?(path_segments) do
+      reject_reserved_path(conn)
+    else
+      do_replace(conn, params)
+    end
+  end
+
+  defp do_replace(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
 
@@ -57,7 +83,15 @@ defmodule RiptideWeb.LDP.ResourceController do
     end
   end
 
-  def delete(conn, %{"path" => path_segments}) do
+  def delete(conn, %{"path" => path_segments} = params) do
+    if reserved_path?(path_segments) do
+      reject_reserved_path(conn)
+    else
+      do_delete(conn, params)
+    end
+  end
+
+  defp do_delete(conn, %{"path" => path_segments}) do
     stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
     case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
@@ -71,6 +105,14 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def patch(conn, %{"path" => path_segments} = params) do
+    if reserved_path?(path_segments) do
+      reject_reserved_path(conn)
+    else
+      do_patch(conn, params)
+    end
+  end
+
+  defp do_patch(conn, %{"path" => path_segments} = params) do
     stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
 
     # NOTE: the endpoint's `Plug.Parsers` (see Task 6's scaffold) already
@@ -105,7 +147,15 @@ defmodule RiptideWeb.LDP.ResourceController do
     end
   end
 
-  def create_child(conn, %{"path" => path_segments}) do
+  def create_child(conn, %{"path" => path_segments} = params) do
+    if reserved_path?(path_segments) do
+      reject_reserved_path(conn)
+    else
+      do_create_child(conn, params)
+    end
+  end
+
+  defp do_create_child(conn, %{"path" => path_segments}) do
     tenant_id = conn.assigns.tenant_id
     container_stream_id = stream_id_for(tenant_id, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
