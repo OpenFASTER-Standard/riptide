@@ -89,9 +89,13 @@ ordinary resource under its own Tenant's tree, a Tenant can have as many account
 a second account to an *already-claimed* Tenant needs **zero new code**: it's performed by an
 already-authenticated existing member (the owner, or anyone already granted `write` on that path
 prefix via the existing `Authz.Store.add_policy/3`) as an ordinary write through the existing generic
-`POST /tenants/:tenant_id/resources/accounts/:username` route `ResourceController.create_child/2`
-already provides. Only the *first* account for a brand-new, not-yet-claimed Tenant needs new code
-(§4.2), because that caller isn't authenticated yet — the same bootstrap problem
+`PUT /tenants/:tenant_id/resources/accounts/:username` route `ResourceController.replace/2` already
+provides — `PUT`, not `POST`, since `create_child/2` mints its own random child ID rather than
+accepting the caller-chosen username the account's own deterministic address (§4.1 above) requires.
+Having an account this way is a separate concern from being authorized to use it on that Tenant's own
+resources — see §5's worked example for the explicit policy-grant step this implies. Only the *first*
+account for a brand-new, not-yet-claimed Tenant needs new code (§4.2), because that caller isn't
+authenticated yet — the same bootstrap problem
 `RiptideWeb.Plugs.Authorize.maybe_bootstrap/4` already solves for an *already-authenticated* caller
 claiming a brand-new Tenant (confirmed by reading it directly: it requires a non-nil
 `current_subject["sub"]`, i.e. an already-verified token) — signup needs its own, simpler bootstrap
@@ -213,14 +217,24 @@ primarily against automated account-creation spam.
    username: "alice", password_hash: "<hash>"}`. `guild-a` doesn't exist yet — `claim_tenant_if_unclaimed`
    succeeds, the account fact is written, a JWT comes back.
 3. Later, Alice (now authenticated, using her token through the *existing* generic write path) invites
-   a teammate by writing a second account fact directly: `POST
-   /tenants/guild-a/resources/accounts/bob` with `{username: "bob", password_hash: "<bob's hash>"}` —
-   no new code involved, this is `ResourceController.create_child/2`, already built.
-4. Bob logs in: `POST /auth/login` with `{tenant_id: "guild-a", username: "bob", password_hash:
-   "<hash>"}` — reads his own account fact, verifies, gets his own JWT with his own `sub`.
-5. Both Alice's and Bob's tokens now work identically through the existing `Authenticate`/`Authorize`
+   a teammate by writing a second account fact directly: `PUT
+   /tenants/guild-a/resources/accounts/bob` with the account's own RDF triples as the request body
+   (Turtle, not JSON — this is `ResourceController.replace/2`, already built; note it's `PUT`, not
+   `POST` — `create_child/2` mints its own random child ID and would ignore a caller-chosen `bob`,
+   which is exactly the deterministic path `/auth/login` needs to find the account again later).
+4. Having an account is not the same as being authorized to read/write Guild-A's own resources — Bob's
+   account alone grants him nothing there yet, since credential storage (§4.1) and Authz policy grants
+   are two entirely separate mechanisms. Alice, still using her own token, grants Bob's own subject a
+   policy via the *existing* `POST /tenants/guild-a/policies` (Phase 4c, already built): `{"effect":
+   "allow", "modes": ["read", "write"], "matcher": {"agent": "<bob's own sub, from his account fact>"}}`
+   — again no new code, just the already-built multi-user-per-tenant mechanism this design leans on
+   (§4.1).
+5. Bob logs in: `POST /auth/login` with `{tenant_id: "guild-a", username: "bob", password_hash:
+   "<hash>"}` — reads his own account fact, verifies, gets his own JWT carrying his own `sub`.
+6. Both Alice's and Bob's tokens now work identically through the existing `Authenticate`/`Authorize`
    pipeline for every other route in the system — nothing downstream of authentication needed to
-   change at all.
+   change at all. Bob's own access is exactly as broad as whatever policy Alice granted him in step 4,
+   same as any other multi-subject Tenant already works today.
 
 ## 6. Error handling
 
@@ -257,8 +271,9 @@ primarily against automated account-creation spam.
   tenant_id all return the same `401` shape (assert on status/body equality across all three, not just
   that each individually fails, to actually verify the non-enumeration property).
 - Capstone: signup as Alice → (using her token via the *existing* generic write route) create Bob's
-  account under the same Tenant → Bob logs in independently → both tokens independently pass through
-  the existing `Authenticate`/`Authorize` pipeline against an ordinary Tenant-scoped resource, proving
+  account under the same Tenant → (using the *existing* policy endpoint) grant Bob's own subject a
+  policy on that Tenant → Bob logs in independently → both tokens independently pass through the
+  existing `Authenticate`/`Authorize` pipeline against an ordinary Tenant-scoped resource, proving
   nothing downstream needed to change.
 - Rate-limit tests for both routes, mirroring `HubRateLimit`'s own existing test shape (stub the limit
   to `0`, assert `429`).
