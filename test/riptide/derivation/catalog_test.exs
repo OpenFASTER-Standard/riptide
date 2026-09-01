@@ -30,7 +30,7 @@ defmodule Riptide.Derivation.CatalogTest do
   describe "stream_id helpers" do
     test "catalog_stream_id/1 for a Tenant scope" do
       assert Catalog.catalog_stream_id({:tenant, "acme"}) ==
-               "https://riptide.example/tenants/acme/catalog"
+               "https://riptide.example/tenants/acme/resources/catalog"
     end
 
     test "catalog_stream_id/1 for the Hub scope" do
@@ -39,7 +39,7 @@ defmodule Riptide.Derivation.CatalogTest do
 
     test "pending_review_stream_id/1 for a Tenant scope" do
       assert Catalog.pending_review_stream_id({:tenant, "acme"}) ==
-               "https://riptide.example/tenants/acme/catalog/pending-review"
+               "https://riptide.example/tenants/acme/resources/catalog/pending-review"
     end
   end
 

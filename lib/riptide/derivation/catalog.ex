@@ -53,8 +53,11 @@ defmodule Riptide.Derivation.Catalog do
 
   @spec catalog_stream_id(scope()) :: String.t()
   def catalog_stream_id({:tenant, tenant_id}),
-    do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/catalog"
+    do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/resources/catalog"
 
+  # Unchanged — Hub already has its own working, separate /hub/* HTTP surface
+  # and addressing model (design spec §3); this phase touches only the
+  # Tenant-scoped side.
   def catalog_stream_id(:hub), do: @stream_id_prefix <> "hub/catalog"
 
   @spec pending_review_stream_id(scope()) :: String.t()
@@ -190,7 +193,8 @@ defmodule Riptide.Derivation.Catalog do
   end
 
   @spec job_stream_id(String.t()) :: String.t()
-  def job_stream_id(tenant_id), do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/jobs"
+  def job_stream_id(tenant_id),
+    do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/resources/jobs"
 
   @spec write_job(String.t(), Job.t()) :: {:ok, RDF.BlankNode.t()} | {:error, :not_ready}
   def write_job(tenant_id, %Job{} = job) do
