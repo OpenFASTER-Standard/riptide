@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle) — see issue #58 for the current remaining list (6o demo, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication) — see issue #58 for the current remaining list (6p demo, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1411,5 +1411,64 @@ the touched test files**:
    the HTTP-level test both already used correctly).
 
 **Status**: Phase 6n shipped 2026-09-01. See issue #58's own restated summary for the current
-remaining list (6o — the demo itself, pushed out from 6n's original scope — plus 6g-ii deferred,
-6c-iii-a/6c-iii-b Track B, and Capability grant flow/OAuth Track A, all ready to start).
+remaining list at the time (6o — the demo itself, pushed out from 6n's original scope — plus 6g-ii
+deferred, 6c-iii-a/6c-iii-b Track B, and Capability grant flow/OAuth Track A, all ready to start).
+6o itself was reassigned during the very next phase's own brainstorm — see below.
+
+### 6o — Username/Password Authentication
+
+**Shipped 2026-09-01** — see
+`docs/superpowers/specs/2026-09-01-phase-6o-username-password-auth-design.md`. Direct origin:
+brainstorming what was originally slotted as "6o, the demo" surfaced that the demo's own bootstrap step
+— an unauthenticated browser page proving an identity against a genuinely fresh, real Riptide instance
+— can't assume a random visitor already has an OIDC server of their own, which Riptide's only existing
+identity mechanism (`Riptide.Auth.Verifier.OIDC`) requires. Rather than bolt a demo-only auth hack onto
+6p (the demo itself, pushed back one more letter), a real username/password mechanism — independently
+useful for any Riptide deployment, not just the demo — got its own phase.
+
+**Core architectural finding, reached through several rounds of pushback during brainstorming**:
+accounts are ordinary, individually-addressable Tenant-scoped resources — one stream per account,
+addressed exactly the same way any other Tenant resource already is
+(`stream_id_for({:tenant, tenant_id}, ["accounts", username])`) — not a new storage engine and not a
+global cross-tenant "system" tenant. A global accounts tenant was seriously considered and explicitly
+rejected: investigation confirmed Riptide's own "a Tenant should be trivially movable to a different
+instance, no structural ties" principle doesn't fully hold today (the placement Ra cluster comingles
+every Tenant's Authz policies in one instance-wide structure; Hub is explicitly, deliberately
+instance-scoped, with federation named and deferred in the master design doc) — but a global accounts
+store would have been a *worse* kind of exception than either existing one, since it's specifically the
+ability to log in at all, not just some non-critical data, that would stay behind on the origin
+instance if a Tenant ever moved. Scoping accounts per-Tenant avoids introducing that new failure mode
+entirely, and — the actual payoff — makes "one Tenant, many users" fall out for free: adding a second
+account to an already-claimed Tenant needs zero new code, it's just an ordinary write through the
+*existing* generic `PUT /tenants/:id/resources/*path` route, by whoever already has write access.
+Having an account is a separate concern from being *authorized* on that Tenant's own resources, though
+— an account alone grants nothing; a real deployment still needs an explicit `POST
+/tenants/:id/policies` grant (Phase 4c, already built) for a second user to do anything, which the
+capstone test below exercises explicitly after an earlier draft of both the spec's own worked example
+and the capstone test itself missed this and asserted Bob could read Guild-A's resources right after
+signing up, with no grant at all — caught only once the capstone actually ran and got `403`.
+
+New surface: `POST /auth/signup` and `POST /auth/login`, both deliberately anonymous (no
+`Authenticate`/`Authorize` pipeline — there is no token yet to check, that's the entire point). A new
+`Riptide.Auth.Verifier.Password` verifies Riptide's own self-issued JWTs (HS256, signed with
+`Application.fetch_env!(:riptide, :password_auth_signing_key)` — a fixed dev/test default, a
+prod-required `RIPTIDE_PASSWORD_AUTH_SIGNING_KEY` env var mirroring `SECRET_KEY_BASE`'s own existing
+raise-if-missing pattern exactly), and a new `Riptide.Auth.Verifier.Composite` tries each configured
+verifier in order — now `Authenticate`'s own default, so an OIDC-issued token and a Riptide-issued one
+both work through the exact same, otherwise-unmodified pipeline. Password hashing happens client-side
+(SHA-256); the server stores that hash as-is with no additional server-side re-hash — a deliberate,
+documented tradeoff (a leaked stored value is a directly replayable credential, not just a crackable
+hash), not an oversight, and reversible later without touching anything else in this design.
+
+**One real, non-cosmetic hazard found and guarded against during implementation, not just
+theorized**: `Riptide.Auth.Verifier.OIDC.verify/1` already wraps its own call in `rescue`, but `rescue`
+does not catch a process `:exit` signal — and `JokenJwks`'s own JWKS-fetching strategy GenServer is
+only started when OIDC is actually configured (`Riptide.Application`'s own `auth_children/0`), which is
+never true on a password-auth-only deployment, the exact case this phase exists for. Without an
+explicit guard, `Composite` trying `Verifier.OIDC` first against a password-auth token on such a
+deployment could crash the request via an uncaught `:exit` instead of falling through to
+`Verifier.Password`. `Composite.verify/1` wraps every sub-verifier call in its own `rescue`/`catch
+:exit`, confirmed by a dedicated test using a deliberately `exit/1`-raising fake verifier as the first
+entry in the configured list.
+
+**Status**: Phase 6o shipped 2026-09-01.

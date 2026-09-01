@@ -32,6 +32,7 @@ defmodule Riptide.Application do
         Riptide.Telemetry,
         Riptide.NewStreamRateLimit,
         Riptide.HubRateLimit,
+        Riptide.PasswordAuthRateLimit,
         {Plug.Cowboy, scheme: :http, plug: RiptideWeb.MetricsEndpoint, options: [port: 9090]},
         Riptide.Stream.Placement,
         Riptide.SupervisedProcess.SessionTracker,
