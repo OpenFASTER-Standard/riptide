@@ -24,6 +24,10 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.Authorize
   end
 
+  pipeline :resolve_hub_scope do
+    plug RiptideWeb.Plugs.ResolveHubScope
+  end
+
   scope "/" do
     pipe_through :api
 
@@ -42,6 +46,12 @@ defmodule RiptideWeb.Router do
 
     get "/search", RiptideWeb.Hub.DiscoveryController, :search
     get "/entries/:node_id", RiptideWeb.Hub.DiscoveryController, :show
+  end
+
+  scope "/hub" do
+    pipe_through [:api, :auth, :resolve_hub_scope, :authz]
+
+    get "/resources/*path", RiptideWeb.LDP.ResourceController, :show
   end
 
   scope "/tenants/:tenant_id" do

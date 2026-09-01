@@ -6,6 +6,7 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   import ExUnit.CaptureLog
 
   alias Riptide.Authz.{Policy, Store}
+  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias RiptideWeb.LDP.ResourceController
 
   @opts RiptideWeb.Endpoint.init([])
@@ -422,20 +423,73 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   end
 
   describe "stream_id_for/2 and parse_stream_id/1" do
-    test "parse_stream_id/1 recovers the exact tenant_id and path_segments stream_id_for/2 was built from" do
-      stream_id = ResourceController.stream_id_for("acme", ["docs", "sub"])
-      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["docs", "sub"]}
+    test "parse_stream_id/1 recovers the exact scope and path_segments stream_id_for/2 was built from" do
+      stream_id = ResourceController.stream_id_for({:tenant, "acme"}, ["docs", "sub"])
+
+      assert ResourceController.parse_stream_id(stream_id) ==
+               {:ok, {:tenant, "acme"}, ["docs", "sub"]}
     end
 
-    test "parse_stream_id/1 round-trips for a single-segment path" do
-      stream_id = ResourceController.stream_id_for("acme", ["doc"])
-      assert ResourceController.parse_stream_id(stream_id) == {:ok, "acme", ["doc"]}
+    test "parse_stream_id/1 round-trips for a single-segment Tenant path" do
+      stream_id = ResourceController.stream_id_for({:tenant, "acme"}, ["doc"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, {:tenant, "acme"}, ["doc"]}
     end
 
-    test "parse_stream_id/1 returns :error for a stream_id not shaped like a tenant resource" do
+    test "parse_stream_id/1 round-trips for a Hub path" do
+      stream_id = ResourceController.stream_id_for(:hub, ["catalog"])
+      assert ResourceController.parse_stream_id(stream_id) == {:ok, :hub, ["catalog"]}
+    end
+
+    test "parse_stream_id/1 round-trips for a nested Hub path" do
+      stream_id = ResourceController.stream_id_for(:hub, ["catalog", "capabilities"])
+
+      assert ResourceController.parse_stream_id(stream_id) ==
+               {:ok, :hub, ["catalog", "capabilities"]}
+    end
+
+    test "parse_stream_id/1 returns :error for a stream_id not shaped like a Tenant or Hub resource" do
       assert ResourceController.parse_stream_id("not-a-real-stream-id") == :error
       assert ResourceController.parse_stream_id("https://riptide.example/health") == :error
     end
+  end
+
+  test "GET /hub/resources/*path for a never-written Hub resource returns 404" do
+    conn =
+      :get
+      |> conn("/hub/resources/never-written-#{System.unique_integer([:positive])}")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 404
+  end
+
+  test "GET /hub/resources/*path returns the current state of an admitted Hub Capability" do
+    name = "urn:riptide:capability:hubread-#{System.unique_integer([:positive])}"
+
+    entry = %CapabilityCatalogEntry{
+      name: RDF.iri(name),
+      kind: :effect,
+      component_hash: String.duplicate("b", 64),
+      function: "run",
+      fuel_limit: 10_000_000,
+      timeout_ms: 5_000,
+      memory_limits: %{
+        max_memory_size: nil,
+        max_table_elements: nil,
+        max_instances: nil,
+        max_tables: nil
+      }
+    }
+
+    # `admit_capability/1` here, not `/2` — Task 6 of this same plan
+    # (docs/superpowers/plans/2026-09-01-phase-6n-hub-resource-lifecycle.md)
+    # hasn't landed yet at this point in the sequence and will change this
+    # to /2 (gaining a `replaces` param); when it does, this call site needs
+    # the same update every other `admit_capability/1` caller gets.
+    :ok = Catalog.admit_capability(entry)
+
+    conn = :get |> conn("/hub/resources/catalog/capabilities") |> RiptideWeb.Endpoint.call(@opts)
+    assert conn.status == 200
+    assert conn.resp_body =~ name
   end
 
   test "a %2F-encoded slash inside the tenant_id path segment is rejected with 400, not silently aliased" do

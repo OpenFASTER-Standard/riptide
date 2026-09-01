@@ -39,7 +39,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   defp unique_stream_id,
     do:
-      ResourceController.stream_id_for("sse-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -51,7 +51,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   # "authentication" describe block's own `setup` below.
   defp unique_auth_stream_id,
     do:
-      ResourceController.stream_id_for("sse-auth-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-auth-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -86,7 +86,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
     stream_id =
-      ResourceController.stream_id_for("sse-gap-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-gap-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
 
@@ -183,7 +183,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     end
 
     defp new_ratelimit_stream_id do
-      ResourceController.stream_id_for("sse-ratelimit-test-tenant", [
+      ResourceController.stream_id_for({:tenant, "sse-ratelimit-test-tenant"}, [
         "doc-#{System.unique_integer([:positive])}"
       ])
     end
@@ -265,7 +265,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   describe "authorization" do
     test "subscribing to a stream_id shaped like a tenant resource with no matching policy is denied with 403" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get
@@ -277,7 +277,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "subscribing to a stream_id shaped like a tenant resource with a public read policy succeeds" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
       :ok =
@@ -308,7 +308,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     test "sets tenant_id in Logger metadata even when authorization denies the request" do
       tenant_id = "sse-authz-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get
@@ -329,7 +329,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       ])
 
       tenant_id = "sse-authz-down-test-" <> Uniq.UUID.uuid4()
-      stream_id = ResourceController.stream_id_for(tenant_id, ["doc"])
+      stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["doc"])
 
       conn =
         :get

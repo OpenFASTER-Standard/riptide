@@ -139,7 +139,7 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
 
     on_exit(fn ->
       Riptide.RaTestHelpers.cleanup_stream(
-        ResourceController.stream_id_for(tenant_id, ["shared-doc"])
+        ResourceController.stream_id_for({:tenant, tenant_id}, ["shared-doc"])
       )
     end)
 

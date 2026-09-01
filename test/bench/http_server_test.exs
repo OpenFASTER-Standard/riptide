@@ -70,7 +70,7 @@ defmodule Riptide.Bench.HttpServer do
         matcher: :public
       })
 
-    read_stream_id = ResourceController.stream_id_for(@tenant_id, [@read_path_segment])
+    read_stream_id = ResourceController.stream_id_for({:tenant, @tenant_id}, [@read_path_segment])
     :ok = StreamSupervisor.ensure_ready(read_stream_id)
 
     # A representative small-to-medium resource body (10 triples) for the

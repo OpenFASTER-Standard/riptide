@@ -38,7 +38,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   def show(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
+    stream_id = stream_id_for(conn.assigns.scope, path_segments)
 
     case current_state(stream_id) do
       {:ok, graph} ->
@@ -62,7 +62,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   defp do_replace(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
+    stream_id = stream_id_for(conn.assigns.scope, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
 
     case TurtleCodec.decode(body) do
@@ -92,7 +92,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   defp do_delete(conn, %{"path" => path_segments}) do
-    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
+    stream_id = stream_id_for(conn.assigns.scope, path_segments)
 
     case stream_id |> StreamSupervisor.ensure_ready() |> StreamSupervisor.ensure_ready_status() do
       :ok ->
@@ -113,7 +113,7 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   defp do_patch(conn, %{"path" => path_segments} = params) do
-    stream_id = stream_id_for(conn.assigns.tenant_id, path_segments)
+    stream_id = stream_id_for(conn.assigns.scope, path_segments)
 
     # NOTE: the endpoint's `Plug.Parsers` (see Task 6's scaffold) already
     # parses and consumes the request body for `content-type:
@@ -157,7 +157,7 @@ defmodule RiptideWeb.LDP.ResourceController do
 
   defp do_create_child(conn, %{"path" => path_segments}) do
     tenant_id = conn.assigns.tenant_id
-    container_stream_id = stream_id_for(tenant_id, path_segments)
+    container_stream_id = stream_id_for(conn.assigns.scope, path_segments)
     {:ok, body, conn} = Plug.Conn.read_body(conn)
 
     case TurtleCodec.decode(body) do
@@ -249,30 +249,45 @@ defmodule RiptideWeb.LDP.ResourceController do
     :ok
   end
 
-  @stream_id_prefix "https://riptide.example/tenants/"
+  @tenant_stream_id_prefix "https://riptide.example/tenants/"
+  @hub_stream_id_prefix "https://riptide.example/hub/resources/"
   @resources_segment "/resources/"
 
-  @spec stream_id_for(String.t(), [String.t()]) :: String.t()
-  def stream_id_for(tenant_id, path_segments) do
-    @stream_id_prefix <> tenant_id <> @resources_segment <> Enum.join(path_segments, "/")
+  @spec stream_id_for(Riptide.Derivation.Catalog.scope(), [String.t()]) :: String.t()
+  def stream_id_for({:tenant, tenant_id}, path_segments) do
+    @tenant_stream_id_prefix <> tenant_id <> @resources_segment <> Enum.join(path_segments, "/")
+  end
+
+  def stream_id_for(:hub, path_segments) do
+    @hub_stream_id_prefix <> Enum.join(path_segments, "/")
   end
 
   # The exact inverse of `stream_id_for/2` — used by Phase 4c's authorization
-  # layer (`RiptideWeb.Realtime.SseController`/`ReplicationChannel`, Tasks 7-8)
-  # to recover which tenant/resource an opaque, client-supplied `stream_id`
+  # layer (`RiptideWeb.Realtime.SseController`/`ReplicationChannel`) to
+  # recover which scope/resource an opaque, client-supplied `stream_id`
   # addresses, since neither transport constructs one from a path
-  # server-side (see Phase 4a design spec §5, Phase 4c design spec §7).
-  # `stream_id_for/2`'s format is a pure, deterministic, reversible string —
-  # no hashing or randomness — so parsing it back apart needs no new
-  # persisted state, at the cost of staying coupled to this exact format:
-  # the round-trip tests in `resource_controller_test.exs` exist specifically
-  # to catch a future change here breaking that coupling silently.
-  @spec parse_stream_id(String.t()) :: {:ok, String.t(), [String.t()]} | :error
-  def parse_stream_id(@stream_id_prefix <> rest) do
+  # server-side (see Phase 4a design spec §5, Phase 4c design spec §7, and
+  # design spec `docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md`
+  # §4.2 for the Hub-scope addition). `stream_id_for/2`'s format is a pure,
+  # deterministic, reversible string — no hashing or randomness — so parsing
+  # it back apart needs no new persisted state, at the cost of staying
+  # coupled to this exact format: the round-trip tests in
+  # `resource_controller_test.exs` exist specifically to catch a future
+  # change here breaking that coupling silently.
+  @spec parse_stream_id(String.t()) ::
+          {:ok, Riptide.Derivation.Catalog.scope(), [String.t()]} | :error
+  def parse_stream_id(@tenant_stream_id_prefix <> rest) do
     case String.split(rest, @resources_segment, parts: 2) do
-      [tenant_id, path] when tenant_id != "" -> {:ok, tenant_id, String.split(path, "/")}
-      _ -> :error
+      [tenant_id, path] when tenant_id != "" ->
+        {:ok, {:tenant, tenant_id}, String.split(path, "/")}
+
+      _ ->
+        :error
     end
+  end
+
+  def parse_stream_id(@hub_stream_id_prefix <> path) when path != "" do
+    {:ok, :hub, String.split(path, "/")}
   end
 
   def parse_stream_id(_other), do: :error
