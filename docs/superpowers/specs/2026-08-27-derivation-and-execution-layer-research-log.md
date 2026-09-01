@@ -326,3 +326,143 @@ requirement despite this project's own history of two separate
 resource-exhaustion incidents, no assigned phase for the blob-storage
 design, 6c bundling too much scope into one untracked phase, no exit
 criteria per phase, and a public/governance terminology collision).
+
+## Part 4: Concurrent-effectful-execution coordination (6d-ii)
+
+The parent spec's §7/§10 carried an informal note — "checked: neither
+sagas nor CRDTs establish this" — written during spec-drafting, not from a
+dedicated research pass like Parts 1–2 got. A real pass, done while
+brainstorming 6d-ii's design (2026-09-01), corrected and substantially
+extended that note. Methodology matched Parts 1–2: parallel search across
+6 angles, 24 sources fetched (primary docs/papers weighted over
+secondary), 98 claims extracted, top 25 by centrality taken through 3-vote
+adversarial verification (≥2/3 refutes kills a claim) — 20 confirmed, 5
+refuted (all 5 were overreach/mis-citation on a true underlying point, not
+claims that were simply wrong; detail below).
+
+- **Sagas: the spec's dismissal is correct, and stronger than "checked
+  informally" — it's definitional.** Garcia-Molina & Salem's original
+  paper (ACM SIGMOD 1987, verified against the primary source, DOI
+  10.1145/38713.38742): *"a LLT is a saga if it can be written as a
+  sequence of transactions that can be interleaved with other
+  transactions."* Permitting interleaving with other, unrelated
+  transactions is sagas' explicit design goal, not an oversight — a saga
+  guarantees atomicity (all-or-compensated) of *its own* steps, nothing
+  about serializing two different sagas against each other. Sagas are the
+  wrong tool category for this problem, not a tool that falls short of it.
+- **CRDTs: also correctly dismissed, with one adjacent technique checked
+  and found not to transfer.** Canonical op-based CRDT correctness
+  (Baquero, Almeida & Shoker, arXiv:1710.04469 — verified via direct PDF
+  extraction) is *defined* in terms of operations proven to commute
+  (`f(g(σ))=g(f(σ))`) — foundational, not incidental, so it doesn't extend
+  to arbitrary/opaque WASM effects whose commutativity can't be
+  established. One genuinely adjacent technique was found and checked:
+  LSCRDT (Saquib, Krintz & Wolski, IEEE IC2E 2022) achieves consistency
+  for *non-commutative* operations without locking, by having all
+  replicas converge on one total log order — the authors explicitly
+  liken this to Raft's own replicated-state-machine model. But it
+  requires detecting conflicts and **rolling back and replaying**
+  operations on divergence, which is fundamentally incompatible with
+  one-shot, irreversible external effects (a real-world charge or
+  deployment can't be rolled back and replayed). Confirmed dead end, not
+  assumed.
+- **Idempotency keys solve a different, narrower problem than the one
+  6d-ii needs solved.** Stripe's idempotency layer (docs.stripe.com,
+  stripe.com/blog/idempotency) validates that a *reused* key's parameters
+  match the original request and replays the first response — it's bound
+  to one specific request payload, not an independent resource identity,
+  so it cannot serialize two *different* concurrent requests targeting
+  the same underlying resource. Temporal's own engineering blog
+  independently demonstrates the exact gap with a worked example: a
+  check-then-create pattern (`UserExists()` then `CreateUser()`) still
+  races between two different concurrent callers even with idempotency
+  logic present, because idempotency and mutual exclusion are different
+  properties. Idempotency keys remain valuable as a complementary,
+  retry-safety layer — just not as the primary mechanism.
+- **Distributed locks built as a client library on top of existing Raft
+  consensus are real, established precedent, directly transferable to
+  `:ra`.** etcd's `clientv3/concurrency` package builds distributed mutual
+  exclusion (session/lease-bound key + a fair queue ordered by etcd's own
+  monotonic `CreateRevision`) entirely on top of etcd's existing
+  Raft-backed KV store — not a bespoke lock service. (One claim here was
+  refuted on a narrow technical point: the `Mutex` type's methods take a
+  `context.Context` and return an `error`, so it doesn't *literally*
+  satisfy Go's zero-argument `sync.Locker` interface as its own doc
+  comment loosely suggests — the underlying pattern, a lock recipe layered
+  on existing consensus, stands.) This is direct precedent for building on
+  `:ra` rather than inventing new consensus, though — see the design
+  doc's own conclusion below — the recommended mechanism turned out not
+  to need an explicit lock object at all.
+- **Fencing tokens exist to patch a specific failure mode that doesn't
+  apply once execution is routed through the leader itself.** A fencing
+  token (a monotonically increasing number issued with each lock grant)
+  defends against a paused/GC'd/partitioned lock holder waking up after
+  its lease has already been reassigned and still acting — but it only
+  works if the *protected resource* checks the token, which requires the
+  resource to cooperate. Riptide's Capabilities are opaque, external,
+  and can't be made to check anything Riptide issues. This is a genuine
+  limitation of any design based on "acquire a lock, then separately go
+  invoke the effect" — motivating (see design doc) a mechanism where the
+  code path that invokes the effect only ever runs *as a direct
+  consequence of currently being the leader*, so there's no window for a
+  stale holder to act after the fact in the first place.
+- **Real production workflow orchestrators solve this exact problem, and
+  confirm resource identity must be caller-supplied.** Temporal's actual
+  guarantee — after the adversarial pass caught and corrected an initial
+  mis-citation (five independent votes confirmed the *default*
+  `WorkflowIdReusePolicy` is `ALLOW_DUPLICATE`, not `REJECT_DUPLICATE` as
+  first drafted, per docs.temporal.io and a temporalio/sdk-java GitHub
+  issue on this exact confusion) — is that **at most one Workflow
+  Execution with a given Workflow Id can be open at any time,
+  unconditionally, regardless of reuse policy**; the reuse policy only
+  governs whether a *new* execution may reuse an id after a *prior* one
+  has closed. Workflow Id is explicitly caller-supplied and
+  business-meaningful (Temporal's own docs: "use the record ID as the
+  Workflow Id"). Argo Workflows has a first-class `mutex` synchronization
+  primitive scoped to a Template or Workflow for the same purpose. Both
+  independently confirm: resource identity has to come from the caller,
+  not be inferred or declared by the effect itself — consistent with
+  Riptide's Capabilities being opaque to the host.
+- **Actor-model "single owner per key" is the closest architectural
+  analogue to what 6l already built, with one caveat that cuts in
+  Riptide's favor.** Akka Cluster Sharding guarantees at most one
+  instance per entity id, cluster-wide, via deterministic
+  hash(id)→shard. Confirmed caveat, not assumed: this guarantee is
+  conditional on the operator choosing a safe cluster-downing strategy —
+  Akka's own docs warn that an unsafe one under partition/long-GC-pause
+  can split the cluster and start the same entity twice, a documented
+  unsafe window. `:ra`'s own Raft implementation doesn't share this
+  weakness: a leader requires an actual quorum majority to be elected,
+  so split-brain is structurally impossible rather than avoided by
+  correct configuration. 6l's `RaCluster.stream_leader?/1` already gives
+  Riptide this property for Job-stream execution ownership; 6d-ii's
+  design reuses it directly rather than building a parallel mechanism.
+
+**Sources** (24 fetched; primary/official docs and peer-reviewed papers
+weighted over blogs): Martin Kleppmann's "How to do distributed locking"
+and the antirez Redlock rebuttal it responds to; `pkg.go.dev` and GitHub
+source for `go.etcd.io/etcd/client/v3/concurrency`; two independent
+fencing-token engineering write-ups; Temporal's official docs
+(`docs.temporal.io`, `ruby.temporal.io`) and engineering blog; AWS Step
+Functions and Argo Workflows official docs; Stripe's idempotency docs and
+engineering blog, plus Brandur Ortiz's independent write-up; the Sagas
+paper itself (ACM DL) and the `microservices.io` secondary summary;
+Baquero/Almeida/Shoker's pure op-based CRDTs paper and the LSCRDT paper
+(IC2E 2022), plus Wikipedia's CRDT overview for corroboration; Akka's
+official Cluster Sharding, Kubernetes-lease, and split-brain-resolver
+docs; and the `rabbitmq/ra` GitHub repository itself for `:ra`'s own
+documented primitives.
+
+**Connecting verdict, informing the design doc's 6d-ii decision:** no
+literature gap remains unaddressed the way Part 1's versioning question
+did — every angle either confirms a usable, precedented pattern
+(Raft-backed exclusivity, caller-supplied resource identity) or
+confirms a genuine dead end (sagas, CRDTs, idempotency-alone) with a
+citable reason why. The one design idea that emerged from synthesizing
+these findings against Riptide's own existing architecture — routing
+resource-key exclusion through 6l's already-elected per-tenant Job-stream
+leader as purely local, in-memory state, rather than any new distributed
+primitive — isn't itself drawn from external precedent; it's the
+recognition that 6l's own mechanism, applied consistently, already
+provides everything this problem needs. See the design doc for the full
+argument.
