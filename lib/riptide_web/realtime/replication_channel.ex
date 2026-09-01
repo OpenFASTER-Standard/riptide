@@ -24,17 +24,17 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
   @impl true
   def join("replication:" <> stream_id, %{"after" => cursor}, socket) do
     case ResourceController.parse_stream_id(stream_id) do
-      {:ok, tenant_id, path_segments} ->
-        Logger.metadata(tenant_id: tenant_id)
+      {:ok, scope, path_segments} ->
+        maybe_log_tenant_metadata(scope)
         maybe_set_subject_metadata(socket.assigns.current_subject)
 
         case Riptide.Authz.evaluate(
-               tenant_id,
+               scope,
                path_segments,
                socket.assigns.current_subject,
                :read
              ) do
-          :allow -> check_new_stream_rate_limit(stream_id, cursor, socket)
+          :allow -> join_with_rate_limit(scope, stream_id, cursor, socket)
           _ -> {:error, %{"reason" => "unauthorized"}}
         end
 
@@ -59,6 +59,33 @@ defmodule RiptideWeb.Realtime.ReplicationChannel do
 
   defp maybe_set_subject_metadata(claims) do
     if sub = claims["sub"], do: Logger.metadata(subject: sub)
+  end
+
+  defp maybe_log_tenant_metadata({:tenant, tenant_id}), do: Logger.metadata(tenant_id: tenant_id)
+  defp maybe_log_tenant_metadata(:hub), do: :ok
+
+  # Hub-scoped reads are network-public (no tenant/authz ownership check
+  # narrows who can join), so — like RiptideWeb.Hub.DiscoveryController and
+  # RiptideWeb.Realtime.SseController.subscribe_with_rate_limit/3 — they get
+  # their own subject-keyed quota here. Tenant-scoped joins keep relying
+  # solely on RiptideWeb.Plugs.Authorize/Riptide.Authz for access control,
+  # unchanged.
+  defp join_with_rate_limit(:hub, stream_id, cursor, socket) do
+    case socket |> rate_limit_key() |> Riptide.HubRateLimit.check_read() do
+      :allow -> check_new_stream_rate_limit(stream_id, cursor, socket)
+      :deny -> {:error, %{"reason" => "rate_limited"}}
+    end
+  end
+
+  defp join_with_rate_limit({:tenant, _tenant_id}, stream_id, cursor, socket) do
+    check_new_stream_rate_limit(stream_id, cursor, socket)
+  end
+
+  defp rate_limit_key(socket) do
+    case socket.assigns.current_subject do
+      %{"sub" => sub} when is_binary(sub) -> sub
+      _ -> "anonymous"
+    end
   end
 
   # Joining before a stream's first write is intentional (a client watching

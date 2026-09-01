@@ -338,6 +338,53 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
       assert conn.status == 503
     end
+
+    test "subscribing to a Hub-shaped stream_id succeeds for an admitted Hub resource" do
+      name = "urn:riptide:capability:ssehub-#{System.unique_integer([:positive])}"
+
+      entry = %Riptide.Derivation.CapabilityCatalogEntry{
+        name: RDF.iri(name),
+        kind: :effect,
+        component_hash: String.duplicate("b", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      # `admit_capability/1` here, not `/2` — Task 6 of this same plan
+      # (docs/superpowers/plans/2026-09-01-phase-6n-hub-resource-lifecycle.md)
+      # hasn't landed yet at this point in the sequence.
+      :ok = Riptide.Derivation.Catalog.admit_capability(entry)
+
+      # Deliberately no on_exit cleanup — the capability stream is a single,
+      # shared, non-unique stream across the whole test suite; see
+      # catalog_test.exs's own "Hub vs. Tenant scope isolation" test for why
+      # force-deleting it here would be unsafe. This test's own name is
+      # already unique-suffixed.
+      stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
+      path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
+
+      conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "subscribing to a Hub-shaped stream_id is rate-limited" do
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :hub_read_rate_limit, 0)
+
+      stream_id = "https://riptide.example/hub/resources/catalog"
+      path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
+
+      conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
+
+      assert conn.status == 429
+    end
   end
 
   defp eventually(fun, attempts_left \\ 50) do

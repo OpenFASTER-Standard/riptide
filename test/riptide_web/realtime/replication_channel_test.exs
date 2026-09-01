@@ -264,6 +264,52 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     assert Logger.metadata()[:subject] == "user-1"
   end
 
+  test "joining a Hub-shaped topic succeeds for an admitted Hub resource" do
+    name = "urn:riptide:capability:wshub-#{System.unique_integer([:positive])}"
+
+    entry = %Riptide.Derivation.CapabilityCatalogEntry{
+      name: RDF.iri(name),
+      kind: :effect,
+      component_hash: String.duplicate("b", 64),
+      function: "run",
+      fuel_limit: 10_000_000,
+      timeout_ms: 5_000,
+      memory_limits: %{
+        max_memory_size: nil,
+        max_table_elements: nil,
+        max_instances: nil,
+        max_tables: nil
+      }
+    }
+
+    # `admit_capability/1` here, not `/2` — Task 6 of this same plan
+    # (docs/superpowers/plans/2026-09-01-phase-6n-hub-resource-lifecycle.md)
+    # hasn't landed yet at this point in the sequence. Deliberately no
+    # on_exit cleanup either — see sse_controller_test.exs's identical new
+    # test for why (shared, non-unique Hub stream).
+    :ok = Riptide.Derivation.Catalog.admit_capability(entry)
+
+    stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
+    {:ok, socket} = connect(Socket, %{})
+
+    assert {:ok, _reply, _socket} =
+             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+               "after" => 0
+             })
+  end
+
+  test "joining a Hub-shaped topic is rate-limited" do
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :hub_read_rate_limit, 0)
+
+    stream_id = "https://riptide.example/hub/resources/catalog"
+    {:ok, socket} = connect(Socket, %{})
+
+    assert {:error, %{"reason" => "rate_limited"}} =
+             subscribe_and_join(socket, ReplicationChannel, "replication:" <> stream_id, %{
+               "after" => 0
+             })
+  end
+
   describe "new-stream rate limiting (atom-exhaustion guard)" do
     setup do
       Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
