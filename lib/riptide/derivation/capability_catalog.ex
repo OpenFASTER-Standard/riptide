@@ -59,7 +59,7 @@ defmodule Riptide.Derivation.CapabilityCatalog do
   end
 
   defp fetch_and_cache(hash) do
-    with {:ok, bytes} <- BlobStore.get(hash) do
+    with {:ok, bytes} <- safe_get(hash) do
       path = cache_path_for(hash)
 
       with :ok <- File.mkdir_p(Path.dirname(path)),
@@ -67,6 +67,25 @@ defmodule Riptide.Derivation.CapabilityCatalog do
         {:ok, path}
       end
     end
+  end
+
+  # `BlobStore.get/1`'s `GenServer.call` uses the default 5000ms timeout,
+  # but the single `BlobStore` process it calls into can itself block far
+  # longer internally (up to 30s per remote node it tries, sequentially,
+  # once a blob isn't found locally — see `BlobStore.fetch_remote/1`) —
+  # e.g. when a `LocationIndex` entry still points at a node that's since
+  # torn down (a `:peer`-based test cluster that already stopped). A
+  # caller-side timeout there raises/exits the CALLING process, not
+  # `BlobStore`'s own — but `materialize/1`'s own contract promises
+  # `{:error, term()}` for every failure, never a raise. Confirmed live: a
+  # stale `LocationIndex` entry from an earlier test made
+  # `ContextResolver.resolve_all/2` (which materializes every Hub
+  # capability, not just one) time out and 500 an entirely unrelated
+  # Tenant's request.
+  defp safe_get(hash) do
+    BlobStore.get(hash)
+  catch
+    :exit, _ -> {:error, :blob_unavailable}
   end
 
   defp cache_path_for(hash) do
