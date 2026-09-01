@@ -35,6 +35,13 @@ defmodule RiptideWeb.Router do
     get "/health/ready", RiptideWeb.HealthController, :ready
   end
 
+  scope "/auth" do
+    pipe_through [:api]
+
+    post "/signup", RiptideWeb.Auth.SignupController, :create
+    post "/login", RiptideWeb.Auth.LoginController, :create
+  end
+
   scope "/" do
     pipe_through [:api, :auth_query_param]
 
