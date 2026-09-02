@@ -223,9 +223,18 @@ const state = {
   chapter1: { capabilityNodeId: null, jobNodeId: null },
   chapter2: { capabilityNodeId: null, jobNodeId: null },
   chapter3: { secondJobNodeId: null, patternNodeId: null, thirdJobNodeId: null },
-  chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null, v2PatternNodeId: null },
+  chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null },
   chapter5: { job1NodeId: null, job2NodeId: null },
   chapter6: { ruleNodeId: null },
+  // Every Chapter from 3 onward subscribes to the SAME shared .../resources/jobs stream, whose
+  // backlog (by this point) already contains earlier Chapters' own completed Jobs — a fresh
+  // EventSource has no way to start mid-stream (browsers only echo Last-Event-ID on their own
+  // automatic reconnects, never on the first connection, and this backend's own SSE endpoint
+  // otherwise legitimately replays full history — see the paired backend fix in 6p-iii). Tracking
+  // the highest stream sequence (the SSE frame's own "id:" field, exposed as
+  // MessageEvent.lastEventId) any Chapter has already consumed lets every later Chapter's own
+  // jobStatus watch ignore stale backlog and react only to genuinely new events.
+  lastConsumedJobSequence: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,7 +262,9 @@ async function fetchTurtle(path, token) {
 function subscribeStream(streamId, token, onPatch) {
   const url = `${state.baseUrl}/streams/${encodeURIComponent(streamId)}/subscribe?token=${token}`;
   const es = new EventSource(url);
-  es.onmessage = (ev) => onPatch(new N3.Parser().parse(ev.data));
+  // Second arg: this frame's own stream sequence number (the SSE "id:" field) — callers watching
+  // a stream with pre-existing history use it to ignore stale backlog. See state.lastConsumedJobSequence.
+  es.onmessage = (ev) => onPatch(new N3.Parser().parse(ev.data), Number(ev.lastEventId));
   return es; // caller closes via es.close() once its own condition is met
 }
 
@@ -667,7 +678,7 @@ async function useCapability(container, stateKey) {
     state[stateKey].jobNodeId = submitted.job_node;
 
     const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
-    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads, sequence) => {
       // Not matched against submitted.job_node: a Job's blank-node subject has no identity
       // outside the one Turtle document it was originally written in — each SSE frame is parsed
       // independently by N3.js, and Riptide.RDF.TurtleCodec (a thin wrapper over the `rdf`
@@ -676,13 +687,17 @@ async function useCapability(container, stateKey) {
       // a fresh subscribe's very first frame shows the Job as `[ a <urn:riptide:vocab:Job> ; ...
       // ]`, and Catalog.mark_job_done/3's own completion patch (lib/riptide/derivation/catalog.ex)
       // writes only jobStatus/jobResult, so there's no other field in that same frame to
-      // correlate by either. Each Chapter here only ever has one Job in flight at a time, so
-      // matching on "a jobStatus quad just turned done/failed" — with no subject check at all —
-      // is unambiguous and correct for this demo's own narrative.
+      // correlate by either. Skip anything already consumed by an earlier Chapter's own watch
+      // (see state.lastConsumedJobSequence) — this stream accumulates every Job for the whole
+      // demo, so by Chapter 3 onward its backlog already contains prior Chapters' own completions.
+      // Each Chapter here only ever has one Job in flight at a time, so matching on "a jobStatus
+      // quad just turned done/failed" among the still-unconsumed events is unambiguous.
+      if (sequence <= state.lastConsumedJobSequence) return;
       const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
       if (!statusQuad) return;
       const status = statusQuad.object.value;
       if (status !== "done" && status !== "failed") return;
+      state.lastConsumedJobSequence = sequence;
       es.close();
       renderCapabilityPayoff(useResult, stateKey, status, quads);
     });
@@ -820,9 +835,15 @@ async function submitSecondBadgeTask(container) {
     state.chapter3.secondJobNodeId = submitted.job_node;
 
     const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
-    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
-      const statusQuad = quads.find((q) => q.subject.value === submitted.job_node && q.predicate.value === VOCAB.jobStatus);
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads, sequence) => {
+      // Same reasoning as Chapters 1/2's own useCapability(): no blank-node subject identity
+      // survives across independent SSE frames, only one Job is ever in flight here, and
+      // state.lastConsumedJobSequence skips this stream's already-consumed backlog (Chapter 1's
+      // own Job already completed by the time this one subscribes).
+      if (sequence <= state.lastConsumedJobSequence) return;
+      const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
       if (!statusQuad || statusQuad.object.value !== "done") return;
+      state.lastConsumedJobSequence = sequence;
       es.close();
 
       const btn = document.createElement("button");

@@ -23,6 +23,14 @@ config :riptide, RiptideWeb.Endpoint,
 # prod-required RIPTIDE_PASSWORD_AUTH_SIGNING_KEY env var this does NOT apply to.
 config :riptide, password_auth_signing_key: "dev-only-insecure-password-auth-signing-key"
 
+# WRITE_RATE_LIMIT is optional (defaults to Riptide.WriteRateLimit's own built-in 10/minute) —
+# examples/guild-demo's own smoke-test.mjs drives far more than 10 writes against Guild A's single
+# tenant well within a minute (every Chapter's own admits/proposals/policy grants, run back to
+# back by Playwright, add up to well over 10 — confirmed live via a real 429 on Chapter 5's own
+# second concurrent Task submission), which a human clicking through the same demo over several
+# minutes would never hit. Raises the limit for the smoke test's own fully-controlled instance only.
+config :riptide, write_rate_limit: String.to_integer(System.get_env("WRITE_RATE_LIMIT") || "10")
+
 # ## SSL Support
 #
 # In order to use HTTPS in development, a self-signed

@@ -56,12 +56,21 @@ const state = {
   baseUrl: null,
   guildA: { tenantId: null, aliceToken: null, aliceSub: null },
   guildB: { tenantId: null, bobToken: null, bobSub: null },
+  guildC: { tenantId: null, carolToken: null, carolSub: null },
   chapter1: { capabilityNodeId: null, jobNodeId: null },
   chapter2: { capabilityNodeId: null, jobNodeId: null },
   chapter3: { secondJobNodeId: null, patternNodeId: null, thirdJobNodeId: null },
   chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null },
   chapter5: { job1NodeId: null, job2NodeId: null },
-  chapter6: { ruleNodeId: null },
+  // Every Chapter from 3 onward subscribes to the SAME shared .../resources/jobs stream, whose
+  // backlog (by this point) already contains earlier Chapters' own completed Jobs — a fresh
+  // EventSource has no way to start mid-stream (browsers only echo Last-Event-ID on their own
+  // automatic reconnects, never on the first connection, and this backend's own SSE endpoint
+  // otherwise legitimately replays full history — see the paired backend fix in 6p-iii). Tracking
+  // the highest stream sequence (the SSE frame's own "id:" field, exposed as
+  // MessageEvent.lastEventId) any Chapter has already consumed lets every later Chapter's own
+  // jobStatus watch ignore stale backlog and react only to genuinely new events.
+  lastConsumedJobSequence: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +98,9 @@ async function fetchTurtle(path, token) {
 function subscribeStream(streamId, token, onPatch) {
   const url = `${state.baseUrl}/streams/${encodeURIComponent(streamId)}/subscribe?token=${token}`;
   const es = new EventSource(url);
-  es.onmessage = (ev) => onPatch(new N3.Parser().parse(ev.data));
+  // Second arg: this frame's own stream sequence number (the SSE "id:" field) — callers watching
+  // a stream with pre-existing history use it to ignore stale backlog. See state.lastConsumedJobSequence.
+  es.onmessage = (ev) => onPatch(new N3.Parser().parse(ev.data), Number(ev.lastEventId));
   return es; // caller closes via es.close() once its own condition is met
 }
 
@@ -322,7 +333,7 @@ async function useCapability(container, stateKey) {
     state[stateKey].jobNodeId = submitted.job_node;
 
     const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
-    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads, sequence) => {
       // Not matched against submitted.job_node: a Job's blank-node subject has no identity
       // outside the one Turtle document it was originally written in — each SSE frame is parsed
       // independently by N3.js, and Riptide.RDF.TurtleCodec (a thin wrapper over the `rdf`
@@ -331,13 +342,17 @@ async function useCapability(container, stateKey) {
       // a fresh subscribe's very first frame shows the Job as `[ a <urn:riptide:vocab:Job> ; ...
       // ]`, and Catalog.mark_job_done/3's own completion patch (lib/riptide/derivation/catalog.ex)
       // writes only jobStatus/jobResult, so there's no other field in that same frame to
-      // correlate by either. Each Chapter here only ever has one Job in flight at a time, so
-      // matching on "a jobStatus quad just turned done/failed" — with no subject check at all —
-      // is unambiguous and correct for this demo's own narrative.
+      // correlate by either. Skip anything already consumed by an earlier Chapter's own watch
+      // (see state.lastConsumedJobSequence) — this stream accumulates every Job for the whole
+      // demo, so by Chapter 3 onward its backlog already contains prior Chapters' own completions.
+      // Each Chapter here only ever has one Job in flight at a time, so matching on "a jobStatus
+      // quad just turned done/failed" among the still-unconsumed events is unambiguous.
+      if (sequence <= state.lastConsumedJobSequence) return;
       const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
       if (!statusQuad) return;
       const status = statusQuad.object.value;
       if (status !== "done" && status !== "failed") return;
+      state.lastConsumedJobSequence = sequence;
       es.close();
       renderCapabilityPayoff(useResult, stateKey, status, quads);
     });
@@ -423,11 +438,15 @@ async function submitSecondBadgeTask(container) {
     state.chapter3.secondJobNodeId = submitted.job_node;
 
     const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
-    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads, sequence) => {
       // Same reasoning as Chapters 1/2's own useCapability(): no blank-node subject identity
-      // survives across independent SSE frames, and only one Job is ever in flight here.
+      // survives across independent SSE frames, only one Job is ever in flight here, and
+      // state.lastConsumedJobSequence skips this stream's already-consumed backlog (Chapter 1's
+      // own Job already completed by the time this one subscribes).
+      if (sequence <= state.lastConsumedJobSequence) return;
       const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
       if (!statusQuad || statusQuad.object.value !== "done") return;
+      state.lastConsumedJobSequence = sequence;
       es.close();
 
       const btn = document.createElement("button");
@@ -700,6 +719,189 @@ async function proposeRedundantVariant(container) {
     `;
     result.appendChild(payoff);
     addNextButton(result);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 5: Two players, one chest
+// ---------------------------------------------------------------------------
+CHAPTERS.push({
+  title: "Chapter 5: Two players, one chest",
+  render(container) {
+    container.innerHTML = `
+      <h2>Chapter 5: Two players, one chest</h2>
+      <p>Two players reach for the same chest at once:</p>
+      <button id="chapter5-submit-both-button">Both open the chest!</button>
+      <div id="chapter5-result"><div id="chapter5-timeline"></div></div>
+    `;
+    document.getElementById("chapter5-submit-both-button").onclick = () => submitBothChestTasks(container);
+  },
+});
+
+async function submitBothChestTasks(container) {
+  const result = document.getElementById("chapter5-result");
+  const mutexKey = "guild-demo-shared-chest";
+  const submittedAt = Date.now();
+
+  try {
+    const [alice, bob] = await Promise.all([
+      postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, {
+        description: "make a badge that says Welcome, Adventurer!", mutex_key: mutexKey,
+      }),
+      postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, {
+        description: "make a badge that says Great job, Champion!", mutex_key: mutexKey,
+      }),
+    ]);
+    state.chapter5.job1NodeId = alice.job_node;
+    state.chapter5.job2NodeId = bob.job_node;
+
+    const completions = [];
+    const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads, sequence) => {
+      // Both Tasks share mutex_key, so Riptide.Derivation.JobTrigger's own run_exclusively/2
+      // guarantees they never execute concurrently — that's "no double-loot". Two Jobs are in
+      // flight here, but (same reasoning as every other Chapter's own job-status watch — no
+      // stable identity survives an SSE frame's independent parse) they're only counted, never
+      // individually attributed: all that matters for this beat is that both eventually finish.
+      if (sequence <= state.lastConsumedJobSequence) return;
+      const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
+      if (!statusQuad) return;
+      const status = statusQuad.object.value;
+      if (status !== "done" && status !== "failed") return;
+      state.lastConsumedJobSequence = sequence;
+      completions.push({ status, elapsedMs: Date.now() - submittedAt });
+      renderTimeline(completions);
+
+      if (completions.length >= 2) {
+        es.close();
+        const payoff = document.createElement("div");
+        payoff.className = "payoff";
+        payoff.innerHTML = `
+          <p>Both Jobs completed — no double-loot: the shared mutex_key means
+          Riptide.Derivation.JobTrigger never runs two Jobs for the same key concurrently, even
+          though both Tasks were submitted at the same instant.</p>
+        `;
+        result.appendChild(payoff);
+        addNextButton(result);
+      }
+    });
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+function renderTimeline(completions) {
+  const timeline = document.getElementById("chapter5-timeline");
+  timeline.innerHTML = completions
+    .map((c, i) => `<div>Job ${i + 1} finished (${c.status}) after ${c.elapsedMs}ms</div>`)
+    .join("");
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 6: Ask a question, not just store data
+// ---------------------------------------------------------------------------
+// A fresh, third guild — deliberately never taught a Capability, and so never has a
+// Capability-shaped Rule anywhere in its own Catalog. POST /tenants/:id/query
+// (Riptide.Derivation.QueryInterpreter) refuses to evaluate a Tenant's ruleset at all the moment
+// ANY of its admitted Rules has a CapabilityReference body — Matcher.evaluate/2's own safety
+// check treats a Capability-invoking Rule's head variables as unbound, by design (confirmed live:
+// a real 422 {"error":"query_evaluation_failed","reason":"{:unsafe_rule, ...}"} against Guild A's
+// own tenant, whose badgeResult pattern from Chapter 3 is exactly this shape) — and every other
+// guild in this demo (A, B) already has that pattern admitted. There's also no self-service HTTP
+// surface anywhere in this system for admitting a hand-authored logic Rule directly (an explicit
+// non-goal of the 6p-i design spec) — Rules only ever enter a Catalog via a Task resolving through
+// a real Capability, or via install/Crosswalk copying one from another tenant. Both facts mean a
+// live end-to-end demo of QueryInterpreter's own real recursive/fixpoint evaluation isn't reachable
+// through this page's own real-HTTP-only, no-backend-changes constraints — this Chapter shows the
+// real endpoint honestly (a genuinely empty ruleset, so the starting facts pass through unchanged),
+// rather than fabricating a derivation this backend cannot actually perform for any tenant this
+// demo can construct via HTTP alone.
+CHAPTERS.push({
+  title: "Chapter 6: Ask a question, not just store data",
+  render(container) {
+    container.innerHTML = `
+      <h2>Chapter 6: Ask a question, not just store data</h2>
+      <p>A third guild rises — Guild C, which hasn't taught any tricks yet. See what Riptide's
+      query endpoint does with it:</p>
+      <button id="chapter6-begin-button">Begin Guild C</button>
+      <div id="chapter6-result"></div>
+    `;
+    document.getElementById("chapter6-begin-button").onclick = () => beginGuildC(container);
+  },
+});
+
+async function beginGuildC(container) {
+  const result = document.getElementById("chapter6-result");
+  try {
+    const passwordHash = await sha256hex("guild-demo-pw");
+    const response = await postJson("/auth/signup", null, { name: "guild-c", username: "carol", password_hash: passwordHash });
+    state.guildC.tenantId = response.tenant_id;
+    state.guildC.carolToken = response.token;
+    state.guildC.carolSub = response.sub;
+
+    const section = document.createElement("div");
+    section.innerHTML = `
+      <p>Write Carol's starting skill:</p>
+      <input type="text" id="chapter6-skill-input" value="swordFighting" />
+      <button id="chapter6-write-facts-button">Write starting facts</button>
+    `;
+    result.appendChild(section);
+    document.getElementById("chapter6-write-facts-button").onclick = () => writeStartingFacts(container);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function writeStartingFacts(container) {
+  const result = document.getElementById("chapter6-result");
+  try {
+    const skill = document.getElementById("chapter6-skill-input").value;
+    const turtle = `@prefix rel: <urn:riptide:relation:> .\n<urn:test:carol> rel:hasSkill "${skill}" .`;
+    await putTurtle(`/tenants/${state.guildC.tenantId}/resources/characters/carol`, state.guildC.carolToken, turtle);
+
+    const btn = document.createElement("button");
+    btn.id = "chapter6-ask-button";
+    btn.textContent = "Ask the question";
+    btn.onclick = () => askQuestion(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function askQuestion(container) {
+  const result = document.getElementById("chapter6-result");
+  try {
+    const res = await fetch(`${state.baseUrl}/tenants/${state.guildC.tenantId}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${state.guildC.carolToken}` },
+      body: JSON.stringify({ starting_resource_path: ["characters", "carol"] }),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new HttpError(res.status, text);
+    const store = new N3.Store();
+    store.addQuads(new N3.Parser().parse(text));
+
+    const skillQuads = store.getQuads("urn:test:carol", "urn:riptide:relation:hasSkill", null);
+
+    const payoff = document.createElement("div");
+    payoff.className = "payoff";
+    payoff.innerHTML = `
+      <p>The query endpoint read Carol's own starting facts and evaluated Guild C's entire
+      admitted ruleset against them, in one real HTTP call: <strong>${skillQuads.map((q) => q.object.value).join(", ")}</strong>.</p>
+      <p><em>Guild C hasn't admitted any Rules yet, so nothing new derives here — the facts pass
+      straight through, which is exactly what a zero-round fixpoint looks like. The same endpoint
+      runs a genuine recursive fixpoint loop the moment a Tenant's Catalog holds a recursive Rule
+      (see Riptide.Derivation.QueryInterpreter) — this demo's own Chapters 1-5 just never produce
+      a Catalog this endpoint can evaluate: every Rule they admit comes from a real Capability
+      invocation, and this endpoint's own safety check deliberately refuses a Capability-shaped
+      Rule entirely, so a live recursive derivation isn't something a real visitor to this page
+      could reach today.</em></p>
+    `;
+    result.appendChild(payoff);
+    result.appendChild(document.createTextNode("The end — thanks for visiting the guild!"));
   } catch (err) {
     renderError(err, result);
   }

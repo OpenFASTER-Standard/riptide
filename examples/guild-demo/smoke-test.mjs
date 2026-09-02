@@ -65,6 +65,12 @@ async function main() {
       LLM_API_BASE_URL: `http://localhost:${MOCK_LLM_PORT}`,
       LLM_API_KEY: "smoke-test-key",
       LLM_API_MODEL: "smoke-test-model",
+      // The full 7-Chapter run drives well over 10 writes against Guild A's single tenant within
+      // well under a minute — Riptide.WriteRateLimit's own default 10/minute is a real,
+      // deliberate per-tenant safety limit, not a bug, but this script's own fully-controlled
+      // instance needs it raised (confirmed live via a real 429 on Chapter 5's own second
+      // concurrent Task submission before this was added). See config/dev.exs's own comment.
+      WRITE_RATE_LIMIT: "1000",
     },
     stdio: "inherit",
   });
@@ -151,7 +157,20 @@ async function runChapters(page) {
   log("Chapter 4 passed");
   await page.click('button:has-text("Next chapter")');
 
-  // Later tasks append one more `log(...)` + assertion block here per Chapter, in order.
+  // Chapter 5
+  await page.click('#chapter5-submit-both-button');
+  await page.waitForSelector('.payoff:has-text("no double-loot")', { timeout: 20000 });
+  log("Chapter 5 passed");
+  await page.click('button:has-text("Next chapter")');
+
+  // Chapter 6
+  await page.click('#chapter6-begin-button');
+  await page.waitForSelector('#chapter6-write-facts-button', { timeout: 10000 });
+  await page.click('#chapter6-write-facts-button');
+  await page.waitForSelector('#chapter6-ask-button', { timeout: 10000 });
+  await page.click('#chapter6-ask-button');
+  await page.waitForSelector('.payoff:has-text("swordFighting")', { timeout: 10000 });
+  log("Chapter 6 passed");
 }
 
 main().catch((err) => {
