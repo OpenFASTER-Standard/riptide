@@ -389,21 +389,22 @@ defmodule Riptide.Derivation.DedupGate do
     end
   end
 
-  @spec propose_crosswalk(Catalog.scope(), Crosswalk.t(), RDF.BlankNode.t() | nil) ::
+  @spec propose_crosswalk(Catalog.scope(), Catalog.scope(), Crosswalk.t(), RDF.BlankNode.t() | nil) ::
           {:ok, RDF.BlankNode.t()} | {:error, term()}
-  def propose_crosswalk(review_scope, %Crosswalk{} = crosswalk, replaces) do
+  def propose_crosswalk(_target_scope, review_scope, %Crosswalk{} = crosswalk, replaces) do
     Catalog.queue_crosswalk_review(review_scope, %PendingCrosswalkReview{
       candidate: crosswalk,
       replaces: replaces
     })
   end
 
-  @spec approve_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
-  def approve_crosswalk_review(review_scope, node) do
+  @spec approve_crosswalk_review(Catalog.scope(), Catalog.scope(), RDF.BlankNode.t()) ::
+          :ok | {:error, term()}
+  def approve_crosswalk_review(target_scope, review_scope, node) do
     with {:ok, pending_reviews} <- Catalog.list_crosswalk_pending_reviews(review_scope),
          {_node, pending} <- List.keyfind(pending_reviews, node, 0, :not_found) do
-      :ok = Catalog.admit_crosswalk(pending.candidate, pending.replaces)
-      maybe_supersede_crosswalk(pending.replaces)
+      :ok = Catalog.admit_crosswalk(target_scope, pending.candidate, pending.replaces)
+      maybe_supersede_crosswalk(target_scope, pending.replaces)
       Catalog.resolve_crosswalk_review(review_scope, node)
     else
       :not_found -> {:error, :not_found}
@@ -411,28 +412,33 @@ defmodule Riptide.Derivation.DedupGate do
     end
   end
 
-  defp maybe_supersede_crosswalk(nil), do: :ok
-  defp maybe_supersede_crosswalk(node), do: Catalog.supersede_crosswalk(node)
+  defp maybe_supersede_crosswalk(_target_scope, nil), do: :ok
+  defp maybe_supersede_crosswalk(target_scope, node), do: Catalog.supersede_crosswalk(target_scope, node)
 
   @spec decline_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def decline_crosswalk_review(review_scope, node),
     do: Catalog.resolve_crosswalk_review(review_scope, node)
 
-  @spec propose_capability(Catalog.scope(), CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) ::
-          {:ok, RDF.BlankNode.t()} | {:error, term()}
-  def propose_capability(review_scope, %CapabilityCatalogEntry{} = entry, replaces) do
+  @spec propose_capability(
+          Catalog.scope(),
+          Catalog.scope(),
+          CapabilityCatalogEntry.t(),
+          RDF.BlankNode.t() | nil
+        ) :: {:ok, RDF.BlankNode.t()} | {:error, term()}
+  def propose_capability(_target_scope, review_scope, %CapabilityCatalogEntry{} = entry, replaces) do
     Catalog.queue_capability_review(review_scope, %PendingCapabilityReview{
       candidate: entry,
       replaces: replaces
     })
   end
 
-  @spec approve_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
-  def approve_capability_review(review_scope, node) do
+  @spec approve_capability_review(Catalog.scope(), Catalog.scope(), RDF.BlankNode.t()) ::
+          :ok | {:error, term()}
+  def approve_capability_review(target_scope, review_scope, node) do
     with {:ok, pending_reviews} <- Catalog.list_capability_pending_reviews(review_scope),
          {_node, pending} <- List.keyfind(pending_reviews, node, 0, :not_found) do
-      :ok = Catalog.admit_capability(pending.candidate, pending.replaces)
-      maybe_supersede_capability(pending.replaces)
+      :ok = Catalog.admit_capability(target_scope, pending.candidate, pending.replaces)
+      maybe_supersede_capability(target_scope, pending.replaces)
       Catalog.resolve_capability_review(review_scope, node)
     else
       :not_found -> {:error, :not_found}
@@ -440,8 +446,10 @@ defmodule Riptide.Derivation.DedupGate do
     end
   end
 
-  defp maybe_supersede_capability(nil), do: :ok
-  defp maybe_supersede_capability(node), do: Catalog.supersede_capability(node)
+  defp maybe_supersede_capability(_target_scope, nil), do: :ok
+
+  defp maybe_supersede_capability(target_scope, node),
+    do: Catalog.supersede_capability(target_scope, node)
 
   @spec decline_capability_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def decline_capability_review(review_scope, node),

@@ -53,22 +53,17 @@ defmodule Riptide.Derivation.Catalog do
                                                 "urn:riptide:vocab:ResolvedPendingCapabilityReview"
                                               )
 
-  @type scope :: {:tenant, String.t()} | :hub
+  @type scope :: {:tenant, String.t()}
 
   @spec catalog_stream_id(scope()) :: String.t()
   def catalog_stream_id({:tenant, tenant_id}),
     do: @stream_id_prefix <> "tenants/" <> tenant_id <> "/resources/catalog"
 
-  # Unchanged — Hub already has its own working, separate /hub/* HTTP surface
-  # and addressing model (design spec §3); this phase touches only the
-  # Tenant-scoped side.
-  def catalog_stream_id(:hub), do: @stream_id_prefix <> "hub/resources/catalog"
-
   @spec pending_review_stream_id(scope()) :: String.t()
   def pending_review_stream_id(scope), do: catalog_stream_id(scope) <> "/pending-review"
 
-  @spec crosswalk_stream_id() :: String.t()
-  def crosswalk_stream_id, do: catalog_stream_id(:hub) <> "/crosswalks"
+  @spec crosswalk_stream_id(scope()) :: String.t()
+  def crosswalk_stream_id(scope), do: catalog_stream_id(scope) <> "/crosswalks"
 
   @spec list_entries(scope()) :: {:ok, [{RDF.BlankNode.t(), Rule.t()}]} | {:error, :not_ready}
   def list_entries(scope) do
@@ -104,25 +99,26 @@ defmodule Riptide.Derivation.Catalog do
     )
   end
 
-  @spec admit_crosswalk(Crosswalk.t(), RDF.BlankNode.t() | nil) :: :ok | {:error, :not_ready}
-  def admit_crosswalk(%Crosswalk{} = crosswalk, replaces) do
+  @spec admit_crosswalk(scope(), Crosswalk.t(), RDF.BlankNode.t() | nil) ::
+          :ok | {:error, :not_ready}
+  def admit_crosswalk(scope, %Crosswalk{} = crosswalk, replaces) do
     {node, crosswalk_graph} = CrosswalkRDFCodec.to_rdf(crosswalk)
     graph = maybe_add_supersedes(crosswalk_graph, node, replaces)
-    write_patch(crosswalk_stream_id(), RDF.Graph.triples(graph), [])
+    write_patch(crosswalk_stream_id(scope), RDF.Graph.triples(graph), [])
   end
 
-  @spec supersede_crosswalk(RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
-  def supersede_crosswalk(node) do
+  @spec supersede_crosswalk(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def supersede_crosswalk(scope, node) do
     write_patch(
-      crosswalk_stream_id(),
+      crosswalk_stream_id(scope),
       [{node, @rdf_type, @riptide_superseded_crosswalk}],
       [{node, @rdf_type, @riptide_crosswalk}]
     )
   end
 
-  @spec list_crosswalks() :: {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
-  def list_crosswalks do
-    with {:ok, graph} <- read_graph(crosswalk_stream_id()) do
+  @spec list_crosswalks(scope()) :: {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
+  def list_crosswalks(scope) do
+    with {:ok, graph} <- read_graph(crosswalk_stream_id(scope)) do
       nodes = nodes_of_type(graph, @riptide_crosswalk)
       {:ok, Enum.map(nodes, &{&1, CrosswalkRDFCodec.from_rdf(&1, graph)})}
     end
@@ -158,30 +154,30 @@ defmodule Riptide.Derivation.Catalog do
     )
   end
 
-  @spec capability_stream_id() :: String.t()
-  def capability_stream_id, do: catalog_stream_id(:hub) <> "/capabilities"
+  @spec capability_stream_id(scope()) :: String.t()
+  def capability_stream_id(scope), do: catalog_stream_id(scope) <> "/capabilities"
 
-  @spec admit_capability(CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) ::
+  @spec admit_capability(scope(), CapabilityCatalogEntry.t(), RDF.BlankNode.t() | nil) ::
           :ok | {:error, :not_ready}
-  def admit_capability(%CapabilityCatalogEntry{} = entry, replaces) do
+  def admit_capability(scope, %CapabilityCatalogEntry{} = entry, replaces) do
     {node, entry_graph} = CapabilityCatalogRDFCodec.to_rdf(entry)
     graph = maybe_add_supersedes(entry_graph, node, replaces)
-    write_patch(capability_stream_id(), RDF.Graph.triples(graph), [])
+    write_patch(capability_stream_id(scope), RDF.Graph.triples(graph), [])
   end
 
-  @spec supersede_capability(RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
-  def supersede_capability(node) do
+  @spec supersede_capability(scope(), RDF.BlankNode.t()) :: :ok | {:error, :not_ready}
+  def supersede_capability(scope, node) do
     write_patch(
-      capability_stream_id(),
+      capability_stream_id(scope),
       [{node, @rdf_type, @riptide_superseded_capability_catalog_entry}],
       [{node, @rdf_type, @riptide_capability_catalog_entry}]
     )
   end
 
-  @spec list_capabilities() ::
+  @spec list_capabilities(scope()) ::
           {:ok, [{RDF.BlankNode.t(), CapabilityCatalogEntry.t()}]} | {:error, :not_ready}
-  def list_capabilities do
-    with {:ok, graph} <- read_graph(capability_stream_id()) do
+  def list_capabilities(scope) do
+    with {:ok, graph} <- read_graph(capability_stream_id(scope)) do
       nodes = nodes_of_type(graph, @riptide_capability_catalog_entry)
       {:ok, Enum.map(nodes, &{&1, CapabilityCatalogRDFCodec.from_rdf(&1, graph)})}
     end
