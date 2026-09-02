@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components) — see issue #58 for the current remaining list (6p-iii the demo page, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse) — see issue #58 for the current remaining list (6p-iii the demo page, now unblocked; 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1599,3 +1599,77 @@ trap — confirmed it correctly rules out the different `{:error, {:trap, _}}` a
 `.wasm` file also produces, which the literal panic-message assertion would not have caught either way).
 
 **Status**: Phase 6p-ii shipped 2026-09-02.
+
+### 6q — Tenant Sovereignty
+
+**Shipped 2026-09-02** — see
+`docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md` and
+`docs/superpowers/plans/2026-09-02-phase-6q-tenant-sovereignty.md`. Direct origin: a brainstorming
+question while scoping 6p-iii (the demo page) — "How does a Hub Browser make sense? Mustn't it be
+scoped to a tenant always?" — surfaced that Hub, a single global scope shared across every tenant,
+directly contradicted the multi-tenant isolation every other part of Sub-project 6 already assumed.
+Rather than patch around it, this phase eliminates Hub entirely: **each tenant is now its own fully
+independent server**, with sharing achieved by composing two already-existing mechanisms (admit into
+your own Catalog + grant a `:public` Authz policy) instead of a separate global namespace.
+
+Four pillars, following the design spec's own decomposition:
+- **Tenant identity**: a plain, self-generated `Uniq.UUID.uuid4()` (mirrors `sub`'s own existing
+  no-coordination pattern) — no signup race to arbitrate. A separate, thin `name → tenant_id`
+  registry (`Riptide.Placement.claim_name/2`/`lookup_name/1`, a Ra command/query on the existing
+  placement cluster) is the *only* piece still needing a shared arbiter, since a human-chosen name
+  is the one thing that still benefits from being unique fleet-wide.
+- **Authz policy storage**: moved off a dedicated Ra-backed structure into ordinary per-tenant facts
+  (`Riptide.Authz.Store.TenantFacts`), mirroring `Riptide.Accounts`'s own precedent from 6o.
+  `Riptide.Authz.Store.Placement` deleted outright.
+- **Hub collapse**: `Catalog.scope()` narrows from `{:tenant, String.t()} | :hub` to just
+  `{:tenant, String.t()}`. Deep investigation (multiple rounds of research agents) found most of
+  Hub's own dedicated machinery was either pure duplication of already-existing Tenant-scoped code
+  (`Hub.ProposeController`/`Hub.ReviewController` were byte-for-byte duplicates of
+  `TenantProposeController`/`TenantReviewController`) or trivially generalizable
+  (`DedupGate.propose/4`/`approve_review/3` were already scope-polymorphic — the actual
+  Hub-specificity lived only in `Catalog`'s own zero-arity stream-id helpers). Six controllers plus
+  `RiptideWeb.Plugs.ResolveHubScope` deleted; `TenantCapabilityController`/`TenantCrosswalkController`/
+  `TenantInstallController`/`TenantDiscoveryController.show/2` replace them.
+- **Blob storage**: `Riptide.BlobStore`/`LocationIndex`/`Healer` all gained a leading `tenant_id` —
+  blobs are no longer cross-tenant-shared at the storage layer. Cross-tenant sharing now works via
+  **copy-on-install**: installing another tenant's Capability fetches its blob bytes and writes a
+  private copy into the installer's own tenant-scoped store (mirroring how `Install.install/3`
+  already gives Rules their own durable copy rather than a live reference), so an installed
+  Capability keeps working even after the source tenant deletes its own original — proven directly
+  by this phase's own capstone test.
+
+Five smaller gap-resolutions surfaced along the way, each grounded in an existing precedent rather
+than invented fresh: no bootstrap-on-first-write fallback needed anymore (`tenant_id` is opaque and
+only ever created via explicit signup, so there's no "unclaimed tenant someone stumbles onto" case
+left); public-read abuse protection (`Riptide.HubRateLimit.check_read/1`) retargeted from "hit `:hub`
+scope" to "this request's Authz decision matched a `:public` policy" (`Riptide.PublicReadRateLimit`,
+wired into `Authorize`/`SseController`/`ReplicationChannel` — extended beyond the design spec's
+literal `Authorize`-only wording, since leaving the realtime transports unprotected would reopen
+exactly the gap the spec's own reasoning argues against); `Riptide.HubRateLimit.check_propose/1`
+renamed to `Riptide.WriteRateLimit.check/1` (it was already a general per-tenant write quota, never
+actually Hub-specific); `ContextResolver` drops its implicit Hub-rule-merge (a Tenant's resolved
+Context is now exactly its own admitted Rules/Capabilities, no passthrough); `CapabilityCatalog.
+materialize/1` threaded to `/2` so blob resolution knows which tenant's store to read from.
+
+Executed as one comprehensive 12-task plan (per explicit instruction — no sub-phase split, unlike
+6p's own pattern), each task following strict TDD: write the failing test, confirm it fails for the
+expected reason, implement, confirm it passes, commit. Two real task-ordering bugs were caught and
+fixed during the plan's own self-review before execution began (an earlier task's code calling a
+function only defined in a later task); several more real breaks were only found by actually running
+each task's own affected-area tests rather than assuming a mechanical rename was complete — most
+notably, narrowing `Catalog.scope()` in the task that changed Capability/Crosswalk storage
+immediately broke `ContextResolver.resolve_all/2` (a real production caller two tasks away from the
+one nominally "owning" that code path), surfaced only by running the wider affected-area test
+`mix test` command each task's own step specified rather than just the task's headline test file.
+The final full-suite regression (`mix test`, no scoping) caught several more genuine breaks no
+single task's own narrower verification step would have: two capstone tests still using pre-6q
+signup/login param shapes and the deleted `/hub/capabilities` route, and one capstone test
+(`hub_resource_lifecycle_capstone_test.exs`) whose entire exit criterion — a public Hub resource
+surface — no longer existed at all and was deleted outright rather than patched, since its actual
+propose/approve/replaces/supersede coverage was already duplicated by
+`tenant_capability_controller_test.exs`. A parallel `mix credo --strict` comparison against
+`origin/main` (zero findings there) confirmed every one of the 11 findings accumulated across the
+whole branch was newly introduced by 6q's own code, not pre-existing — all fixed before merge.
+
+**Status**: Phase 6q shipped 2026-09-02. 6p-iii (the demo page) is now unblocked and can resume,
+informed by the new tenant-scoped Hub model this phase replaced it with.
