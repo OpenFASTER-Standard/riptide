@@ -15,7 +15,7 @@ defmodule RiptideWeb.TenantCapabilityController do
   def propose(conn, params) do
     tenant_id = conn.assigns.tenant_id
 
-    case Riptide.HubRateLimit.check_propose(tenant_id) do
+    case Riptide.WriteRateLimit.check(tenant_id) do
       :deny -> send_resp(conn, 429, "")
       :allow -> handle_propose(conn, tenant_id, params)
     end

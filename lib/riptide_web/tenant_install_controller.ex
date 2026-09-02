@@ -15,7 +15,7 @@ defmodule RiptideWeb.TenantInstallController do
   def install(conn, %{"source_tenant_id" => source_tenant_id, "node_id" => node_id}) do
     tenant_id = conn.assigns.tenant_id
 
-    case Riptide.HubRateLimit.check_propose(tenant_id) do
+    case Riptide.WriteRateLimit.check(tenant_id) do
       :deny -> send_resp(conn, 429, "")
       :allow -> handle_install(conn, tenant_id, source_tenant_id, node_id)
     end

@@ -10,12 +10,18 @@ defmodule RiptideWeb.Realtime.SseController do
 
   def subscribe(conn, %{"stream_id" => stream_id}) do
     case ResourceController.parse_stream_id(stream_id) do
-      {:ok, scope, path_segments} ->
-        maybe_log_tenant_metadata(scope)
+      {:ok, {:tenant, tenant_id}, path_segments} ->
+        Logger.metadata(tenant_id: tenant_id)
 
-        case Riptide.Authz.evaluate(scope, path_segments, conn.assigns.current_subject, :read) do
-          :allow -> subscribe_with_rate_limit(conn, scope, stream_id)
-          _ -> send_resp(conn, 403, "")
+        case Riptide.Authz.evaluate_with_matcher(
+               {:tenant, tenant_id},
+               path_segments,
+               conn.assigns.current_subject,
+               :read
+             ) do
+          {:allow, :public} -> check_public_read_then_subscribe(conn, stream_id)
+          {:allow, _other} -> do_subscribe(conn, stream_id)
+          :deny -> send_resp(conn, 403, "")
         end
 
       _ ->
@@ -29,33 +35,21 @@ defmodule RiptideWeb.Realtime.SseController do
 
       send_resp(conn, 503, "")
   catch
-    # Riptide.Authz.evaluate/4 can raise/exit if the placement cluster
-    # backing the policy store is fully unreachable — this transport calls
-    # it directly rather than through RiptideWeb.Plugs.Authorize (see that
-    # plug's own rescue/catch on this same failure mode), so needs the same
-    # protection here.
+    # Riptide.Authz.evaluate_with_matcher/4 can raise/exit if the placement
+    # cluster backing the policy store is fully unreachable — this transport
+    # calls it directly rather than through RiptideWeb.Plugs.Authorize (see
+    # that plug's own rescue/catch on this same failure mode), so needs the
+    # same protection here.
     :exit, reason ->
       Logger.warning("SseController.subscribe/2 caught exit: #{inspect(reason)}")
       send_resp(conn, 503, "")
   end
 
-  defp maybe_log_tenant_metadata({:tenant, tenant_id}), do: Logger.metadata(tenant_id: tenant_id)
-  defp maybe_log_tenant_metadata(:hub), do: :ok
-
-  # Hub-scoped reads are network-public (no tenant/authz ownership check
-  # narrows who can subscribe), so — like RiptideWeb.Hub.DiscoveryController
-  # — they get their own subject/IP-keyed quota here. Tenant-scoped reads
-  # keep relying solely on RiptideWeb.Plugs.Authorize/Riptide.Authz for
-  # access control, unchanged.
-  defp subscribe_with_rate_limit(conn, :hub, stream_id) do
-    case conn |> rate_limit_key() |> Riptide.HubRateLimit.check_read() do
+  defp check_public_read_then_subscribe(conn, stream_id) do
+    case conn |> rate_limit_key() |> Riptide.PublicReadRateLimit.check() do
       :allow -> do_subscribe(conn, stream_id)
       :deny -> send_resp(conn, 429, "")
     end
-  end
-
-  defp subscribe_with_rate_limit(conn, {:tenant, _tenant_id}, stream_id) do
-    do_subscribe(conn, stream_id)
   end
 
   defp rate_limit_key(conn) do

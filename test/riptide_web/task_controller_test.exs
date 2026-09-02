@@ -64,7 +64,7 @@ defmodule RiptideWeb.TaskControllerTest do
       }
     }
 
-    :ok = Catalog.admit_capability(entry, nil)
+    :ok = Catalog.admit_capability({:tenant, tenant_id}, entry, nil)
 
     :ok =
       Riptide.Authz.Store.TenantFacts.add_policy(

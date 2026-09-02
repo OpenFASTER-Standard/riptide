@@ -250,7 +250,6 @@ defmodule RiptideWeb.LDP.ResourceController do
   end
 
   @tenant_stream_id_prefix "https://riptide.example/tenants/"
-  @hub_stream_id_prefix "https://riptide.example/hub/resources/"
   @resources_segment "/resources/"
 
   @spec stream_id_for(Riptide.Derivation.Catalog.scope(), [String.t()]) :: String.t()
@@ -258,22 +257,17 @@ defmodule RiptideWeb.LDP.ResourceController do
     @tenant_stream_id_prefix <> tenant_id <> @resources_segment <> Enum.join(path_segments, "/")
   end
 
-  def stream_id_for(:hub, path_segments) do
-    @hub_stream_id_prefix <> Enum.join(path_segments, "/")
-  end
-
   # The exact inverse of `stream_id_for/2` — used by Phase 4c's authorization
   # layer (`RiptideWeb.Realtime.SseController`/`ReplicationChannel`) to
   # recover which scope/resource an opaque, client-supplied `stream_id`
   # addresses, since neither transport constructs one from a path
-  # server-side (see Phase 4a design spec §5, Phase 4c design spec §7, and
-  # design spec `docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md`
-  # §4.2 for the Hub-scope addition). `stream_id_for/2`'s format is a pure,
-  # deterministic, reversible string — no hashing or randomness — so parsing
-  # it back apart needs no new persisted state, at the cost of staying
-  # coupled to this exact format: the round-trip tests in
-  # `resource_controller_test.exs` exist specifically to catch a future
-  # change here breaking that coupling silently.
+  # server-side (see Phase 4a design spec §5, Phase 4c design spec §7).
+  # `stream_id_for/2`'s format is a pure, deterministic, reversible string —
+  # no hashing or randomness — so parsing it back apart needs no new
+  # persisted state, at the cost of staying coupled to this exact format:
+  # the round-trip tests in `resource_controller_test.exs` exist
+  # specifically to catch a future change here breaking that coupling
+  # silently.
   @spec parse_stream_id(String.t()) ::
           {:ok, Riptide.Derivation.Catalog.scope(), [String.t()]} | :error
   def parse_stream_id(@tenant_stream_id_prefix <> rest) do
@@ -284,10 +278,6 @@ defmodule RiptideWeb.LDP.ResourceController do
       _ ->
         :error
     end
-  end
-
-  def parse_stream_id(@hub_stream_id_prefix <> path) when path != "" do
-    {:ok, :hub, String.split(path, "/")}
   end
 
   def parse_stream_id(_other), do: :error

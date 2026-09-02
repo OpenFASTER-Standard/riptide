@@ -23,24 +23,39 @@ defmodule RiptideWeb.Plugs.Authorize do
     path_segments = Map.get(conn.params, "path") || []
     mode = mode_for(conn.method)
 
-    case Riptide.Authz.evaluate(scope, path_segments, current_subject, mode) do
-      :allow -> conn
+    case Riptide.Authz.evaluate_with_matcher(scope, path_segments, current_subject, mode) do
+      {:allow, :public} -> check_public_read_rate_limit(conn)
+      {:allow, _other_matcher} -> conn
       :deny -> reject(conn)
     end
   rescue
     _ -> service_unavailable(conn)
   catch
-    # Riptide.Authz.evaluate/4 can raise/exit if the placement cluster backing the policy store is
-    # fully unreachable (Riptide.Placement's own documented raise-on-total-failure behavior) — every
-    # authenticated LDP/policy route goes through this plug, so left uncaught this surfaces as a
-    # generic Phoenix 500 with no way for a caller/load-balancer to tell "genuinely forbidden" apart
-    # from "transient, back off and retry," the same distinction RiptideWeb.HealthController's
-    # /health/ready already makes for this exact failure mode.
+    # Riptide.Authz.evaluate_with_matcher/4 can raise/exit if the placement cluster backing the
+    # policy store is fully unreachable (Riptide.Placement's own documented raise-on-total-failure
+    # behavior) — every authenticated LDP/policy route goes through this plug, so left uncaught this
+    # surfaces as a generic Phoenix 500 with no way for a caller/load-balancer to tell "genuinely
+    # forbidden" apart from "transient, back off and retry," the same distinction
+    # RiptideWeb.HealthController's /health/ready already makes for this exact failure mode.
     :exit, _ -> service_unavailable(conn)
   end
 
   defp mode_for("GET"), do: :read
   defp mode_for(_other), do: :write
+
+  defp check_public_read_rate_limit(conn) do
+    case conn |> rate_limit_key() |> Riptide.PublicReadRateLimit.check() do
+      :allow -> conn
+      :deny -> conn |> send_resp(429, "") |> halt()
+    end
+  end
+
+  defp rate_limit_key(conn) do
+    case conn.assigns.current_subject do
+      %{"sub" => sub} when is_binary(sub) -> sub
+      _ -> conn.remote_ip |> :inet.ntoa() |> to_string()
+    end
+  end
 
   defp reject(conn) do
     conn

@@ -5,7 +5,6 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   require Logger
 
   alias Riptide.Authz.{Policy, Store}
-  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias Riptide.Event
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
@@ -340,43 +339,21 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       assert conn.status == 503
     end
 
-    test "subscribing to a Hub-shaped stream_id succeeds for an admitted Hub resource" do
-      name = "urn:riptide:capability:ssehub-#{System.unique_integer([:positive])}"
+    test "subscribing to a stream_id resolving to a :public-granted tenant resource succeeds" do
+      stream_id = unique_stream_id()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+      StreamSupervisor.ensure_ready(stream_id)
 
-      entry = %CapabilityCatalogEntry{
-        name: RDF.iri(name),
-        kind: :effect,
-        component_hash: String.duplicate("b", 64),
-        function: "run",
-        fuel_limit: 10_000_000,
-        timeout_ms: 5_000,
-        memory_limits: %{
-          max_memory_size: nil,
-          max_table_elements: nil,
-          max_instances: nil,
-          max_tables: nil
-        }
-      }
-
-      :ok = Catalog.admit_capability(entry, nil)
-
-      # Deliberately no on_exit cleanup — the capability stream is a single,
-      # shared, non-unique stream across the whole test suite; see
-      # catalog_test.exs's own "Hub vs. Tenant scope isolation" test for why
-      # force-deleting it here would be unsafe. This test's own name is
-      # already unique-suffixed.
-      stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
       path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
-
       conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
 
       assert conn.status == 200
     end
 
-    test "subscribing to a Hub-shaped stream_id is rate-limited" do
-      Riptide.AppEnvTestHelpers.put_env(:riptide, :hub_read_rate_limit, 0)
+    test "subscribing to a stream_id resolving to a :public-granted tenant resource is rate-limited" do
+      Riptide.AppEnvTestHelpers.put_env(:riptide, :public_read_rate_limit, 0)
 
-      stream_id = "https://riptide.example/hub/resources/catalog"
+      stream_id = unique_stream_id()
       path = "/streams/#{URI.encode_www_form(stream_id)}/subscribe"
 
       conn = :get |> conn(path) |> RiptideWeb.Endpoint.call(@opts)
