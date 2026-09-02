@@ -1520,6 +1520,35 @@ seconds for, which this new capstone test's own first draft simply hadn't matche
 
 **Status**: Phase 6p-i shipped 2026-09-01.
 
+### Post-6p-i CI flake: `placement_membership_test.exs`, second occurrence
+
+Caught 2026-09-02 on 6p-ii's own spec PR (docs-only — a full CI run on it failing at all was the
+tell), and confirmed via GitHub Actions history to be a genuine recurrence, not something that PR
+caused: the exact same test (`Riptide.PlacementMembershipTest`, "returns whatever was last cached via
+a membership-changed broadcast") had already failed once on `main` itself the previous day. The prior
+fix (documented above, in the "Post-6l CI root-cause sweep" — widening this test's own `eventually/2`
+poll from 2.5s to 10s) was confirmed still in place, not regressed, so widening it further would have
+just been another "known flake, just rerun"-shaped band-aid, explicitly the pattern this project's own
+instructions rule out.
+
+**Real root cause**: `PlacementMembership`'s own periodic `:reconcile` tick (every 5s,
+`@reconcile_interval_ms`) writes the real live cluster membership into the same ETS cache the test's
+fake `{:placement_membership_changed, [...]}` broadcast writes a synthetic value into. The 10s poll
+window usually succeeds well before the 5s tick lands, but under CI scheduler contention (the suite has
+grown from 535 tests, when that fix was verified, to 617 today) the tick can fire and silently overwrite
+the fake value before the poll observes it — a genuine race between two writers, not an insufficient
+timeout.
+
+**Fix**: replaced the poll with `:sys.get_state(PlacementMembership)` immediately after the broadcast —
+blocks until every message enqueued ahead of it (including the broadcast) has actually been handled,
+the same precedent already established in `test/riptide/stream/placement_test.exs` and
+`test/riptide/stream/replica_healer_leadership_gate_test.exs`. This closes the race itself rather than
+outrunning it, and removes the now-dead `eventually/2` helper this test file no longer has any use for.
+Verified with 3 consecutive full `mix test` runs, 0 failures (a separate, pre-existing, local-box-only
+`:hub` catalog blank-node-id-collision artifact — already documented above — surfaced on 2 of those 3
+runs and was resolved by `rm -rf priv/ra_data_test`, unrelated to this fix and structurally impossible
+in CI).
+
 ### 6p-ii — Demo WASM Components
 
 **Shipped 2026-09-02** — see
