@@ -3,28 +3,28 @@ defmodule Riptide.Derivation.JobTriggerTest do
 
   alias Riptide.Derivation.JobTrigger
 
-  @resource_locks_table :job_trigger_resource_locks
-  @resource_monitors_table :job_trigger_resource_monitors
+  @mutex_locks_table :job_trigger_mutex_locks
+  @mutex_monitors_table :job_trigger_mutex_monitors
 
   setup do
     on_exit(fn ->
-      :ets.delete_all_objects(@resource_locks_table)
-      :ets.delete_all_objects(@resource_monitors_table)
+      :ets.delete_all_objects(@mutex_locks_table)
+      :ets.delete_all_objects(@mutex_monitors_table)
     end)
 
     :ok
   end
 
   describe "run_exclusively/2 (via test_run_exclusively/2, see its own moduledoc)" do
-    test "with resource_key nil, always runs the function, no reservation made" do
+    test "with mutex_key nil, always runs the function, no reservation made" do
       test_pid = self()
 
       assert :ok = JobTrigger.test_run_exclusively(nil, fn -> send(test_pid, :ran) end)
       assert_receive :ran, 1_000
     end
 
-    test "reserves the resource before returning, so a concurrent second call with the same key is skipped" do
-      resource = {"acme", "run-exclusively-test-#{System.unique_integer([:positive])}"}
+    test "reserves the mutex before returning, so a concurrent second call with the same key is skipped" do
+      mutex = {"acme", "run-exclusively-test-#{System.unique_integer([:positive])}"}
       test_pid = self()
 
       # The first task must stay in flight long enough for this test's own
@@ -37,44 +37,44 @@ defmodule Riptide.Derivation.JobTriggerTest do
       # microsecond-scale local ETS operations this test performs while
       # waiting, not a tight race.
       assert :ok =
-               JobTrigger.test_run_exclusively(resource, fn ->
+               JobTrigger.test_run_exclusively(mutex, fn ->
                  send(test_pid, :first_started)
                  Process.sleep(300)
                  send(test_pid, :first_done)
                end)
 
       assert_receive :first_started, 1_000
-      assert :ets.lookup(@resource_locks_table, resource) != []
+      assert :ets.lookup(@mutex_locks_table, mutex) != []
 
       assert :skipped =
-               JobTrigger.test_run_exclusively(resource, fn -> send(test_pid, :second_ran) end)
+               JobTrigger.test_run_exclusively(mutex, fn -> send(test_pid, :second_ran) end)
 
       refute_receive :second_ran, 500
       assert_receive :first_done, 1_000
     end
 
-    test "releases the resource once the function completes normally, allowing a later call to run" do
-      resource = {"acme", "run-exclusively-release-#{System.unique_integer([:positive])}"}
+    test "releases the mutex once the function completes normally, allowing a later call to run" do
+      mutex = {"acme", "run-exclusively-release-#{System.unique_integer([:positive])}"}
       test_pid = self()
 
-      assert :ok = JobTrigger.test_run_exclusively(resource, fn -> send(test_pid, :done) end)
+      assert :ok = JobTrigger.test_run_exclusively(mutex, fn -> send(test_pid, :done) end)
       assert_receive :done, 1_000
 
-      assert eventually(fn -> :ets.lookup(@resource_locks_table, resource) == [] end)
+      assert eventually(fn -> :ets.lookup(@mutex_locks_table, mutex) == [] end)
 
-      assert :ok = JobTrigger.test_run_exclusively(resource, fn -> send(test_pid, :ran_again) end)
+      assert :ok = JobTrigger.test_run_exclusively(mutex, fn -> send(test_pid, :ran_again) end)
       assert_receive :ran_again, 1_000
     end
 
-    test "releases the resource even if the function crashes abnormally, not just on a normal return" do
-      resource = {"acme", "run-exclusively-crash-#{System.unique_integer([:positive])}"}
+    test "releases the mutex even if the function crashes abnormally, not just on a normal return" do
+      mutex = {"acme", "run-exclusively-crash-#{System.unique_integer([:positive])}"}
 
-      assert :ok = JobTrigger.test_run_exclusively(resource, fn -> raise "boom" end)
-      assert :ets.lookup(@resource_locks_table, resource) != []
+      assert :ok = JobTrigger.test_run_exclusively(mutex, fn -> raise "boom" end)
+      assert :ets.lookup(@mutex_locks_table, mutex) != []
 
-      assert eventually(fn -> :ets.lookup(@resource_locks_table, resource) == [] end)
+      assert eventually(fn -> :ets.lookup(@mutex_locks_table, mutex) == [] end)
 
-      assert :ok = JobTrigger.test_run_exclusively(resource, fn -> :ok end)
+      assert :ok = JobTrigger.test_run_exclusively(mutex, fn -> :ok end)
     end
   end
 

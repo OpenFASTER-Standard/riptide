@@ -18,7 +18,7 @@ defmodule Riptide.Derivation.JobRDFCodec do
   @riptide_job_graph RDF.iri("urn:riptide:vocab:jobGraph")
   @riptide_job_result RDF.iri("urn:riptide:vocab:jobResult")
   @riptide_job_error RDF.iri("urn:riptide:vocab:jobError")
-  @riptide_job_resource_key RDF.iri("urn:riptide:vocab:jobResourceKey")
+  @riptide_job_mutex_key RDF.iri("urn:riptide:vocab:jobMutexKey")
   @riptide_job_resolved_via RDF.iri("urn:riptide:vocab:jobResolvedVia")
   @riptide_job_original_description RDF.iri("urn:riptide:vocab:jobOriginalDescription")
   @riptide_job_trace RDF.iri("urn:riptide:vocab:jobTrace")
@@ -41,8 +41,8 @@ defmodule Riptide.Derivation.JobRDFCodec do
       |> maybe_add(node, @riptide_job_error, job.error && RDF.literal(job.error))
       |> maybe_add(
         node,
-        @riptide_job_resource_key,
-        job.resource_key && RDF.literal(job.resource_key)
+        @riptide_job_mutex_key,
+        job.mutex_key && RDF.literal(job.mutex_key)
       )
       |> maybe_add(
         node,
@@ -114,7 +114,7 @@ defmodule Riptide.Derivation.JobRDFCodec do
       job_graph: decode_optional_string(description, @riptide_job_graph),
       result: RDF.Description.first(description, @riptide_job_result),
       error: decode_optional_string(description, @riptide_job_error),
-      resource_key: decode_optional_string(description, @riptide_job_resource_key),
+      mutex_key: decode_optional_string(description, @riptide_job_mutex_key),
       resolved_via: decode_resolved_via_optional(description),
       original_description:
         decode_optional_string(description, @riptide_job_original_description),

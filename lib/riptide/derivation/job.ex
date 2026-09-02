@@ -6,7 +6,7 @@ defmodule Riptide.Derivation.Job do
   §5. Plain writes, never reviewed (unlike a `CapabilityCatalogEntry` or
   Rule Catalog admission).
 
-  A Job may declare `resource_key` (see design spec
+  A Job may declare `mutex_key` (see design spec
   `docs/superpowers/specs/2026-09-01-phase-6d-ii-concurrent-effects-design.md`
   §4.3) to mark that it must never execute concurrently with another Job
   for the same Tenant declaring the same key. `nil` (the default) means
@@ -33,7 +33,7 @@ defmodule Riptide.Derivation.Job do
     :job_graph,
     :result,
     :error,
-    :resource_key,
+    :mutex_key,
     :resolved_via,
     :original_description,
     :trace
@@ -50,7 +50,7 @@ defmodule Riptide.Derivation.Job do
           job_graph: String.t() | nil,
           result: RDF.Term.t() | nil,
           error: String.t() | nil,
-          resource_key: String.t() | nil,
+          mutex_key: String.t() | nil,
           resolved_via: resolved_via() | nil,
           original_description: String.t() | nil,
           trace: Rule.t() | nil

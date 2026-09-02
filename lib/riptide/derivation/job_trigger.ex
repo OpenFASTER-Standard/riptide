@@ -7,21 +7,21 @@ defmodule Riptide.Derivation.JobTrigger do
   reactively via `Riptide.Derivation.Catalog`'s own `{:job_written,
   stream_id}` broadcast and self-healingly via `Riptide.PeriodicSweep`.
 
-  A Job may declare `resource_key` — see design spec
+  A Job may declare `mutex_key` — see design spec
   `docs/superpowers/specs/2026-09-01-phase-6d-ii-concurrent-effects-design.md`
   §4 — to mark that it must never execute concurrently with another Job for
   the same Tenant declaring the same key. Because every Job for a Tenant is
   already guaranteed to be evaluated by this same, uniquely Ra-elected
   process (the property `RaCluster.stream_leader?/1` already gives, §4.1),
   enforcing that is purely local, in-memory bookkeeping — two `:ets` tables
-  owned by this process (`@resource_locks_table` for the currently-in-flight
-  set, `@resource_monitors_table` to map a monitored Task's `reference()`
-  back to the resource it holds, for crash-safe release) — not a new
+  owned by this process (`@mutex_locks_table` for the currently-in-flight
+  set, `@mutex_monitors_table` to map a monitored Task's `reference()`
+  back to the mutex it holds, for crash-safe release) — not a new
   distributed primitive. Both tables die with this process, by design: on
   crash or planned leadership handover, whatever they held stops mattering
   (§4.4), and the newly-started/newly-leading process begins with an empty
   set — the same at-least-once contract Job execution already has,
-  `resource_key` or not.
+  `mutex_key` or not.
   """
 
   use Riptide.PeriodicSweep,
@@ -45,18 +45,18 @@ defmodule Riptide.Derivation.JobTrigger do
   # execute here — see test_run_exclusively/2's own comment for how tests
   # preserve that), so this doesn't weaken the actual guarantee; it only
   # lets tests assert against table contents directly
-  # (`:ets.lookup(@resource_locks_table, ...)`) without a bespoke
+  # (`:ets.lookup(@mutex_locks_table, ...)`) without a bespoke
   # inspection API.
-  @resource_locks_table :job_trigger_resource_locks
-  @resource_monitors_table :job_trigger_resource_monitors
+  @mutex_locks_table :job_trigger_mutex_locks
+  @mutex_monitors_table :job_trigger_mutex_monitors
 
   @spec start_link(term()) :: GenServer.on_start()
   def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl GenServer
   def init(:ok) do
-    :ets.new(@resource_locks_table, [:set, :public, :named_table])
-    :ets.new(@resource_monitors_table, [:set, :public, :named_table])
+    :ets.new(@mutex_locks_table, [:set, :public, :named_table])
+    :ets.new(@mutex_monitors_table, [:set, :public, :named_table])
     Phoenix.PubSub.subscribe(Riptide.PubSub, @jobs_topic)
     schedule_sweep()
     {:ok, %{}}
@@ -71,10 +71,10 @@ defmodule Riptide.Derivation.JobTrigger do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    case :ets.lookup(@resource_monitors_table, ref) do
-      [{^ref, resource}] ->
-        :ets.delete(@resource_monitors_table, ref)
-        :ets.delete(@resource_locks_table, resource)
+    case :ets.lookup(@mutex_monitors_table, ref) do
+      [{^ref, mutex}] ->
+        :ets.delete(@mutex_monitors_table, ref)
+        :ets.delete(@mutex_locks_table, mutex)
 
       [] ->
         :ok
@@ -84,8 +84,8 @@ defmodule Riptide.Derivation.JobTrigger do
   end
 
   @impl GenServer
-  def handle_call({:run_exclusively, resource, fun}, _from, state) do
-    {:reply, run_exclusively(resource, fun), state}
+  def handle_call({:run_exclusively, mutex, fun}, _from, state) do
+    {:reply, run_exclusively(mutex, fun), state}
   end
 
   @impl Riptide.PeriodicSweep
@@ -99,7 +99,7 @@ defmodule Riptide.Derivation.JobTrigger do
   # against whatever process calls IT — correct in production, since
   # try_spawn_execution/3 always calls it from within this GenServer's own
   # process (handle_info and periodic_sweep both execute here already,
-  # unchanged from before this module gained resource-key exclusion). A
+  # unchanged from before this module gained mutex-key exclusion). A
   # test calling run_exclusively/2 directly would instead make the TEST
   # process own the monitor, so the crash-safe cleanup in
   # handle_info({:DOWN, ...}) above — which only ever runs inside THIS
@@ -111,17 +111,17 @@ defmodule Riptide.Derivation.JobTrigger do
   # process calling GenServer.call on itself deadlocks.
   @doc false
   @spec test_run_exclusively({String.t(), String.t()} | nil, (-> term())) :: :ok | :skipped
-  def test_run_exclusively(resource, fun) do
-    GenServer.call(__MODULE__, {:run_exclusively, resource, fun})
+  def test_run_exclusively(mutex, fun) do
+    GenServer.call(__MODULE__, {:run_exclusively, mutex, fun})
   end
 
-  # Runs `fun` under `@execution_supervisor`, exclusively for `resource` (a
-  # `{tenant_id, resource_key}` pair) if given — `nil` skips exclusion
-  # entirely (most Jobs don't declare a resource_key, design spec §4.3).
+  # Runs `fun` under `@execution_supervisor`, exclusively for `mutex` (a
+  # `{tenant_id, mutex_key}` pair) if given — `nil` skips exclusion
+  # entirely (most Jobs don't declare a mutex_key, design spec §4.3).
   # `:ets.insert_new/2` is the whole reservation: an atomic "claim this key
   # only if nobody already holds it," so there's no separate
   # check-then-claim race. Returns `:skipped` (not an error) when the
-  # resource is already held — the caller is expected to just retry on its
+  # mutex is already held — the caller is expected to just retry on its
   # own next sweep, the same as any other transient condition already is.
   @doc false
   @spec run_exclusively({String.t(), String.t()} | nil, (-> term())) :: :ok | :skipped
@@ -130,11 +130,11 @@ defmodule Riptide.Derivation.JobTrigger do
     :ok
   end
 
-  def run_exclusively(resource, fun) do
-    if :ets.insert_new(@resource_locks_table, {resource}) do
+  def run_exclusively(mutex, fun) do
+    if :ets.insert_new(@mutex_locks_table, {mutex}) do
       {:ok, pid} = Task.Supervisor.start_child(@execution_supervisor, fun)
       ref = Process.monitor(pid)
-      :ets.insert(@resource_monitors_table, {ref, resource})
+      :ets.insert(@mutex_monitors_table, {ref, mutex})
       :ok
     else
       :skipped
@@ -159,11 +159,11 @@ defmodule Riptide.Derivation.JobTrigger do
     end
   end
 
-  defp try_spawn_execution(stream_id, node, %Job{resource_key: nil} = job) do
+  defp try_spawn_execution(stream_id, node, %Job{mutex_key: nil} = job) do
     run_exclusively(nil, fn -> execute(stream_id, node, job) end)
   end
 
-  defp try_spawn_execution(stream_id, node, %Job{tenant_id: tenant_id, resource_key: key} = job) do
+  defp try_spawn_execution(stream_id, node, %Job{tenant_id: tenant_id, mutex_key: key} = job) do
     run_exclusively({tenant_id, key}, fn -> execute(stream_id, node, job) end)
   end
 
