@@ -13,14 +13,15 @@ defmodule Riptide.Derivation.CapabilityCatalog do
   alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
 
   @doc """
-  Finds a Hub-scope Capability by its own `name` IRI. A thin wrapper over
-  `Catalog.list_capabilities/0` — shared here (not duplicated at each call
+  Finds a tenant-scope Capability by its own `name` IRI. A thin wrapper over
+  `Catalog.list_capabilities/1` — shared here (not duplicated at each call
   site) since both this module's own capstone usage and 6l's
   `ContextResolver` need the exact same "resolve by name" lookup.
   """
-  @spec find_by_name(RDF.IRI.t()) :: {:ok, CapabilityCatalogEntry.t()} | {:error, :not_found}
-  def find_by_name(name) do
-    with {:ok, entries} <- Catalog.list_capabilities() do
+  @spec find_by_name(Catalog.scope(), RDF.IRI.t()) ::
+          {:ok, CapabilityCatalogEntry.t()} | {:error, :not_found}
+  def find_by_name(scope, name) do
+    with {:ok, entries} <- Catalog.list_capabilities(scope) do
       find_entry(entries, name)
     end
   end

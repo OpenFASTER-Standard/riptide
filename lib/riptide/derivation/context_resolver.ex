@@ -27,14 +27,15 @@ defmodule Riptide.Derivation.ContextResolver do
   end
 
   @doc """
-  Builds a Context populated with EVERY Hub Capability and every Rule visible to `tenant_id`
-  (Tenant-scope entries, then Hub-scope, matching `resolve/3`'s own Tenant-before-Hub precedent) —
-  unlike `resolve/3`, which transitively walks from one known starting Rule, this enumerates
-  everything available up front, for a caller (Task submission, 6m) that doesn't yet know what it
-  needs resolved. A Capability that fails to materialize (e.g. its blob is unreachable) is skipped,
-  not fatal — LLMFallback simply won't be told about it, the same degraded-but-available behavior
-  as if it had never been registered, rather than failing every Task submission because one
-  unrelated Capability is temporarily broken.
+  Builds a Context populated with every Capability and every Rule admitted into `tenant_id`'s own
+  Catalog (design spec `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md`
+  §4.5 — each tenant's Catalog is now fully sovereign, no implicit Hub-scope merge) — unlike
+  `resolve/3`, which transitively walks from one known starting Rule, this enumerates everything
+  available up front, for a caller (Task submission, 6m) that doesn't yet know what it needs
+  resolved. A Capability that fails to materialize (e.g. its blob is unreachable) is skipped, not
+  fatal — LLMFallback simply won't be told about it, the same degraded-but-available behavior as if
+  it had never been registered, rather than failing every Task submission because one unrelated
+  Capability is temporarily broken.
   """
   @spec resolve_all(String.t(), map() | nil) :: {:ok, Context.t()}
   def resolve_all(tenant_id, current_subject) do
@@ -47,11 +48,6 @@ defmodule Riptide.Derivation.ContextResolver do
      }}
   end
 
-  # Minimal Task-5-follow-on fix: Catalog.list_capabilities/0 (Hub-scoped) no
-  # longer exists now that Catalog.scope() dropped :hub — this call site now
-  # passes the tenant's own scope instead. Task 8 revisits this function
-  # (and its sibling all_rules/1) more fully; this only keeps it working in
-  # the meantime.
   defp all_capabilities(tenant_id) do
     case Catalog.list_capabilities({:tenant, tenant_id}) do
       {:ok, entries} -> Enum.reduce(entries, %{}, &materialize_into/2)
@@ -66,11 +62,6 @@ defmodule Riptide.Derivation.ContextResolver do
     end
   end
 
-  # Minimal Task-5-follow-on fix, same reasoning as all_capabilities/1 above:
-  # rules_by_signature_name(:hub) no longer has a valid scope to call. Task 8
-  # makes this deletion the deliberate behavior change (spec §4.5) rather
-  # than just an unblocking patch; this only keeps it working in the
-  # meantime.
   defp all_rules(tenant_id), do: rules_by_signature_name({:tenant, tenant_id})
 
   defp rules_by_signature_name(scope) do
@@ -122,7 +113,7 @@ defmodule Riptide.Derivation.ContextResolver do
          capabilities,
          rules
        ) do
-    with {:ok, capabilities} <- resolve_capability(iri, capabilities) do
+    with {:ok, capabilities} <- resolve_capability(tenant_id, iri, capabilities) do
       walk_body(tenant_id, rest, visited, capabilities, rules)
     end
   end
@@ -133,11 +124,12 @@ defmodule Riptide.Derivation.ContextResolver do
     end
   end
 
-  defp resolve_capability(iri, capabilities) do
+  defp resolve_capability(tenant_id, iri, capabilities) do
     if Map.has_key?(capabilities, iri) do
       {:ok, capabilities}
     else
-      with {:ok, entry} <- capability_not_found(CapabilityCatalog.find_by_name(iri), iri),
+      with {:ok, entry} <-
+             capability_not_found(CapabilityCatalog.find_by_name({:tenant, tenant_id}, iri), iri),
            {:ok, definition} <- CapabilityCatalog.materialize(entry) do
         {:ok, Map.put(capabilities, iri, definition)}
       end
@@ -147,16 +139,8 @@ defmodule Riptide.Derivation.ContextResolver do
   defp capability_not_found({:ok, entry}, _iri), do: {:ok, entry}
   defp capability_not_found({:error, :not_found}, iri), do: {:error, {:not_found, iri}}
 
-  # Tenant-scope first (a Job's own tenant may have installed/admitted a
-  # private Rule under this IRI), falling back to Hub-scope (a globally
-  # shared Rule the tenant hasn't installed but can still reference
-  # directly) — mirrors every other Sub-project 6 catalog lookup's own
-  # Tenant-before-Hub precedence.
   defp find_rule(tenant_id, iri) do
-    case find_rule_in_scope({:tenant, tenant_id}, iri) do
-      {:ok, rule} -> {:ok, rule}
-      :not_found -> find_rule_in_scope(:hub, iri) |> rule_not_found(iri)
-    end
+    find_rule_in_scope({:tenant, tenant_id}, iri) |> rule_not_found(iri)
   end
 
   defp find_rule_in_scope(scope, iri) do

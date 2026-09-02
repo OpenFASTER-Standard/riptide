@@ -168,7 +168,11 @@ defmodule Riptide.Derivation.JobTrigger do
   end
 
   defp execute(stream_id, node, %Job{reference: {:capability, iri}} = job) do
-    with {:ok, entry} <- capability_not_found(CapabilityCatalog.find_by_name(iri), iri),
+    with {:ok, entry} <-
+           capability_not_found(
+             CapabilityCatalog.find_by_name({:tenant, job.tenant_id}, iri),
+             iri
+           ),
          {:ok, definition} <- CapabilityCatalog.materialize(entry) do
       args = Enum.map(job.args, &ExecuteInterpreter.term_to_arg/1)
 
