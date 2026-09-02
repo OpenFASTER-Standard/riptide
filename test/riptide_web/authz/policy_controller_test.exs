@@ -60,9 +60,15 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
 
     assert get_conn.status == 200
 
-    [owner_policy, added_policy] = Jason.decode!(get_conn.resp_body)
-    assert owner_policy["matcher"] == %{"agent" => "the-owner"}
-    assert added_policy == %{"effect" => "allow", "modes" => ["read"], "matcher" => "public"}
+    # TenantFacts.list_policies/2 folds policies from an RDF graph, whose subject iteration order
+    # isn't guaranteed to match write order — assert membership, not position.
+    policies = Jason.decode!(get_conn.resp_body)
+    assert Enum.any?(policies, &(&1["matcher"] == %{"agent" => "the-owner"}))
+
+    assert Enum.any?(
+             policies,
+             &(&1 == %{"effect" => "allow", "modes" => ["read"], "matcher" => "public"})
+           )
   end
 
   test "a non-owner cannot add or list policies for someone else's tenant" do
@@ -128,8 +134,8 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
-    [_owner_policy, added_policy] = Jason.decode!(get_conn.resp_body)
-    assert added_policy["matcher"] == %{"agent" => "friend-1"}
+    policies = Jason.decode!(get_conn.resp_body)
+    added_policy = Enum.find(policies, &(&1["matcher"] == %{"agent" => "friend-1"}))
     assert added_policy["modes"] == ["read", "write"]
   end
 
