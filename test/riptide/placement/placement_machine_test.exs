@@ -3,8 +3,8 @@ defmodule Riptide.Placement.PlacementMachineTest do
 
   alias Riptide.Placement.PlacementMachine
 
-  test "init/1 starts with empty streams, policies, and repair_claims" do
-    assert PlacementMachine.init(%{}) == %{streams: %{}, policies: %{}, repair_claims: %{}}
+  test "init/1 starts with empty streams, names, and repair_claims" do
+    assert PlacementMachine.init(%{}) == %{streams: %{}, names: %{}, repair_claims: %{}}
   end
 
   test "apply/3 stores a new stream's node list" do
@@ -15,7 +15,7 @@ defmodule Riptide.Placement.PlacementMachineTest do
 
     assert new_state == %{
              streams: %{"s1" => [:a, :b, :c]},
-             policies: %{},
+             names: %{},
              repair_claims: %{}
            }
 
@@ -32,7 +32,7 @@ defmodule Riptide.Placement.PlacementMachineTest do
 
     assert new_state == %{
              streams: %{"s1" => [:a, :b, :c]},
-             policies: %{},
+             names: %{},
              repair_claims: %{}
            }
 
@@ -47,25 +47,25 @@ defmodule Riptide.Placement.PlacementMachineTest do
 
     assert state == %{
              streams: %{"s1" => [:a, :b, :c], "s2" => [:d, :e, :f]},
-             policies: %{},
+             names: %{},
              repair_claims: %{}
            }
   end
 
   test "get/2 returns the assigned nodes for a known stream" do
-    state = %{streams: %{"s1" => [:a, :b, :c]}, policies: %{}, repair_claims: %{}}
+    state = %{streams: %{"s1" => [:a, :b, :c]}, names: %{}, repair_claims: %{}}
     assert PlacementMachine.get(state, "s1") == [:a, :b, :c]
   end
 
   test "get/2 returns nil for an unknown stream" do
-    assert PlacementMachine.get(%{streams: %{}, policies: %{}, repair_claims: %{}}, "unknown") ==
+    assert PlacementMachine.get(%{streams: %{}, names: %{}, repair_claims: %{}}, "unknown") ==
              nil
   end
 
-  test "list/1 returns only the stream_id => nodes map, not the internal policies/repair_claims state" do
+  test "list/1 returns only the stream_id => nodes map, not the internal names/repair_claims state" do
     state = %{
       streams: %{"s1" => [:a, :b, :c], "s2" => [:d, :e, :f]},
-      policies: %{"acme" => %{}},
+      names: %{"guild-a" => "tenant-1"},
       repair_claims: %{"s1" => %{dead_node: :b, claimant: :a, claimed_at: 0}}
     }
 
@@ -77,14 +77,14 @@ defmodule Riptide.Placement.PlacementMachineTest do
   end
 
   test "apply/3 {:replace_member, ...} swaps a dead node for a new one in an existing assignment" do
-    state = %{streams: %{"s1" => [:a, :b, :c]}, policies: %{}, repair_claims: %{}}
+    state = %{streams: %{"s1" => [:a, :b, :c]}, names: %{}, repair_claims: %{}}
 
     {new_state, reply, effects} =
       PlacementMachine.apply(%{index: 1}, {:replace_member, "s1", :b, :z}, state)
 
     assert new_state == %{
              streams: %{"s1" => [:a, :z, :c]},
-             policies: %{},
+             names: %{},
              repair_claims: %{}
            }
 
@@ -93,14 +93,14 @@ defmodule Riptide.Placement.PlacementMachineTest do
   end
 
   test "apply/3 {:replace_member, ...} is a no-op if the named dead node is no longer present" do
-    state = %{streams: %{"s1" => [:a, :z, :c]}, policies: %{}, repair_claims: %{}}
+    state = %{streams: %{"s1" => [:a, :z, :c]}, names: %{}, repair_claims: %{}}
 
     {new_state, reply, effects} =
       PlacementMachine.apply(%{index: 2}, {:replace_member, "s1", :b, :y}, state)
 
     assert new_state == %{
              streams: %{"s1" => [:a, :z, :c]},
-             policies: %{},
+             names: %{},
              repair_claims: %{}
            }
 
@@ -109,125 +109,25 @@ defmodule Riptide.Placement.PlacementMachineTest do
   end
 
   test "apply/3 {:replace_member, ...} is a no-op for an unknown stream_id" do
-    state = %{streams: %{}, policies: %{}, repair_claims: %{}}
+    state = %{streams: %{}, names: %{}, repair_claims: %{}}
 
     {new_state, reply, effects} =
       PlacementMachine.apply(%{index: 1}, {:replace_member, "unknown", :a, :b}, state)
 
-    assert new_state == %{streams: %{}, policies: %{}, repair_claims: %{}}
+    assert new_state == %{streams: %{}, names: %{}, repair_claims: %{}}
     assert reply == nil
     assert effects == []
   end
 
-  test "apply/3 {:add_policy, ...} appends to an empty policy list for a new tenant/prefix" do
+  test "apply/3 {:claim_name, ...} claims an unclaimed name" do
     state = PlacementMachine.init(%{})
-    policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
 
     {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], policy}, state)
+      PlacementMachine.apply(%{index: 1}, {:claim_name, "guild-a", "tenant-uuid-1"}, state)
 
     assert new_state == %{
              streams: %{},
-             policies: %{"acme" => %{[] => [policy]}},
-             repair_claims: %{}
-           }
-
-    assert reply == :ok
-    assert effects == []
-  end
-
-  test "apply/3 {:add_policy, ...} appends to an existing policy list rather than replacing it" do
-    state = PlacementMachine.init(%{})
-    first = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
-    second = %Riptide.Authz.Policy{effect: :deny, modes: [:write], matcher: :authenticated}
-
-    {state, _, _} = PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], first}, state)
-
-    {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 2}, {:add_policy, "acme", [], second}, state)
-
-    assert new_state == %{
-             streams: %{},
-             policies: %{"acme" => %{[] => [first, second]}},
-             repair_claims: %{}
-           }
-
-    assert reply == :ok
-    assert effects == []
-  end
-
-  test "apply/3 {:add_policy, ...} deduplicates an exact-duplicate policy instead of appending it again" do
-    state = PlacementMachine.init(%{})
-    policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
-
-    {state, _, _} = PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], policy}, state)
-
-    {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 2}, {:add_policy, "acme", [], policy}, state)
-
-    assert new_state == state
-    assert reply == :ok
-    assert effects == []
-  end
-
-  test "apply/3 {:add_policy, ...} rejects once a tenant/prefix hits the policy cap" do
-    state = PlacementMachine.init(%{})
-
-    state =
-      Enum.reduce(1..1000, state, fn n, acc ->
-        policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: {:agent, "u#{n}"}}
-        {acc, _, _} = PlacementMachine.apply(%{index: n}, {:add_policy, "acme", [], policy}, acc)
-        acc
-      end)
-
-    one_more = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: {:agent, "u1001"}}
-
-    {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 1001}, {:add_policy, "acme", [], one_more}, state)
-
-    assert new_state == state
-    assert reply == {:error, :too_many_policies}
-    assert effects == []
-  end
-
-  test "apply/3 {:add_policy, ...} keeps different path prefixes independent" do
-    state = PlacementMachine.init(%{})
-    root_policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
-    child_policy = %Riptide.Authz.Policy{effect: :deny, modes: [:write], matcher: :authenticated}
-
-    {state, _, _} =
-      PlacementMachine.apply(%{index: 1}, {:add_policy, "acme", [], root_policy}, state)
-
-    {new_state, _, _} =
-      PlacementMachine.apply(%{index: 2}, {:add_policy, "acme", ["secret"], child_policy}, state)
-
-    assert new_state ==
-             %{
-               streams: %{},
-               policies: %{"acme" => %{[] => [root_policy], ["secret"] => [child_policy]}},
-               repair_claims: %{}
-             }
-  end
-
-  test "apply/3 {:claim_tenant_if_unclaimed, ...} creates a tenant-root owner policy when the tenant has zero policies" do
-    state = PlacementMachine.init(%{})
-
-    {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 1}, {:claim_tenant_if_unclaimed, "acme", "user-1"}, state)
-
-    assert new_state == %{
-             streams: %{},
-             policies: %{
-               "acme" => %{
-                 [] => [
-                   %Riptide.Authz.Policy{
-                     effect: :allow,
-                     modes: [:read, :write],
-                     matcher: {:agent, "user-1"}
-                   }
-                 ]
-               }
-             },
+             names: %{"guild-a" => "tenant-uuid-1"},
              repair_claims: %{}
            }
 
@@ -235,37 +135,48 @@ defmodule Riptide.Placement.PlacementMachineTest do
     assert effects == []
   end
 
-  test "apply/3 {:claim_tenant_if_unclaimed, ...} is a no-op if the tenant already has any policy at any prefix" do
+  test "apply/3 {:claim_name, ...} rejects a second claim of the same name" do
     state = PlacementMachine.init(%{})
-    existing = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
 
-    {state, _, _} =
-      PlacementMachine.apply(
-        %{index: 1},
-        {:add_policy, "acme", ["some", "path"], existing},
-        state
-      )
+    {state, :claimed, []} =
+      PlacementMachine.apply(%{index: 1}, {:claim_name, "guild-a", "tenant-uuid-1"}, state)
 
     {new_state, reply, effects} =
-      PlacementMachine.apply(%{index: 2}, {:claim_tenant_if_unclaimed, "acme", "user-2"}, state)
+      PlacementMachine.apply(%{index: 2}, {:claim_name, "guild-a", "tenant-uuid-2"}, state)
 
     assert new_state == state
     assert reply == :already_claimed
     assert effects == []
   end
 
-  test "list_policies/3 returns an empty list for a tenant/prefix with no policies" do
+  test "apply/3 {:claim_name, ...} keeps different names independent" do
     state = PlacementMachine.init(%{})
-    assert PlacementMachine.list_policies(state, "acme", []) == []
+
+    {state, :claimed, []} =
+      PlacementMachine.apply(%{index: 1}, {:claim_name, "guild-a", "tenant-uuid-1"}, state)
+
+    {new_state, reply, effects} =
+      PlacementMachine.apply(%{index: 2}, {:claim_name, "guild-b", "tenant-uuid-2"}, state)
+
+    assert new_state == %{
+             streams: %{},
+             names: %{"guild-a" => "tenant-uuid-1", "guild-b" => "tenant-uuid-2"},
+             repair_claims: %{}
+           }
+
+    assert reply == :claimed
+    assert effects == []
   end
 
-  test "list_policies/3 returns exactly the policies stored at that tenant/prefix" do
-    policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
-    state = %{streams: %{}, policies: %{"acme" => %{["docs"] => [policy]}}, repair_claims: %{}}
+  test "get_name/2 returns the claimed tenant_id, or nil for an unclaimed name" do
+    state = PlacementMachine.init(%{})
+    assert PlacementMachine.get_name(state, "guild-a") == nil
 
-    assert PlacementMachine.list_policies(state, "acme", ["docs"]) == [policy]
-    assert PlacementMachine.list_policies(state, "acme", []) == []
-    assert PlacementMachine.list_policies(state, "other-tenant", ["docs"]) == []
+    {state, :claimed, []} =
+      PlacementMachine.apply(%{index: 1}, {:claim_name, "guild-a", "tenant-uuid-1"}, state)
+
+    assert PlacementMachine.get_name(state, "guild-a") == "tenant-uuid-1"
+    assert PlacementMachine.get_name(state, "guild-b") == nil
   end
 
   describe "{:claim_repair, ...} / {:release_repair, ...} (audit remediation, 2026-08-27)" do

@@ -2,22 +2,43 @@ defmodule Riptide.Placement.PlacementMachine do
   @moduledoc """
   The `:ra_machine` for Riptide's placement metadata cluster — a small,
   elastic-membership Ra cluster (see `Riptide.PlacementMembership`)
-  recording which nodes host each stream's Ra replicas, plus (Phase 4c)
-  authorization policies. Pure and process-free by design, mirroring
+  recording which nodes host each stream's Ra replicas, plus (Phase 6q) a
+  thin name registry mapping a Tenant's chosen human-readable name to its
+  own opaque `tenant_id`. Pure and process-free by design, mirroring
   `Riptide.Stream.RaMachine`: `init/1`/`apply/3` are the only functions Ra
-  itself calls; `get/2`/`list/1`/`list_policies/3` are plain query functions
+  itself calls; `get/2`/`list/1`/`get_name/2` are plain query functions
   run via `Riptide.RaCluster.consistent_query/2`.
 
-  Internal state is `%{streams: %{stream_id() => [node()]}, policies:
-  %{tenant_id() => %{path_prefix() => [policy()]}}, repair_claims:
-  %{stream_id() => repair_claim()}}` — three independent namespaces in one
-  already-hardened, already-bootstrapped Ra cluster, rather than a second
-  cluster to operate. `list/1`'s own external contract is deliberately
-  unchanged (`%{stream_id() => [node()]}` only): it backs
+  Internal state is `%{streams: %{stream_id() => [node()]}, names:
+  %{String.t() => String.t()}, repair_claims: %{stream_id() =>
+  repair_claim()}}` — three independent namespaces in one already-hardened,
+  already-bootstrapped Ra cluster, rather than a second cluster to operate.
+  `list/1`'s own external contract is deliberately unchanged
+  (`%{stream_id() => [node()]}` only): it backs
   `Riptide.Placement.list_all/1`, which `Riptide.Stream.ReplicaHealer.sweep/0`
-  iterates expecting *only* `{stream_id, nodes}` entries — mixing a policies
+  iterates expecting *only* `{stream_id, nodes}` entries — mixing a names
   or repair_claims key into that same flat map would make the healer call
   `RaCluster.uid_for/1` on a non-stream-id key and crash its next sweep.
+
+  ## Name registry (Phase 6q)
+
+  Authz policies used to live in this same cluster's own `policies`
+  namespace, keyed by `tenant_id`, with `{:claim_tenant_if_unclaimed, ...}`
+  arbitrating a race over who got a given `tenant_id` — a real concern when
+  `tenant_id` was a human-chosen, caller-supplied string. Phase 6q makes
+  `tenant_id` a locally-generated UUID instead (no collision, no race), so
+  that race disappears — but a human-chosen *name* still needs exactly the
+  same kind of arbitration a short, contested string always does. `names`
+  is that registry: `{:claim_name, name, tenant_id}` is structurally
+  identical to the old `{:claim_tenant_if_unclaimed, ...}` command, just
+  claiming a name instead of a bare tenant_id and no longer also writing an
+  owner policy as a side effect (see `Riptide.Accounts.sign_up/3`, which
+  now sequences that as a separate step after a successful claim). Authz
+  policies themselves moved out of this cluster entirely, into ordinary
+  facts inside each tenant's own stream (`Riptide.Authz.Store.TenantFacts`)
+  — see design spec
+  `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md`
+  §4.2/§4.3.
 
   ## Repair claims (audit remediation, 2026-08-27)
 
@@ -49,21 +70,18 @@ defmodule Riptide.Placement.PlacementMachine do
   @behaviour :ra_machine
 
   @type stream_id :: String.t()
-  @type tenant_id :: String.t()
-  @type path_prefix :: [String.t()]
-  @type policy :: struct()
   @type repair_claim :: %{dead_node: node(), claimant: node(), claimed_at: integer()}
 
   @type state :: %{
           streams: %{stream_id() => [node()]},
-          policies: %{tenant_id() => %{path_prefix() => [policy()]}},
+          names: %{String.t() => String.t()},
           repair_claims: %{stream_id() => repair_claim()}
         }
 
   @claim_ttl_seconds 120
 
   @impl :ra_machine
-  def init(_config), do: %{streams: %{}, policies: %{}, repair_claims: %{}}
+  def init(_config), do: %{streams: %{}, names: %{}, repair_claims: %{}}
 
   # Idempotent by construction — see Phase 3c-i design spec §4. Since every
   # command is serialized through Raft consensus, whichever proposal for a
@@ -146,61 +164,15 @@ defmodule Riptide.Placement.PlacementMachine do
     end
   end
 
-  # Bounds unbounded growth from a client (malicious, or merely a buggy
-  # retry loop) calling `POST /tenants/:id/policies` with the same or
-  # near-identical body repeatedly: `existing ++ [policy]` with no cap would
-  # otherwise grow this in-memory, Raft-replicated list forever, and every
-  # entry is scanned linearly on every `Riptide.Authz.evaluate/4` call for
-  # that tenant, so unbounded growth here also degrades every authorization
-  # decision's latency. Deduplicating exact-duplicate policies closes the
-  # most common case (identical retries) for free; `@max_policies_per_prefix`
-  # bounds the rest. Same idempotent-by-construction shape as {:assign, ...}
-  # otherwise: every command is serialized through Raft, so concurrent
-  # `add_policy` calls for the same tenant/prefix are safely ordered by the
-  # log rather than racing.
-  @max_policies_per_prefix 1000
-
+  # See moduledoc's "Name registry" section — structurally identical to the
+  # old {:claim_tenant_if_unclaimed, ...} command, just claiming a name
+  # instead of a bare tenant_id.
   @impl :ra_machine
-  def apply(_meta, {:add_policy, tenant_id, path_prefix, policy}, state) do
-    existing = state.policies |> Map.get(tenant_id, %{}) |> Map.get(path_prefix, [])
-
-    cond do
-      policy in existing ->
-        {state, :ok, []}
-
-      length(existing) >= @max_policies_per_prefix ->
-        {state, {:error, :too_many_policies}, []}
-
-      true ->
-        new_state =
-          put_in(
-            state,
-            [:policies, Access.key(tenant_id, %{}), path_prefix],
-            existing ++ [policy]
-          )
-
-        {new_state, :ok, []}
-    end
-  end
-
-  # A tenant is "unclaimed" if it has zero policies at every path prefix —
-  # see the Phase 4c design spec §6. This must be a single Ra command (not a
-  # separate list-then-add pair of calls from the caller) so that two
-  # different agents racing to claim the same brand-new tenant resolve to
-  # exactly one winner, the same way `{:assign, ...}`'s own idempotency
-  # relies on Raft's log ordering rather than a caller-side check-then-act.
-  @impl :ra_machine
-  def apply(_meta, {:claim_tenant_if_unclaimed, tenant_id, subject}, state) do
-    if tenant_claimed?(state, tenant_id) do
+  def apply(_meta, {:claim_name, name, tenant_id}, state) do
+    if Map.has_key?(state.names, name) do
       {state, :already_claimed, []}
     else
-      owner_policy = %Riptide.Authz.Policy{
-        effect: :allow,
-        modes: [:read, :write],
-        matcher: {:agent, subject}
-      }
-
-      new_state = put_in(state, [:policies, tenant_id], %{[] => [owner_policy]})
+      new_state = put_in(state, [:names, name], tenant_id)
       {new_state, :claimed, []}
     end
   end
@@ -215,13 +187,6 @@ defmodule Riptide.Placement.PlacementMachine do
     {new_state, :claimed, []}
   end
 
-  defp tenant_claimed?(state, tenant_id) do
-    state.policies
-    |> Map.get(tenant_id, %{})
-    |> Map.values()
-    |> Enum.any?(&(&1 != []))
-  end
-
   @spec get(state(), stream_id()) :: [node()] | nil
   def get(state, stream_id) do
     Map.get(state.streams, stream_id)
@@ -230,10 +195,6 @@ defmodule Riptide.Placement.PlacementMachine do
   @spec list(state()) :: %{stream_id() => [node()]}
   def list(state), do: state.streams
 
-  @spec list_policies(state(), tenant_id(), path_prefix()) :: [policy()]
-  def list_policies(state, tenant_id, path_prefix) do
-    state.policies
-    |> Map.get(tenant_id, %{})
-    |> Map.get(path_prefix, [])
-  end
+  @spec get_name(state(), String.t()) :: String.t() | nil
+  def get_name(state, name), do: Map.get(state.names, name)
 end
