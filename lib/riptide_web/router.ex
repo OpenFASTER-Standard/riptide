@@ -44,8 +44,13 @@ defmodule RiptideWeb.Router do
     get "/tenant-names/:name", RiptideWeb.Auth.TenantNamesController, :show
   end
 
+  # No :api pipeline here — SseController always responds with a fixed
+  # "text/event-stream" body (see its own moduledoc-adjacent do_subscribe_existing_stream/3),
+  # never content-negotiated JSON/Turtle/JSON-LD, so gating it behind :accepts only serves to
+  # reject every real browser EventSource request, which always sends `Accept: text/event-stream`
+  # — confirmed live via a genuine 406.
   scope "/" do
-    pipe_through [:api, :auth_query_param]
+    pipe_through [:auth_query_param]
 
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end

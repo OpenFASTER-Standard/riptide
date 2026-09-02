@@ -149,7 +149,18 @@ defmodule RiptideWeb.Realtime.SseController do
     conn
   end
 
-  @spec last_event_id(Plug.Conn.t()) :: {:ok, integer() | nil} | :error
+  # `[] -> {:ok, 0}`, not `{:ok, nil}`: a real browser's EventSource never sends
+  # `Last-Event-ID` on its first-ever connection to a stream (there's no prior event to echo
+  # back), which is the overwhelmingly common case, not an edge case — and `0` is this module's
+  # own "from the very start" cursor (see the 409/gap test above, which asserts against an
+  # explicit `Last-Event-ID: 0`). `RaMachine.get_since/2`'s `nil` cursor is a real, separately
+  # tested, deliberate live-tail-only mode (`get_since(nil) returns an empty backlog (live-tail
+  # semantics)`, ra_machine_test.exs) meant for a caller that explicitly wants to skip backlog —
+  # conflating a merely-absent header with that opt-in silently dropped every event written
+  # before a client's first subscribe, confirmed live: `do_subscribe_existing_stream/3`'s own
+  # backlog-then-live-tail design (see its comment above) never actually delivered the backlog
+  # half for a first-time subscriber.
+  @spec last_event_id(Plug.Conn.t()) :: {:ok, integer()} | :error
   defp last_event_id(conn) do
     case Plug.Conn.get_req_header(conn, "last-event-id") do
       [id] ->
@@ -159,7 +170,7 @@ defmodule RiptideWeb.Realtime.SseController do
         end
 
       [] ->
-        {:ok, nil}
+        {:ok, 0}
     end
   end
 end
