@@ -197,4 +197,7 @@ defmodule Riptide.Placement.PlacementMachine do
 
   @spec get_name(state(), String.t()) :: String.t() | nil
   def get_name(state, name), do: Map.get(state.names, name)
+
+  @spec list_names(state()) :: %{String.t() => String.t()}
+  def list_names(state), do: state.names
 end

@@ -121,6 +121,13 @@ defmodule Riptide.Placement do
     end)
   end
 
+  @spec list_all_names() :: %{String.t() => String.t()}
+  def list_all_names do
+    with_current_members(fn server_id ->
+      RaCluster.consistent_query(server_id, &PlacementMachine.list_names/1)
+    end)
+  end
+
   # Tries each currently-known member, in order, until one answers —
   # `RaCluster.process_command/2` and `consistent_query/2` both raise on
   # failure/timeout, so a failing member is caught here and the next one

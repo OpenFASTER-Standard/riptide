@@ -69,7 +69,7 @@ defmodule Riptide.BlobStoreCapstoneTest do
 
     assert {:ok, output} = Capability.invoke(definition, "acme", nil, ["World"])
 
-    assert {:ok, hash} = BlobStore.put(output)
+    assert {:ok, hash} = BlobStore.put("acme", output)
 
     # The hash-pointer Fact: an ordinary RDF triple a real ExecuteInterpreter
     # caller would write onto whatever resource this Capability's result
@@ -89,6 +89,6 @@ defmodule Riptide.BlobStoreCapstoneTest do
       |> String.trim_leading("urn:riptide-blob:sha256:")
 
     assert extracted_hash == hash
-    assert {:ok, ^output} = BlobStore.get(extracted_hash)
+    assert {:ok, ^output} = BlobStore.get("acme", extracted_hash)
   end
 end

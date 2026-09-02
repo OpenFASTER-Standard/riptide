@@ -24,8 +24,8 @@ defmodule Riptide.Derivation.ContextResolverTest do
     :ok
   end
 
-  defp admit_capability!(target_scope, name) do
-    {:ok, hash} = BlobStore.put(:crypto.strong_rand_bytes(32))
+  defp admit_capability!({:tenant, tenant_id} = target_scope, name) do
+    {:ok, hash} = BlobStore.put(tenant_id, :crypto.strong_rand_bytes(32))
 
     entry = %CapabilityCatalogEntry{
       name: cap(name),

@@ -173,7 +173,7 @@ defmodule Riptide.Derivation.JobTrigger do
              CapabilityCatalog.find_by_name({:tenant, job.tenant_id}, iri),
              iri
            ),
-         {:ok, definition} <- CapabilityCatalog.materialize(entry) do
+         {:ok, definition} <- CapabilityCatalog.materialize(job.tenant_id, entry) do
       args = Enum.map(job.args, &ExecuteInterpreter.term_to_arg/1)
 
       case Capability.invoke(definition, job.tenant_id, nil, args) do

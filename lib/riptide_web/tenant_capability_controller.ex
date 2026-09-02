@@ -36,7 +36,7 @@ defmodule RiptideWeb.TenantCapabilityController do
        ) do
     with {:ok, kind} <- parse_kind(kind_string),
          {:ok, bytes} <- Base.decode64(component_bytes_b64),
-         {:ok, hash} <- BlobStore.put(bytes) do
+         {:ok, hash} <- BlobStore.put(tenant_id, bytes) do
       entry = %CapabilityCatalogEntry{
         name: RDF.iri(name),
         kind: kind,

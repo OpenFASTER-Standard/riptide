@@ -40,7 +40,7 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
 
   defp register_capstone_capability(tenant_id) do
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = Riptide.BlobStore.put(component_bytes)
+    {:ok, hash} = Riptide.BlobStore.put(tenant_id, component_bytes)
 
     entry = %Riptide.Derivation.CapabilityCatalogEntry{
       name: RDF.iri("urn:riptide:capability:capstoneGreet"),
@@ -57,7 +57,7 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
       }
     }
 
-    :ok = Catalog.admit_capability(entry, nil)
+    :ok = Catalog.admit_capability({:tenant, tenant_id}, entry, nil)
 
     :ok =
       Riptide.Authz.Store.TenantFacts.add_policy(

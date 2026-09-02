@@ -50,13 +50,13 @@ defmodule Riptide.Derivation.ContextResolver do
 
   defp all_capabilities(tenant_id) do
     case Catalog.list_capabilities({:tenant, tenant_id}) do
-      {:ok, entries} -> Enum.reduce(entries, %{}, &materialize_into/2)
+      {:ok, entries} -> Enum.reduce(entries, %{}, &materialize_into(tenant_id, &1, &2))
       {:error, :not_ready} -> %{}
     end
   end
 
-  defp materialize_into({_node, entry}, acc) do
-    case CapabilityCatalog.materialize(entry) do
+  defp materialize_into(tenant_id, {_node, entry}, acc) do
+    case CapabilityCatalog.materialize(tenant_id, entry) do
       {:ok, definition} -> Map.put(acc, entry.name, definition)
       {:error, _reason} -> acc
     end
@@ -130,7 +130,7 @@ defmodule Riptide.Derivation.ContextResolver do
     else
       with {:ok, entry} <-
              capability_not_found(CapabilityCatalog.find_by_name({:tenant, tenant_id}, iri), iri),
-           {:ok, definition} <- CapabilityCatalog.materialize(entry) do
+           {:ok, definition} <- CapabilityCatalog.materialize(tenant_id, entry) do
         {:ok, Map.put(capabilities, iri, definition)}
       end
     end

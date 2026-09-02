@@ -83,7 +83,7 @@ defmodule RiptideWeb.DemoBackendAdditionsCapstoneTest do
     claim_tenant(tenant_id)
 
     bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = Riptide.BlobStore.put(bytes)
+    {:ok, hash} = Riptide.BlobStore.put(tenant_id, bytes)
 
     cap_name =
       RDF.iri("urn:riptide:capability:capstone-6p-i-#{System.unique_integer([:positive])}")
@@ -103,7 +103,7 @@ defmodule RiptideWeb.DemoBackendAdditionsCapstoneTest do
       }
     }
 
-    :ok = Catalog.admit_capability(entry, nil)
+    :ok = Catalog.admit_capability({:tenant, tenant_id}, entry, nil)
 
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 

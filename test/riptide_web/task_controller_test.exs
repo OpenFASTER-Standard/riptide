@@ -47,7 +47,7 @@ defmodule RiptideWeb.TaskControllerTest do
 
   defp register_task_submit_capability(tenant_id, local_name) do
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = Riptide.BlobStore.put(component_bytes)
+    {:ok, hash} = Riptide.BlobStore.put(tenant_id, component_bytes)
 
     entry = %Riptide.Derivation.CapabilityCatalogEntry{
       name: RDF.iri("urn:riptide:capability:#{local_name}"),

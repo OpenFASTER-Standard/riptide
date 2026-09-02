@@ -78,7 +78,7 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
     propose_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capabilities", body)
+      |> conn("/tenants/#{tenant_id}/capabilities", body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -88,7 +88,7 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
     approve_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capability-reviews/#{node_id}/approve")
+      |> conn("/tenants/#{tenant_id}/capability-reviews/#{node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
@@ -101,14 +101,14 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
     local_name = String.trim_leading(name, "urn:riptide:capability:")
 
     FakeStore.start(%{
-      {"acme", ["capabilities", local_name]} => [
+      {tenant_id, ["capabilities", local_name]} => [
         %Policy{effect: :allow, modes: [:invoke], matcher: :public}
       ]
     })
 
-    assert {:ok, entry} = CapabilityCatalog.find_by_name(RDF.iri(name))
-    assert {:ok, definition} = CapabilityCatalog.materialize(entry)
-    assert {:ok, result} = Capability.invoke(definition, "acme", nil, ["World"])
+    assert {:ok, entry} = CapabilityCatalog.find_by_name({:tenant, tenant_id}, RDF.iri(name))
+    assert {:ok, definition} = CapabilityCatalog.materialize(tenant_id, entry)
+    assert {:ok, result} = Capability.invoke(definition, tenant_id, nil, ["World"])
     assert result == "\"Hello, World!\""
   end
 end
