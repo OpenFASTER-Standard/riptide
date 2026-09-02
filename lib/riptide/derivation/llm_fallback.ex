@@ -35,7 +35,7 @@ defmodule Riptide.Derivation.LLMFallback do
       Application.get_env(
         :riptide,
         :llm_fallback_client,
-        Riptide.Derivation.LLMFallback.Client.Anthropic
+        Riptide.Derivation.LLMFallback.Client.OpenAICompatible
       )
 
     with {:ok, response_text} <- call_client(client, task_description, context),
