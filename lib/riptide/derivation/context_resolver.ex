@@ -40,15 +40,20 @@ defmodule Riptide.Derivation.ContextResolver do
   def resolve_all(tenant_id, current_subject) do
     {:ok,
      %Context{
-       capabilities: all_capabilities(),
+       capabilities: all_capabilities(tenant_id),
        rules: all_rules(tenant_id),
        tenant_id: tenant_id,
        current_subject: current_subject
      }}
   end
 
-  defp all_capabilities do
-    case Catalog.list_capabilities() do
+  # Minimal Task-5-follow-on fix: Catalog.list_capabilities/0 (Hub-scoped) no
+  # longer exists now that Catalog.scope() dropped :hub — this call site now
+  # passes the tenant's own scope instead. Task 8 revisits this function
+  # (and its sibling all_rules/1) more fully; this only keeps it working in
+  # the meantime.
+  defp all_capabilities(tenant_id) do
+    case Catalog.list_capabilities({:tenant, tenant_id}) do
       {:ok, entries} -> Enum.reduce(entries, %{}, &materialize_into/2)
       {:error, :not_ready} -> %{}
     end
@@ -61,11 +66,12 @@ defmodule Riptide.Derivation.ContextResolver do
     end
   end
 
-  defp all_rules(tenant_id) do
-    tenant_rules = rules_by_signature_name({:tenant, tenant_id})
-    hub_rules = rules_by_signature_name(:hub)
-    Map.merge(hub_rules, tenant_rules)
-  end
+  # Minimal Task-5-follow-on fix, same reasoning as all_capabilities/1 above:
+  # rules_by_signature_name(:hub) no longer has a valid scope to call. Task 8
+  # makes this deletion the deliberate behavior change (spec §4.5) rather
+  # than just an unblocking patch; this only keeps it working in the
+  # meantime.
+  defp all_rules(tenant_id), do: rules_by_signature_name({:tenant, tenant_id})
 
   defp rules_by_signature_name(scope) do
     case Catalog.list_entries(scope) do

@@ -1,10 +1,8 @@
-defmodule RiptideWeb.Hub.CrosswalkController do
+defmodule RiptideWeb.TenantCrosswalkController do
   @moduledoc """
-  Propose a Crosswalk and approve/decline it, mirroring
-  `RiptideWeb.Hub.ProposeController`/`ReviewController`'s exact shape
-  (design spec
-  `docs/superpowers/specs/2026-08-30-phase-6i-crosswalks-and-installation-design.md`
-  §9).
+  Propose a Crosswalk into the caller's own tenant Catalog, and approve/decline it — a direct
+  Tenant-scoped analogue of the deleted `RiptideWeb.Hub.CrosswalkController` (design spec
+  `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md` §4.5).
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -40,9 +38,10 @@ defmodule RiptideWeb.Hub.CrosswalkController do
           match_type: match_type
         }
 
+        scope = {:tenant, tenant_id}
         replaces = parse_replaces(params)
 
-        case DedupGate.propose_crosswalk({:tenant, tenant_id}, crosswalk, replaces) do
+        case DedupGate.propose_crosswalk(scope, scope, crosswalk, replaces) do
           {:ok, node} ->
             body =
               Jason.encode!(%{"outcome" => "queued", "node_id" => RDF.BlankNode.value(node)})
@@ -57,11 +56,6 @@ defmodule RiptideWeb.Hub.CrosswalkController do
 
   defp handle_propose(conn, _tenant_id, _params), do: send_resp(conn, 400, "")
 
-  # Explicit case matching, not String.to_existing_atom/1: these atoms
-  # otherwise appear nowhere as literals in `lib/` (only in `Crosswalk`'s
-  # own `@type`, which typespecs don't reliably intern at runtime) — see
-  # `CrosswalkRDFCodec`'s identical `decode_match_type/1` for the full
-  # reasoning.
   defp parse_match_type("exact_match"), do: :exact_match
   defp parse_match_type("close_match"), do: :close_match
   defp parse_match_type("broad_match"), do: :broad_match
@@ -76,8 +70,9 @@ defmodule RiptideWeb.Hub.CrosswalkController do
 
   def approve(conn, %{"node_id" => node_id}) do
     tenant_id = conn.assigns.tenant_id
+    scope = {:tenant, tenant_id}
 
-    case DedupGate.approve_crosswalk_review({:tenant, tenant_id}, RDF.BlankNode.new(node_id)) do
+    case DedupGate.approve_crosswalk_review(scope, scope, RDF.BlankNode.new(node_id)) do
       :ok -> send_resp(conn, 200, "")
       {:error, :not_found} -> send_resp(conn, 404, "")
       {:error, _reason} -> send_resp(conn, 503, "")

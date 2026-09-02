@@ -87,19 +87,15 @@ defmodule RiptideWeb.Router do
     post "/pending-reviews/:node_id/decline", RiptideWeb.TenantReviewController, :decline
     get "/discovery/search", RiptideWeb.TenantDiscoveryController, :search
 
-    post "/hub/propose", RiptideWeb.Hub.ProposeController, :propose
-    post "/hub/pending-reviews/:node_id/approve", RiptideWeb.Hub.ReviewController, :approve
-    post "/hub/pending-reviews/:node_id/decline", RiptideWeb.Hub.ReviewController, :decline
-
     post "/hub/install", RiptideWeb.Hub.InstallController, :install
     post "/hub/install-reviews/:node_id/approve", RiptideWeb.Hub.InstallController, :approve
     post "/hub/install-reviews/:node_id/decline", RiptideWeb.Hub.InstallController, :decline
-    post "/hub/crosswalks", RiptideWeb.Hub.CrosswalkController, :propose
-    post "/hub/crosswalk-reviews/:node_id/approve", RiptideWeb.Hub.CrosswalkController, :approve
-    post "/hub/crosswalk-reviews/:node_id/decline", RiptideWeb.Hub.CrosswalkController, :decline
 
-    post "/hub/capabilities", RiptideWeb.Hub.CapabilityController, :propose
-    post "/hub/capability-reviews/:node_id/approve", RiptideWeb.Hub.CapabilityController, :approve
-    post "/hub/capability-reviews/:node_id/decline", RiptideWeb.Hub.CapabilityController, :decline
+    post "/crosswalks", RiptideWeb.TenantCrosswalkController, :propose
+    post "/crosswalk-reviews/:node_id/approve", RiptideWeb.TenantCrosswalkController, :approve
+    post "/crosswalk-reviews/:node_id/decline", RiptideWeb.TenantCrosswalkController, :decline
+    post "/capabilities", RiptideWeb.TenantCapabilityController, :propose
+    post "/capability-reviews/:node_id/approve", RiptideWeb.TenantCapabilityController, :approve
+    post "/capability-reviews/:node_id/decline", RiptideWeb.TenantCapabilityController, :decline
   end
 end
