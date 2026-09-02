@@ -56,17 +56,17 @@ const CANNED_COMPLETIONS = [
   {
     match: "make a badge that says Welcome, Adventurer!",
     rule:
-      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guild-demo-badge, "Welcome, Adventurer!", Result).',
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Welcome, Adventurer!", Result).',
   },
   {
     match: "make a badge that says Great job, Champion!",
     rule:
-      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guild-demo-badge, "Great job, Champion!", Result).',
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Great job, Champion!", Result).',
   },
   {
     match: "try the cursed amulet",
     rule:
-      'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guild-demo-curse, Result).',
+      'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guildDemoCurse, Result).',
   },
 ];
 
@@ -123,7 +123,7 @@ curl -s -X POST http://localhost:4100/chat/completions \
   -d '{"model":"x","messages":[{"role":"user","content":"...\nTask: make a badge that says Welcome, Adventurer!\n\nOutput ONLY..."}]}'
 ```
 
-Expected: `{"choices":[{"message":{"content":"badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guild-demo-badge, \"Welcome, Adventurer!\", Result)."}}]}`. Also confirm an unmatched prompt returns `500` with a clear error body. Kill the background server (`kill %1`) once confirmed.
+Expected: `{"choices":[{"message":{"content":"badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, \"Welcome, Adventurer!\", Result)."}}]}`. Also confirm an unmatched prompt returns `500` with a clear error body. Kill the background server (`kill %1`) once confirmed.
 
 - [ ] **Step 3: Commit**
 
@@ -608,6 +608,19 @@ async function teachCapability(container, stateKey, capabilityName, capabilityFu
 
     await postJson(`/tenants/${state.guildA.tenantId}/capability-reviews/${propose.node_id}/approve`, state.guildA.aliceToken, {});
 
+    // A Job's actual execution runs asynchronously on whichever node leads its stream, with no
+    // per-request subject at all (Riptide.Derivation.JobTrigger.execute/3 always invokes with a
+    // nil current_subject) — so :invoke authorization can only ever be satisfied by a
+    // subject-agnostic (:public) policy, never an owner-scoped {:agent, sub} one. This is the
+    // same explicit "admit into your Catalog, then separately grant a :public policy" two-step
+    // RiptideWeb.TenantCapabilityController's own moduledoc describes, and the same pattern every
+    // real end-to-end capstone test in this codebase already seeds.
+    await postJson(`/tenants/${state.guildA.tenantId}/policies`, state.guildA.aliceToken, {
+      effect: "allow",
+      modes: ["invoke"],
+      matcher: "public",
+    });
+
     const badge = document.createElement("div");
     badge.className = "payoff";
     badge.textContent = "✓ Taught";
@@ -643,7 +656,18 @@ async function useCapability(container, stateKey) {
 
     const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
     const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
-      const statusQuad = quads.find((q) => q.subject.value === submitted.job_node && q.predicate.value === VOCAB.jobStatus);
+      // Not matched against submitted.job_node: a Job's blank-node subject has no identity
+      // outside the one Turtle document it was originally written in — each SSE frame is parsed
+      // independently by N3.js, and Riptide.RDF.TurtleCodec (a thin wrapper over the `rdf`
+      // library's own standard, spec-legal Turtle writer) renders a blank node with zero inbound
+      // references using anonymous `[...]` syntax, which carries no label at all. Confirmed live:
+      // a fresh subscribe's very first frame shows the Job as `[ a <urn:riptide:vocab:Job> ; ...
+      // ]`, and Catalog.mark_job_done/3's own completion patch (lib/riptide/derivation/catalog.ex)
+      // writes only jobStatus/jobResult, so there's no other field in that same frame to
+      // correlate by either. Each Chapter here only ever has one Job in flight at a time, so
+      // matching on "a jobStatus quad just turned done/failed" — with no subject check at all —
+      // is unambiguous and correct for this demo's own narrative.
+      const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
       if (!statusQuad) return;
       const status = statusQuad.object.value;
       if (status !== "done" && status !== "failed") return;
@@ -651,7 +675,19 @@ async function useCapability(container, stateKey) {
       renderCapabilityPayoff(useResult, stateKey, status, quads);
     });
   } catch (err) {
-    renderError(err, useResult);
+    // The curse capability traps on EVERY invocation — LLMFallback.run/3 actually invokes the
+    // Capability for real to ground a binding before it ever writes a Job (see
+    // resolve_exactly_one_binding/3 in lib/riptide/derivation/llm_fallback.ex), so a
+    // never-succeeds capability fails right here, synchronously, as a 422 on the Task submission
+    // itself — no Job is ever written, so there's no async "failed" status to watch for over SSE
+    // the way Chapter 1's own success path works. Route straight to the same payoff a "failed"
+    // Job would have gotten; any other error (wrong description, network, etc.) still surfaces
+    // through the normal error path.
+    if (stateKey === "chapter2" && err instanceof HttpError && err.status === 422) {
+      renderCapabilityPayoff(useResult, stateKey, "failed", []);
+    } else {
+      renderError(err, useResult);
+    }
   }
 }
 
@@ -665,8 +701,10 @@ function renderCapabilityPayoff(container, stateKey, status, quads) {
     // own jobResult literal carries it verbatim; JSON.parse unwraps the outer encoding.
     payoff.innerHTML = JSON.parse(resultQuad.object.value);
   } else if (stateKey === "chapter2" && status === "failed") {
+    // No errorQuad at all in the (actual, common) synchronous-422 case above — quads is [].
     const errorQuad = quads.find((q) => q.predicate.value === VOCAB.jobError);
-    payoff.innerHTML = `<strong>The curse backfires!</strong><p>${errorQuad.object.value}</p><p><em>WASI caught the fault cleanly — no crash, no hang, just a clean trap.</em></p>`;
+    const errorText = errorQuad ? errorQuad.object.value : "the capability trapped before a Job could even be written";
+    payoff.innerHTML = `<strong>The curse backfires!</strong><p>${errorText}</p><p><em>WASI caught the fault cleanly — no crash, no hang, just a clean trap.</em></p>`;
   } else {
     payoff.textContent = `Unexpected Job status: ${status}`;
   }
@@ -679,7 +717,7 @@ pushCapabilityChapter({
   title: "Chapter 1: Teach Riptide its first trick",
   stateKey: "chapter1",
   wasmPath: "capabilities/badge-qr-generator/badge-qr-generator.wasm",
-  capabilityName: "urn:riptide:capability:guild-demo-badge",
+  capabilityName: "urn:riptide:capability:guildDemoBadge",
   capabilityFunction: "generate-qr-code",
 });
 
@@ -687,7 +725,7 @@ pushCapabilityChapter({
   title: "Chapter 2: A capability that bites back",
   stateKey: "chapter2",
   wasmPath: "capabilities/curse/curse.wasm",
-  capabilityName: "urn:riptide:capability:guild-demo-curse",
+  capabilityName: "urn:riptide:capability:guildDemoCurse",
   capabilityFunction: "curse",
 });
 ```

@@ -6,6 +6,7 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { rmSync } from "node:fs";
 import { startMockLlmServer } from "./mock-llm-server.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +36,20 @@ async function waitForReady(url, attempts = 60) {
   throw new Error(`${url} never became ready`);
 }
 
+// `mix phx.server`'s own Ra/blob/capability-cache state is durable on disk across restarts
+// (that's the whole point in real use) — but this script's own "genuinely fresh Riptide
+// instance" premise (guild-a/guild-b must be claimable every run) needs a clean slate each time,
+// confirmed necessary live: a second run without this hit a real 409 on signup, since the first
+// run's own guild-a tenant was still on disk from priv/ra_data's own durable log.
+function cleanDevState() {
+  for (const dir of ["priv/ra_data", "priv/blob_data", "priv/capability_cache"]) {
+    rmSync(path.join(RIPTIDE_ROOT, dir), { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  cleanDevState();
+
   const mockLlm = await startMockLlmServer(MOCK_LLM_PORT);
   log(`mock LLM server up on :${MOCK_LLM_PORT}`);
 
@@ -43,6 +57,10 @@ async function main() {
     cwd: RIPTIDE_ROOT,
     env: {
       ...process.env,
+      // wasmtime (needed for Chapters 1/2's real Capability invocation) lives at
+      // /work/.local/bin, not on this box's default PATH — confirmed the hard way: without this,
+      // Capability.invoke/4 fails with `System.cmd("wasmtime", ...) ** (ErlangError) :enoent`.
+      PATH: `/work/.local/bin:${process.env.PATH}`,
       PORT: String(RIPTIDE_PORT),
       LLM_API_BASE_URL: `http://localhost:${MOCK_LLM_PORT}`,
       LLM_API_KEY: "smoke-test-key",
@@ -51,19 +69,26 @@ async function main() {
     stdio: "inherit",
   });
 
+  let browser;
+
   try {
     await waitForReady(`${BASE_URL}/health/ready`);
     log("Riptide dev server ready");
 
-    const browser = await chromium.launch();
+    browser = await chromium.launch();
     const page = await browser.newPage();
     await page.goto(`file://${path.join(__dirname, "index.html")}`);
 
     await runChapters(page);
 
-    await browser.close();
     log("ALL CHAPTERS PASSED");
   } finally {
+    // Without this, a failure above (any thrown error) skips straight to this finally without
+    // ever reaching the old inline `browser.close()` — confirmed live: a failed run left chromium
+    // (and its renderer/gpu/zygote child processes) running indefinitely, keeping this script's
+    // own node process alive too, since Node won't exit while a child process still holds a pipe
+    // open.
+    if (browser) await browser.close();
     server.kill();
     mockLlm.close();
   }
@@ -75,6 +100,24 @@ async function runChapters(page) {
   await page.click('#begin-button');
   await page.waitForSelector('.payoff:has-text("Welcome, Alice")', { timeout: 10000 });
   log("Chapter 0 passed");
+  await page.click('button:has-text("Next chapter")');
+
+  // Chapter 1
+  await page.setInputFiles('#chapter1-wasm-input', path.join(__dirname, "capabilities/badge-qr-generator/badge-qr-generator.wasm"));
+  await page.click('#chapter1-teach-button');
+  await page.waitForSelector('#chapter1-use-section', { timeout: 10000 });
+  await page.click('#chapter1-submit-button'); // uses the pre-filled default description
+  await page.waitForSelector('.payoff svg', { timeout: 15000 });
+  log("Chapter 1 passed");
+  await page.click('button:has-text("Next chapter")');
+
+  // Chapter 2
+  await page.setInputFiles('#chapter2-wasm-input', path.join(__dirname, "capabilities/curse/curse.wasm"));
+  await page.click('#chapter2-teach-button');
+  await page.waitForSelector('#chapter2-use-section', { timeout: 10000 });
+  await page.click('#chapter2-submit-button');
+  await page.waitForSelector('.payoff:has-text("backfires")', { timeout: 15000 });
+  log("Chapter 2 passed");
   await page.click('button:has-text("Next chapter")');
 
   // Later tasks append one more `log(...)` + assertion block here per Chapter, in order.

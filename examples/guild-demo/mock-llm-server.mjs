@@ -18,17 +18,17 @@ const CANNED_COMPLETIONS = [
   {
     match: "make a badge that says Welcome, Adventurer!",
     rule:
-      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guild-demo-badge, "Welcome, Adventurer!", Result).',
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Welcome, Adventurer!", Result).',
   },
   {
     match: "make a badge that says Great job, Champion!",
     rule:
-      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guild-demo-badge, "Great job, Champion!", Result).',
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Great job, Champion!", Result).',
   },
   {
     match: "try the cursed amulet",
     rule:
-      'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guild-demo-curse, Result).',
+      'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guildDemoCurse, Result).',
   },
 ];
 
