@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions) — see issue #58 for the current remaining list (6p-ii demo WASM components, 6p-iii the demo page, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components) — see issue #58 for the current remaining list (6p-iii the demo page, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1519,3 +1519,54 @@ own pre-existing "sharing a resource_key" (now "mutex_key") test already documen
 seconds for, which this new capstone test's own first draft simply hadn't matched.
 
 **Status**: Phase 6p-i shipped 2026-09-01.
+
+### 6p-ii — Demo WASM Components
+
+**Shipped 2026-09-02** — see
+`docs/superpowers/specs/2026-09-02-phase-6p-ii-demo-wasm-components-design.md`. Direct origin:
+6p-i's own spec named this as the second of three independent sub-phases the demo (6p) was split into
+during brainstorming — the demo narrative's beats 1 and 2 ("teach Riptide its first trick" and "teach it
+a second, deliberately-broken capability") need two real WASM Capability components that don't exist
+yet, and 6n's own spec had already explicitly deferred any convenient authoring tooling for producing
+them. This phase hand-authors both, the same way this codebase's one existing hand-built component
+(`test/fixtures/riptide_capability/fixture.wasm`, from 6b-i) was produced: a hand-written WIT world +
+Rust source, built once via `cargo component build --release`, checked into the repo as a binary
+artifact with a documented rebuild recipe — no live, buildable Rust crate checked in.
+
+Both components live at `examples/guild-demo/capabilities/`, each in its own subdirectory
+(`badge-qr-generator/`, `curse/`) with a README mirroring the existing fixture's own format. The
+badge/QR-code generator (`generate-qr-code(text: string) -> string`) encodes the demo visitor's own
+free-text Task content — not a fixed URL, reconciling an earlier `examples/live-story`-tied framing with
+the eventual guild/badge narrative — as a self-contained SVG string, using the `qrcode` crate
+(`0.14.1`, `default-features = false, features = ["svg"]`, deliberately avoiding the `image`/`pic`
+raster-codec dependency chain). The curse component (`curse() -> ()`) calls `panic!(...)` immediately,
+deliberately not reusing the existing fixture's `burn-fuel()` fuel-exhaustion/timeout mechanic:
+`Riptide.Capability.classify_result/2` has two genuinely different non-success branches
+(`:resource_exhausted` vs. `{:trap, output}`), and an immediate panic lands in the latter within
+milliseconds rather than waiting out a multi-second fuel/timeout window — a better match for the demo
+beat's own "traps the fault cleanly, live, not a crash/hang" framing.
+
+Both components' behavior was validated by actually building and invoking them via `wasmtime` — first
+during brainstorming (informing the design), then again during implementation against the real checked-in
+artifacts — rather than assumed from reading crate/API docs. This environment (`wasm32-wasip2` rustup
+target, `cargo-component 0.21.1`) had neither installed before this phase; both are now present
+system-wide on the box this work was done from.
+
+Testing goes through `Riptide.Capability.invoke/4` directly (existing, unchanged) — no HTTP layer, no
+DedupGate/propose-approve flow needed to exercise either component's own behavior. The QR generator's
+test asserts the returned string parses as well-formed SVG (start tag, end tag, XML declaration —
+deliberately not a byte-exact golden match, which would be brittle against `qrcode` crate version
+bumps); the curse component's test asserts `{:error, {:trap, output}}` specifically.
+
+**One real bug caught only by actually running the curse test against the real component, not assumed
+from the design spec's own earlier manual validation**: the test's first draft asserted
+`output =~ "the chest is cursed"` (the literal panic message) — this passed during the design spec's own
+ad hoc `wasmtime` invocation (run directly, with no flags suppressing the guest's stderr), but failed
+against the real invocation path, because `Riptide.Capability.run_wasmtime/1` passes `-S
+inherit-stderr=n`, so the guest's own WASI stderr (where Rust's panic hook writes the message) never
+reaches the captured output at all — only wasmtime's own top-level trap report does. Fixed by asserting
+on `"unreachable"` instead (present in the real trap report, and specific to an actual in-execution wasm
+trap — confirmed it correctly rules out the different `{:error, {:trap, _}}` a merely-missing/unreadable
+`.wasm` file also produces, which the literal panic-message assertion would not have caught either way).
+
+**Status**: Phase 6p-ii shipped 2026-09-02.
