@@ -71,6 +71,44 @@ defmodule RiptideWeb.Authz.PolicyControllerTest do
            )
   end
 
+  test "an owner can grant :invoke to another agent through this API" do
+    tenant_id = "policy-api-test-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+
+    body =
+      Jason.encode!(%{
+        "effect" => "allow",
+        "modes" => ["invoke"],
+        "matcher" => %{"agent" => "friend-1"}
+      })
+
+    post_conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/policies", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert post_conn.status == 201
+
+    get_conn =
+      :get
+      |> conn("/tenants/#{tenant_id}/policies")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    policies = Jason.decode!(get_conn.resp_body)
+
+    assert Enum.any?(
+             policies,
+             &(&1 == %{
+                 "effect" => "allow",
+                 "modes" => ["invoke"],
+                 "matcher" => %{"agent" => "friend-1"}
+               })
+           )
+  end
+
   test "a non-owner cannot add or list policies for someone else's tenant" do
     tenant_id = "policy-api-test-" <> Uniq.UUID.uuid4()
     claim_tenant(tenant_id)

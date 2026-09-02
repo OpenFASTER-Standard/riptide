@@ -38,6 +38,18 @@ defmodule Riptide.AccountsTest do
       assert {:error, :already_claimed} =
                Accounts.sign_up(tenant_id, "mallory", String.duplicate("b", 64))
     end
+
+    test "grants the owner :invoke (not just :read/:write) on her own tenant, so she can invoke a Capability she registers herself without a separately-granted policy" do
+      assert {:ok, %{sub: sub, tenant_id: tenant_id}} =
+               Accounts.sign_up(unique_tenant(), "alice", String.duplicate("a", 64))
+
+      [owner_policy] = Riptide.Authz.Store.TenantFacts.list_policies(tenant_id, [])
+      assert owner_policy.effect == :allow
+      assert owner_policy.matcher == {:agent, sub}
+      assert :invoke in owner_policy.modes
+      assert :read in owner_policy.modes
+      assert :write in owner_policy.modes
+    end
   end
 
   describe "log_in/3" do
