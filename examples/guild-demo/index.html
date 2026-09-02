@@ -59,7 +59,7 @@ const state = {
   chapter1: { capabilityNodeId: null, jobNodeId: null },
   chapter2: { capabilityNodeId: null, jobNodeId: null },
   chapter3: { secondJobNodeId: null, patternNodeId: null, thirdJobNodeId: null },
-  chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null, v2PatternNodeId: null },
+  chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null },
   chapter5: { job1NodeId: null, job2NodeId: null },
   chapter6: { ruleNodeId: null },
 };
@@ -512,6 +512,191 @@ async function submitThirdBadgeTask(container) {
       <p>Task 1 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 2 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 3 resolved via: <strong>${submitted.resolved_via}</strong></p>
+    `;
+    result.appendChild(payoff);
+    addNextButton(result);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 4: Two guilds, shared knowledge
+// ---------------------------------------------------------------------------
+CHAPTERS.push({
+  title: "Chapter 4: Two guilds, shared knowledge",
+  render(container) {
+    container.innerHTML = `
+      <h2>Chapter 4: Two guilds, shared knowledge</h2>
+      <p>A second guild rises. Bootstrap Guild B:</p>
+      <button id="chapter4-begin-guildb-button">Begin Guild B</button>
+      <div id="chapter4-result"></div>
+      <div id="chapter4-live-pane"><h3>Guild A's public noticeboard</h3><ul id="chapter4-live-list"></ul></div>
+    `;
+    document.getElementById("chapter4-begin-guildb-button").onclick = () => beginGuildB(container);
+  },
+});
+
+async function beginGuildB(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    const passwordHash = await sha256hex("guild-demo-pw");
+    const response = await postJson("/auth/signup", null, { name: "guild-b", username: "bob", password_hash: passwordHash });
+    state.guildB.tenantId = response.tenant_id;
+    state.guildB.bobToken = response.token;
+    state.guildB.bobSub = response.sub;
+
+    // Guild B's own live pane subscribes to Guild A's catalog now, before Alice grants :public —
+    // it just won't see anything until that grant happens (matches ResourceController's own
+    // 6q-shipped Authz gate; subscribing early is what makes the later grant feel "live").
+    const catalogStreamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/catalog`;
+    subscribeStream(catalogStreamId, state.guildB.bobToken, (quads) => {
+      const li = document.createElement("li");
+      li.textContent = `New entry: ${quads.map((q) => q.subject.value).join(", ")}`;
+      document.getElementById("chapter4-live-list").appendChild(li);
+    });
+
+    const btn = document.createElement("button");
+    btn.id = "chapter4-admit-local-button";
+    btn.textContent = "Admit Guild B's own convention";
+    btn.onclick = () => admitGuildBLocalRule(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+function admitGuildBLocalRule(container) {
+  const result = document.getElementById("chapter4-result");
+  // Illustrative only — no API call. This step's whole point is establishing that Guild B already
+  // has its own separate vocabulary before installing Guild A's pattern; the demo already shows a
+  // real admit flow in Chapters 1-3, so this one stays a narrative beat, not a repeat of it.
+  state.chapter4.guildBLocalRuleNodeId = "guildBAwardedBadge";
+
+  const btn = document.createElement("button");
+  btn.id = "chapter4-grant-public-button";
+  btn.textContent = "Guild A: grant public read";
+  btn.onclick = () => grantPublicRead(container);
+  result.appendChild(btn);
+}
+
+async function grantPublicRead(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    await postJson(`/tenants/${state.guildA.tenantId}/policies`, state.guildA.aliceToken, {
+      effect: "allow", modes: ["read"], matcher: "public",
+    });
+
+    const btn = document.createElement("button");
+    btn.id = "chapter4-discover-button";
+    btn.textContent = "Guild B: discover Guild A's pattern";
+    btn.onclick = () => discoverPattern(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function discoverPattern(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    const nameLookup = await postJson(`/tenant-names/guild-a`, null, null).catch(async () => {
+      // GET, not POST — postJson always POSTs, so call fetch directly for this one lookup.
+      const res = await fetch(`${state.baseUrl}/tenant-names/guild-a`);
+      if (!res.ok) throw new HttpError(res.status, await res.text());
+      return res.json();
+    });
+
+    const store = await fetchTurtle(`/tenants/${nameLookup.tenant_id}/discovery/search?q=badge`, state.guildB.bobToken);
+    // Not the Rule node's own subject.value: a blank node has no identity outside the one Turtle
+    // document it's parsed from, and this response's top-level Rule node has zero inbound
+    // references, so Riptide.RDF.TurtleCodec's underlying writer renders it as anonymous `[...]`
+    // syntax with no label at all (confirmed live — same class of bug as the Job-matching fix in
+    // Chapters 1/2). RiptideWeb.TenantDiscoveryController.search/2 carries the real, addressable
+    // id as its own nodeId literal specifically so a real client can recover it.
+    const nodeIdQuad = store.getQuads(null, "urn:riptide:vocab:nodeId", null)[0];
+    state.chapter4.discoveredNodeId = nodeIdQuad.object.value;
+
+    const payoff = document.createElement("div");
+    payoff.className = "payoff";
+    payoff.textContent = `Discovered: ${state.chapter4.discoveredNodeId}`;
+    result.appendChild(payoff);
+
+    const btn = document.createElement("button");
+    btn.id = "chapter4-install-button";
+    btn.textContent = "Guild B: install it";
+    btn.onclick = () => installPattern(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function installPattern(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    const installed = await postJson(`/tenants/${state.guildB.tenantId}/install`, state.guildB.bobToken, {
+      source_tenant_id: state.guildA.tenantId,
+      node_id: state.chapter4.discoveredNodeId,
+    });
+    state.chapter4.installReviewNodeId = installed.node_id;
+
+    const btn = document.createElement("button");
+    btn.id = "chapter4-approve-install-button";
+    btn.textContent = "Approve the install";
+    btn.onclick = () => approveInstall(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function approveInstall(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    await postJson(`/tenants/${state.guildB.tenantId}/pending-reviews/${state.chapter4.installReviewNodeId}/approve`, state.guildB.bobToken, {});
+
+    const btn = document.createElement("button");
+    btn.id = "chapter4-v2-button";
+    btn.textContent = "Guild A: teach a \"new\" badge variant";
+    btn.onclick = () => proposeRedundantVariant(container);
+    result.appendChild(btn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+// Not a version-supersede beat: DedupGate.classify/2 only ever produces :merge (a proposal
+// superseding an existing entry) when the existing entry is narrower than the new candidate. But
+// Chapter 3's own pattern already generalizes to the single most-general shape this one-string-arg
+// capability can have (any two badge invocations anti-unify to the exact same Var-shaped Rule) —
+// so no later badge-flavored proposal against it can ever be broader, only identical. Confirmed
+// live via direct replay: every such proposal comes back {"outcome":"rejected","reason":
+// ":already_covered"}, never :merge. That rejection IS the real, true, correct behavior to show
+// here — DedupGate recognizing genuinely redundant knowledge and refusing to duplicate it — so
+// this step's payoff is that recognition, not a fabricated "v1 superseded" outcome.
+async function proposeRedundantVariant(container) {
+  const result = document.getElementById("chapter4-result");
+  try {
+    // Worded with no "badge"/"result" word so Discovery.find/2 (which would otherwise resolve it
+    // instantly against the already-admitted pattern) never intercepts it before it reaches LLM
+    // fallback — the point here is a genuinely fresh Trace reaching DedupGate's own classification.
+    const variantTask = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, {
+      description: "forge a token for the newest arrival",
+    });
+
+    const proposed = await postJson(`/tenants/${state.guildA.tenantId}/propose`, state.guildA.aliceToken, {
+      job1: state.chapter1.jobNodeId,
+      job2: variantTask.job_node,
+      replaces: state.chapter3.patternNodeId,
+    });
+
+    const payoff = document.createElement("div");
+    payoff.className = "payoff";
+    payoff.innerHTML = `
+      <p><strong>Already covered!</strong> (outcome: ${proposed.outcome}${proposed.reason ? `, reason: ${proposed.reason}` : ""})</p>
+      <p>Guild A's existing pattern already generalizes over every badge message — DedupGate recognized
+      this "new" variant teaches nothing it doesn't already know, and declined to duplicate it.</p>
     `;
     result.appendChild(payoff);
     addNextButton(result);

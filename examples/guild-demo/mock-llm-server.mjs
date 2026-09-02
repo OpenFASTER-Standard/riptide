@@ -30,6 +30,18 @@ const CANNED_COMPLETIONS = [
     rule:
       'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guildDemoCurse, Result).',
   },
+  // Chapter 4's "ship a v2" step (Task 6): needs a Job with a real, freshly-resolved trace to
+  // generalize a superseding pattern from — reusing either of the two Jobs already generalized
+  // into v1 just reproduces the identical Rule, which DedupGate correctly rejects as redundant
+  // (confirmed live). Worded with no "badge"/"result" word at all so Discovery.find/2's own
+  // tokenized word-overlap match (against v1's already-admitted badgeResult predicate) never
+  // intercepts this Task before it reaches LLM fallback — same head predicate as the other two
+  // badge completions, per the exact-head-match constraint noted above.
+  {
+    match: "forge a token for the newest arrival",
+    rule:
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "You\'re the newest arrival!", Result).',
+  },
 ];
 
 function findCompletion(prompt) {

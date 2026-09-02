@@ -133,6 +133,24 @@ async function runChapters(page) {
   log("Chapter 3 passed");
   await page.click('button:has-text("Next chapter")');
 
+  // Chapter 4
+  await page.click('#chapter4-begin-guildb-button');
+  await page.waitForSelector('#chapter4-admit-local-button', { timeout: 10000 });
+  await page.click('#chapter4-admit-local-button');
+  await page.waitForSelector('#chapter4-grant-public-button', { timeout: 10000 });
+  await page.click('#chapter4-grant-public-button');
+  await page.waitForSelector('#chapter4-discover-button', { timeout: 10000 });
+  await page.click('#chapter4-discover-button');
+  await page.waitForSelector('#chapter4-install-button', { timeout: 10000 });
+  await page.click('#chapter4-install-button');
+  await page.waitForSelector('#chapter4-approve-install-button', { timeout: 10000 });
+  await page.click('#chapter4-approve-install-button');
+  await page.waitForSelector('#chapter4-v2-button', { timeout: 10000 });
+  await page.click('#chapter4-v2-button');
+  await page.waitForSelector('.payoff:has-text("Already covered")', { timeout: 15000 });
+  log("Chapter 4 passed");
+  await page.click('button:has-text("Next chapter")');
+
   // Later tasks append one more `log(...)` + assertion block here per Chapter, in order.
 }
 

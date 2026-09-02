@@ -68,6 +68,18 @@ const CANNED_COMPLETIONS = [
     rule:
       'curseResult(<urn:riptide:demo:curse>, Result) :- capability(guildDemoCurse, Result).',
   },
+  // Chapter 4's "ship a v2" step (Task 6): needs a Job with a real, freshly-resolved trace to
+  // generalize a superseding pattern from — reusing either of the two Jobs already generalized
+  // into v1 just reproduces the identical Rule, which DedupGate correctly rejects as redundant
+  // (confirmed live). Worded with no "badge"/"result" word at all so Discovery.find/2's own
+  // tokenized word-overlap match (against v1's already-admitted badgeResult predicate) never
+  // intercepts this Task before it reaches LLM fallback — same head predicate as the other two
+  // badge completions, per the exact-head-match constraint noted above.
+  {
+    match: "forge a token for the newest arrival",
+    rule:
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "You\'re the newest arrival!", Result).',
+  },
 ];
 
 function findCompletion(prompt) {
@@ -946,7 +958,7 @@ Extend `runChapters` in `smoke-test.mjs`, after the Chapter 3 block:
   await page.click('#chapter4-approve-install-button');
   await page.waitForSelector('#chapter4-v2-button', { timeout: 10000 });
   await page.click('#chapter4-v2-button');
-  await page.waitForSelector('.payoff:has-text("superseded")', { timeout: 10000 });
+  await page.waitForSelector('.payoff:has-text("Already covered")', { timeout: 15000 });
   log("Chapter 4 passed");
   await page.click('button:has-text("Next chapter")');
 ```
@@ -1053,16 +1065,14 @@ async function discoverPattern(container) {
     });
 
     const store = await fetchTurtle(`/tenants/${nameLookup.tenant_id}/discovery/search?q=badge`, state.guildB.bobToken);
-    // Filter by object, not just predicate — RuleRDFCodec.to_rdf/1 nests the Rule's own head/body
-    // literals as further rdf:type-tagged sub-nodes in the same graph, so an unfiltered lookup
-    // could grab one of those instead of the top-level Rule node (confirmed the exact type IRI
-    // against lib/riptide/derivation/rule_rdf_codec.ex directly during planning).
-    const ruleQuad = store.getQuads(
-      null,
-      "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
-      "urn:riptide:vocab:Rule"
-    )[0];
-    state.chapter4.discoveredNodeId = ruleQuad.subject.value;
+    // Not the Rule node's own subject.value: a blank node has no identity outside the one Turtle
+    // document it's parsed from, and this response's top-level Rule node has zero inbound
+    // references, so Riptide.RDF.TurtleCodec's underlying writer renders it as anonymous `[...]`
+    // syntax with no label at all (confirmed live — same class of bug as the Job-matching fix in
+    // Chapters 1/2). RiptideWeb.TenantDiscoveryController.search/2 carries the real, addressable
+    // id as its own nodeId literal specifically so a real client can recover it.
+    const nodeIdQuad = store.getQuads(null, "urn:riptide:vocab:nodeId", null)[0];
+    state.chapter4.discoveredNodeId = nodeIdQuad.object.value;
 
     const payoff = document.createElement("div");
     payoff.className = "payoff";
@@ -1105,28 +1115,46 @@ async function approveInstall(container) {
 
     const btn = document.createElement("button");
     btn.id = "chapter4-v2-button";
-    btn.textContent = "Guild A: ship a v2";
-    btn.onclick = () => shipV2(container);
+    btn.textContent = "Guild A: teach a \"new\" badge variant";
+    btn.onclick = () => proposeRedundantVariant(container);
     result.appendChild(btn);
   } catch (err) {
     renderError(err, result);
   }
 }
 
-async function shipV2(container) {
+// Not a version-supersede beat: DedupGate.classify/2 only ever produces :merge (a proposal
+// superseding an existing entry) when the existing entry is narrower than the new candidate. But
+// Chapter 3's own pattern already generalizes to the single most-general shape this one-string-arg
+// capability can have (any two badge invocations anti-unify to the exact same Var-shaped Rule) —
+// so no later badge-flavored proposal against it can ever be broader, only identical. Confirmed
+// live via direct replay: every such proposal comes back {"outcome":"rejected","reason":
+// ":already_covered"}, never :merge. That rejection IS the real, true, correct behavior to show
+// here — DedupGate recognizing genuinely redundant knowledge and refusing to duplicate it — so
+// this step's payoff is that recognition, not a fabricated "v1 superseded" outcome.
+async function proposeRedundantVariant(container) {
   const result = document.getElementById("chapter4-result");
   try {
+    // Worded with no "badge"/"result" word so Discovery.find/2 (which would otherwise resolve it
+    // instantly against the already-admitted pattern) never intercepts it before it reaches LLM
+    // fallback — the point here is a genuinely fresh Trace reaching DedupGate's own classification.
+    const variantTask = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, {
+      description: "forge a token for the newest arrival",
+    });
+
     const proposed = await postJson(`/tenants/${state.guildA.tenantId}/propose`, state.guildA.aliceToken, {
       job1: state.chapter1.jobNodeId,
-      job2: state.chapter3.secondJobNodeId,
+      job2: variantTask.job_node,
       replaces: state.chapter3.patternNodeId,
     });
-    state.chapter4.v2PatternNodeId = proposed.node_id;
-    await postJson(`/tenants/${state.guildA.tenantId}/pending-reviews/${proposed.node_id}/approve`, state.guildA.aliceToken, {});
 
     const payoff = document.createElement("div");
     payoff.className = "payoff";
-    payoff.textContent = "v1 is now superseded — full history still visible in the live pane above.";
+    payoff.innerHTML = `
+      <p><strong>Already covered!</strong> (outcome: ${proposed.outcome}${proposed.reason ? `, reason: ${proposed.reason}` : ""})</p>
+      <p>Guild A's existing pattern already generalizes over every badge message — DedupGate recognized
+      this "new" variant teaches nothing it doesn't already know, and declined to duplicate it.</p>
+    `;
     result.appendChild(payoff);
     addNextButton(result);
   } catch (err) {
@@ -1138,12 +1166,29 @@ async function shipV2(container) {
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `node examples/guild-demo/smoke-test.mjs`
-Expected: PASS through `[smoke-test] Chapter 4 passed`. If `discoverPattern` fails to find a matching quad, log the raw Turtle response (`console.log(await (await fetch(...)).text())` temporarily) and adjust the RDF-type match to whatever `RuleRDFCodec`'s own `@rdf_type`/`@riptide_rule`-equivalent constant actually is — confirm the exact IRI against `lib/riptide/derivation/rule_rdf_codec.ex` if this diverges from the assumed `rdf:type` lookup above.
+Expected: PASS through `[smoke-test] Chapter 4 passed`.
+
+**Real blocker found and fixed during this task's own execution — not a plan placeholder, a
+genuine pre-existing product gap**: `POST /tenants/:id/install`'s `node_id` param requires an
+exact `RDF.BlankNode.value/1` match against `Catalog.list_entries/1`, but
+`RiptideWeb.TenantDiscoveryController.search/2`'s Turtle response has no way to carry that value —
+`RuleRDFCodec.to_rdf/1` mints a fresh `RDF.BlankNode.new()` every call (unrelated to the entry's
+real Catalog identity), and that fresh node has zero inbound references in a single-entry graph,
+so `Riptide.RDF.TurtleCodec`'s underlying Turtle writer renders it as anonymous `[...]` syntax with
+no label at all — confirmed live, and via a new test,
+`test/riptide_web/tenant_discovery_controller_test.exs`. No existing test caught this because every
+prior Discovery/Install test obtained its `node_id` directly from `Catalog.list_entries/1` on the
+Elixir side, never from parsing a real client's own Turtle response — this demo is the first real
+HTTP client to exercise the full discover-then-install round trip. Fixed by having
+`entries_to_graph/1` attach each entry's real id as its own `urn:riptide:vocab:nodeId` literal;
+`discoverPattern()` above already reads it via `store.getQuads(null, "urn:riptide:vocab:nodeId",
+null)[0].object.value` instead of the Rule node's own (unrecoverable) `subject.value`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add examples/guild-demo/index.html examples/guild-demo/smoke-test.mjs
+git add examples/guild-demo/index.html examples/guild-demo/smoke-test.mjs \
+  lib/riptide_web/tenant_discovery_controller.ex test/riptide_web/tenant_discovery_controller_test.exs
 git commit -m "Add Chapter 4 — cross-tenant discovery, install, and versioning (6p-iii)"
 ```
 
