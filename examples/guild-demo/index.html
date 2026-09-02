@@ -189,6 +189,49 @@ function addNextButton(container, label = "Next chapter →") {
   container.appendChild(btn);
 }
 
+// ---------------------------------------------------------------------------
+// Chapter 0: Bootstrap
+// ---------------------------------------------------------------------------
+CHAPTERS.push({
+  title: "Chapter 0: Bootstrap",
+  render(container) {
+    container.innerHTML = `
+      <h2>Chapter 0: Bootstrap</h2>
+      <p>Every run of this demo mints a brand-new guild. Point it at your Riptide instance:</p>
+      <label>API base URL: <input type="url" id="base-url-input" value="http://localhost:4000" /></label>
+      <button id="begin-button">Begin</button>
+      <div id="chapter0-result"></div>
+    `;
+    document.getElementById("begin-button").onclick = () => beginChapter0(container);
+  },
+});
+
+async function beginChapter0(container) {
+  const result = document.getElementById("chapter0-result");
+  result.innerHTML = "";
+  state.baseUrl = document.getElementById("base-url-input").value;
+
+  try {
+    const passwordHash = await sha256hex("guild-demo-pw");
+    const response = await postJson("/auth/signup", null, {
+      name: "guild-a",
+      username: "alice",
+      password_hash: passwordHash,
+    });
+    state.guildA.tenantId = response.tenant_id;
+    state.guildA.aliceToken = response.token;
+    state.guildA.aliceSub = response.sub;
+
+    const payoff = document.createElement("div");
+    payoff.className = "payoff";
+    payoff.textContent = "Welcome, Alice of Guild A!";
+    result.appendChild(payoff);
+    addNextButton(result);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", renderCurrentChapter);
 </script>
 </body>
