@@ -17,9 +17,6 @@ defmodule Riptide.BlobStoreCapstoneTest do
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
 
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
-
     def start(policies_by_prefix) do
       case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
         {:ok, pid} -> pid
@@ -72,7 +69,7 @@ defmodule Riptide.BlobStoreCapstoneTest do
 
     assert {:ok, output} = Capability.invoke(definition, "acme", nil, ["World"])
 
-    assert {:ok, hash} = BlobStore.put(output)
+    assert {:ok, hash} = BlobStore.put("acme", output)
 
     # The hash-pointer Fact: an ordinary RDF triple a real ExecuteInterpreter
     # caller would write onto whatever resource this Capability's result
@@ -92,6 +89,6 @@ defmodule Riptide.BlobStoreCapstoneTest do
       |> String.trim_leading("urn:riptide-blob:sha256:")
 
     assert extracted_hash == hash
-    assert {:ok, ^output} = BlobStore.get(extracted_hash)
+    assert {:ok, ^output} = BlobStore.get("acme", extracted_hash)
   end
 end

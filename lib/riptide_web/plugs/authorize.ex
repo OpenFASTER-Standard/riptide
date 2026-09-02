@@ -1,16 +1,13 @@
 defmodule RiptideWeb.Plugs.Authorize do
   @moduledoc """
-  Enforces `Riptide.Authz.evaluate/4`'s decision on every tenant-scoped LDP
-  route — mirrors `RiptideWeb.Plugs.ResolveTenant`/`Authenticate`'s shape.
-  Halts with `403` on deny.
+  Enforces `Riptide.Authz.evaluate/4`'s decision on every tenant-scoped LDP route — mirrors
+  `RiptideWeb.Plugs.ResolveTenant`/`Authenticate`'s shape. Halts with `403` on deny.
 
-  On an otherwise-denied *authenticated write*, first checks whether the
-  tenant is still unclaimed (see the Phase 4c design spec §6):
-  `Riptide.Authz.Store.claim_tenant_if_unclaimed/2` is a single atomic Ra
-  command, not a separate check-then-add pair of calls, so a race between
-  two different agents both attempting to be "first write" to the same
-  brand-new tenant resolves to exactly one owner. Anonymous requests and
-  reads never reach this path — they're just denied.
+  There is no bootstrap-on-first-write fallback (removed in Phase 6q, design spec
+  `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md` §4.4): `tenant_id` is now
+  an opaque, self-generated UUID nobody could ever guess or write to before it exists — a tenant only
+  ever comes into being via the explicit `Riptide.Accounts.sign_up/3` sequence, so there is no
+  "unclaimed tenant someone stumbles onto" case left to handle here.
   """
   import Plug.Conn
 
@@ -26,48 +23,39 @@ defmodule RiptideWeb.Plugs.Authorize do
     path_segments = Map.get(conn.params, "path") || []
     mode = mode_for(conn.method)
 
-    case Riptide.Authz.evaluate(scope, path_segments, current_subject, mode) do
-      :allow -> conn
-      :deny -> maybe_bootstrap(conn, scope, current_subject, mode)
+    case Riptide.Authz.evaluate_with_matcher(scope, path_segments, current_subject, mode) do
+      {:allow, :public} -> check_public_read_rate_limit(conn)
+      {:allow, _other_matcher} -> conn
+      :deny -> reject(conn)
     end
   rescue
     _ -> service_unavailable(conn)
   catch
-    # Riptide.Authz.evaluate/4 (and claim_tenant_if_unclaimed/2 below) can
-    # raise/exit if the placement cluster backing the policy store is fully
-    # unreachable (Riptide.Placement's own documented raise-on-total-failure
-    # behavior) — every authenticated LDP/policy route goes through this
-    # plug, so left uncaught this surfaces as a generic Phoenix 500 with no
-    # way for a caller/load-balancer to tell "genuinely forbidden" apart
-    # from "transient, back off and retry," the same distinction
-    # RiptideWeb.HealthController's /health/ready already makes for this
-    # exact failure mode.
+    # Riptide.Authz.evaluate_with_matcher/4 can raise/exit if the placement cluster backing the
+    # policy store is fully unreachable (Riptide.Placement's own documented raise-on-total-failure
+    # behavior) — every authenticated LDP/policy route goes through this plug, so left uncaught this
+    # surfaces as a generic Phoenix 500 with no way for a caller/load-balancer to tell "genuinely
+    # forbidden" apart from "transient, back off and retry," the same distinction
+    # RiptideWeb.HealthController's /health/ready already makes for this exact failure mode.
     :exit, _ -> service_unavailable(conn)
   end
 
-  # Guards against `current_subject["sub"]` being `nil` (bootstrapping the
-  # tenant with an `{:agent, nil}` owner policy that would then match any
-  # other subject-less token — see `Riptide.Authz`'s own guard on this same
-  # shape). `Riptide.Auth.TokenConfig` requires `sub` on every verified
-  # token, so this should not be reachable in practice; kept as defense in
-  # depth rather than trusting that invariant to hold from this call site
-  # alone.
-  defp maybe_bootstrap(conn, {:tenant, tenant_id}, %{"sub" => sub}, :write)
-       when not is_nil(sub) do
-    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
+  defp mode_for("GET"), do: :read
+  defp mode_for(_other), do: :write
 
-    case store.claim_tenant_if_unclaimed(tenant_id, sub) do
-      :claimed -> conn
-      :already_claimed -> reject(conn)
+  defp check_public_read_rate_limit(conn) do
+    case conn |> rate_limit_key() |> Riptide.PublicReadRateLimit.check() do
+      :allow -> conn
+      :deny -> conn |> send_resp(429, "") |> halt()
     end
   end
 
-  # Covers :hub (never reaches Authorize in practice — no write route exists for it) and any
-  # future non-tenant scope; keeps this function total instead of relying on that never happening.
-  defp maybe_bootstrap(conn, _scope, _current_subject, _mode), do: reject(conn)
-
-  defp mode_for("GET"), do: :read
-  defp mode_for(_other), do: :write
+  defp rate_limit_key(conn) do
+    case conn.assigns.current_subject do
+      %{"sub" => sub} when is_binary(sub) -> sub
+      _ -> conn.remote_ip |> :inet.ntoa() |> to_string()
+    end
+  end
 
   defp reject(conn) do
     conn

@@ -22,12 +22,13 @@ defmodule RiptideWeb.UsernamePasswordAuthCapstoneTest do
   end
 
   test "signup -> invite a teammate via the existing generic write route -> both log in independently -> both tokens work through the existing Authenticate/Authorize pipeline" do
-    tenant_id = "capstone-tenant-#{System.unique_integer([:positive])}"
+    name = "capstone-tenant-" <> Uniq.UUID.uuid4()
 
-    # 1. Alice signs up, creating the Tenant and her own account together.
+    # 1. Alice signs up, creating the Tenant (self-generated UUID, coordinated only by
+    # its own human-chosen name) and her own account together.
     signup_body =
       Jason.encode!(%{
-        "tenant_id" => tenant_id,
+        "name" => name,
         "username" => "alice",
         "password_hash" => String.duplicate("a", 64)
       })
@@ -39,7 +40,7 @@ defmodule RiptideWeb.UsernamePasswordAuthCapstoneTest do
       |> RiptideWeb.Endpoint.call(@opts)
 
     assert signup_conn.status == 200
-    alice_token = Jason.decode!(signup_conn.resp_body)["token"]
+    %{"token" => alice_token, "tenant_id" => tenant_id} = Jason.decode!(signup_conn.resp_body)
 
     # 2. Alice invites Bob by writing a second account fact directly, using her own
     # token via the EXISTING generic write route (PUT, not POST — a client-named
@@ -82,10 +83,10 @@ defmodule RiptideWeb.UsernamePasswordAuthCapstoneTest do
 
     assert grant_policy_conn.status == 201
 
-    # 3. Bob logs in independently.
+    # 3. Bob logs in independently, by the same human-chosen name Alice signed up with.
     bob_login_body =
       Jason.encode!(%{
-        "tenant_id" => tenant_id,
+        "name" => name,
         "username" => "bob",
         "password_hash" => String.duplicate("b", 64)
       })

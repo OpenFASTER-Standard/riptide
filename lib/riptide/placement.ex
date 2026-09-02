@@ -102,28 +102,29 @@ defmodule Riptide.Placement do
     end)
   end
 
-  @spec add_policy(String.t(), [String.t()], Riptide.Authz.Policy.t()) ::
-          :ok | {:error, :too_many_policies}
-  def add_policy(tenant_id, path_prefix, policy) do
+  # See Riptide.Placement.PlacementMachine's own moduledoc ("Name registry")
+  # for the full rationale — replaces the old claim_tenant_if_unclaimed/2,
+  # which arbitrated a race over tenant_id itself; that race no longer
+  # exists now that tenant_id is a locally-generated UUID, but a
+  # human-chosen name still needs exactly this kind of arbitration.
+  @spec claim_name(String.t(), String.t()) :: :claimed | :already_claimed
+  def claim_name(name, tenant_id) do
     with_current_members(fn server_id ->
-      RaCluster.process_command(server_id, {:add_policy, tenant_id, path_prefix, policy})
+      RaCluster.process_command(server_id, {:claim_name, name, tenant_id})
     end)
   end
 
-  @spec list_policies(String.t(), [String.t()]) :: [Riptide.Authz.Policy.t()]
-  def list_policies(tenant_id, path_prefix) do
+  @spec lookup_name(String.t()) :: String.t() | nil
+  def lookup_name(name) do
     with_current_members(fn server_id ->
-      RaCluster.consistent_query(
-        server_id,
-        &PlacementMachine.list_policies(&1, tenant_id, path_prefix)
-      )
+      RaCluster.consistent_query(server_id, &PlacementMachine.get_name(&1, name))
     end)
   end
 
-  @spec claim_tenant_if_unclaimed(String.t(), String.t()) :: :claimed | :already_claimed
-  def claim_tenant_if_unclaimed(tenant_id, subject) do
+  @spec list_all_names() :: %{String.t() => String.t()}
+  def list_all_names do
     with_current_members(fn server_id ->
-      RaCluster.process_command(server_id, {:claim_tenant_if_unclaimed, tenant_id, subject})
+      RaCluster.consistent_query(server_id, &PlacementMachine.list_names/1)
     end)
   end
 

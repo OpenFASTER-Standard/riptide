@@ -28,9 +28,6 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
 
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
-
     def start(policies_by_prefix) do
       case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
         {:ok, pid} -> pid
@@ -49,7 +46,13 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
   test "exit criterion: register via real HTTP, approve, resolve and invoke by IRI alone" do
     tenant_id = "capstone-" <> Uniq.UUID.uuid4()
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
 
     on_exit(fn ->
       Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))
@@ -76,7 +79,7 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
     propose_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capabilities", body)
+      |> conn("/tenants/#{tenant_id}/capabilities", body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -86,7 +89,7 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
     approve_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capability-reviews/#{node_id}/approve")
+      |> conn("/tenants/#{tenant_id}/capability-reviews/#{node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
@@ -99,14 +102,14 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
     local_name = String.trim_leading(name, "urn:riptide:capability:")
 
     FakeStore.start(%{
-      {"acme", ["capabilities", local_name]} => [
+      {tenant_id, ["capabilities", local_name]} => [
         %Policy{effect: :allow, modes: [:invoke], matcher: :public}
       ]
     })
 
-    assert {:ok, entry} = CapabilityCatalog.find_by_name(RDF.iri(name))
-    assert {:ok, definition} = CapabilityCatalog.materialize(entry)
-    assert {:ok, result} = Capability.invoke(definition, "acme", nil, ["World"])
+    assert {:ok, entry} = CapabilityCatalog.find_by_name({:tenant, tenant_id}, RDF.iri(name))
+    assert {:ok, definition} = CapabilityCatalog.materialize(tenant_id, entry)
+    assert {:ok, result} = Capability.invoke(definition, tenant_id, nil, ["World"])
     assert result == "\"Hello, World!\""
   end
 end

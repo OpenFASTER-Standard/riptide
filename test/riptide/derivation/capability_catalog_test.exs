@@ -40,12 +40,15 @@ defmodule Riptide.Derivation.CapabilityCatalogTest do
     }
   end
 
-  test "materialize/1 reuses an already-local BlobStore replica without a network fetch" do
+  defp tenant_id, do: "cap-catalog-test-" <> Uniq.UUID.uuid4()
+
+  test "materialize/2 reuses an already-local BlobStore replica without a network fetch" do
+    tenant_id = tenant_id()
     bytes = :crypto.strong_rand_bytes(1024)
-    {:ok, hash} = BlobStore.put(bytes)
+    {:ok, hash} = BlobStore.put(tenant_id, bytes)
     entry = sample_entry(hash)
 
-    assert {:ok, %Definition{} = definition} = CapabilityCatalog.materialize(entry)
+    assert {:ok, %Definition{} = definition} = CapabilityCatalog.materialize(tenant_id, entry)
 
     assert definition.name == entry.name
     assert definition.kind == entry.kind
@@ -54,13 +57,13 @@ defmodule Riptide.Derivation.CapabilityCatalogTest do
     assert definition.timeout_ms == entry.timeout_ms
     assert definition.memory_limits == entry.memory_limits
     # Reused BlobStore's own on-disk path directly — no separate cache copy.
-    assert definition.component == BlobStore.path_for(hash)
+    assert definition.component == BlobStore.path_for(tenant_id, hash)
     assert File.read!(definition.component) == bytes
   end
 
-  test "materialize/1 for a hash that exists nowhere returns an error" do
+  test "materialize/2 for a hash that exists nowhere returns an error" do
     entry = sample_entry(String.duplicate("0", 64))
 
-    assert {:error, _reason} = CapabilityCatalog.materialize(entry)
+    assert {:error, _reason} = CapabilityCatalog.materialize(tenant_id(), entry)
   end
 end

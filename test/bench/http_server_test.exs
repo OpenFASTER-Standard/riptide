@@ -64,7 +64,7 @@ defmodule Riptide.Bench.HttpServer do
     {:ok, _pid} = Supervisor.restart_child(Riptide.Supervisor, RiptideWeb.Endpoint)
 
     :ok =
-      Store.Placement.add_policy(@tenant_id, [], %Policy{
+      Store.TenantFacts.add_policy(@tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read, :write],
         matcher: :public

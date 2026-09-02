@@ -27,51 +27,65 @@ defmodule Riptide.BlobStoreClusterTest do
     :ok
   end
 
-  test "put/1 replicates to RF other live nodes; get/1 succeeds from a node that never wrote it" do
+  test "put/2 replicates to RF other live nodes; get/2 succeeds from a node that never wrote it" do
     peers = bootstrap_peers(@peers)
     [{_pid_a, node_a, _}, {_pid_b, node_b, _}, {_pid_c, node_c, _}] = peers
 
+    tenant_id = "blob-cluster-" <> Uniq.UUID.uuid4()
     bytes = :crypto.strong_rand_bytes(1024)
 
-    assert {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [bytes])
+    assert {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [tenant_id, bytes])
 
     assert eventually(fn ->
-             case :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [hash]) do
+             case :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [
+                    tenant_id,
+                    hash
+                  ]) do
                {:ok, nodes} -> Enum.sort(nodes) == Enum.sort([node_a, node_b, node_c])
                _ -> false
              end
            end)
 
-    # node_c never received the original put/1 directly from a test call —
-    # it only has a copy because put/1's own replication pushed one there.
-    assert {:ok, ^bytes} = :erpc.call(node_c, Riptide.BlobStore, :get, [hash])
+    # node_c never received the original put/2 directly from a test call —
+    # it only has a copy because put/2's own replication pushed one there.
+    assert {:ok, ^bytes} = :erpc.call(node_c, Riptide.BlobStore, :get, [tenant_id, hash])
   end
 
   test "a corrupted local copy is rejected on read, not silently served" do
     peers = bootstrap_peers(@peers)
     [{_pid_a, node_a, _}, _peer_b, _peer_c] = peers
 
+    tenant_id = "blob-cluster-" <> Uniq.UUID.uuid4()
     bytes = :crypto.strong_rand_bytes(1024)
-    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [bytes])
+    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [tenant_id, bytes])
 
     # Corrupt node_a's own local copy directly on disk.
-    path = :erpc.call(node_a, Riptide.BlobStore, :path_for, [hash])
+    path = :erpc.call(node_a, Riptide.BlobStore, :path_for, [tenant_id, hash])
     :erpc.call(node_a, File, :write, [path, "corrupted"])
 
-    assert {:error, :not_found} = :erpc.call(node_a, Riptide.BlobStore, :get, [hash])
+    assert {:error, :not_found} = :erpc.call(node_a, Riptide.BlobStore, :get, [tenant_id, hash])
   end
 
   test "healer repairs a blob after its holding node dies" do
     peers = bootstrap_peers(@peers ++ [@spare])
     [{_pid_a, node_a, _}, {_pid_b, _node_b, _}, {_pid_c, node_c, _}, {_pid_d, _node_d, _}] = peers
 
+    # Healer.sweep/0's own known_tenant_ids/0 discovers tenants via the name
+    # registry — a tenant with no claimed name is invisible to it, so the
+    # tenant must actually claim one here just like a real signup would.
+    tenant_id = "blob-cluster-healer-" <> Uniq.UUID.uuid4()
+    assert :claimed = :erpc.call(node_a, Riptide.Placement, :claim_name, [tenant_id, tenant_id])
+
     bytes = :crypto.strong_rand_bytes(1024)
-    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [bytes])
+    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [tenant_id, bytes])
 
     assert eventually(fn ->
              match?(
                {:ok, [_, _, _]},
-               :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [hash])
+               :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [
+                 tenant_id,
+                 hash
+               ])
              )
            end)
 
@@ -81,7 +95,10 @@ defmodule Riptide.BlobStoreClusterTest do
              fn ->
                :erpc.call(node_a, Riptide.BlobStore.Healer, :sweep, [])
 
-               case :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [hash]) do
+               case :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [
+                      tenant_id,
+                      hash
+                    ]) do
                  {:ok, nodes} -> length(nodes) == 3 and node_c not in nodes
                  _ -> false
                end
@@ -90,8 +107,10 @@ defmodule Riptide.BlobStoreClusterTest do
            )
 
     # The repaired-in replica set still serves the original bytes correctly.
-    {:ok, [n | _]} = :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [hash])
-    assert {:ok, ^bytes} = :erpc.call(n, Riptide.BlobStore, :get, [hash])
+    {:ok, [n | _]} =
+      :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [tenant_id, hash])
+
+    assert {:ok, ^bytes} = :erpc.call(n, Riptide.BlobStore, :get, [tenant_id, hash])
   end
 
   # Bare `:peer` nodes never boot the full Riptide.Application (its

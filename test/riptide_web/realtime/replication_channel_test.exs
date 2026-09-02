@@ -9,7 +9,6 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   require Logger
 
   alias Riptide.Authz.{Policy, Store}
-  alias Riptide.Derivation.{CapabilityCatalogEntry, Catalog}
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
@@ -37,7 +36,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   # authorization now being enforced doesn't change their expected outcomes,
   # same pattern as `sse_controller_test.exs`'s Task 7 setup.
   setup do
-    Store.Placement.add_policy("ws-test-tenant", [], %Policy{
+    Store.TenantFacts.add_policy("ws-test-tenant", [], %Policy{
       effect: :allow,
       modes: [:read],
       matcher: :public
@@ -206,7 +205,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
     :ok =
-      Store.Placement.add_policy(tenant_id, [], %Policy{
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -265,29 +264,11 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     assert Logger.metadata()[:subject] == "user-1"
   end
 
-  test "joining a Hub-shaped topic succeeds for an admitted Hub resource" do
-    name = "urn:riptide:capability:wshub-#{System.unique_integer([:positive])}"
+  test "joining a topic resolving to a :public-granted tenant resource succeeds" do
+    stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    StreamSupervisor.ensure_ready(stream_id)
 
-    entry = %CapabilityCatalogEntry{
-      name: RDF.iri(name),
-      kind: :effect,
-      component_hash: String.duplicate("b", 64),
-      function: "run",
-      fuel_limit: 10_000_000,
-      timeout_ms: 5_000,
-      memory_limits: %{
-        max_memory_size: nil,
-        max_table_elements: nil,
-        max_instances: nil,
-        max_tables: nil
-      }
-    }
-
-    # Deliberately no on_exit cleanup — see sse_controller_test.exs's
-    # identical new test for why (shared, non-unique Hub stream).
-    :ok = Catalog.admit_capability(entry, nil)
-
-    stream_id = "https://riptide.example/hub/resources/catalog/capabilities"
     {:ok, socket} = connect(Socket, %{})
 
     assert {:ok, _reply, _socket} =
@@ -296,10 +277,10 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
              })
   end
 
-  test "joining a Hub-shaped topic is rate-limited" do
-    Riptide.AppEnvTestHelpers.put_env(:riptide, :hub_read_rate_limit, 0)
+  test "joining a topic resolving to a :public-granted tenant resource is rate-limited" do
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :public_read_rate_limit, 0)
 
-    stream_id = "https://riptide.example/hub/resources/catalog"
+    stream_id = unique_stream_id()
     {:ok, socket} = connect(Socket, %{})
 
     assert {:error, %{"reason" => "rate_limited"}} =
@@ -312,7 +293,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     setup do
       Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
 
-      Store.Placement.add_policy("ws-ratelimit-test-tenant", [], %Policy{
+      Store.TenantFacts.add_policy("ws-ratelimit-test-tenant", [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public

@@ -33,13 +33,17 @@ defmodule Riptide.Derivation.CatalogTest do
                "https://riptide.example/tenants/acme/resources/catalog"
     end
 
-    test "catalog_stream_id/1 for the Hub scope" do
-      assert Catalog.catalog_stream_id(:hub) == "https://riptide.example/hub/resources/catalog"
-    end
-
     test "pending_review_stream_id/1 for a Tenant scope" do
       assert Catalog.pending_review_stream_id({:tenant, "acme"}) ==
                "https://riptide.example/tenants/acme/resources/catalog/pending-review"
+    end
+
+    test "capability_stream_id/1 and crosswalk_stream_id/1 are scope-polymorphic" do
+      assert Catalog.capability_stream_id({:tenant, "acme"}) ==
+               "https://riptide.example/tenants/acme/resources/catalog/capabilities"
+
+      assert Catalog.crosswalk_stream_id({:tenant, "acme"}) ==
+               "https://riptide.example/tenants/acme/resources/catalog/crosswalks"
     end
   end
 
@@ -96,8 +100,11 @@ defmodule Riptide.Derivation.CatalogTest do
     end
   end
 
-  describe "admit_capability/2 + supersede_capability/1" do
-    test "a superseded capability disappears from list_capabilities/0; admitting with replaces: writes the supersedes link" do
+  describe "admit_capability/3 + supersede_capability/2" do
+    test "a superseded capability disappears from list_capabilities/1; admitting with replaces: writes the supersedes link" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.capability_stream_id(scope)) end)
+
       name = RDF.iri("urn:riptide:capability:supersede-cap-#{System.unique_integer([:positive])}")
 
       old_entry = %Riptide.Derivation.CapabilityCatalogEntry{
@@ -115,25 +122,48 @@ defmodule Riptide.Derivation.CatalogTest do
         }
       }
 
-      # Deliberately no on_exit cleanup — Catalog.capability_stream_id/0 is a
-      # single, shared, non-unique stream across the whole test suite (like
-      # :hub's own Rule catalog); see this file's own "Hub vs. Tenant scope
-      # isolation" test for why force-deleting it here would be unsafe
-      # (races any other test concurrently or subsequently writing to the
-      # same stream). This test's own `name` is already unique-suffixed and
-      # its assertions are scoped to just that name, so accumulation from
-      # other tests doesn't affect it.
-      :ok = Catalog.admit_capability(old_entry, nil)
-      {:ok, entries} = Catalog.list_capabilities()
+      :ok = Catalog.admit_capability(scope, old_entry, nil)
+      {:ok, entries} = Catalog.list_capabilities(scope)
       {old_node, ^old_entry} = Enum.find(entries, fn {_n, e} -> e.name == name end)
 
       new_entry = %{old_entry | function: "run_v2"}
-      :ok = Catalog.admit_capability(new_entry, old_node)
-      :ok = Catalog.supersede_capability(old_node)
+      :ok = Catalog.admit_capability(scope, new_entry, old_node)
+      :ok = Catalog.supersede_capability(scope, old_node)
 
-      {:ok, entries_after} = Catalog.list_capabilities()
+      {:ok, entries_after} = Catalog.list_capabilities(scope)
       matching = Enum.filter(entries_after, fn {_n, e} -> e.name == name end)
       assert [{_node, ^new_entry}] = matching
+    end
+
+    test "capabilities in one tenant's scope are invisible from another tenant's scope" do
+      scope_a = unique_tenant()
+      scope_b = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.capability_stream_id(scope_a))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.capability_stream_id(scope_b))
+      end)
+
+      entry = %Riptide.Derivation.CapabilityCatalogEntry{
+        name:
+          RDF.iri("urn:riptide:capability:isolation-cap-#{System.unique_integer([:positive])}"),
+        kind: :effect,
+        component_hash: String.duplicate("c", 64),
+        function: "run",
+        fuel_limit: 10_000_000,
+        timeout_ms: 5_000,
+        memory_limits: %{
+          max_memory_size: nil,
+          max_table_elements: nil,
+          max_instances: nil,
+          max_tables: nil
+        }
+      }
+
+      :ok = Catalog.admit_capability(scope_a, entry, nil)
+
+      assert {:ok, [{_node, ^entry}]} = Catalog.list_capabilities(scope_a)
+      assert {:ok, []} = Catalog.list_capabilities(scope_b)
     end
   end
 
@@ -197,37 +227,11 @@ defmodule Riptide.Derivation.CatalogTest do
     end
   end
 
-  describe "Hub vs. Tenant scope isolation" do
-    test "admitting into :hub never surfaces in a Tenant's list_entries/1, and vice versa" do
-      tenant_scope = unique_tenant()
+  describe "admit_crosswalk/3 + list_crosswalks/1 — real round-trip" do
+    test "an admitted Crosswalk is found live by list_crosswalks/1" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.crosswalk_stream_id(scope)) end)
 
-      # :hub is a single, shared, non-unique stream across the whole test
-      # suite (unlike unique_tenant()'s per-test isolation) — force-deleting
-      # it here would race any other test concurrently or subsequently
-      # writing to :hub (confirmed live: :ra.force_delete_server/2 on a
-      # shared stream_id can leave the very next admit_entry/1 against that
-      # same stream_id hitting :noproc before the lazy re-create catches
-      # up). Tolerate accumulation instead — that's why this test already
-      # asserts via Enum.any?/refute Enum.any? rather than an exact list.
-      on_exit(fn ->
-        Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id(tenant_scope))
-      end)
-
-      hub_rule = sample_rule("hub-pattern")
-      tenant_rule = sample_rule("tenant-pattern")
-
-      :ok = Catalog.admit_entry(:hub, hub_rule, nil)
-      :ok = Catalog.admit_entry(tenant_scope, tenant_rule, nil)
-
-      assert {:ok, [{_node, ^tenant_rule}]} = Catalog.list_entries(tenant_scope)
-      assert {:ok, hub_entries} = Catalog.list_entries(:hub)
-      assert Enum.any?(hub_entries, fn {_node, rule} -> rule == hub_rule end)
-      refute Enum.any?(hub_entries, fn {_node, rule} -> rule == tenant_rule end)
-    end
-  end
-
-  describe "admit_crosswalk/1 + list_crosswalks/0 — real round-trip" do
-    test "an admitted Crosswalk is found live by list_crosswalks/0" do
       crosswalk = %Crosswalk{
         subject_predicate:
           rel("crosswalktest-pendingDeploy#{System.unique_integer([:positive])}"),
@@ -236,15 +240,18 @@ defmodule Riptide.Derivation.CatalogTest do
         match_type: :exact_match
       }
 
-      :ok = Catalog.admit_crosswalk(crosswalk, nil)
+      :ok = Catalog.admit_crosswalk(scope, crosswalk, nil)
 
-      assert {:ok, entries} = Catalog.list_crosswalks()
+      assert {:ok, entries} = Catalog.list_crosswalks(scope)
       assert Enum.any?(entries, fn {_node, entry} -> entry == crosswalk end)
     end
   end
 
-  describe "admit_crosswalk/2 + supersede_crosswalk/1" do
-    test "a superseded crosswalk disappears from list_crosswalks/0; admitting with replaces: writes the supersedes link" do
+  describe "admit_crosswalk/3 + supersede_crosswalk/2" do
+    test "a superseded crosswalk disappears from list_crosswalks/1; admitting with replaces: writes the supersedes link" do
+      scope = unique_tenant()
+      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.crosswalk_stream_id(scope)) end)
+
       subject_predicate =
         rel("supersede-crosswalk-subject-#{System.unique_integer([:positive])}")
 
@@ -255,29 +262,44 @@ defmodule Riptide.Derivation.CatalogTest do
         match_type: :exact_match
       }
 
-      # Deliberately no on_exit cleanup — Catalog.crosswalk_stream_id/0 is a
-      # single, shared, non-unique stream across the whole test suite; see
-      # this file's own "Hub vs. Tenant scope isolation" test for why
-      # force-deleting it here would be unsafe. This test's own
-      # `subject_predicate` is already unique-suffixed and its assertions
-      # are scoped to just that predicate, so accumulation from other tests
-      # doesn't affect it.
-      :ok = Catalog.admit_crosswalk(old_crosswalk, nil)
-      {:ok, entries} = Catalog.list_crosswalks()
+      :ok = Catalog.admit_crosswalk(scope, old_crosswalk, nil)
+      {:ok, entries} = Catalog.list_crosswalks(scope)
 
       {old_node, ^old_crosswalk} =
         Enum.find(entries, fn {_n, c} -> c.subject_predicate == subject_predicate end)
 
       new_crosswalk = %{old_crosswalk | match_type: :close_match}
-      :ok = Catalog.admit_crosswalk(new_crosswalk, old_node)
-      :ok = Catalog.supersede_crosswalk(old_node)
+      :ok = Catalog.admit_crosswalk(scope, new_crosswalk, old_node)
+      :ok = Catalog.supersede_crosswalk(scope, old_node)
 
-      {:ok, entries_after} = Catalog.list_crosswalks()
+      {:ok, entries_after} = Catalog.list_crosswalks(scope)
 
       matching =
         Enum.filter(entries_after, fn {_n, c} -> c.subject_predicate == subject_predicate end)
 
       assert [{_node, ^new_crosswalk}] = matching
+    end
+
+    test "crosswalks in one tenant's scope are invisible from another tenant's scope" do
+      scope_a = unique_tenant()
+      scope_b = unique_tenant()
+
+      on_exit(fn ->
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.crosswalk_stream_id(scope_a))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.crosswalk_stream_id(scope_b))
+      end)
+
+      crosswalk = %Crosswalk{
+        subject_predicate:
+          rel("isolation-crosswalk-subject-#{System.unique_integer([:positive])}"),
+        object_predicate: rel("isolation-crosswalk-object-#{System.unique_integer([:positive])}"),
+        match_type: :exact_match
+      }
+
+      :ok = Catalog.admit_crosswalk(scope_a, crosswalk, nil)
+
+      assert {:ok, [{_node, ^crosswalk}]} = Catalog.list_crosswalks(scope_a)
+      assert {:ok, []} = Catalog.list_crosswalks(scope_b)
     end
   end
 end

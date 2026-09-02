@@ -19,9 +19,6 @@ defmodule Riptide.Capability.BadgeQrGeneratorTest do
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
 
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
-
     def start(policies_by_prefix) do
       case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
         {:ok, pid} -> pid

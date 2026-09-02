@@ -24,10 +24,6 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.Authorize
   end
 
-  pipeline :resolve_hub_scope do
-    plug RiptideWeb.Plugs.ResolveHubScope
-  end
-
   scope "/" do
     pipe_through :api
 
@@ -43,22 +39,15 @@ defmodule RiptideWeb.Router do
   end
 
   scope "/" do
+    pipe_through [:api]
+
+    get "/tenant-names/:name", RiptideWeb.Auth.TenantNamesController, :show
+  end
+
+  scope "/" do
     pipe_through [:api, :auth_query_param]
 
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
-  end
-
-  scope "/hub" do
-    pipe_through [:api, :auth]
-
-    get "/search", RiptideWeb.Hub.DiscoveryController, :search
-    get "/entries/:node_id", RiptideWeb.Hub.DiscoveryController, :show
-  end
-
-  scope "/hub" do
-    pipe_through [:api, :auth, :resolve_hub_scope, :authz]
-
-    get "/resources/*path", RiptideWeb.LDP.ResourceController, :show
   end
 
   scope "/tenants/:tenant_id" do
@@ -80,20 +69,18 @@ defmodule RiptideWeb.Router do
     post "/pending-reviews/:node_id/approve", RiptideWeb.TenantReviewController, :approve
     post "/pending-reviews/:node_id/decline", RiptideWeb.TenantReviewController, :decline
     get "/discovery/search", RiptideWeb.TenantDiscoveryController, :search
+    get "/entries/:node_id", RiptideWeb.TenantDiscoveryController, :show
 
-    post "/hub/propose", RiptideWeb.Hub.ProposeController, :propose
-    post "/hub/pending-reviews/:node_id/approve", RiptideWeb.Hub.ReviewController, :approve
-    post "/hub/pending-reviews/:node_id/decline", RiptideWeb.Hub.ReviewController, :decline
+    post "/install", RiptideWeb.TenantInstallController, :install
+    post "/install-reviews/:node_id/approve", RiptideWeb.TenantInstallController, :approve
+    post "/install-reviews/:node_id/decline", RiptideWeb.TenantInstallController, :decline
+    post "/install-capability", RiptideWeb.TenantInstallController, :install_capability
 
-    post "/hub/install", RiptideWeb.Hub.InstallController, :install
-    post "/hub/install-reviews/:node_id/approve", RiptideWeb.Hub.InstallController, :approve
-    post "/hub/install-reviews/:node_id/decline", RiptideWeb.Hub.InstallController, :decline
-    post "/hub/crosswalks", RiptideWeb.Hub.CrosswalkController, :propose
-    post "/hub/crosswalk-reviews/:node_id/approve", RiptideWeb.Hub.CrosswalkController, :approve
-    post "/hub/crosswalk-reviews/:node_id/decline", RiptideWeb.Hub.CrosswalkController, :decline
-
-    post "/hub/capabilities", RiptideWeb.Hub.CapabilityController, :propose
-    post "/hub/capability-reviews/:node_id/approve", RiptideWeb.Hub.CapabilityController, :approve
-    post "/hub/capability-reviews/:node_id/decline", RiptideWeb.Hub.CapabilityController, :decline
+    post "/crosswalks", RiptideWeb.TenantCrosswalkController, :propose
+    post "/crosswalk-reviews/:node_id/approve", RiptideWeb.TenantCrosswalkController, :approve
+    post "/crosswalk-reviews/:node_id/decline", RiptideWeb.TenantCrosswalkController, :decline
+    post "/capabilities", RiptideWeb.TenantCapabilityController, :propose
+    post "/capability-reviews/:node_id/approve", RiptideWeb.TenantCapabilityController, :approve
+    post "/capability-reviews/:node_id/decline", RiptideWeb.TenantCapabilityController, :decline
   end
 end

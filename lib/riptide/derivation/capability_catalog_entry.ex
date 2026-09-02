@@ -1,10 +1,10 @@
 defmodule Riptide.Derivation.CapabilityCatalogEntry do
   @moduledoc """
-  A Hub-scope, reviewed Capability, addressable by IRI. Identical field set to
+  A tenant-scope, reviewed Capability, addressable by IRI. Identical field set to
   `Riptide.Capability.Definition` except `component` (a literal local path,
   meaningless outside the node that happened to receive it) is replaced by
   `component_hash` (a content hash, resolvable to real bytes on any node via
-  `Riptide.BlobStore` — see `Riptide.Derivation.CapabilityCatalog.materialize/1`).
+  `Riptide.BlobStore` — see `Riptide.Derivation.CapabilityCatalog.materialize/2`).
   See design spec
   `docs/superpowers/specs/2026-08-31-phase-6k-dynamic-capability-registration-design.md`
   §4.

@@ -28,7 +28,8 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
 
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
 
-    {:ok, hash} = :erpc.call(hd_node(peers), Riptide.BlobStore, :put, [component_bytes])
+    {:ok, hash} =
+      :erpc.call(hd_node(peers), Riptide.BlobStore, :put, [tenant_id, component_bytes])
 
     cap_name =
       RDF.iri("urn:riptide:capability:job-trigger-cap-#{System.unique_integer([:positive])}")
@@ -48,10 +49,15 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
+    :ok =
+      :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [
+        {:tenant, tenant_id},
+        entry,
+        nil
+      ])
 
     # Capability.invoke/4 goes through the real, default-deny authz store
-    # (Riptide.Authz.Store.Placement) unconditionally — no FakeStore swap
+    # (Riptide.Authz.Store.TenantFacts) unconditionally — no FakeStore swap
     # is available here (bare :peer nodes never boot the full app/HTTP
     # layer), so a real Policy write through the already-bootstrapped
     # placement cluster is required for the executor's own invocation to
@@ -60,7 +66,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
     :ok =
-      :erpc.call(hd_node(peers), Riptide.Placement, :add_policy, [
+      :erpc.call(hd_node(peers), Riptide.Authz.Store.TenantFacts, :add_policy, [
         tenant_id,
         ["capabilities", local_name],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
@@ -188,7 +194,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
     node_a = hd_node(peers)
 
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [component_bytes])
+    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [tenant_id, component_bytes])
 
     cap_name =
       RDF.iri("urn:riptide:capability:job-trigger-crash-#{System.unique_integer([:positive])}")
@@ -208,12 +214,17 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(node_a, Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
+    :ok =
+      :erpc.call(node_a, Riptide.Derivation.Catalog, :admit_capability, [
+        {:tenant, tenant_id},
+        entry,
+        nil
+      ])
 
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
     :ok =
-      :erpc.call(node_a, Riptide.Placement, :add_policy, [
+      :erpc.call(node_a, Riptide.Authz.Store.TenantFacts, :add_policy, [
         tenant_id,
         ["capabilities", local_name],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
@@ -293,7 +304,9 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :job_stream_id, [tenant_id])
 
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = :erpc.call(hd_node(peers), Riptide.BlobStore, :put, [component_bytes])
+
+    {:ok, hash} =
+      :erpc.call(hd_node(peers), Riptide.BlobStore, :put, [tenant_id, component_bytes])
 
     cap_name =
       RDF.iri("urn:riptide:capability:job-trigger-resource-#{System.unique_integer([:positive])}")
@@ -313,12 +326,17 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
       }
     }
 
-    :ok = :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [entry, nil])
+    :ok =
+      :erpc.call(hd_node(peers), Riptide.Derivation.Catalog, :admit_capability, [
+        {:tenant, tenant_id},
+        entry,
+        nil
+      ])
 
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
     :ok =
-      :erpc.call(hd_node(peers), Riptide.Placement, :add_policy, [
+      :erpc.call(hd_node(peers), Riptide.Authz.Store.TenantFacts, :add_policy, [
         tenant_id,
         ["capabilities", local_name],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}

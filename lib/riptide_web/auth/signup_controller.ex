@@ -20,16 +20,16 @@ defmodule RiptideWeb.Auth.SignupController do
   end
 
   defp handle_create(conn, %{
-         "tenant_id" => tenant_id,
+         "name" => name,
          "username" => username,
          "password_hash" => password_hash
        })
-       when is_binary(tenant_id) and is_binary(username) and is_binary(password_hash) do
-    if valid_identifier?(tenant_id) and valid_identifier?(username) and
+       when is_binary(name) and is_binary(username) and is_binary(password_hash) do
+    if valid_identifier?(name) and valid_identifier?(username) and
          Regex.match?(@password_hash_pattern, password_hash) do
-      case Riptide.Accounts.sign_up(tenant_id, username, password_hash) do
-        {:ok, %{token: token, sub: sub}} ->
-          body = Jason.encode!(%{"token" => token, "sub" => sub})
+      case Riptide.Accounts.sign_up(name, username, password_hash) do
+        {:ok, %{token: token, sub: sub, tenant_id: tenant_id}} ->
+          body = Jason.encode!(%{"token" => token, "sub" => sub, "tenant_id" => tenant_id})
           conn |> put_resp_content_type("application/json") |> send_resp(200, body)
 
         {:error, :already_claimed} ->
@@ -49,10 +49,10 @@ defmodule RiptideWeb.Auth.SignupController do
 
   defp handle_create(conn, _params), do: send_resp(conn, 400, "")
 
-  # `tenant_id`/`username` become stream_id path segments
+  # `username` becomes a stream_id path segment
   # (`RiptideWeb.LDP.ResourceController.stream_id_for/2`, which joins on
-  # "/") — a "/" in either would corrupt addressing, so both are rejected
-  # here before any claim/write is attempted.
+  # "/") — a "/" would corrupt addressing, so both `name` and `username`
+  # are rejected here before any claim/write is attempted.
   defp valid_identifier?(value), do: value != "" and not String.contains?(value, "/")
 
   # Unlike Hub.DiscoveryController's own rate_limit_key/1 (which this

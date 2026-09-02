@@ -95,16 +95,9 @@ defmodule Riptide.Derivation.InstallTest do
     test "a predicate mapped by an existing Crosswalk is rewritten; an unmatched predicate is left native" do
       tenant_id = unique_tenant()
 
-      # crosswalk_stream_id() is a single, shared, non-unique stream across
-      # the whole test suite (like :hub's own catalog — see
-      # catalog_test.exs's "Hub vs. Tenant scope isolation" test) — never
-      # force-deleted here, since that can leave the very next writer
-      # hitting :noproc before the lazy re-create catches up (confirmed
-      # live: this table needed force-deletion here previously caused a
-      # separate, unrelated dedup_gate_test.exs crosswalk test elsewhere in
-      # the suite to fail with exactly that). Tolerate accumulation instead.
       on_exit(fn ->
         Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, tenant_id}))
+        Riptide.RaTestHelpers.cleanup_stream(Catalog.crosswalk_stream_id({:tenant, tenant_id}))
       end)
 
       source_predicate = rel("pendingDeploy#{System.unique_integer([:positive])}")
@@ -124,8 +117,8 @@ defmodule Riptide.Derivation.InstallTest do
         match_type: :exact_match
       }
 
-      :ok = Catalog.admit_crosswalk(crosswalk, nil)
-      {:ok, crosswalks} = Catalog.list_crosswalks()
+      :ok = Catalog.admit_crosswalk({:tenant, tenant_id}, crosswalk, nil)
+      {:ok, crosswalks} = Catalog.list_crosswalks({:tenant, tenant_id})
       {crosswalk_node, ^crosswalk} = Enum.find(crosswalks, fn {_node, c} -> c == crosswalk end)
 
       pattern = %Rule{

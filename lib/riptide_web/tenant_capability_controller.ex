@@ -1,10 +1,10 @@
-defmodule RiptideWeb.Hub.CapabilityController do
+defmodule RiptideWeb.TenantCapabilityController do
   @moduledoc """
-  Propose a Capability (metadata + base64 bytes in one request) and
-  approve/decline it, mirroring `RiptideWeb.Hub.CrosswalkController`'s exact
-  shape (design spec
-  `docs/superpowers/specs/2026-08-31-phase-6k-dynamic-capability-registration-design.md`
-  §7).
+  Propose a Capability into the caller's own tenant Catalog, and approve/decline it — a direct
+  Tenant-scoped analogue of the deleted `RiptideWeb.Hub.CapabilityController` (design spec
+  `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md` §4.5). "Publishing" is no
+  longer a distinct action here — admit into your own Catalog, then separately grant it a `:public`
+  read policy via `POST /tenants/:tenant_id/policies`.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -15,7 +15,7 @@ defmodule RiptideWeb.Hub.CapabilityController do
   def propose(conn, params) do
     tenant_id = conn.assigns.tenant_id
 
-    case Riptide.HubRateLimit.check_propose(tenant_id) do
+    case Riptide.WriteRateLimit.check(tenant_id) do
       :deny -> send_resp(conn, 429, "")
       :allow -> handle_propose(conn, tenant_id, params)
     end
@@ -36,7 +36,7 @@ defmodule RiptideWeb.Hub.CapabilityController do
        ) do
     with {:ok, kind} <- parse_kind(kind_string),
          {:ok, bytes} <- Base.decode64(component_bytes_b64),
-         {:ok, hash} <- BlobStore.put(bytes) do
+         {:ok, hash} <- BlobStore.put(tenant_id, bytes) do
       entry = %CapabilityCatalogEntry{
         name: RDF.iri(name),
         kind: kind,
@@ -47,9 +47,10 @@ defmodule RiptideWeb.Hub.CapabilityController do
         memory_limits: parse_memory_limits(memory_limits_params)
       }
 
+      scope = {:tenant, tenant_id}
       replaces = parse_replaces(params)
 
-      case DedupGate.propose_capability({:tenant, tenant_id}, entry, replaces) do
+      case DedupGate.propose_capability(scope, scope, entry, replaces) do
         {:ok, node} ->
           body = Jason.encode!(%{"outcome" => "queued", "node_id" => RDF.BlankNode.value(node)})
           conn |> put_resp_content_type("application/json") |> send_resp(200, body)
@@ -64,8 +65,6 @@ defmodule RiptideWeb.Hub.CapabilityController do
 
   defp handle_propose(conn, _tenant_id, _params), do: send_resp(conn, 400, "")
 
-  # Explicit case matching, not String.to_existing_atom/1 — mirrors
-  # CrosswalkController's own parse_match_type/1 reasoning exactly.
   defp parse_kind("effect"), do: {:ok, :effect}
   defp parse_kind("observe"), do: {:ok, :observe}
   defp parse_kind(_other), do: {:error, :invalid_kind}
@@ -86,8 +85,9 @@ defmodule RiptideWeb.Hub.CapabilityController do
 
   def approve(conn, %{"node_id" => node_id}) do
     tenant_id = conn.assigns.tenant_id
+    scope = {:tenant, tenant_id}
 
-    case DedupGate.approve_capability_review({:tenant, tenant_id}, RDF.BlankNode.new(node_id)) do
+    case DedupGate.approve_capability_review(scope, scope, RDF.BlankNode.new(node_id)) do
       :ok -> send_resp(conn, 200, "")
       {:error, :not_found} -> send_resp(conn, 404, "")
       {:error, _reason} -> send_resp(conn, 503, "")

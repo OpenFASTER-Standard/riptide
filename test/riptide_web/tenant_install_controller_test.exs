@@ -1,9 +1,9 @@
-defmodule RiptideWeb.Hub.InstallControllerTest do
+defmodule RiptideWeb.TenantInstallControllerTest do
   use ExUnit.Case, async: false
   import Plug.Test
   import Plug.Conn
 
-  alias Riptide.Authz.Store
+  alias Riptide.Authz.{Policy, Store}
   alias Riptide.Derivation.{Catalog, Parser, Provenance}
 
   @opts RiptideWeb.Endpoint.init([])
@@ -22,33 +22,50 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
   end
 
   defp claim_tenant(tenant_id) do
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
   end
 
-  test "install a Hub entry into a Tenant, then approve — it becomes live in the Tenant's own Catalog" do
+  defp publish_source(source_tenant_id) do
+    :ok =
+      Store.TenantFacts.add_policy(source_tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read],
+        matcher: :public
+      })
+  end
+
+  test "install a source tenant's entry into a Tenant, then approve — it becomes live in the installing Tenant's own Catalog" do
+    source_tenant_id = "install-source-" <> Uniq.UUID.uuid4()
     tenant_id = "install-test-" <> Uniq.UUID.uuid4()
     predicate_name = "installhttp#{System.unique_integer([:positive])}"
     claim_tenant(tenant_id)
+    publish_source(source_tenant_id)
 
     on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, source_tenant_id}))
       Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, tenant_id}))
       Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))
     end)
 
-    hub_rule_text =
+    source_rule_text =
       "#{predicate_name}(<urn:test:alice>, \"hi\") :- pendingDeploy(<urn:test:alice>, \"v1\")."
 
-    {:ok, hub_rule} = Parser.decode(hub_rule_text)
-    :ok = Catalog.admit_entry(:hub, hub_rule, nil)
-    {:ok, hub_entries} = Catalog.list_entries(:hub)
-    {hub_node, ^hub_rule} = Enum.find(hub_entries, fn {_n, r} -> r == hub_rule end)
-    hub_node_id = RDF.BlankNode.value(hub_node)
+    {:ok, source_rule} = Parser.decode(source_rule_text)
+    :ok = Catalog.admit_entry({:tenant, source_tenant_id}, source_rule, nil)
+    {:ok, source_entries} = Catalog.list_entries({:tenant, source_tenant_id})
+    {source_node, ^source_rule} = Enum.find(source_entries, fn {_n, r} -> r == source_rule end)
+    source_node_id = RDF.BlankNode.value(source_node)
 
-    body = Jason.encode!(%{"hub_node_id" => hub_node_id})
+    body = Jason.encode!(%{"source_tenant_id" => source_tenant_id, "node_id" => source_node_id})
 
     install_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/install", body)
+      |> conn("/tenants/#{tenant_id}/install", body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -58,7 +75,7 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
 
     approve_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/install-reviews/#{review_node_id}/approve")
+      |> conn("/tenants/#{tenant_id}/install-reviews/#{review_node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
@@ -70,8 +87,10 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
   end
 
   test "exit criterion (issue #71): install with partial vocabulary overlap binds matched fields through a Crosswalk and records manually-originated Provenance for unmatched fields" do
+    source_tenant_id = "install-source-capstone-" <> Uniq.UUID.uuid4()
     installing_tenant = "install-capstone-" <> Uniq.UUID.uuid4()
     claim_tenant(installing_tenant)
+    publish_source(source_tenant_id)
 
     source_predicate_name = "pendingDeployCapstone#{System.unique_integer([:positive])}"
     target_predicate_name = "deploymentQueuedCapstone#{System.unique_integer([:positive])}"
@@ -79,6 +98,8 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
     pattern_predicate_name = "deployNotifyCapstone#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, source_tenant_id}))
+
       Riptide.RaTestHelpers.cleanup_stream(
         Catalog.catalog_stream_id({:tenant, installing_tenant})
       )
@@ -95,8 +116,8 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
     {:ok, existing_rule} = Parser.decode(existing_rule_text)
     :ok = Catalog.admit_entry({:tenant, installing_tenant}, existing_rule, nil)
 
-    # Propose and approve a Crosswalk from the Hub pattern's own predicate to
-    # the installing Tenant's.
+    # Propose and approve a Crosswalk from the source tenant's own pattern
+    # predicate to the installing Tenant's.
     crosswalk_body =
       Jason.encode!(%{
         "subject_predicate" => "urn:riptide:relation:#{source_predicate_name}",
@@ -106,7 +127,7 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
 
     crosswalk_propose_conn =
       :post
-      |> conn("/tenants/#{installing_tenant}/hub/crosswalks", crosswalk_body)
+      |> conn("/tenants/#{installing_tenant}/crosswalks", crosswalk_body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -116,29 +137,30 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
 
     crosswalk_approve_conn =
       :post
-      |> conn("/tenants/#{installing_tenant}/hub/crosswalk-reviews/#{crosswalk_node_id}/approve")
+      |> conn("/tenants/#{installing_tenant}/crosswalk-reviews/#{crosswalk_node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
     assert crosswalk_approve_conn.status == 200
 
-    # Publish the Hub pattern — two predicates: one has a Crosswalk to the
-    # installing Tenant's vocabulary, one doesn't.
-    hub_rule_text =
+    # Publish the source tenant's pattern — two predicates: one has a
+    # Crosswalk to the installing Tenant's vocabulary, one doesn't.
+    source_rule_text =
       "#{pattern_predicate_name}(<urn:test:a>, \"hi\") :- " <>
         "#{source_predicate_name}(<urn:test:a>, \"v1\"), #{unmatched_predicate_name}(<urn:test:a>, \"v1\")."
 
-    {:ok, hub_rule} = Parser.decode(hub_rule_text)
-    :ok = Catalog.admit_entry(:hub, hub_rule, nil)
-    {:ok, hub_entries} = Catalog.list_entries(:hub)
-    {hub_node, ^hub_rule} = Enum.find(hub_entries, fn {_n, r} -> r == hub_rule end)
-    hub_node_id = RDF.BlankNode.value(hub_node)
+    {:ok, source_rule} = Parser.decode(source_rule_text)
+    :ok = Catalog.admit_entry({:tenant, source_tenant_id}, source_rule, nil)
+    {:ok, source_entries} = Catalog.list_entries({:tenant, source_tenant_id})
+    {source_node, ^source_rule} = Enum.find(source_entries, fn {_n, r} -> r == source_rule end)
+    source_node_id = RDF.BlankNode.value(source_node)
 
-    install_body = Jason.encode!(%{"hub_node_id" => hub_node_id})
+    install_body =
+      Jason.encode!(%{"source_tenant_id" => source_tenant_id, "node_id" => source_node_id})
 
     install_conn =
       :post
-      |> conn("/tenants/#{installing_tenant}/hub/install", install_body)
+      |> conn("/tenants/#{installing_tenant}/install", install_body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -148,7 +170,7 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
 
     install_approve_conn =
       :post
-      |> conn("/tenants/#{installing_tenant}/hub/install-reviews/#{install_node_id}/approve")
+      |> conn("/tenants/#{installing_tenant}/install-reviews/#{install_node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 
@@ -169,7 +191,7 @@ defmodule RiptideWeb.Hub.InstallControllerTest do
     assert unmatched_predicate in body_predicates
     refute source_predicate in body_predicates
 
-    assert %Provenance{origin: {:installed_from, ^hub_node, field_bindings}} =
+    assert %Provenance{origin: {:installed_from, ^source_node, field_bindings}} =
              installed_rule.provenance
 
     assert Enum.any?(field_bindings, fn

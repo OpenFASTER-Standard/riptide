@@ -16,7 +16,7 @@ defmodule RiptideWeb.TaskController do
   def create(conn, %{"description" => description} = params) do
     tenant_id = conn.assigns.tenant_id
 
-    case Riptide.HubRateLimit.check_propose(tenant_id) do
+    case Riptide.WriteRateLimit.check(tenant_id) do
       :deny -> send_resp(conn, 429, "")
       :allow -> handle_create(conn, tenant_id, description, params)
     end

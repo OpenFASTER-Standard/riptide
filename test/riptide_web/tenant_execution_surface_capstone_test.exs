@@ -40,7 +40,7 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
 
   defp register_capstone_capability(tenant_id) do
     component_bytes = File.read!("test/fixtures/riptide_capability/fixture.wasm")
-    {:ok, hash} = Riptide.BlobStore.put(component_bytes)
+    {:ok, hash} = Riptide.BlobStore.put(tenant_id, component_bytes)
 
     entry = %Riptide.Derivation.CapabilityCatalogEntry{
       name: RDF.iri("urn:riptide:capability:capstoneGreet"),
@@ -57,10 +57,10 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
       }
     }
 
-    :ok = Catalog.admit_capability(entry, nil)
+    :ok = Catalog.admit_capability({:tenant, tenant_id}, entry, nil)
 
     :ok =
-      Riptide.Placement.add_policy(
+      Riptide.Authz.Store.TenantFacts.add_policy(
         tenant_id,
         ["capabilities", "capstoneGreet"],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
@@ -69,7 +69,14 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
 
   test "exit criterion: Task -> LLMFallback -> propose -> approve -> Task -> Discovery, zero LLM calls" do
     tenant_id = "tenant-surface-capstone-" <> Uniq.UUID.uuid4()
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
+
     register_capstone_capability(tenant_id)
 
     on_exit(fn ->

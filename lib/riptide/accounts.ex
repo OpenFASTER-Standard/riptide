@@ -13,20 +13,21 @@ defmodule Riptide.Accounts do
 
   alias Riptide.Accounts.{Account, RDFCodec}
   alias Riptide.Auth.PasswordTokenConfig
-  alias Riptide.Authz.Store.Placement, as: AuthzPlacement
+  alias Riptide.Authz.Store.TenantFacts
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
   alias RiptideWeb.LDP.ResourceController
 
   @spec sign_up(String.t(), String.t(), String.t()) ::
-          {:ok, %{token: String.t(), sub: String.t()}}
+          {:ok, %{token: String.t(), sub: String.t(), tenant_id: String.t()}}
           | {:error, :already_claimed}
           | {:error, :not_ready}
-  def sign_up(tenant_id, username, password_hash_sha256) do
+  def sign_up(name, username, password_hash_sha256) do
+    tenant_id = Uniq.UUID.uuid4()
     sub = Uniq.UUID.uuid4()
 
-    case AuthzPlacement.claim_tenant_if_unclaimed(tenant_id, sub) do
+    case Riptide.Placement.claim_name(name, tenant_id) do
       :already_claimed ->
         {:error, :already_claimed}
 
@@ -37,24 +38,38 @@ defmodule Riptide.Accounts do
           sub: sub
         }
 
+        owner_policy = %Riptide.Authz.Policy{
+          effect: :allow,
+          modes: [:read, :write],
+          matcher: {:agent, sub}
+        }
+
         with :ok <- write_account(tenant_id, username, account),
+             :ok <- TenantFacts.add_policy(tenant_id, [], owner_policy),
              {:ok, token} <- PasswordTokenConfig.sign(sub) do
-          {:ok, %{token: token, sub: sub}}
+          {:ok, %{token: token, sub: sub, tenant_id: tenant_id}}
         end
     end
   end
 
   @spec log_in(String.t(), String.t(), String.t()) ::
           {:ok, String.t()} | {:error, :invalid_credentials} | {:error, :not_ready}
-  def log_in(tenant_id, username, password_hash_sha256) do
-    with {:ok, account} <- read_account(tenant_id, username) do
-      if account.password_hash_sha256 == password_hash_sha256 do
-        PasswordTokenConfig.sign(account.sub)
-      else
+  def log_in(name, username, password_hash_sha256) do
+    case Riptide.Placement.lookup_name(name) do
+      nil ->
         {:error, :invalid_credentials}
-      end
+
+      tenant_id ->
+        with {:ok, account} <- read_account(tenant_id, username) do
+          verify_password(account, password_hash_sha256)
+        end
     end
   end
+
+  defp verify_password(%Account{password_hash_sha256: hash} = account, hash),
+    do: PasswordTokenConfig.sign(account.sub)
+
+  defp verify_password(_account, _password_hash_sha256), do: {:error, :invalid_credentials}
 
   defp write_account(tenant_id, username, %Account{} = account) do
     stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["accounts", username])

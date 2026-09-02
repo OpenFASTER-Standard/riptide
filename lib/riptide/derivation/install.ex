@@ -35,7 +35,7 @@ defmodule Riptide.Derivation.Install do
           {Rule.t(), [Provenance.field_binding()]}
   def install(hub_entry_node, %Rule{} = pattern, tenant_id) do
     vocabulary = tenant_vocabulary(tenant_id)
-    {:ok, crosswalks} = Catalog.list_crosswalks()
+    {:ok, crosswalks} = Catalog.list_crosswalks({:tenant, tenant_id})
     predicates = pattern.signature.reads ++ pattern.signature.produces
 
     {rewrites, field_bindings} =

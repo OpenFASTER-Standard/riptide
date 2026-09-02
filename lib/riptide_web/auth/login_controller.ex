@@ -16,12 +16,12 @@ defmodule RiptideWeb.Auth.LoginController do
   end
 
   defp handle_create(conn, %{
-         "tenant_id" => tenant_id,
+         "name" => name,
          "username" => username,
          "password_hash" => password_hash
        })
-       when is_binary(tenant_id) and is_binary(username) and is_binary(password_hash) do
-    case Riptide.Accounts.log_in(tenant_id, username, password_hash) do
+       when is_binary(name) and is_binary(username) and is_binary(password_hash) do
+    case Riptide.Accounts.log_in(name, username, password_hash) do
       {:ok, token} ->
         body = Jason.encode!(%{"token" => token})
         conn |> put_resp_content_type("application/json") |> send_resp(200, body)

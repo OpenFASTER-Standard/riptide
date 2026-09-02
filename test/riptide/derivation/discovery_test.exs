@@ -151,9 +151,6 @@ defmodule Riptide.Derivation.DiscoveryTest do
 
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
-
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
   end
 
   defmodule FakeClient do
