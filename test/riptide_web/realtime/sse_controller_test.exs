@@ -28,7 +28,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
   # same pattern as `resource_controller_test.exs`'s Task 5 setup.
   setup do
     for tenant_id <- ["sse-test-tenant", "sse-gap-test-tenant"] do
-      Store.Placement.add_policy(tenant_id, [], %Policy{
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -123,7 +123,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     setup do
       Riptide.AppEnvTestHelpers.put_env(:riptide, :auth_verifier, StubVerifier)
 
-      Store.Placement.add_policy("sse-auth-test-tenant", [], %Policy{
+      Store.TenantFacts.add_policy("sse-auth-test-tenant", [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -174,7 +174,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     setup do
       Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
 
-      Store.Placement.add_policy("sse-ratelimit-test-tenant", [], %Policy{
+      Store.TenantFacts.add_policy("sse-ratelimit-test-tenant", [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -282,7 +282,7 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
       :ok =
-        Store.Placement.add_policy(tenant_id, [], %Policy{
+        Store.TenantFacts.add_policy(tenant_id, [], %Policy{
           effect: :allow,
           modes: [:read],
           matcher: :public

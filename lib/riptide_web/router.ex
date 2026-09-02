@@ -43,6 +43,12 @@ defmodule RiptideWeb.Router do
   end
 
   scope "/" do
+    pipe_through [:api]
+
+    get "/tenant-names/:name", RiptideWeb.Auth.TenantNamesController, :show
+  end
+
+  scope "/" do
     pipe_through [:api, :auth_query_param]
 
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe

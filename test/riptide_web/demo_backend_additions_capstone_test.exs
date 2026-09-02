@@ -22,7 +22,12 @@ defmodule RiptideWeb.DemoBackendAdditionsCapstoneTest do
   end
 
   defp claim_tenant(tenant_id) do
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
   end
 
   defp rel(name), do: RDF.iri("urn:riptide:relation:" <> name)
@@ -103,7 +108,7 @@ defmodule RiptideWeb.DemoBackendAdditionsCapstoneTest do
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
     :ok =
-      Riptide.Placement.add_policy(tenant_id, ["capabilities", local_name], %Riptide.Authz.Policy{
+      Riptide.Authz.Store.TenantFacts.add_policy(tenant_id, ["capabilities", local_name], %Riptide.Authz.Policy{
         effect: :allow,
         modes: [:invoke],
         matcher: :public

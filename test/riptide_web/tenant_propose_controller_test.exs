@@ -21,7 +21,12 @@ defmodule RiptideWeb.TenantProposeControllerTest do
   end
 
   defp claim_tenant(tenant_id) do
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
   end
 
   defp trace_for(subject, predicate_name) do

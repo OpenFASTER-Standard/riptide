@@ -97,55 +97,38 @@ defmodule Riptide.PlacementTest do
     end
   end
 
-  describe "add_policy/3, list_policies/2, and claim_tenant_if_unclaimed/2 against the real metadata cluster" do
-    test "add_policy/3 then list_policies/2 round-trips a real policy" do
-      tenant_id = "authz-test-" <> Uniq.UUID.uuid4()
-      policy = %Riptide.Authz.Policy{effect: :allow, modes: [:read], matcher: :public}
+  describe "claim_name/2 and lookup_name/1 against the real metadata cluster" do
+    test "claim_name/2 claims a brand-new name exactly once" do
+      name = "authz-claim-test-" <> Uniq.UUID.uuid4()
 
-      assert Placement.add_policy(tenant_id, [], policy) == :ok
-      assert Placement.list_policies(tenant_id, []) == [policy]
+      assert Placement.claim_name(name, "tenant-1") == :claimed
+      assert Placement.claim_name(name, "tenant-2") == :already_claimed
+      assert Placement.lookup_name(name) == "tenant-1"
     end
 
-    test "list_policies/2 returns an empty list for a tenant/prefix with no policies" do
-      tenant_id = "authz-test-empty-" <> Uniq.UUID.uuid4()
-      assert Placement.list_policies(tenant_id, []) == []
+    test "lookup_name/1 returns nil for a name that was never claimed" do
+      assert Placement.lookup_name("authz-lookup-empty-" <> Uniq.UUID.uuid4()) == nil
     end
 
-    test "claim_tenant_if_unclaimed/2 claims a brand-new tenant exactly once" do
-      tenant_id = "authz-claim-test-" <> Uniq.UUID.uuid4()
-
-      assert Placement.claim_tenant_if_unclaimed(tenant_id, "user-1") == :claimed
-      assert Placement.claim_tenant_if_unclaimed(tenant_id, "user-2") == :already_claimed
-
-      assert Placement.list_policies(tenant_id, []) == [
-               %Riptide.Authz.Policy{
-                 effect: :allow,
-                 modes: [:read, :write],
-                 matcher: {:agent, "user-1"}
-               }
-             ]
-    end
-
-    test "claim_tenant_if_unclaimed/2 resolves a real race between two simultaneous claims to exactly one winner" do
-      tenant_id = "authz-claim-race-test-" <> Uniq.UUID.uuid4()
+    test "claim_name/2 resolves a real race between two simultaneous claims to exactly one winner" do
+      name = "authz-claim-race-test-" <> Uniq.UUID.uuid4()
 
       results =
         [
-          Task.async(fn -> Placement.claim_tenant_if_unclaimed(tenant_id, "racer-1") end),
-          Task.async(fn -> Placement.claim_tenant_if_unclaimed(tenant_id, "racer-2") end)
+          Task.async(fn -> Placement.claim_name(name, "racer-1") end),
+          Task.async(fn -> Placement.claim_name(name, "racer-2") end)
         ]
         |> Enum.map(&Task.await/1)
 
       assert Enum.sort(results) == [:already_claimed, :claimed]
 
-      # Exactly one owner policy exists afterward, for whichever racer's
-      # command Raft's log actually ordered first — never both, never
-      # neither. Every command against this Ra cluster is serialized
-      # through consensus, so this proves the race is resolved by the log
-      # itself rather than by any check-then-act ordering on the caller side.
-      assert [%Riptide.Authz.Policy{matcher: {:agent, winner}}] =
-               Placement.list_policies(tenant_id, [])
-
+      # Exactly one tenant_id is claimed for this name afterward, for
+      # whichever racer's command Raft's log actually ordered first — never
+      # both, never neither. Every command against this Ra cluster is
+      # serialized through consensus, so this proves the race is resolved by
+      # the log itself rather than by any check-then-act ordering on the
+      # caller side.
+      winner = Placement.lookup_name(name)
       assert winner in ["racer-1", "racer-2"]
     end
   end

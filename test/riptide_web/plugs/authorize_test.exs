@@ -16,10 +16,6 @@ defmodule RiptideWeb.Plugs.AuthorizeTest do
 
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
-
-    @impl true
-    def claim_tenant_if_unclaimed("unclaimed-tenant", _subject), do: :claimed
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
   end
 
   setup do
@@ -67,29 +63,10 @@ defmodule RiptideWeb.Plugs.AuthorizeTest do
     assert conn.status == 403
   end
 
-  test "an authenticated write to an unclaimed tenant bootstraps ownership and is allowed" do
+  test "an authenticated write with no matching policy is denied — no bootstrap fallback" do
     conn =
       :put
-      |> conn_for("unclaimed-tenant", ["docs"], %{"sub" => "user-1"})
-      |> Authorize.call(Authorize.init([]))
-
-    refute conn.halted
-  end
-
-  test "an anonymous write to an unclaimed tenant is denied, not treated as a claim attempt" do
-    conn =
-      :put
-      |> conn_for("unclaimed-tenant", ["docs"], nil)
-      |> Authorize.call(Authorize.init([]))
-
-    assert conn.halted
-    assert conn.status == 403
-  end
-
-  test "a read (never a write) never bootstraps ownership even when authenticated" do
-    conn =
-      :get
-      |> conn_for("unclaimed-tenant", ["docs"], %{"sub" => "user-1"})
+      |> conn_for("no-such-tenant", ["docs"], %{"sub" => "user-1"})
       |> Authorize.call(Authorize.init([]))
 
     assert conn.halted

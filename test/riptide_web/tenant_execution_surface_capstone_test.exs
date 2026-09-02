@@ -60,7 +60,7 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
     :ok = Catalog.admit_capability(entry, nil)
 
     :ok =
-      Riptide.Placement.add_policy(
+      Riptide.Authz.Store.TenantFacts.add_policy(
         tenant_id,
         ["capabilities", "capstoneGreet"],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
@@ -69,7 +69,12 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
 
   test "exit criterion: Task -> LLMFallback -> propose -> approve -> Task -> Discovery, zero LLM calls" do
     tenant_id = "tenant-surface-capstone-" <> Uniq.UUID.uuid4()
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
     register_capstone_capability(tenant_id)
 
     on_exit(fn ->

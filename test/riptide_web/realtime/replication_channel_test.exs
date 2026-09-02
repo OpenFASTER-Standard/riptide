@@ -37,7 +37,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
   # authorization now being enforced doesn't change their expected outcomes,
   # same pattern as `sse_controller_test.exs`'s Task 7 setup.
   setup do
-    Store.Placement.add_policy("ws-test-tenant", [], %Policy{
+    Store.TenantFacts.add_policy("ws-test-tenant", [], %Policy{
       effect: :allow,
       modes: [:read],
       matcher: :public
@@ -206,7 +206,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
 
     :ok =
-      Store.Placement.add_policy(tenant_id, [], %Policy{
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public
@@ -312,7 +312,7 @@ defmodule RiptideWeb.Realtime.ReplicationChannelTest do
     setup do
       Riptide.AppEnvTestHelpers.put_env(:riptide, :new_stream_rate_limit, 2)
 
-      Store.Placement.add_policy("ws-ratelimit-test-tenant", [], %Policy{
+      Store.TenantFacts.add_policy("ws-ratelimit-test-tenant", [], %Policy{
         effect: :allow,
         modes: [:read],
         matcher: :public

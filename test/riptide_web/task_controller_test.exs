@@ -37,7 +37,12 @@ defmodule RiptideWeb.TaskControllerTest do
   end
 
   defp claim_tenant(tenant_id) do
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
   end
 
   defp register_task_submit_capability(tenant_id, local_name) do
@@ -62,7 +67,7 @@ defmodule RiptideWeb.TaskControllerTest do
     :ok = Catalog.admit_capability(entry, nil)
 
     :ok =
-      Riptide.Placement.add_policy(
+      Riptide.Authz.Store.TenantFacts.add_policy(
         tenant_id,
         ["capabilities", local_name],
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}

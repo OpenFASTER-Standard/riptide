@@ -15,7 +15,7 @@ defmodule RiptideWeb.Authz.PolicyController do
 
   def create(conn, params) do
     tenant_id = conn.assigns.tenant_id
-    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
+    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.TenantFacts)
 
     case policy_from_params(params) do
       {:ok, policy} ->
@@ -39,7 +39,7 @@ defmodule RiptideWeb.Authz.PolicyController do
 
   def index(conn, _params) do
     tenant_id = conn.assigns.tenant_id
-    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
+    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.TenantFacts)
     policies = store.list_policies(tenant_id, [])
 
     conn

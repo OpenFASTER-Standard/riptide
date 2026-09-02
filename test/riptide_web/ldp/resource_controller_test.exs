@@ -21,7 +21,7 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
   # their own brand-new, unseeded `authz-e2e-*` tenants instead.
   setup do
     for tenant_id <- ["test-tenant", "tenant-a", "tenant-b"] do
-      Store.Placement.add_policy(tenant_id, [], %Policy{
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,
         modes: [:read, :write],
         matcher: :public
@@ -561,10 +561,9 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
       assert conn.status == 403
     end
 
-    test "the first authenticated write to a brand-new tenant claims ownership and succeeds" do
+    test "an authenticated write to a brand-new tenant with no policy grant yet is denied — no bootstrap fallback" do
       tenant_id = "authz-e2e-" <> Uniq.UUID.uuid4()
       path = "/tenants/#{tenant_id}/resources/doc"
-      on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(tenant_id, path)) end)
 
       owner_claims = %{"sub" => "owner-" <> Uniq.UUID.uuid4()}
       Application.put_env(:riptide, :authz_test_verifier_claims, owner_claims)
@@ -583,22 +582,20 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
         |> put_req_header("authorization", "Bearer owner-token")
         |> RiptideWeb.Endpoint.call(@opts)
 
-      assert put_conn.status == 201
-
-      get_conn =
-        :get
-        |> conn(path)
-        |> put_req_header("authorization", "Bearer owner-token")
-        |> RiptideWeb.Endpoint.call(@opts)
-
-      assert get_conn.status == 200
-      assert get_conn.resp_body =~ "\"z\""
+      assert put_conn.status == 403
     end
 
-    test "a different identity is denied access to an already-claimed tenant's resource" do
+    test "a write with an existing owner policy grant succeeds, and a different identity is denied" do
       tenant_id = "authz-e2e-" <> Uniq.UUID.uuid4()
       path = "/tenants/#{tenant_id}/resources/doc"
       on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id_for(tenant_id, path)) end)
+
+      :ok =
+        Riptide.Authz.Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
+          effect: :allow,
+          modes: [:read, :write],
+          matcher: {:agent, "the-owner"}
+        })
 
       Riptide.AppEnvTestHelpers.put_env(
         :riptide,
@@ -606,11 +603,14 @@ defmodule RiptideWeb.LDP.ResourceControllerTest do
         RiptideWeb.LDP.ResourceControllerTest.StubOwnerVerifier
       )
 
-      :put
-      |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"z\" .\n")
-      |> put_req_header("content-type", "text/turtle")
-      |> put_req_header("authorization", "Bearer owner-token")
-      |> RiptideWeb.Endpoint.call(@opts)
+      put_conn =
+        :put
+        |> conn(path, "<https://pod.example/x> <https://pod.example/y> \"z\" .\n")
+        |> put_req_header("content-type", "text/turtle")
+        |> put_req_header("authorization", "Bearer owner-token")
+        |> RiptideWeb.Endpoint.call(@opts)
+
+      assert put_conn.status == 201
 
       other_get_conn =
         :get

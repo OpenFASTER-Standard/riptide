@@ -27,9 +27,6 @@ defmodule Riptide.Derivation.JobTriggerCapstoneTest do
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
 
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
-
     def start(policies_by_prefix) do
       case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
         {:ok, pid} -> pid
@@ -48,7 +45,12 @@ defmodule Riptide.Derivation.JobTriggerCapstoneTest do
 
   test "exit criterion: register+approve a Capability via real HTTP, write a Job, watch it execute" do
     tenant_id = "job-capstone-" <> Uniq.UUID.uuid4()
-    :claimed = Store.Placement.claim_tenant_if_unclaimed(tenant_id, "the-owner")
+    :ok =
+      Store.TenantFacts.add_policy(tenant_id, [], %Policy{
+        effect: :allow,
+        modes: [:read, :write],
+        matcher: {:agent, "the-owner"}
+      })
 
     on_exit(fn ->
       Riptide.RaTestHelpers.cleanup_stream(Catalog.pending_review_stream_id({:tenant, tenant_id}))

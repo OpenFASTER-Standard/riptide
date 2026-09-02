@@ -16,13 +16,13 @@ defmodule RiptideWeb.Auth.SignupControllerTest do
     :ok
   end
 
-  defp unique_tenant, do: "signupctl-tenant-#{System.unique_integer([:positive])}"
+  defp unique_name, do: "signupctl-name-#{System.unique_integer([:positive])}"
 
   defp signup_body(overrides \\ %{}) do
     Jason.encode!(
       Map.merge(
         %{
-          "tenant_id" => unique_tenant(),
+          "name" => unique_name(),
           "username" => "alice",
           "password_hash" => String.duplicate("a", 64)
         },
@@ -31,7 +31,7 @@ defmodule RiptideWeb.Auth.SignupControllerTest do
     )
   end
 
-  test "valid signup returns 200 with a usable token" do
+  test "valid signup returns 200 with a usable token, sub, and a freshly-minted tenant_id" do
     conn =
       :post
       |> conn("/auth/signup", signup_body())
@@ -42,11 +42,12 @@ defmodule RiptideWeb.Auth.SignupControllerTest do
     body = Jason.decode!(conn.resp_body)
     assert is_binary(body["token"])
     assert is_binary(body["sub"])
+    assert is_binary(body["tenant_id"])
   end
 
-  test "signing up against an already-claimed tenant_id returns 409" do
-    tenant_id = unique_tenant()
-    body = signup_body(%{"tenant_id" => tenant_id})
+  test "signing up against an already-claimed name returns 409" do
+    name = unique_name()
+    body = signup_body(%{"name" => name})
 
     first_conn =
       :post
@@ -58,17 +59,17 @@ defmodule RiptideWeb.Auth.SignupControllerTest do
 
     second_conn =
       :post
-      |> conn("/auth/signup", signup_body(%{"tenant_id" => tenant_id, "username" => "mallory"}))
+      |> conn("/auth/signup", signup_body(%{"name" => name, "username" => "mallory"}))
       |> put_req_header("content-type", "application/json")
       |> RiptideWeb.Endpoint.call(@opts)
 
     assert second_conn.status == 409
   end
 
-  test "a tenant_id containing '/' returns 400 without claiming anything" do
+  test "a name containing '/' returns 400 without claiming anything" do
     conn =
       :post
-      |> conn("/auth/signup", signup_body(%{"tenant_id" => "has/slash"}))
+      |> conn("/auth/signup", signup_body(%{"name" => "has/slash"}))
       |> put_req_header("content-type", "application/json")
       |> RiptideWeb.Endpoint.call(@opts)
 
