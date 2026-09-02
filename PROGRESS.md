@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse) — see issue #58 for the current remaining list (6p-iii the demo page, now unblocked; 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q, 6r shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse; Generic OpenAI-Compatible LLM Client) — see issue #58 for the current remaining list (6p-iii the demo page, now unblocked; 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1673,3 +1673,28 @@ whole branch was newly introduced by 6q's own code, not pre-existing — all fix
 
 **Status**: Phase 6q shipped 2026-09-02. 6p-iii (the demo page) is now unblocked and can resume,
 informed by the new tenant-scoped Hub model this phase replaced it with.
+
+### 6r — Generic OpenAI-Compatible LLM Client
+
+**Shipped 2026-09-02.** Direct origin: resuming 6p-iii's own brainstorming, its demo page needed to
+document `LLMFallback`'s API-key prerequisite — and 6f's original `LLMFallback.Client.Anthropic` was
+hardcoded to one vendor's own wire format (`https://api.anthropic.com/v1/messages`, `x-api-key`
+header, `content: [{type, text}]` response shape). Since nearly every LLM provider today speaks (or
+offers a compatibility endpoint for) the OpenAI chat-completions wire format, hardcoding one vendor
+into a "pluggable `Client` behaviour" that already existed specifically to avoid that was an
+avoidable constraint, not a real requirement — so this phase replaced it outright rather than adding
+a second vendor-specific client alongside it.
+
+`Riptide.Derivation.LLMFallback.Client.OpenAICompatible` replaces
+`Riptide.Derivation.LLMFallback.Client.Anthropic` (deleted, along with its test) as
+`LLMFallback.run/3`'s own default `Application.get_env(:riptide, :llm_fallback_client, ...)` target.
+Three env vars, read lazily per-call (unchanged pattern): `LLM_API_BASE_URL`, `LLM_API_KEY`,
+`LLM_API_MODEL` — no default base URL or model, since defaulting either would just be picking a
+vendor again under a different name. `POST {base_url}/chat/completions`, `Authorization: Bearer
+{api_key}`, body `%{model: model, messages: [%{role: "user", content: prompt}]}` (the `messages`
+shape itself was already identical between the two APIs); response extraction from
+`{"choices" => [{"message" => {"content" => text}}]}`. Any of the three env vars missing now
+surfaces as a single `{:error, :missing_api_config}` (replacing the old single-key
+`:missing_api_key}`), since three things can be unset instead of one.
+
+**Status**: Phase 6r shipped 2026-09-02.
