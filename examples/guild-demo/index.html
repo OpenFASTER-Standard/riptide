@@ -396,6 +396,130 @@ pushCapabilityChapter({
   capabilityFunction: "curse",
 });
 
+// ---------------------------------------------------------------------------
+// Chapter 3: The system learns a pattern
+// ---------------------------------------------------------------------------
+CHAPTERS.push({
+  title: "Chapter 3: The system learns a pattern",
+  render(container) {
+    container.innerHTML = `
+      <h2>Chapter 3: The system learns a pattern</h2>
+      <p>Submit a second, similar Task:</p>
+      <input type="text" id="chapter3-description-input" value="make a badge that says Great job, Champion!" />
+      <button id="chapter3-submit-button">Submit Task</button>
+      <div id="chapter3-result"></div>
+    `;
+    document.getElementById("chapter3-submit-button").onclick = () => submitSecondBadgeTask(container);
+  },
+});
+
+async function submitSecondBadgeTask(container) {
+  const result = document.getElementById("chapter3-result");
+  result.innerHTML = "";
+  const description = document.getElementById("chapter3-description-input").value;
+
+  try {
+    const submitted = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, { description });
+    state.chapter3.secondJobNodeId = submitted.job_node;
+
+    const streamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/jobs`;
+    const es = subscribeStream(streamId, state.guildA.aliceToken, (quads) => {
+      // Same reasoning as Chapters 1/2's own useCapability(): no blank-node subject identity
+      // survives across independent SSE frames, and only one Job is ever in flight here.
+      const statusQuad = quads.find((q) => q.predicate.value === VOCAB.jobStatus);
+      if (!statusQuad || statusQuad.object.value !== "done") return;
+      es.close();
+
+      const btn = document.createElement("button");
+      btn.id = "chapter3-propose-button";
+      btn.textContent = "Propose this as a pattern";
+      btn.onclick = () => proposePattern(container);
+      result.appendChild(btn);
+    });
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function proposePattern(container) {
+  const result = document.getElementById("chapter3-result");
+
+  try {
+    const proposed = await postJson(`/tenants/${state.guildA.tenantId}/propose`, state.guildA.aliceToken, {
+      job1: state.chapter1.jobNodeId,
+      job2: state.chapter3.secondJobNodeId,
+    });
+    state.chapter3.patternNodeId = proposed.node_id;
+
+    // The propose response itself carries no trace/template/evidence content — read the same
+    // pending-review data Catalog.list_pending_reviews/1 already exposes as a library function,
+    // via the ordinary generic LDP resource-read path (GET .../resources/catalog/pending-review
+    // never applies the reserved-path check that only gates writes — confirmed by reading
+    // ResourceController.show/2 and Catalog.pending_review_stream_id/1 directly).
+    const store = await fetchTurtle(`/tenants/${state.guildA.tenantId}/resources/catalog/pending-review`, state.guildA.aliceToken);
+    const candidateQuad = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:candidate"), null)[0];
+    const evidenceQuads = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:fidelityEvidence"), null);
+
+    const evidencePanel = document.createElement("div");
+    evidencePanel.className = "payoff";
+    evidencePanel.innerHTML = `
+      <p><strong>Generalization proposed</strong> (outcome: ${proposed.outcome}, kind: ${proposed.kind})</p>
+      <p>Candidate node: ${candidateQuad ? candidateQuad.object.value : "(see raw Turtle above)"}</p>
+      <p>Fidelity evidence entries: ${evidenceQuads.length}</p>
+    `;
+    result.appendChild(evidencePanel);
+
+    const approveBtn = document.createElement("button");
+    approveBtn.id = "chapter3-approve-button";
+    approveBtn.textContent = "Approve";
+    approveBtn.onclick = () => approvePattern(container);
+    result.appendChild(approveBtn);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function approvePattern(container) {
+  const result = document.getElementById("chapter3-result");
+
+  try {
+    await postJson(`/tenants/${state.guildA.tenantId}/pending-reviews/${state.chapter3.patternNodeId}/approve`, state.guildA.aliceToken, {});
+
+    const thirdSection = document.createElement("div");
+    thirdSection.innerHTML = `
+      <p>A third, similar Task — watch how it resolves this time:</p>
+      <input type="text" id="chapter3-third-description-input" value="make a badge that says You've got this!" />
+      <button id="chapter3-third-submit-button">Submit Task</button>
+    `;
+    result.appendChild(thirdSection);
+    document.getElementById("chapter3-third-submit-button").onclick = () => submitThirdBadgeTask(container);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
+async function submitThirdBadgeTask(container) {
+  const result = document.getElementById("chapter3-result");
+
+  try {
+    const description = document.getElementById("chapter3-third-description-input").value;
+    const submitted = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, { description });
+    state.chapter3.thirdJobNodeId = submitted.job_node;
+
+    const payoff = document.createElement("div");
+    payoff.className = "payoff";
+    payoff.innerHTML = `
+      <p>Task 1 resolved via: <strong>llm_fallback</strong></p>
+      <p>Task 2 resolved via: <strong>llm_fallback</strong></p>
+      <p>Task 3 resolved via: <strong>${submitted.resolved_via}</strong></p>
+    `;
+    result.appendChild(payoff);
+    addNextButton(result);
+  } catch (err) {
+    renderError(err, result);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", renderCurrentChapter);
 </script>
 </body>
