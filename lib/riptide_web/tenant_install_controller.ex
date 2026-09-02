@@ -44,6 +44,57 @@ defmodule RiptideWeb.TenantInstallController do
     end
   end
 
+  # A CapabilityCatalogEntry isn't a Rule and doesn't go through Install.install/3's
+  # Crosswalk-mapping logic at all — this is copy-on-install instead: fetch the source tenant's own
+  # blob bytes and write them into the caller's own tenant-scoped BlobStore, so the installed copy
+  # keeps working even if the source tenant's original is later deleted (design spec
+  # `docs/superpowers/specs/2026-09-02-phase-6q-tenant-sovereignty-design.md` §4.7).
+  def install_capability(conn, %{"source_tenant_id" => source_tenant_id, "node_id" => node_id}) do
+    tenant_id = conn.assigns.tenant_id
+
+    case Riptide.WriteRateLimit.check(tenant_id) do
+      :deny -> send_resp(conn, 429, "")
+      :allow -> handle_install_capability(conn, tenant_id, source_tenant_id, node_id)
+    end
+  end
+
+  def install_capability(conn, _params), do: send_resp(conn, 400, "")
+
+  defp handle_install_capability(conn, tenant_id, source_tenant_id, node_id) do
+    {:ok, source_capabilities} = Catalog.list_capabilities({:tenant, source_tenant_id})
+
+    found =
+      Enum.find(source_capabilities, fn {node, _entry} -> RDF.BlankNode.value(node) == node_id end)
+
+    case found do
+      nil ->
+        send_resp(conn, 404, "")
+
+      {_source_node, entry} ->
+        with {:ok, bytes} <- Riptide.BlobStore.get(source_tenant_id, entry.component_hash),
+             {:ok, new_hash} <- Riptide.BlobStore.put(tenant_id, bytes) do
+          installed_entry = %{entry | component_hash: new_hash}
+          scope = {:tenant, tenant_id}
+
+          case DedupGate.propose_capability(scope, scope, installed_entry, nil) do
+            {:ok, review_node} ->
+              body =
+                Jason.encode!(%{
+                  "outcome" => "queued",
+                  "node_id" => RDF.BlankNode.value(review_node)
+                })
+
+              conn |> put_resp_content_type("application/json") |> send_resp(200, body)
+
+            {:error, _reason} ->
+              send_resp(conn, 503, "")
+          end
+        else
+          _error -> send_resp(conn, 503, "")
+        end
+    end
+  end
+
   defp handle_install(conn, tenant_id, source_tenant_id, node_id) do
     {:ok, source_entries} = Catalog.list_entries({:tenant, source_tenant_id})
     found = Enum.find(source_entries, fn {node, _rule} -> RDF.BlankNode.value(node) == node_id end)

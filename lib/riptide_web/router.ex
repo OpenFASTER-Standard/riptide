@@ -74,6 +74,7 @@ defmodule RiptideWeb.Router do
     post "/install", RiptideWeb.TenantInstallController, :install
     post "/install-reviews/:node_id/approve", RiptideWeb.TenantInstallController, :approve
     post "/install-reviews/:node_id/decline", RiptideWeb.TenantInstallController, :decline
+    post "/install-capability", RiptideWeb.TenantInstallController, :install_capability
 
     post "/crosswalks", RiptideWeb.TenantCrosswalkController, :propose
     post "/crosswalk-reviews/:node_id/approve", RiptideWeb.TenantCrosswalkController, :approve
