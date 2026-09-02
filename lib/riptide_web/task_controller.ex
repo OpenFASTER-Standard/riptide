@@ -26,27 +26,28 @@ defmodule RiptideWeb.TaskController do
 
   defp handle_create(conn, tenant_id, description, params) do
     facts = Map.get(params, "facts", [])
+    mutex_key = Map.get(params, "mutex_key")
     current_subject = conn.assigns[:current_subject]
 
     case Discovery.find({:tenant, tenant_id}, description) do
       {:ok, [{_node, rule} | _rest]} ->
-        write_discovery_job(conn, tenant_id, description, rule, facts)
+        write_discovery_job(conn, tenant_id, description, rule, facts, mutex_key)
 
       {:ok, []} ->
-        resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject)
+        resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject, mutex_key)
 
       {:error, :not_ready} ->
         send_resp(conn, 503, "")
     end
   end
 
-  defp resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject) do
+  defp resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject, mutex_key) do
     graph = facts_to_graph(facts)
     {:ok, context} = ContextResolver.resolve_all(tenant_id, current_subject)
 
     case LLMFallback.run(description, graph, context) do
       {:ok, trace} ->
-        write_llm_fallback_job(conn, tenant_id, description, trace)
+        write_llm_fallback_job(conn, tenant_id, description, trace, mutex_key)
 
       {:error, reason} ->
         body = Jason.encode!(%{"error" => "llm_fallback_failed", "reason" => inspect(reason)})
@@ -54,7 +55,7 @@ defmodule RiptideWeb.TaskController do
     end
   end
 
-  defp write_discovery_job(conn, tenant_id, description, rule, facts) do
+  defp write_discovery_job(conn, tenant_id, description, rule, facts, mutex_key) do
     case write_task_facts(tenant_id, facts) do
       {:ok, job_graph_stream_id} ->
         job = %Job{
@@ -65,6 +66,7 @@ defmodule RiptideWeb.TaskController do
           job_graph: job_graph_stream_id,
           result: nil,
           error: nil,
+          mutex_key: mutex_key,
           resolved_via: :discovery,
           original_description: description,
           trace: nil
@@ -81,7 +83,8 @@ defmodule RiptideWeb.TaskController do
          conn,
          tenant_id,
          description,
-         %Rule{body: [%CapabilityReference{capability: capability_iri, args: args}]} = trace
+         %Rule{body: [%CapabilityReference{capability: capability_iri, args: args}]} = trace,
+         mutex_key
        ) do
     job = %Job{
       tenant_id: tenant_id,
@@ -91,6 +94,7 @@ defmodule RiptideWeb.TaskController do
       job_graph: nil,
       result: nil,
       error: nil,
+      mutex_key: mutex_key,
       resolved_via: :llm_fallback,
       original_description: description,
       trace: trace
