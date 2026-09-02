@@ -135,7 +135,7 @@ async function runChapters(page) {
   await page.click('#chapter3-approve-button');
   await page.waitForSelector('#chapter3-third-submit-button', { timeout: 10000 });
   await page.click('#chapter3-third-submit-button');
-  await page.waitForSelector('.payoff:has-text("discovery")', { timeout: 15000 });
+  await page.waitForSelector('.payoff:has-text("safely declined")', { timeout: 15000 });
   log("Chapter 3 passed");
   await page.click('button:has-text("Next chapter")');
 

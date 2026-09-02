@@ -25,6 +25,17 @@ const CANNED_COMPLETIONS = [
     rule:
       'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Great job, Champion!", Result).',
   },
+  // Chapter 3's own third Task (Task 5): worded to overlap "badge" so Discovery.find/2 DOES match
+  // the pattern just admitted from the two completions above — but that pattern's own body is a
+  // bare Capability call with no fact to bind a fresh argument from, so
+  // ExecuteInterpreter.invokable_via_facts?/1 correctly declines to reuse it and this Task falls
+  // back to the LLM after all (confirmed live — before that check existed, this exact Task
+  // silently wrote a Job that failed every time with {:unbound_variable, _}).
+  {
+    match: "make a badge that says You've got this!",
+    rule:
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "You\'ve got this!", Result).',
+  },
   {
     match: "try the cursed amulet",
     rule:

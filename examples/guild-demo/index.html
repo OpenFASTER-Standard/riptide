@@ -475,15 +475,20 @@ async function proposePattern(container) {
     // via the ordinary generic LDP resource-read path (GET .../resources/catalog/pending-review
     // never applies the reserved-path check that only gates writes — confirmed by reading
     // ResourceController.show/2 and Catalog.pending_review_stream_id/1 directly).
+    //
+    // Not matched against proposed.node_id as a blank-node subject: same class of bug as the
+    // Job-matching fix in Chapters 1/2 — this PendingReview's own top-level node has zero inbound
+    // references, so Riptide.RDF.TurtleCodec's underlying writer renders it as anonymous `[...]`
+    // syntax with no label at all (confirmed live: constructing N3.DataFactory.blankNode(node_id)
+    // and querying by subject never matched anything, silently). Only one review is pending here,
+    // so matching by predicate alone — no subject filter — is unambiguous.
     const store = await fetchTurtle(`/tenants/${state.guildA.tenantId}/resources/catalog/pending-review`, state.guildA.aliceToken);
-    const candidateQuad = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:candidate"), null)[0];
-    const evidenceQuads = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:fidelityEvidence"), null);
+    const evidenceQuads = store.getQuads(null, N3.DataFactory.namedNode("urn:riptide:vocab:fidelityEvidence"), null);
 
     const evidencePanel = document.createElement("div");
     evidencePanel.className = "payoff";
     evidencePanel.innerHTML = `
       <p><strong>Generalization proposed</strong> (outcome: ${proposed.outcome}, kind: ${proposed.kind})</p>
-      <p>Candidate node: ${candidateQuad ? candidateQuad.object.value : "(see raw Turtle above)"}</p>
       <p>Fidelity evidence entries: ${evidenceQuads.length}</p>
     `;
     result.appendChild(evidencePanel);
@@ -525,12 +530,22 @@ async function submitThirdBadgeTask(container) {
     const submitted = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, { description });
     state.chapter3.thirdJobNodeId = submitted.job_node;
 
+    // Discovery DOES recognize this Task by keyword against the pattern just admitted — but that
+    // pattern's own body is a bare Capability call with no fact to bind a fresh argument from
+    // (nothing in this demo ever teaches Riptide *how* Alice's badge text varies, only that it
+    // does), so RiptideWeb.TaskController now safely declines to reuse it directly and asks the
+    // LLM again instead — confirmed live via a real fix this task's own execution required
+    // (ExecuteInterpreter.invokable_via_facts?/1): before it existed, this exact Task silently
+    // wrote a Job that failed every time with {:unbound_variable, _}.
     const payoff = document.createElement("div");
     payoff.className = "payoff";
     payoff.innerHTML = `
       <p>Task 1 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 2 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 3 resolved via: <strong>${submitted.resolved_via}</strong></p>
+      <p><em>Discovery did recognize this one by keyword against the pattern just admitted — but that
+      pattern has no way to bind a fresh badge message from facts alone, so Riptide safely declined to
+      reuse it directly and asked the LLM again instead, rather than writing a Job doomed to fail.</em></p>
     `;
     result.appendChild(payoff);
     addNextButton(result);
@@ -565,16 +580,6 @@ async function beginGuildB(container) {
     state.guildB.bobToken = response.token;
     state.guildB.bobSub = response.sub;
 
-    // Guild B's own live pane subscribes to Guild A's catalog now, before Alice grants :public —
-    // it just won't see anything until that grant happens (matches ResourceController's own
-    // 6q-shipped Authz gate; subscribing early is what makes the later grant feel "live").
-    const catalogStreamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/catalog`;
-    subscribeStream(catalogStreamId, state.guildB.bobToken, (quads) => {
-      const li = document.createElement("li");
-      li.textContent = `New entry: ${quads.map((q) => q.subject.value).join(", ")}`;
-      document.getElementById("chapter4-live-list").appendChild(li);
-    });
-
     const btn = document.createElement("button");
     btn.id = "chapter4-admit-local-button";
     btn.textContent = "Admit Guild B's own convention";
@@ -604,6 +609,30 @@ async function grantPublicRead(container) {
   try {
     await postJson(`/tenants/${state.guildA.tenantId}/policies`, state.guildA.aliceToken, {
       effect: "allow", modes: ["read"], matcher: "public",
+    });
+
+    // Only subscribe now, not from the moment Guild B was bootstrapped: a browser's EventSource
+    // treats a non-2xx HTTP response (403, before this grant existed) as a terminal failure, not
+    // something it retries after — confirmed live (a real 403 in the server logs, with zero
+    // reconnect attempts afterward, even once this same grant later existed). Subscribing only
+    // once the grant is already in place means the very first response is a real 200, whose own
+    // backlog already includes Guild A's admitted pattern — still a live pane from here on.
+    // Not `quads.map((q) => q.subject.value)`: a catalog admission patch nests a Rule's own
+    // head/body/signature/provenance as dozens of further blank-node-subject triples in the same
+    // event, and (same reasoning as every other Chapter's own SSE handling) those blank-node
+    // labels are just N3.js's own per-parse auto-generated ids, not anything meaningful to a
+    // reader — confirmed live: an unfiltered dump renders as a wall of "n3-73, n3-74, ..." noise.
+    // Counting rdf:type <urn:riptide:vocab:Rule> occurrences gives an honest, human-readable
+    // signal of real Catalog activity instead.
+    const catalogStreamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/catalog`;
+    subscribeStream(catalogStreamId, state.guildB.bobToken, (quads) => {
+      const ruleTypeQuads = quads.filter(
+        (q) => q.predicate.value === "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" && q.object.value === "urn:riptide:vocab:Rule"
+      );
+      if (ruleTypeQuads.length === 0) return;
+      const li = document.createElement("li");
+      li.textContent = `New Catalog activity: ${ruleTypeQuads.length} Rule node(s) touched`;
+      document.getElementById("chapter4-live-list").appendChild(li);
     });
 
     const btn = document.createElement("button");

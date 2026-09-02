@@ -63,6 +63,17 @@ const CANNED_COMPLETIONS = [
     rule:
       'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "Great job, Champion!", Result).',
   },
+  // Chapter 3's own third Task (Task 5): worded to overlap "badge" so Discovery.find/2 DOES match
+  // the pattern just admitted from the two completions above — but that pattern's own body is a
+  // bare Capability call with no fact to bind a fresh argument from, so
+  // ExecuteInterpreter.invokable_via_facts?/1 correctly declines to reuse it and this Task falls
+  // back to the LLM after all (confirmed live — before that check existed, this exact Task
+  // silently wrote a Job that failed every time with {:unbound_variable, _}).
+  {
+    match: "make a badge that says You've got this!",
+    rule:
+      'badgeResult(<urn:riptide:demo:badge>, Result) :- capability(guildDemoBadge, "You\'ve got this!", Result).',
+  },
   {
     match: "try the cursed amulet",
     rule:
@@ -796,7 +807,7 @@ Extend `runChapters` in `smoke-test.mjs`, after the Chapter 2 block:
   await page.click('#chapter3-approve-button');
   await page.waitForSelector('#chapter3-third-submit-button', { timeout: 10000 });
   await page.click('#chapter3-third-submit-button');
-  await page.waitForSelector('.payoff:has-text("discovery")', { timeout: 15000 });
+  await page.waitForSelector('.payoff:has-text("safely declined")', { timeout: 15000 });
   log("Chapter 3 passed");
   await page.click('button:has-text("Next chapter")');
 ```
@@ -870,15 +881,20 @@ async function proposePattern(container) {
     // The propose response itself carries no trace/template/evidence content — read the same
     // pending-review data Catalog.list_pending_reviews/1 already exposes as a library function,
     // via the ordinary generic LDP resource-read path (see this task's own Interfaces note).
+    //
+    // Not matched against proposed.node_id as a blank-node subject: same class of bug as the
+    // Job-matching fix in Chapters 1/2 — this PendingReview's own top-level node has zero inbound
+    // references, so Riptide.RDF.TurtleCodec's underlying writer renders it as anonymous `[...]`
+    // syntax with no label at all (confirmed live: constructing N3.DataFactory.blankNode(node_id)
+    // and querying by subject never matched anything, silently). Only one review is pending here,
+    // so matching by predicate alone — no subject filter — is unambiguous.
     const store = await fetchTurtle(`/tenants/${state.guildA.tenantId}/resources/catalog/pending-review`, state.guildA.aliceToken);
-    const candidateQuad = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:candidate"), null)[0];
-    const evidenceQuads = store.getQuads(N3.DataFactory.blankNode(proposed.node_id), N3.DataFactory.namedNode("urn:riptide:vocab:fidelityEvidence"), null);
+    const evidenceQuads = store.getQuads(null, N3.DataFactory.namedNode("urn:riptide:vocab:fidelityEvidence"), null);
 
     const evidencePanel = document.createElement("div");
     evidencePanel.className = "payoff";
     evidencePanel.innerHTML = `
       <p><strong>Generalization proposed</strong> (outcome: ${proposed.outcome}, kind: ${proposed.kind})</p>
-      <p>Candidate node: ${candidateQuad ? candidateQuad.object.value : "(see raw Turtle above)"}</p>
       <p>Fidelity evidence entries: ${evidenceQuads.length}</p>
     `;
     result.appendChild(evidencePanel);
@@ -920,12 +936,22 @@ async function submitThirdBadgeTask(container) {
     const submitted = await postJson(`/tenants/${state.guildA.tenantId}/tasks`, state.guildA.aliceToken, { description });
     state.chapter3.thirdJobNodeId = submitted.job_node;
 
+    // Discovery DOES recognize this Task by keyword against the pattern just admitted — but that
+    // pattern's own body is a bare Capability call with no fact to bind a fresh argument from
+    // (nothing in this demo ever teaches Riptide *how* Alice's badge text varies, only that it
+    // does), so RiptideWeb.TaskController now safely declines to reuse it directly and asks the
+    // LLM again instead — confirmed live via a real fix this task's own execution required
+    // (ExecuteInterpreter.invokable_via_facts?/1): before it existed, this exact Task silently
+    // wrote a Job that failed every time with {:unbound_variable, _}.
     const payoff = document.createElement("div");
     payoff.className = "payoff";
     payoff.innerHTML = `
       <p>Task 1 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 2 resolved via: <strong>llm_fallback</strong></p>
       <p>Task 3 resolved via: <strong>${submitted.resolved_via}</strong></p>
+      <p><em>Discovery did recognize this one by keyword against the pattern just admitted — but that
+      pattern has no way to bind a fresh badge message from facts alone, so Riptide safely declined to
+      reuse it directly and asked the LLM again instead, rather than writing a Job doomed to fail.</em></p>
     `;
     result.appendChild(payoff);
     addNextButton(result);
@@ -1017,16 +1043,6 @@ async function beginGuildB(container) {
     state.guildB.bobToken = response.token;
     state.guildB.bobSub = response.sub;
 
-    // Guild B's own live pane subscribes to Guild A's catalog now, before Alice grants :public —
-    // it just won't see anything until that grant happens (matches ResourceController's own
-    // 6q-shipped Authz gate; subscribing early is what makes the later grant feel "live").
-    const catalogStreamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/catalog`;
-    subscribeStream(catalogStreamId, state.guildB.bobToken, (quads) => {
-      const li = document.createElement("li");
-      li.textContent = `New entry: ${quads.map((q) => q.subject.value).join(", ")}`;
-      document.getElementById("chapter4-live-list").appendChild(li);
-    });
-
     const btn = document.createElement("button");
     btn.id = "chapter4-admit-local-button";
     btn.textContent = "Admit Guild B's own convention";
@@ -1037,25 +1053,18 @@ async function beginGuildB(container) {
   }
 }
 
-async function admitGuildBLocalRule(container) {
+function admitGuildBLocalRule(container) {
   const result = document.getElementById("chapter4-result");
-  try {
-    // Guild B's own differently-named-predicate Rule, admitted directly as an ordinary Turtle
-    // write — no Task/LLMFallback involvement needed for this establishing step.
-    const turtle = `@prefix : <urn:riptide:relation:> .\n:guildBAwardedBadge a <urn:riptide:vocab:LocalPlaceholder> .`;
-    // This chapter's own local convention is illustrative context, not itself part of any later
-    // API call — it establishes Guild B already has her own vocabulary before installing Guild
-    // A's pattern, matching the original narrative's own framing.
-    state.chapter4.guildBLocalRuleNodeId = "guildBAwardedBadge";
+  // Illustrative only — no API call. This step's whole point is establishing that Guild B already
+  // has its own separate vocabulary before installing Guild A's pattern; the demo already shows a
+  // real admit flow in Chapters 1-3, so this one stays a narrative beat, not a repeat of it.
+  state.chapter4.guildBLocalRuleNodeId = "guildBAwardedBadge";
 
-    const btn = document.createElement("button");
-    btn.id = "chapter4-grant-public-button";
-    btn.textContent = "Guild A: grant public read";
-    btn.onclick = () => grantPublicRead(container);
-    result.appendChild(btn);
-  } catch (err) {
-    renderError(err, result);
-  }
+  const btn = document.createElement("button");
+  btn.id = "chapter4-grant-public-button";
+  btn.textContent = "Guild A: grant public read";
+  btn.onclick = () => grantPublicRead(container);
+  result.appendChild(btn);
 }
 
 async function grantPublicRead(container) {
@@ -1063,6 +1072,30 @@ async function grantPublicRead(container) {
   try {
     await postJson(`/tenants/${state.guildA.tenantId}/policies`, state.guildA.aliceToken, {
       effect: "allow", modes: ["read"], matcher: "public",
+    });
+
+    // Only subscribe now, not from the moment Guild B was bootstrapped: a browser's EventSource
+    // treats a non-2xx HTTP response (403, before this grant existed) as a terminal failure, not
+    // something it retries after — confirmed live (a real 403 in the server logs, with zero
+    // reconnect attempts afterward, even once this same grant later existed). Subscribing only
+    // once the grant is already in place means the very first response is a real 200, whose own
+    // backlog already includes Guild A's admitted pattern — still a live pane from here on.
+    // Not `quads.map((q) => q.subject.value)`: a catalog admission patch nests a Rule's own
+    // head/body/signature/provenance as dozens of further blank-node-subject triples in the same
+    // event, and (same reasoning as every other Chapter's own SSE handling) those blank-node
+    // labels are just N3.js's own per-parse auto-generated ids, not anything meaningful to a
+    // reader — confirmed live: an unfiltered dump renders as a wall of "n3-73, n3-74, ..." noise.
+    // Counting rdf:type <urn:riptide:vocab:Rule> occurrences gives an honest, human-readable
+    // signal of real Catalog activity instead.
+    const catalogStreamId = `https://riptide.example/tenants/${state.guildA.tenantId}/resources/catalog`;
+    subscribeStream(catalogStreamId, state.guildB.bobToken, (quads) => {
+      const ruleTypeQuads = quads.filter(
+        (q) => q.predicate.value === "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" && q.object.value === "urn:riptide:vocab:Rule"
+      );
+      if (ruleTypeQuads.length === 0) return;
+      const li = document.createElement("li");
+      li.textContent = `New Catalog activity: ${ruleTypeQuads.length} Rule node(s) touched`;
+      document.getElementById("chapter4-live-list").appendChild(li);
     });
 
     const btn = document.createElement("button");
@@ -1509,9 +1542,64 @@ Expected: `[smoke-test] ALL CHAPTERS PASSED`, with no leftover `mix phx.server`/
 
 Open `index.html` in a real browser against a freshly-booted dev instance (not the smoke test's own automated Playwright browser) and click through all seven Chapters by hand, confirming every payoff described in the spec's §4.4-4.9 actually reads well and looks right visually — the smoke test only confirms elements *appear*, not that the page is pleasant to actually watch.
 
+**Real bugs found and fixed during this step — not visible to the smoke test's own coarse
+assertions**, via a scratch Playwright screenshot script driving the real flow and inspecting each
+payoff visually (not part of the shipped repo, deleted after use):
+
+1. Chapter 3's evidence panel showed a broken placeholder ("Candidate node: (see raw Turtle
+   above)", with no raw Turtle actually shown anywhere) — `proposePattern()` tried to query the
+   pending-review Turtle by constructing `N3.DataFactory.blankNode(proposed.node_id)` as a
+   subject filter, but (same class of bug as the Job-matching fix in Chapters 1/2) that node has
+   no label surviving the parse. Fixed by matching on the `fidelityEvidence` predicate alone, and
+   dropping the "Candidate node" line entirely (a parser-internal id, never meaningful to a
+   reader, even once found).
+2. Chapter 4's "public noticeboard" live pane was permanently empty — `beginGuildB()` subscribed
+   to Guild A's catalog stream *before* Alice's `:public` read grant existed, and a browser's
+   EventSource treats a non-2xx response (the resulting 403) as a terminal failure, never
+   retrying — confirmed live (a real 403 in the server log, zero reconnect attempts afterward,
+   even once the grant later existed). Fixed by moving the subscribe call into `grantPublicRead()`,
+   after the grant succeeds.
+3. Once reachable, that same live pane dumped a wall of raw N3.js-internal blank-node labels
+   ("n3-73, n3-74, ..." dozens deep) — `quads.map((q) => q.subject.value)` printed every blank
+   node in a catalog-admission patch's own deeply-nested Rule structure. Fixed by counting
+   `rdf:type <urn:riptide:vocab:Rule>` occurrences instead of dumping raw subjects.
+4. **The most significant finding**: Chapter 5's "no double-loot" payoff showed one of the two
+   mutex-Jobs as `failed`, not `done`. Root cause, confirmed via a real Job's own `jobError` field
+   read off a live server and cross-checked against `AntiUnifier.generalize/2`'s own
+   implementation: a Rule generalized purely from Capability-invocation Traces (Chapter 3's own
+   `badgeResult` pattern — no `FactPattern` literal anywhere in its body, since
+   `AntiUnifier.generalize/2` never synthesizes one) has a free Var no caller-supplied facts could
+   ever bind. `Riptide.Derivation.Discovery.find/2` still matches such a Rule by keyword (correctly
+   — it's a real, valid Catalog entry), but `RiptideWeb.TaskController` routing a Task to it via
+   `resolved_via: :discovery` was silently writing a Job doomed to fail with
+   `{:unbound_variable, _}` every time — a genuine, previously-uncaught **backend** bug, not a
+   demo bug: even `test/riptide_web/tenant_execution_surface_capstone_test.exs`'s own "exit
+   criterion" test had this exact gap (asserted `resolved_via == :discovery` but never checked the
+   resulting Job's own `status`, so it passed while its own Job silently failed underneath it).
+   This affected Chapter 3's own third Task too (the "resolved via Discovery" narrative beat),
+   which happened to never claim success beyond the resolution mechanism, so it wasn't visibly
+   broken, just quietly wrong. Fixed with a new public
+   `Riptide.Derivation.ExecuteInterpreter.invokable_via_facts?/1`, used by `TaskController` to skip
+   past any Discovery match that could never be satisfied by any facts, falling through to
+   LLMFallback instead of writing an unwinnable Job — full test suite green afterward (621/0), the
+   capstone test's own name and assertions updated to describe the corrected behavior, and
+   Chapter 3's own third-Task payoff rewritten to honestly explain why it now falls back to the
+   LLM instead of claiming a Discovery-resolved success that was never actually reachable. Chapter
+   5 needed no changes at all once this landed — both mutex Jobs now correctly fall through to
+   LLMFallback and complete.
+
 - [ ] **Step 3: `finishing-a-development-branch`**
 
-Announce: "I'm using the finishing-a-development-branch skill to complete this work." Push, open the implementation PR, poll CI green (this PR is docs/frontend-only — `mix test`/`mix credo --strict`/`mix format --check-formatted` should be unaffected, but confirm the CI run is still green, not just assumed). Per this sub-project's established pattern, do **not** merge either this PR or the still-open spec PR (#135) until explicitly instructed — then merge the spec PR first, merge latest `main` into this branch if needed, then merge this implementation PR.
+Announce: "I'm using the finishing-a-development-branch skill to complete this work." Push, open
+the implementation PR, poll CI green. This PR is **not** docs/frontend-only, despite the plan's own
+original assumption — Tasks 4, 6, 7, and 9's own execution each surfaced real, confirmed backend
+bugs (SSE content-negotiation and first-subscribe backlog loss; missing `:invoke` authorization;
+Discovery search responses with no addressable node id; and this task's own
+`invokable_via_facts?/1` fix) requiring real `lib/`/`test/` changes — confirm `mix
+test`/`mix credo --strict`/`mix format --check-formatted` are all genuinely green in CI, not
+assumed unaffected. Per this sub-project's established pattern, do **not** merge either this PR or
+the still-open spec PR (#135) until explicitly instructed — then merge the spec PR first, merge
+latest `main` into this branch if needed, then merge this implementation PR.
 
 ## Self-Review
 
