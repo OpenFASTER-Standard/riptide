@@ -101,6 +101,22 @@ defmodule Riptide.Derivation.ExecuteInterpreter do
     end
   end
 
+  @doc """
+  Whether `rule` could ever be satisfied by *any* facts a caller might supply — the same
+  structural safety check `resolve_bindings/3`/`call_template/3` already apply, exposed so a
+  caller deciding whether to route a Task to this Rule at all (before ever writing a Job) can
+  check first. A Rule generalized purely from Capability-invocation Traces (no `FactPattern`
+  literal anywhere in its own body) can never satisfy this: `AntiUnifier.generalize/2` never
+  synthesizes a `FactPattern` to bind a newly-introduced Var, so such a Rule's own free Vars are
+  permanently unbindable by any external caller — confirmed live: `Riptide.Derivation.Discovery`
+  matching a Task's own description against exactly this Rule shape, then invoking it via
+  `Riptide.Derivation.JobTrigger`, reliably fails every time with `{:unbound_variable, _}`,
+  the same class of failure `check_vars_bound/2`'s own moduledoc already documents as a known,
+  previously-crashing case for the sibling `resolve_bindings/3` path.
+  """
+  @spec invokable_via_facts?(Rule.t()) :: boolean()
+  def invokable_via_facts?(%Rule{body: body}), do: check_vars_bound(body, MapSet.new()) == :ok
+
   defp check_resolvable(body, context) do
     Enum.reduce_while(body, :ok, fn literal, :ok ->
       case check_literal_resolvable(literal, context) do
