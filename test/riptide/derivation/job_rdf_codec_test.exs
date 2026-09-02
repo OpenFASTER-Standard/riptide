@@ -63,8 +63,8 @@ defmodule Riptide.Derivation.JobRDFCodecTest do
     assert JobRDFCodec.from_rdf(node, graph) == job
   end
 
-  test "round-trips a Job with a resource_key set" do
-    job = sample_job(%{resource_key: "restart-payments-service"})
+  test "round-trips a Job with a mutex_key set" do
+    job = sample_job(%{mutex_key: "restart-payments-service"})
 
     {node, graph} = JobRDFCodec.to_rdf(job)
 

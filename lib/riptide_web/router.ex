@@ -74,6 +74,7 @@ defmodule RiptideWeb.Router do
     get "/policies", RiptideWeb.Authz.PolicyController, :index
 
     post "/tasks", RiptideWeb.TaskController, :create
+    post "/query", RiptideWeb.TenantQueryController, :create
 
     post "/propose", RiptideWeb.TenantProposeController, :propose
     post "/pending-reviews/:node_id/approve", RiptideWeb.TenantReviewController, :approve

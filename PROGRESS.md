@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication) — see issue #58 for the current remaining list (6p demo, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions) — see issue #58 for the current remaining list (6p-ii demo WASM components, 6p-iii the demo page, 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1472,3 +1472,50 @@ deployment could crash the request via an uncaught `:exit` instead of falling th
 entry in the configured list.
 
 **Status**: Phase 6o shipped 2026-09-01.
+
+### 6p-i — Demo Backend Additions
+
+**Shipped 2026-09-01** — see
+`docs/superpowers/specs/2026-09-01-phase-6p-i-demo-backend-additions-design.md`. Direct origin:
+brainstorming the Sub-project 6 demo (6p, pushed back from 6o once that letter was reassigned to
+username/password authentication) found two of its six planned beats needed real backend surface that
+didn't exist yet — "two players, one chest" (6d-ii's concurrent-effects guarantee) needed a way to mark
+two Task submissions as mutually exclusive, and "ask a question, not just store data" (6c-ii's
+recursive/fixpoint rule evaluation) needed *any* HTTP surface at all for `QueryInterpreter`, confirmed
+by direct search to be 100% library-only before this phase. 6p was split into three sub-phases during
+brainstorming (6p-i backend, 6p-ii the demo's own WASM components, 6p-iii the demo page itself), each
+with its own spec → plan → implementation cycle — this is the first, with no dependency on the other
+two.
+
+`Job.resource_key` is renamed to `Job.mutex_key` throughout — struct field, RDF predicate
+(`urn:riptide:vocab:jobResourceKey` → `urn:riptide:vocab:jobMutexKey`), and, deliberately going beyond
+the literal field rename, `JobTrigger`'s own internal ETS table names and local variable names too
+(`@resource_locks_table` → `@mutex_locks_table`, etc.) — the old name collided with Riptide's own, much
+more prominent LDP "resource" concept (`/resources/*path`), and leaving it in the file's own internal
+naming would have left the exact same collision one layer deeper right next to the freshly-renamed
+public field. Confirmed no real deployment/data exists anywhere using the old predicate, so this was a
+clean rename, not a migration. `TaskController` now threads an optional `mutex_key` from the
+`POST /tasks` JSON body into both Job-construction paths (Discovery-resolved and LLMFallback-resolved)
+— previously silently dropped even if a caller sent one.
+
+New `POST /tenants/:tenant_id/query` reuses existing storage entirely rather than inventing any new
+wire format: the ruleset is the Tenant's own already-admitted Catalog (`Catalog.list_entries/1`,
+unchanged), the starting facts come from reading one caller-named existing Tenant resource
+(`{"starting_resource_path": ["characters", "alice"]}`), and the response is the resulting graph as
+Turtle — the same "return the current full graph" shape `ResourceController.show/2` already uses,
+confirmed correct by reading `QueryInterpreter.loop/5` directly (the returned graph is the union of
+starting facts and everything derived, not a diff). Deliberately diverges from `show/2`'s own semantics
+in one place: a `starting_resource_path` that's never been written evaluates against an empty starting
+graph (`200`), not `404` — a legitimate query outcome, not a broken request.
+
+**One real gap caught only by actually running the capstone test, not assumed from the design**: the
+first capstone attempt asserted both same-`mutex_key` Jobs would be `:done` within a 10-second window
+and failed — Alice's Job completed but Bob's stayed `:pending` indefinitely at that timeout. Root cause,
+confirmed by inspecting the actual Job states rather than guessing: whichever Job loses the mutex race
+on its own `{:job_written, stream_id}` broadcast is skipped that round and only retried on
+`JobTrigger`'s own 30-second periodic sweep (no test-config override for
+`:job_trigger_sweep_interval_ms`) — exactly the same timing property `job_trigger_cluster_test.exs`'s
+own pre-existing "sharing a resource_key" (now "mutex_key") test already documented and budgeted 50
+seconds for, which this new capstone test's own first draft simply hadn't matched.
+
+**Status**: Phase 6p-i shipped 2026-09-01.

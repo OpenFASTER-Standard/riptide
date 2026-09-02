@@ -285,7 +285,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
   # against the trivial fixture.wasm complete too fast to reliably observe
   # an overlap window one way or the other in a cluster test, so trying to
   # assert it here would be flaky, not more rigorous.
-  test "two Jobs for the same Tenant sharing a resource_key both eventually complete" do
+  test "two Jobs for the same Tenant sharing a mutex_key both eventually complete" do
     peers = bootstrap_peers(@peers)
     tenant_id = "job-trigger-resource-#{System.unique_integer([:positive])}"
 
@@ -324,7 +324,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
         %Riptide.Authz.Policy{effect: :allow, modes: [:invoke], matcher: :public}
       ])
 
-    resource_key = "shared-resource-#{System.unique_integer([:positive])}"
+    mutex_key = "shared-mutex-#{System.unique_integer([:positive])}"
 
     job = fn name ->
       %Riptide.Derivation.Job{
@@ -335,7 +335,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
         job_graph: nil,
         result: nil,
         error: nil,
-        resource_key: resource_key
+        mutex_key: mutex_key
       }
     end
 
@@ -351,7 +351,7 @@ defmodule Riptide.Derivation.JobTriggerClusterTest do
                job.("Bob")
              ])
 
-    # Whichever of the two Jobs loses the resource_key race on its own
+    # Whichever of the two Jobs loses the mutex_key race on its own
     # {:job_written, stream_id} broadcast gets skipped that round and only
     # retried on the next periodic_sweep — 30s in this test env too, since
     # :job_trigger_sweep_interval_ms has no test-config override. 250 * 200ms

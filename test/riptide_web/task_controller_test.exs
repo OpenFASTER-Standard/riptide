@@ -196,4 +196,109 @@ defmodule RiptideWeb.TaskControllerTest do
     assert conn.status == 422
     assert {:ok, []} = Catalog.list_jobs(Catalog.job_stream_id(tenant_id))
   end
+
+  defmodule MutexKeyLLMClient do
+    @behaviour Riptide.Derivation.LLMFallback.Client
+
+    @impl true
+    def complete(_prompt) do
+      {:ok,
+       "taskDone(<urn:test:line-1>, Result) :- capability(taskSubmitMutexGreet, \"World\", Result)."}
+    end
+  end
+
+  test "a submitted mutex_key lands on the written Job when resolved via Discovery" do
+    tenant_id = "task-submit-mutex-discovery-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+
+    on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.job_stream_id(tenant_id))
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, tenant_id}))
+    end)
+
+    predicate_name = "tasksubmitmutex#{System.unique_integer([:positive])}"
+    seed_predicate = "tasksubmitmutexseed#{System.unique_integer([:positive])}"
+
+    rule = %Riptide.Derivation.Rule{
+      signature: %Riptide.Derivation.Signature{
+        name: RDF.iri("urn:riptide:relation:#{predicate_name}"),
+        parameters: [%Riptide.Derivation.Var{name: "Subject"}],
+        reads: [RDF.iri("urn:riptide:relation:#{seed_predicate}")],
+        produces: [RDF.iri("urn:riptide:relation:#{predicate_name}")]
+      },
+      head: %Riptide.Derivation.Literal.FactPattern{
+        predicate: RDF.iri("urn:riptide:relation:#{predicate_name}"),
+        args: [%Riptide.Derivation.Var{name: "Subject"}, RDF.literal("done")]
+      },
+      body: [
+        %Riptide.Derivation.Literal.FactPattern{
+          predicate: RDF.iri("urn:riptide:relation:#{seed_predicate}"),
+          args: [%Riptide.Derivation.Var{name: "Subject"}, RDF.literal("v1")]
+        }
+      ]
+    }
+
+    :ok = Catalog.admit_entry({:tenant, tenant_id}, rule, nil)
+
+    body =
+      Jason.encode!(%{
+        "description" => predicate_name,
+        "facts" => [
+          %{
+            "subject" => "urn:test:subject-1",
+            "predicate" => "urn:riptide:relation:#{seed_predicate}",
+            "object" => "v1"
+          }
+        ],
+        "mutex_key" => "shared-chest"
+      })
+
+    conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/tasks", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 202
+    response = Jason.decode!(conn.resp_body)
+    job_node = response["job_node"]
+
+    {:ok, jobs} = Catalog.list_jobs(Catalog.job_stream_id(tenant_id))
+    {_node, job} = Enum.find(jobs, fn {n, _j} -> RDF.BlankNode.value(n) == job_node end)
+    assert job.mutex_key == "shared-chest"
+
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(job.job_graph) end)
+  end
+
+  test "a submitted mutex_key lands on the written Job when resolved via LLMFallback" do
+    tenant_id = "task-submit-mutex-llm-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+    register_task_submit_capability(tenant_id, "taskSubmitMutexGreet")
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :llm_fallback_client, MutexKeyLLMClient)
+
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(Catalog.job_stream_id(tenant_id)) end)
+
+    body =
+      Jason.encode!(%{
+        "description" => "mark this line done",
+        "facts" => [],
+        "mutex_key" => "shared-chest"
+      })
+
+    conn =
+      :post
+      |> conn("/tenants/#{tenant_id}/tasks", body)
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 202
+    response = Jason.decode!(conn.resp_body)
+    job_node = response["job_node"]
+
+    {:ok, jobs} = Catalog.list_jobs(Catalog.job_stream_id(tenant_id))
+    {_node, job} = Enum.find(jobs, fn {n, _j} -> RDF.BlankNode.value(n) == job_node end)
+    assert job.mutex_key == "shared-chest"
+  end
 end
