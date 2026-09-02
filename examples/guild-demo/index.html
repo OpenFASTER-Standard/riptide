@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>A Guild's First Day — the Riptide Demo</title>
+<script src="https://unpkg.com/n3/browser/n3.min.js"></script>
+<style>
+  :root {
+    --parchment: #f4e8d0;
+    --ink: #2b2116;
+    --gold: #b8860b;
+    --danger: #8b2e2e;
+    --success: #2e6b3e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; display: flex; min-height: 100vh;
+    font-family: Georgia, 'Times New Roman', serif;
+    background: var(--parchment); color: var(--ink);
+  }
+  #quest-log {
+    width: 240px; padding: 1.5rem 1rem; background: #e8d8b0;
+    border-right: 2px solid var(--gold); flex-shrink: 0;
+  }
+  #quest-log h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  #quest-log ol { list-style: none; margin: 0; padding: 0; }
+  #quest-log li { padding: 0.4rem 0; opacity: 0.5; }
+  #quest-log li.current { opacity: 1; font-weight: bold; color: var(--gold); }
+  #quest-log li.done { opacity: 0.8; }
+  #quest-log li.done::before { content: "✓ "; color: var(--success); }
+  #chapter-view { flex: 1; padding: 2rem; max-width: 720px; }
+  button {
+    font-family: inherit; background: var(--gold); color: white; border: none;
+    padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 1rem;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  input[type="text"], input[type="url"], input[type="file"] {
+    font-family: inherit; padding: 0.4rem; width: 100%; margin: 0.4rem 0;
+  }
+  .payoff { background: white; border: 1px solid #ccc; border-radius: 4px; padding: 1rem; margin-top: 1rem; }
+  .error { background: #fdecea; border: 1px solid var(--danger); color: var(--danger); padding: 0.75rem; border-radius: 4px; margin-top: 0.75rem; }
+</style>
+</head>
+<body>
+  <nav id="quest-log">
+    <h1>A Guild's First Day</h1>
+    <ol id="quest-log-list"></ol>
+  </nav>
+  <main id="chapter-view"></main>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const state = {
+  baseUrl: null,
+  guildA: { tenantId: null, aliceToken: null, aliceSub: null },
+  guildB: { tenantId: null, bobToken: null, bobSub: null },
+  chapter1: { capabilityNodeId: null, jobNodeId: null },
+  chapter2: { capabilityNodeId: null, jobNodeId: null },
+  chapter3: { secondJobNodeId: null, patternNodeId: null, thirdJobNodeId: null },
+  chapter4: { guildBLocalRuleNodeId: null, discoveredNodeId: null, installReviewNodeId: null, v2PatternNodeId: null },
+  chapter5: { job1NodeId: null, job2NodeId: null },
+  chapter6: { ruleNodeId: null },
+};
+
+// ---------------------------------------------------------------------------
+// Data-access helpers
+// ---------------------------------------------------------------------------
+class HttpError extends Error {
+  constructor(status, body) {
+    super(`HTTP ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function fetchTurtle(path, token) {
+  const res = await fetch(state.baseUrl + path, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  const text = await res.text();
+  if (!res.ok) throw new HttpError(res.status, text);
+  const store = new N3.Store();
+  store.addQuads(new N3.Parser().parse(text));
+  return store;
+}
+
+function subscribeStream(streamId, token, onPatch) {
+  const url = `${state.baseUrl}/streams/${encodeURIComponent(streamId)}/subscribe?token=${token}`;
+  const es = new EventSource(url);
+  es.onmessage = (ev) => onPatch(new N3.Parser().parse(ev.data));
+  return es; // caller closes via es.close() once its own condition is met
+}
+
+async function postJson(path, token, body) {
+  const res = await fetch(state.baseUrl + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new HttpError(res.status, text);
+  return text === "" ? null : JSON.parse(text);
+}
+
+async function putTurtle(path, token, turtle) {
+  const res = await fetch(state.baseUrl + path, {
+    method: "PUT",
+    headers: { "Content-Type": "text/turtle", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: turtle,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new HttpError(res.status, text);
+}
+
+async function sha256hex(text) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Riptide's own RDF vocabulary IRIs — mirrors the exact terms the backend's own RDF codecs write
+// (JobRDFCodec, CapabilityCatalogRDFCodec, etc.), confirmed directly against
+// lib/riptide/derivation/job_rdf_codec.ex during planning.
+const VOCAB = {
+  jobStatus: "urn:riptide:vocab:jobStatus",
+  jobResult: "urn:riptide:vocab:jobResult",
+  jobError: "urn:riptide:vocab:jobError",
+};
+
+function renderError(err, container) {
+  const div = document.createElement("div");
+  div.className = "error";
+  if (err instanceof HttpError) {
+    div.textContent = errorMessageFor(err);
+  } else {
+    div.textContent = `Unexpected error: ${err.message}`;
+  }
+  container.appendChild(div);
+}
+
+function errorMessageFor(err) {
+  if (err.status === 409) return "This name is already claimed on this Riptide instance — point the demo at a fresh one.";
+  if (err.status === 422 && err.body.includes("llm_fallback_failed")) {
+    return "The backend's LLM API call failed — confirm LLM_API_BASE_URL/LLM_API_KEY/LLM_API_MODEL are set on the Riptide instance (see README).";
+  }
+  if (err.status === 429) return "Rate-limited — wait a moment and try again.";
+  if (err.status === 503) return "Backend temporarily unavailable — try again.";
+  return `HTTP ${err.status}: ${err.body}`;
+}
+
+// ---------------------------------------------------------------------------
+// Stepper engine — Chapter definitions are pushed onto this array by later tasks, each as
+// { title, render(container) } where render() populates #chapter-view for that Chapter and is
+// responsible for calling advanceToNext() once its own payoff has rendered.
+// ---------------------------------------------------------------------------
+const CHAPTERS = [];
+let currentChapterIndex = 0;
+
+function renderQuestLog() {
+  const list = document.getElementById("quest-log-list");
+  list.innerHTML = "";
+  CHAPTERS.forEach((chapter, i) => {
+    const li = document.createElement("li");
+    li.textContent = chapter.title;
+    if (i < currentChapterIndex) li.className = "done";
+    if (i === currentChapterIndex) li.className = "current";
+    list.appendChild(li);
+  });
+}
+
+function renderCurrentChapter() {
+  renderQuestLog();
+  const container = document.getElementById("chapter-view");
+  container.innerHTML = "";
+  if (CHAPTERS.length === 0) return; // no Chapters registered yet
+  CHAPTERS[currentChapterIndex].render(container);
+}
+
+function advanceToNext() {
+  currentChapterIndex += 1;
+  if (currentChapterIndex < CHAPTERS.length) renderCurrentChapter();
+}
+
+function addNextButton(container, label = "Next chapter →") {
+  const btn = document.createElement("button");
+  btn.textContent = label;
+  btn.onclick = advanceToNext;
+  container.appendChild(btn);
+}
+
+window.addEventListener("DOMContentLoaded", renderCurrentChapter);
+</script>
+</body>
+</html>
