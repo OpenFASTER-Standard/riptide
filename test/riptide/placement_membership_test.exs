@@ -18,14 +18,24 @@ defmodule Riptide.PlacementMembershipTest do
         {:placement_membership_changed, [node(), :"riptide@10.0.0.7"]}
       )
 
-      # The already-running Riptide.PlacementMembership process (started by
-      # the application supervision tree — see Task 4) processes the
-      # broadcast asynchronously — poll instead of a fixed sleep, since a
-      # busier scheduler (seen on CI) can take longer than any fixed delay
-      # to deliver and handle the message.
-      assert eventually(fn ->
-               PlacementMembership.current_members() == [node(), :"riptide@10.0.0.7"]
-             end)
+      # Deterministic sync, not a poll: the already-running
+      # Riptide.PlacementMembership process (started by the application
+      # supervision tree — see Task 4) also runs its own periodic :reconcile
+      # tick (every 5s), which writes the REAL live membership into the same
+      # ETS cache this broadcast just wrote a fake value into — a genuine
+      # race the previous fixed-width poll (widened from 2.5s to 10s, see
+      # git history) didn't actually close, it just usually finished before
+      # the 5s reconcile tick could land, and occasionally didn't under CI
+      # scheduler contention. `:sys.get_state/1` blocks until every message
+      # enqueued ahead of it — including the broadcast above — has actually
+      # been handled (same precedent as
+      # test/riptide/stream/placement_test.exs and
+      # test/riptide/stream/replica_healer_leadership_gate_test.exs), so this
+      # observes the post-handling state directly instead of racing a
+      # second, independent writer to the same cache.
+      :sys.get_state(PlacementMembership)
+
+      assert PlacementMembership.current_members() == [node(), :"riptide@10.0.0.7"]
     end
   end
 
@@ -107,28 +117,6 @@ defmodule Riptide.PlacementMembershipTest do
       assert_raise RuntimeError, ~r/no placement-cluster members could be/, fn ->
         Riptide.Placement.lookup("irrelevant-stream-id")
       end
-    end
-  end
-
-  # 50 attempts * 200ms = 10s total budget, matching the same
-  # `eventually/2` pattern's established convention everywhere else in this
-  # suite (11 other test files, all 50 * 200ms) for "wait for an
-  # already-running process to finish handling an async message" — this
-  # file's own version used to poll at 50 * 50ms = only 2.5s, a real
-  # outlier that surfaced as a genuine, if rare, flake under a busy full
-  # `mix test` run (535 tests, high scheduler contention) even though this
-  # exact test passes reliably in isolation.
-  defp eventually(fun, attempts_left \\ 50) do
-    cond do
-      fun.() ->
-        true
-
-      attempts_left <= 1 ->
-        false
-
-      true ->
-        Process.sleep(200)
-        eventually(fun, attempts_left - 1)
     end
   end
 end
