@@ -24,10 +24,6 @@ defmodule RiptideWeb.Router do
     plug RiptideWeb.Plugs.Authorize
   end
 
-  pipeline :resolve_hub_scope do
-    plug RiptideWeb.Plugs.ResolveHubScope
-  end
-
   scope "/" do
     pipe_through :api
 
@@ -54,19 +50,6 @@ defmodule RiptideWeb.Router do
     get "/streams/:stream_id/subscribe", RiptideWeb.Realtime.SseController, :subscribe
   end
 
-  scope "/hub" do
-    pipe_through [:api, :auth]
-
-    get "/search", RiptideWeb.Hub.DiscoveryController, :search
-    get "/entries/:node_id", RiptideWeb.Hub.DiscoveryController, :show
-  end
-
-  scope "/hub" do
-    pipe_through [:api, :auth, :resolve_hub_scope, :authz]
-
-    get "/resources/*path", RiptideWeb.LDP.ResourceController, :show
-  end
-
   scope "/tenants/:tenant_id" do
     pipe_through [:api, :tenant, :auth, :authz]
 
@@ -86,10 +69,11 @@ defmodule RiptideWeb.Router do
     post "/pending-reviews/:node_id/approve", RiptideWeb.TenantReviewController, :approve
     post "/pending-reviews/:node_id/decline", RiptideWeb.TenantReviewController, :decline
     get "/discovery/search", RiptideWeb.TenantDiscoveryController, :search
+    get "/entries/:node_id", RiptideWeb.TenantDiscoveryController, :show
 
-    post "/hub/install", RiptideWeb.Hub.InstallController, :install
-    post "/hub/install-reviews/:node_id/approve", RiptideWeb.Hub.InstallController, :approve
-    post "/hub/install-reviews/:node_id/decline", RiptideWeb.Hub.InstallController, :decline
+    post "/install", RiptideWeb.TenantInstallController, :install
+    post "/install-reviews/:node_id/approve", RiptideWeb.TenantInstallController, :approve
+    post "/install-reviews/:node_id/decline", RiptideWeb.TenantInstallController, :decline
 
     post "/crosswalks", RiptideWeb.TenantCrosswalkController, :propose
     post "/crosswalk-reviews/:node_id/approve", RiptideWeb.TenantCrosswalkController, :approve

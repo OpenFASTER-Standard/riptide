@@ -63,4 +63,57 @@ defmodule RiptideWeb.TenantDiscoveryControllerTest do
     assert conn.status == 200
     assert conn.resp_body =~ predicate_name
   end
+
+  test "GET /tenants/:tenant_id/entries/:node_id fetches a specific entry by its blank-node id" do
+    tenant_id = "discovery-show-" <> Uniq.UUID.uuid4()
+    predicate_name = "discoveryshow#{System.unique_integer([:positive])}"
+    claim_tenant(tenant_id)
+
+    on_exit(fn ->
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, tenant_id}))
+    end)
+
+    predicate = RDF.iri("urn:riptide:relation:#{predicate_name}")
+
+    rule = %Riptide.Derivation.Rule{
+      signature: %Riptide.Derivation.Signature{
+        name: predicate,
+        parameters: [],
+        reads: [],
+        produces: [predicate]
+      },
+      head: %Riptide.Derivation.Literal.FactPattern{
+        predicate: predicate,
+        args: [RDF.iri("urn:test:subject"), RDF.literal("done")]
+      },
+      body: []
+    }
+
+    :ok = Catalog.admit_entry({:tenant, tenant_id}, rule, nil)
+    {:ok, entries} = Catalog.list_entries({:tenant, tenant_id})
+    {node, ^rule} = Enum.find(entries, fn {_n, r} -> r == rule end)
+    node_id = RDF.BlankNode.value(node)
+
+    conn =
+      :get
+      |> conn("/tenants/#{tenant_id}/entries/#{node_id}")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ predicate_name
+  end
+
+  test "GET /tenants/:tenant_id/entries/:node_id returns 404 for an id that was never admitted" do
+    tenant_id = "discovery-show-missing-" <> Uniq.UUID.uuid4()
+    claim_tenant(tenant_id)
+
+    conn =
+      :get
+      |> conn("/tenants/#{tenant_id}/entries/nonexistent")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 404
+  end
 end
