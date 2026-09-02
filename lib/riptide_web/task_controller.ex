@@ -9,7 +9,16 @@ defmodule RiptideWeb.TaskController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias Riptide.Derivation.{Catalog, ContextResolver, Discovery, ExecuteInterpreter, Job, LLMFallback, Rule}
+  alias Riptide.Derivation.{
+    Catalog,
+    ContextResolver,
+    Discovery,
+    ExecuteInterpreter,
+    Job,
+    LLMFallback,
+    Rule
+  }
+
   alias Riptide.Derivation.Literal.CapabilityReference
   alias Riptide.{Event, Stream.StreamServer, Stream.StreamSupervisor}
 
@@ -31,24 +40,57 @@ defmodule RiptideWeb.TaskController do
 
     case Discovery.find({:tenant, tenant_id}, description) do
       {:ok, entries} ->
-        # Not just the top-ranked match: a Rule generalized purely from Capability-invocation
-        # Traces (no FactPattern literal anywhere in its own body — the shape
-        # AntiUnifier.generalize/2 produces when the two source Traces were themselves bare
-        # CapabilityReference calls) has a free Var no caller-supplied facts could ever bind —
-        # confirmed live, routing a Task to it via Discovery reliably fails the resulting Job with
-        # {:unbound_variable, _} every time, silently (a 202 that looks successful). Skip past any
-        # such unsafe match to the next-ranked one, exactly like finding no match at all.
-        case Enum.find(entries, fn {_node, rule} -> ExecuteInterpreter.invokable_via_facts?(rule) end) do
-          {_node, rule} ->
-            write_discovery_job(conn, tenant_id, description, rule, facts, mutex_key)
-
-          nil ->
-            resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject, mutex_key)
-        end
+        route_by_invokable_match(
+          conn,
+          tenant_id,
+          description,
+          facts,
+          current_subject,
+          mutex_key,
+          invokable_match(entries)
+        )
 
       {:error, :not_ready} ->
         send_resp(conn, 503, "")
     end
+  end
+
+  # Not just the top-ranked Discovery match: a Rule generalized purely from Capability-invocation
+  # Traces (no FactPattern literal anywhere in its own body — the shape AntiUnifier.generalize/2
+  # produces when the two source Traces were themselves bare CapabilityReference calls) has a free
+  # Var no caller-supplied facts could ever bind — confirmed live, routing a Task to it via
+  # Discovery reliably fails the resulting Job with {:unbound_variable, _} every time, silently (a
+  # 202 that looks successful). Skip past any such unsafe match to the next-ranked one, exactly
+  # like finding no match at all.
+  defp invokable_match(entries) do
+    Enum.find(entries, fn {_node, rule} -> ExecuteInterpreter.invokable_via_facts?(rule) end)
+  end
+
+  defp route_by_invokable_match(
+         conn,
+         tenant_id,
+         description,
+         facts,
+         _current_subject,
+         mutex_key,
+         {
+           _node,
+           rule
+         }
+       ) do
+    write_discovery_job(conn, tenant_id, description, rule, facts, mutex_key)
+  end
+
+  defp route_by_invokable_match(
+         conn,
+         tenant_id,
+         description,
+         facts,
+         current_subject,
+         mutex_key,
+         nil
+       ) do
+    resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject, mutex_key)
   end
 
   defp resolve_via_llm_fallback(conn, tenant_id, description, facts, current_subject, mutex_key) do

@@ -3,6 +3,7 @@ defmodule Riptide.AccountsTest do
 
   alias Riptide.Accounts
   alias Riptide.Auth.Verifier.Password
+  alias Riptide.Authz.Store.TenantFacts
 
   setup do
     Riptide.AppEnvTestHelpers.put_env(
@@ -43,7 +44,7 @@ defmodule Riptide.AccountsTest do
       assert {:ok, %{sub: sub, tenant_id: tenant_id}} =
                Accounts.sign_up(unique_tenant(), "alice", String.duplicate("a", 64))
 
-      [owner_policy] = Riptide.Authz.Store.TenantFacts.list_policies(tenant_id, [])
+      [owner_policy] = TenantFacts.list_policies(tenant_id, [])
       assert owner_policy.effect == :allow
       assert owner_policy.matcher == {:agent, sub}
       assert :invoke in owner_policy.modes
