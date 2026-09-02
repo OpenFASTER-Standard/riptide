@@ -389,7 +389,12 @@ defmodule Riptide.Derivation.DedupGate do
     end
   end
 
-  @spec propose_crosswalk(Catalog.scope(), Catalog.scope(), Crosswalk.t(), RDF.BlankNode.t() | nil) ::
+  @spec propose_crosswalk(
+          Catalog.scope(),
+          Catalog.scope(),
+          Crosswalk.t(),
+          RDF.BlankNode.t() | nil
+        ) ::
           {:ok, RDF.BlankNode.t()} | {:error, term()}
   def propose_crosswalk(_target_scope, review_scope, %Crosswalk{} = crosswalk, replaces) do
     Catalog.queue_crosswalk_review(review_scope, %PendingCrosswalkReview{
@@ -413,7 +418,9 @@ defmodule Riptide.Derivation.DedupGate do
   end
 
   defp maybe_supersede_crosswalk(_target_scope, nil), do: :ok
-  defp maybe_supersede_crosswalk(target_scope, node), do: Catalog.supersede_crosswalk(target_scope, node)
+
+  defp maybe_supersede_crosswalk(target_scope, node),
+    do: Catalog.supersede_crosswalk(target_scope, node)
 
   @spec decline_crosswalk_review(Catalog.scope(), RDF.BlankNode.t()) :: :ok | {:error, term()}
   def decline_crosswalk_review(review_scope, node),

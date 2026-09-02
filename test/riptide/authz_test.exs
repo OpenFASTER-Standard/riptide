@@ -154,7 +154,10 @@ defmodule Riptide.AuthzTest do
 
   describe "evaluate/4 still returns a plain :allow/:deny (unchanged public contract)" do
     test "allow" do
-      FakeStore.start(%{{"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]})
+      FakeStore.start(%{
+        {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
+      })
+
       assert Authz.evaluate({:tenant, "acme"}, [], nil, :read) == :allow
     end
 

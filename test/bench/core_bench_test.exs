@@ -19,6 +19,7 @@ defmodule Riptide.Bench.CoreBench do
 
   alias Riptide.{Authz, Event, Placement}
   alias Riptide.Authz.Policy
+  alias Riptide.Authz.Store.TenantFacts
   alias Riptide.RDF.{Patch, TurtleCodec}
   alias Riptide.Stream.StreamServer
 
@@ -56,7 +57,7 @@ defmodule Riptide.Bench.CoreBench do
     authz_tenant = "bench-authz-tenant-" <> Uniq.UUID.uuid4()
 
     :ok =
-      Riptide.Authz.Store.TenantFacts.add_policy(authz_tenant, [], %Policy{
+      TenantFacts.add_policy(authz_tenant, [], %Policy{
         effect: :allow,
         modes: [:read, :write],
         matcher: :public

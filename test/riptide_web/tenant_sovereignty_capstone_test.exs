@@ -3,6 +3,10 @@ defmodule RiptideWeb.TenantSovereigntyCapstoneTest do
   import Plug.Test
   import Plug.Conn
 
+  alias Riptide.Authz.{Policy, Store}
+  alias Riptide.{BlobStore, Capability}
+  alias Riptide.Derivation.{CapabilityCatalog, Catalog}
+
   @opts RiptideWeb.Endpoint.init([])
 
   defp sha256_hex(s), do: :crypto.hash(:sha256, s) |> Base.encode16(case: :lower)
@@ -70,7 +74,7 @@ defmodule RiptideWeb.TenantSovereigntyCapstoneTest do
 
     # Capabilities aren't Rules, so use list_capabilities directly to find the admitted entry's own
     # node id (distinct from the review node id) to install by.
-    {:ok, capabilities} = Riptide.Derivation.Catalog.list_capabilities({:tenant, guild_a})
+    {:ok, capabilities} = Catalog.list_capabilities({:tenant, guild_a})
     assert [{cap_entry_node, _entry}] = capabilities
 
     # Grant :public read so Guild B (a different tenant) can discover it:
@@ -110,8 +114,7 @@ defmodule RiptideWeb.TenantSovereigntyCapstoneTest do
 
     assert install_approve_conn.status == 200
 
-    {:ok, [{_node, installed_entry}]} =
-      Riptide.Derivation.Catalog.list_capabilities({:tenant, guild_b})
+    {:ok, [{_node, installed_entry}]} = Catalog.list_capabilities({:tenant, guild_b})
 
     # Guild B grants itself (:public, for simplicity) invoke rights on its own newly-installed copy.
     # RiptideWeb.Authz.PolicyController's HTTP surface only supports read/write modes scoped to the
@@ -122,27 +125,30 @@ defmodule RiptideWeb.TenantSovereigntyCapstoneTest do
     local_name = String.trim_leading(cap_name, "urn:riptide:capability:")
 
     :ok =
-      Riptide.Authz.Store.TenantFacts.add_policy(guild_b, ["capabilities", local_name], %Riptide.Authz.Policy{
-        effect: :allow,
-        modes: [:invoke],
-        matcher: :public
-      })
+      Store.TenantFacts.add_policy(
+        guild_b,
+        ["capabilities", local_name],
+        %Policy{
+          effect: :allow,
+          modes: [:invoke],
+          matcher: :public
+        }
+      )
 
     # Guild B's own copy is invocable right now:
-    {:ok, definition} = Riptide.Derivation.CapabilityCatalog.materialize(guild_b, installed_entry)
-    assert {:ok, _result} = Riptide.Capability.invoke(definition, guild_b, nil, ["World"])
+    {:ok, definition} = CapabilityCatalog.materialize(guild_b, installed_entry)
+    assert {:ok, _result} = Capability.invoke(definition, guild_b, nil, ["World"])
 
     # The real proof of independence: delete Guild A's own original blob entirely, confirm Guild B's
     # own copy — a different hash if content-addressing ever diverges, but here identical bytes so the
     # SAME hash under a DIFFERENT tenant-scoped path — still works, since it was actually copied, not
     # referenced.
-    original_path = Riptide.BlobStore.path_for(guild_a, installed_entry.component_hash)
+    original_path = BlobStore.path_for(guild_a, installed_entry.component_hash)
     File.rm!(original_path)
     refute File.exists?(original_path)
 
-    {:ok, definition_after_deletion} =
-      Riptide.Derivation.CapabilityCatalog.materialize(guild_b, installed_entry)
+    {:ok, definition_after_deletion} = CapabilityCatalog.materialize(guild_b, installed_entry)
 
-    assert {:ok, _result} = Riptide.Capability.invoke(definition_after_deletion, guild_b, nil, ["World"])
+    assert {:ok, _result} = Capability.invoke(definition_after_deletion, guild_b, nil, ["World"])
   end
 end

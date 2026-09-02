@@ -46,6 +46,7 @@ defmodule Riptide.Derivation.CapabilityCatalogCapstoneTest do
 
   test "exit criterion: register via real HTTP, approve, resolve and invoke by IRI alone" do
     tenant_id = "capstone-" <> Uniq.UUID.uuid4()
+
     :ok =
       Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,

@@ -145,7 +145,8 @@ defmodule Riptide.Derivation.CatalogTest do
       end)
 
       entry = %Riptide.Derivation.CapabilityCatalogEntry{
-        name: RDF.iri("urn:riptide:capability:isolation-cap-#{System.unique_integer([:positive])}"),
+        name:
+          RDF.iri("urn:riptide:capability:isolation-cap-#{System.unique_integer([:positive])}"),
         kind: :effect,
         component_hash: String.duplicate("c", 64),
         function: "run",
@@ -291,8 +292,7 @@ defmodule Riptide.Derivation.CatalogTest do
       crosswalk = %Crosswalk{
         subject_predicate:
           rel("isolation-crosswalk-subject-#{System.unique_integer([:positive])}"),
-        object_predicate:
-          rel("isolation-crosswalk-object-#{System.unique_integer([:positive])}"),
+        object_predicate: rel("isolation-crosswalk-object-#{System.unique_integer([:positive])}"),
         match_type: :exact_match
       }
 

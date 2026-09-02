@@ -20,14 +20,16 @@ defmodule Riptide.Authz.Store.TenantFacts do
   @impl true
   @spec list_policies(String.t(), [String.t()]) :: [Policy.t()]
   def list_policies(tenant_id, path_prefix) do
-    with {:ok, graph} <- read_graph(tenant_id) do
-      graph
-      |> policy_nodes()
-      |> Enum.map(&PolicyRDFCodec.from_rdf(&1, graph))
-      |> Enum.filter(fn {stored_prefix, _policy} -> stored_prefix == path_prefix end)
-      |> Enum.map(fn {_prefix, policy} -> policy end)
-    else
-      {:error, :not_ready} -> []
+    case read_graph(tenant_id) do
+      {:ok, graph} ->
+        graph
+        |> policy_nodes()
+        |> Enum.map(&PolicyRDFCodec.from_rdf(&1, graph))
+        |> Enum.filter(fn {stored_prefix, _policy} -> stored_prefix == path_prefix end)
+        |> Enum.map(fn {_prefix, policy} -> policy end)
+
+      {:error, :not_ready} ->
+        []
     end
   end
 

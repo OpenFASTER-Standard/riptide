@@ -45,6 +45,7 @@ defmodule Riptide.Derivation.JobTriggerCapstoneTest do
 
   test "exit criterion: register+approve a Capability via real HTTP, write a Job, watch it execute" do
     tenant_id = "job-capstone-" <> Uniq.UUID.uuid4()
+
     :ok =
       Store.TenantFacts.add_policy(tenant_id, [], %Policy{
         effect: :allow,
@@ -80,7 +81,7 @@ defmodule Riptide.Derivation.JobTriggerCapstoneTest do
 
     propose_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capabilities", body)
+      |> conn("/tenants/#{tenant_id}/capabilities", body)
       |> put_req_header("content-type", "application/json")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
@@ -90,7 +91,7 @@ defmodule Riptide.Derivation.JobTriggerCapstoneTest do
 
     approve_conn =
       :post
-      |> conn("/tenants/#{tenant_id}/hub/capability-reviews/#{node_id}/approve")
+      |> conn("/tenants/#{tenant_id}/capability-reviews/#{node_id}/approve")
       |> put_req_header("authorization", "Bearer owner-token")
       |> RiptideWeb.Endpoint.call(@opts)
 

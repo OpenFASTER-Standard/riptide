@@ -67,37 +67,38 @@ defmodule RiptideWeb.TenantInstallController do
       Enum.find(source_capabilities, fn {node, _entry} -> RDF.BlankNode.value(node) == node_id end)
 
     case found do
-      nil ->
-        send_resp(conn, 404, "")
-
-      {_source_node, entry} ->
-        with {:ok, bytes} <- Riptide.BlobStore.get(source_tenant_id, entry.component_hash),
-             {:ok, new_hash} <- Riptide.BlobStore.put(tenant_id, bytes) do
-          installed_entry = %{entry | component_hash: new_hash}
-          scope = {:tenant, tenant_id}
-
-          case DedupGate.propose_capability(scope, scope, installed_entry, nil) do
-            {:ok, review_node} ->
-              body =
-                Jason.encode!(%{
-                  "outcome" => "queued",
-                  "node_id" => RDF.BlankNode.value(review_node)
-                })
-
-              conn |> put_resp_content_type("application/json") |> send_resp(200, body)
-
-            {:error, _reason} ->
-              send_resp(conn, 503, "")
-          end
-        else
-          _error -> send_resp(conn, 503, "")
-        end
+      nil -> send_resp(conn, 404, "")
+      {_source_node, entry} -> copy_and_propose(conn, tenant_id, source_tenant_id, entry)
     end
   end
 
+  defp copy_and_propose(conn, tenant_id, source_tenant_id, entry) do
+    with {:ok, bytes} <- Riptide.BlobStore.get(source_tenant_id, entry.component_hash),
+         {:ok, new_hash} <- Riptide.BlobStore.put(tenant_id, bytes) do
+      installed_entry = %{entry | component_hash: new_hash}
+      scope = {:tenant, tenant_id}
+
+      respond_propose_capability(
+        conn,
+        DedupGate.propose_capability(scope, scope, installed_entry, nil)
+      )
+    else
+      _error -> send_resp(conn, 503, "")
+    end
+  end
+
+  defp respond_propose_capability(conn, {:ok, review_node}) do
+    body = Jason.encode!(%{"outcome" => "queued", "node_id" => RDF.BlankNode.value(review_node)})
+    conn |> put_resp_content_type("application/json") |> send_resp(200, body)
+  end
+
+  defp respond_propose_capability(conn, {:error, _reason}), do: send_resp(conn, 503, "")
+
   defp handle_install(conn, tenant_id, source_tenant_id, node_id) do
     {:ok, source_entries} = Catalog.list_entries({:tenant, source_tenant_id})
-    found = Enum.find(source_entries, fn {node, _rule} -> RDF.BlankNode.value(node) == node_id end)
+
+    found =
+      Enum.find(source_entries, fn {node, _rule} -> RDF.BlankNode.value(node) == node_id end)
 
     case found do
       nil ->

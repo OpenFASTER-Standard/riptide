@@ -116,7 +116,8 @@ defmodule Riptide.Derivation.Catalog do
     )
   end
 
-  @spec list_crosswalks(scope()) :: {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
+  @spec list_crosswalks(scope()) ::
+          {:ok, [{RDF.BlankNode.t(), Crosswalk.t()}]} | {:error, :not_ready}
   def list_crosswalks(scope) do
     with {:ok, graph} <- read_graph(crosswalk_stream_id(scope)) do
       nodes = nodes_of_type(graph, @riptide_crosswalk)

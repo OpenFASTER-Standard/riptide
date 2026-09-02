@@ -98,7 +98,9 @@ defmodule Riptide.Authz.PolicyRDFCodec do
         :authenticated
 
       "agent" ->
-        subject = description |> RDF.Description.first(@riptide_matcher_subject) |> RDF.Literal.value()
+        subject =
+          description |> RDF.Description.first(@riptide_matcher_subject) |> RDF.Literal.value()
+
         {:agent, subject}
     end
   end

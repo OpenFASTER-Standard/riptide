@@ -11,6 +11,7 @@ defmodule Riptide.BlobStore.LocationIndex do
   alias Riptide.Placement
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
+  alias RiptideWeb.LDP.ResourceController
 
   @rdf_type RDF.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
   @riptide_hash_entry RDF.iri("urn:riptide:vocab:BlobHashEntry")
@@ -20,7 +21,7 @@ defmodule Riptide.BlobStore.LocationIndex do
 
   @spec stream_id(String.t()) :: String.t()
   def stream_id(tenant_id),
-    do: RiptideWeb.LDP.ResourceController.stream_id_for({:tenant, tenant_id}, ["_blob_location_index"])
+    do: ResourceController.stream_id_for({:tenant, tenant_id}, ["_blob_location_index"])
 
   @spec add_location(String.t(), String.t(), node()) :: :ok | {:error, :not_ready}
   def add_location(tenant_id, hash, node) do

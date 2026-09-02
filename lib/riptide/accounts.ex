@@ -13,6 +13,7 @@ defmodule Riptide.Accounts do
 
   alias Riptide.Accounts.{Account, RDFCodec}
   alias Riptide.Auth.PasswordTokenConfig
+  alias Riptide.Authz.Store.TenantFacts
   alias Riptide.Event
   alias Riptide.RDF.Patch
   alias Riptide.Stream.{StreamServer, StreamSupervisor}
@@ -44,7 +45,7 @@ defmodule Riptide.Accounts do
         }
 
         with :ok <- write_account(tenant_id, username, account),
-             :ok <- Riptide.Authz.Store.TenantFacts.add_policy(tenant_id, [], owner_policy),
+             :ok <- TenantFacts.add_policy(tenant_id, [], owner_policy),
              {:ok, token} <- PasswordTokenConfig.sign(sub) do
           {:ok, %{token: token, sub: sub, tenant_id: tenant_id}}
         end
@@ -60,14 +61,15 @@ defmodule Riptide.Accounts do
 
       tenant_id ->
         with {:ok, account} <- read_account(tenant_id, username) do
-          if account.password_hash_sha256 == password_hash_sha256 do
-            PasswordTokenConfig.sign(account.sub)
-          else
-            {:error, :invalid_credentials}
-          end
+          verify_password(account, password_hash_sha256)
         end
     end
   end
+
+  defp verify_password(%Account{password_hash_sha256: hash} = account, hash),
+    do: PasswordTokenConfig.sign(account.sub)
+
+  defp verify_password(_account, _password_hash_sha256), do: {:error, :invalid_credentials}
 
   defp write_account(tenant_id, username, %Account{} = account) do
     stream_id = ResourceController.stream_id_for({:tenant, tenant_id}, ["accounts", username])

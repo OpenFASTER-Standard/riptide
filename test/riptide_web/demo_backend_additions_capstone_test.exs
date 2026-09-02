@@ -108,11 +108,15 @@ defmodule RiptideWeb.DemoBackendAdditionsCapstoneTest do
     local_name = cap_name |> RDF.IRI.to_string() |> String.trim_leading("urn:riptide:capability:")
 
     :ok =
-      Riptide.Authz.Store.TenantFacts.add_policy(tenant_id, ["capabilities", local_name], %Riptide.Authz.Policy{
-        effect: :allow,
-        modes: [:invoke],
-        matcher: :public
-      })
+      Riptide.Authz.Store.TenantFacts.add_policy(
+        tenant_id,
+        ["capabilities", local_name],
+        %Riptide.Authz.Policy{
+          effect: :allow,
+          modes: [:invoke],
+          matcher: :public
+        }
+      )
 
     mutex_key = "capstone-6p-i-shared-chest-#{System.unique_integer([:positive])}"
 

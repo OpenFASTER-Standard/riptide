@@ -98,9 +98,7 @@ defmodule RiptideWeb.TenantInstallControllerTest do
     pattern_predicate_name = "deployNotifyCapstone#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      Riptide.RaTestHelpers.cleanup_stream(
-        Catalog.catalog_stream_id({:tenant, source_tenant_id})
-      )
+      Riptide.RaTestHelpers.cleanup_stream(Catalog.catalog_stream_id({:tenant, source_tenant_id}))
 
       Riptide.RaTestHelpers.cleanup_stream(
         Catalog.catalog_stream_id({:tenant, installing_tenant})

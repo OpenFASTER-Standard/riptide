@@ -29,14 +29,15 @@ defmodule Riptide.Derivation.CapabilityCatalogClusterTest do
     :ok
   end
 
-  test "materialize/1 fetches from a remote replica and caches it locally, without registering with LocationIndex" do
+  test "materialize/2 fetches from a remote replica and caches it locally, without registering with LocationIndex" do
     peers = bootstrap_peers(@peers ++ [@spare])
     [{_pid_a, node_a, _}, _peer_b, _peer_c, {_pid_d, node_d, _}] = peers
 
+    tenant_id = "cap-cluster-" <> Uniq.UUID.uuid4()
     bytes = :crypto.strong_rand_bytes(1024)
-    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [bytes])
+    {:ok, hash} = :erpc.call(node_a, Riptide.BlobStore, :put, [tenant_id, bytes])
 
-    # node_d never received a local replica from put/1's own replication —
+    # node_d never received a local replica from put/2's own replication —
     # excluded deterministically by other_nodes/0's own sort (see @spare).
     entry = %Riptide.Derivation.CapabilityCatalogEntry{
       name: RDF.iri("urn:riptide:capability:cluster-#{System.unique_integer([:positive])}"),
@@ -54,7 +55,10 @@ defmodule Riptide.Derivation.CapabilityCatalogClusterTest do
     }
 
     assert {:ok, definition} =
-             :erpc.call(node_d, Riptide.Derivation.CapabilityCatalog, :materialize, [entry])
+             :erpc.call(node_d, Riptide.Derivation.CapabilityCatalog, :materialize, [
+               tenant_id,
+               entry
+             ])
 
     assert {:ok, bytes_on_d} = :erpc.call(node_d, File, :read, [definition.component])
     assert bytes_on_d == bytes
@@ -62,7 +66,10 @@ defmodule Riptide.Derivation.CapabilityCatalogClusterTest do
     # Never registered as an official BlobStore replica — only a private
     # materialize cache.
     assert {:ok, locations} =
-             :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [hash])
+             :erpc.call(node_a, Riptide.BlobStore.LocationIndex, :list_locations, [
+               tenant_id,
+               hash
+             ])
 
     refute node_d in locations
   end

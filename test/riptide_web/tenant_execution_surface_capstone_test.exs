@@ -69,12 +69,14 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
 
   test "exit criterion: Task -> LLMFallback -> propose -> approve -> Task -> Discovery, zero LLM calls" do
     tenant_id = "tenant-surface-capstone-" <> Uniq.UUID.uuid4()
+
     :ok =
       Store.TenantFacts.add_policy(tenant_id, [], %Riptide.Authz.Policy{
         effect: :allow,
         modes: [:read, :write],
         matcher: {:agent, "the-owner"}
       })
+
     register_capstone_capability(tenant_id)
 
     on_exit(fn ->

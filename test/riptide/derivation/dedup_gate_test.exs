@@ -781,7 +781,9 @@ defmodule Riptide.Derivation.DedupGateTest do
       match_type: :exact_match
     }
 
-    {:ok, old_review_node} = DedupGate.propose_crosswalk(review_scope, review_scope, old_crosswalk, nil)
+    {:ok, old_review_node} =
+      DedupGate.propose_crosswalk(review_scope, review_scope, old_crosswalk, nil)
+
     :ok = DedupGate.approve_crosswalk_review(review_scope, review_scope, old_review_node)
 
     # propose_crosswalk/4 returns the queued *review's* own node, not the
@@ -879,7 +881,9 @@ defmodule Riptide.Derivation.DedupGateTest do
     review_scope = unique_tenant()
     old_entry = sample_capability(%{})
 
-    {:ok, old_review_node} = DedupGate.propose_capability(review_scope, review_scope, old_entry, nil)
+    {:ok, old_review_node} =
+      DedupGate.propose_capability(review_scope, review_scope, old_entry, nil)
+
     :ok = DedupGate.approve_capability_review(review_scope, review_scope, old_review_node)
 
     # `propose_capability/4` returns the queued *review's* own node, not the
@@ -893,7 +897,10 @@ defmodule Riptide.Derivation.DedupGateTest do
       Enum.find(entries_before, fn {_n, e} -> e.name == old_entry.name end)
 
     new_entry = %{old_entry | function: "run_v2"}
-    {:ok, review_node} = DedupGate.propose_capability(review_scope, review_scope, new_entry, old_catalog_node)
+
+    {:ok, review_node} =
+      DedupGate.propose_capability(review_scope, review_scope, new_entry, old_catalog_node)
+
     :ok = DedupGate.approve_capability_review(review_scope, review_scope, review_node)
 
     {:ok, entries} = Catalog.list_capabilities(review_scope)
