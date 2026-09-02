@@ -231,10 +231,17 @@ matching Rule's own subject quad in the parsed store and uses `quad.subject.valu
   completion the same way. Stores `state.chapter3.secondJobNodeId` for this Task — Chapter 1's own
   already-completed Job is already sitting in `state.chapter1.jobNodeId`, reused directly below.
 - "Propose this as a pattern" button: `POST {baseUrl}/tenants/{guildA.tenantId}/propose` with
-  `{"job1": chapter1.jobNodeId, "job2": chapter3.secondJobNodeId}`. Renders the response body
-  directly: the two traces, `AntiUnifier`'s generalized template, and the fidelity pass/fail
-  evidence, all already present in that endpoint's own JSON. Stores the review's own `node_id`
-  into `state.chapter3.patternNodeId`.
+  `{"job1": chapter1.jobNodeId, "job2": chapter3.secondJobNodeId}`. The response itself only
+  carries `{"outcome", "kind", "node_id"}` — no trace/template/evidence content — so immediately
+  after, calls `fetchTurtle('/tenants/{guildA.tenantId}/resources/catalog/pending-review',
+  aliceToken)` (§4.6) to read the *same* pending-review data `Catalog.list_pending_reviews/1`
+  already exposes as a library function, addressed via the ordinary generic LDP resource-read path
+  — `Catalog.pending_review_stream_id/1` and `ResourceController.stream_id_for/2` construct the
+  identical stream id for this path, and `show/2`'s own GET handler never applies the
+  reserved-path check that only blocks writes, so this already works today with zero new backend
+  code. Finds the blank node matching the just-returned `node_id`, extracts its candidate Rule text
+  and fidelity-evidence quads via N3 queries on the parsed store, and renders both. Stores the
+  review's own `node_id` into `state.chapter3.patternNodeId`.
 - "Approve" button on the resulting review —
   `POST .../pending-reviews/{chapter3.patternNodeId}/approve`.
 - A third Task submission (same phrasing family, stored as `state.chapter3.thirdJobNodeId`) — its
