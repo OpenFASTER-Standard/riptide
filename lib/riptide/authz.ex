@@ -13,26 +13,14 @@ defmodule Riptide.Authz do
   alias Riptide.Derivation.Catalog
 
   @doc """
-  `scope == :hub` is a hardcoded short-circuit, not a policy-store lookup: Hub's read-openness is a
-  structural property of what Hub *is* (`RiptideWeb.Hub.DiscoveryController`'s own moduledoc already
-  states this), not a per-scope setting that should be editable/revocable the way a Tenant's own
-  policies are. Both `:hub` clauses return before `Authz.Store` is ever consulted — its behaviour and
-  `Placement`-backed implementation are unmodified by this, and take only a raw tenant_id string, never
-  `:hub` (design spec `docs/superpowers/specs/2026-09-01-phase-6n-hub-resource-lifecycle-design.md` §4.1).
+  Like `evaluate/4`, but also reports *which policy matcher* actually allowed the request (or `:deny`) —
+  used where the caller needs to distinguish a `:public`-matched allow from a tenant-owned one (e.g.
+  `RiptideWeb.Plugs.Authorize`'s public-read rate limiting). `evaluate/4` is a thin wrapper over this.
   """
-  @spec evaluate(Catalog.scope(), [String.t()], map() | nil, Policy.mode()) :: :allow | :deny
-  def evaluate(:hub, _path_segments, _current_subject, :read) do
-    :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: :allow, mode: :read})
-    :allow
-  end
-
-  def evaluate(:hub, _path_segments, _current_subject, :write) do
-    :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: :deny, mode: :write})
-    :deny
-  end
-
-  def evaluate({:tenant, tenant_id}, path_segments, current_subject, mode) do
-    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.Placement)
+  @spec evaluate_with_matcher(Catalog.scope(), [String.t()], map() | nil, Policy.mode()) ::
+          {:allow, Policy.matcher()} | :deny
+  def evaluate_with_matcher({:tenant, tenant_id}, path_segments, current_subject, mode) do
+    store = Application.get_env(:riptide, :authz_store, Riptide.Authz.Store.TenantFacts)
 
     matching_policies =
       path_segments
@@ -40,11 +28,16 @@ defmodule Riptide.Authz do
       |> Enum.flat_map(&store.list_policies(tenant_id, &1))
       |> Enum.filter(&applies?(&1, current_subject, mode))
 
-    effect =
+    result =
       cond do
-        Enum.any?(matching_policies, &(&1.effect == :deny)) -> :deny
-        Enum.any?(matching_policies, &(&1.effect == :allow)) -> :allow
-        true -> :deny
+        Enum.any?(matching_policies, &(&1.effect == :deny)) ->
+          :deny
+
+        allow_policy = Enum.find(matching_policies, &(&1.effect == :allow)) ->
+          {:allow, allow_policy.matcher}
+
+        true ->
+          :deny
       end
 
     # `effect`/`mode` are both small, fixed sets (2 values each) — safe to
@@ -55,9 +48,18 @@ defmodule Riptide.Authz do
     # kicks in for every request) is invisible on any dashboard — the only
     # signal would be an HTTP 403-rate bump on the LDP routes, and SSE/WS
     # authorization denials have no equivalent status-coded metric at all.
+    effect = if match?({:allow, _}, result), do: :allow, else: :deny
     :telemetry.execute([:riptide, :authz, :decision], %{}, %{effect: effect, mode: mode})
 
-    effect
+    result
+  end
+
+  @spec evaluate(Catalog.scope(), [String.t()], map() | nil, Policy.mode()) :: :allow | :deny
+  def evaluate(scope, path_segments, current_subject, mode) do
+    case evaluate_with_matcher(scope, path_segments, current_subject, mode) do
+      {:allow, _matcher} -> :allow
+      :deny -> :deny
+    end
   end
 
   # Every prefix of path_segments, including the empty one (the tenant

@@ -15,9 +15,6 @@ defmodule Riptide.AuthzTest do
     @impl true
     def add_policy(_tenant_id, _path_prefix, _policy), do: :ok
 
-    @impl true
-    def claim_tenant_if_unclaimed(_tenant_id, _subject), do: :already_claimed
-
     def start(policies_by_prefix) do
       case Agent.start_link(fn -> policies_by_prefix end, name: __MODULE__) do
         {:ok, pid} -> pid
@@ -118,14 +115,52 @@ defmodule Riptide.AuthzTest do
     assert Authz.evaluate({:tenant, "acme"}, ["docs"], nil, :read) == :deny
   end
 
-  test "scope :hub always allows :read regardless of any policy" do
-    FakeStore.start(%{})
-    assert Authz.evaluate(:hub, ["catalog"], nil, :read) == :allow
-    assert Authz.evaluate(:hub, ["catalog"], %{"sub" => "someone"}, :read) == :allow
+  describe "evaluate_with_matcher/4" do
+    test "returns {:allow, matcher} for the specific policy that matched" do
+      FakeStore.start(%{
+        {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]
+      })
+
+      assert Authz.evaluate_with_matcher({:tenant, "acme"}, [], nil, :read) ==
+               {:allow, :public}
+    end
+
+    test "returns :deny when nothing matches" do
+      FakeStore.start(%{})
+
+      assert Authz.evaluate_with_matcher({:tenant, "acme"}, [], nil, :read) == :deny
+    end
+
+    test "an explicit deny policy still wins over an allow, same as evaluate/4" do
+      FakeStore.start(%{
+        {"acme", []} => [
+          %Policy{effect: :allow, modes: [:read], matcher: :public},
+          %Policy{effect: :deny, modes: [:read], matcher: :public}
+        ]
+      })
+
+      assert Authz.evaluate_with_matcher({:tenant, "acme"}, [], nil, :read) == :deny
+    end
+
+    test "returns the {:agent, subject} matcher, not just :allow, for an owner-matched policy" do
+      FakeStore.start(%{
+        {"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: {:agent, "owner"}}]
+      })
+
+      assert Authz.evaluate_with_matcher({:tenant, "acme"}, [], %{"sub" => "owner"}, :read) ==
+               {:allow, {:agent, "owner"}}
+    end
   end
 
-  test "scope :hub always denies :write, never consulting the Store" do
-    FakeStore.start(%{})
-    assert Authz.evaluate(:hub, ["catalog"], %{"sub" => "someone"}, :write) == :deny
+  describe "evaluate/4 still returns a plain :allow/:deny (unchanged public contract)" do
+    test "allow" do
+      FakeStore.start(%{{"acme", []} => [%Policy{effect: :allow, modes: [:read], matcher: :public}]})
+      assert Authz.evaluate({:tenant, "acme"}, [], nil, :read) == :allow
+    end
+
+    test "deny" do
+      FakeStore.start(%{})
+      assert Authz.evaluate({:tenant, "acme"}, [], nil, :read) == :deny
+    end
   end
 end
