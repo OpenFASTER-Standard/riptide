@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-08-30
+**Last updated:** 2026-09-03
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -16,7 +16,7 @@ first place to check for current status, not a historical log.
 | 3 | Clustering / horizontal scale / HA | **Shipped** (phases 3a-3e) — see below |
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
-| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q, 6r shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse; Generic OpenAI-Compatible LLM Client) — see issue #58 for the current remaining list (6p-iii the demo page, now unblocked; 6g-ii, 6c-iii-a/b, Capability grant/OAuth), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q, 6r, 6p-iii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse; Generic OpenAI-Compatible LLM Client; the Sub-project 6 demo page) — the primary spine and every side-track that had a defined exit criterion are now complete; remaining open work is #80 (Capability grant/OAuth), #69 (6g-ii, hybrid keyword+embedding Discovery, deferred — no exit criterion defined yet), #63/#77 (6c-iii-a/b, aggregation + ValidTime-aware querying, Track B) — see issue #58 (being updated alongside this file — it still showed 6o as "the demo, not yet started" as of 2026-09-01, predating 6o's own reassignment to Username/Password Authentication and 6p-i/6p-ii/6q/6r/6p-iii all shipping since), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1698,3 +1698,79 @@ surfaces as a single `{:error, :missing_api_config}` (replacing the old single-k
 `:missing_api_key}`), since three things can be unset instead of one.
 
 **Status**: Phase 6r shipped 2026-09-02.
+
+### 6p-iii — The Sub-project 6 Demo Page
+
+**Shipped 2026-09-03** (spec PR #135, implementation PR #136). The payoff for the whole Sub-project
+6 derivation/execution layer: `examples/guild-demo/index.html`, a single-file, no-build-step,
+RPG-tutorial-styled walkthrough opened directly via `file://`, driving seven Chapters end-to-end
+through nothing but real HTTP against a live Riptide instance — teaching a real WASM Capability and
+watching it execute; watching a deliberately-broken Capability trap cleanly via WASI; anti-unification
+learning a pattern from two similar Tasks (and DedupGate correctly recognizing when a "new" one
+teaches nothing it doesn't already know); cross-tenant Discovery/install with Crosswalk auto-mapping
+(6q's tenant-sovereign model, not the removed Hub Browser); mutex-exclusive concurrent Tasks; and the
+generic recursive/fixpoint `/query` endpoint (6c-ii). A mock LLM server and a Playwright smoke test
+(`mock-llm-server.mjs`, `smoke-test.mjs`) make the whole flow runnable and verifiable without a real
+vendor API key or non-deterministic output.
+
+Two of the plan's own original narrative beats turned out not to be reachable through this backend's
+real HTTP surface at all, discovered only by actually driving each Chapter end-to-end rather than
+asserting elements merely *appear* — both reframed to show the real, honest behavior instead of a
+fabricated one:
+
+- **Chapter 4** ("ship a v2, supersede v1"): `DedupGate.classify/2` only ever produces a superseding
+  `:merge` outcome when the existing Catalog entry is *narrower* than the new candidate — but once a
+  pattern is generalized to the single most-general shape a one-string-arg Capability can have (any
+  two badge invocations anti-unify to the identical Var-shaped Rule), there's nowhere broader left to
+  go; every later proposal against it comes back `:already_covered`, confirmed via direct replay, not
+  guesswork. Reframed as DedupGate correctly recognizing redundant knowledge and declining to
+  duplicate it.
+- **Chapter 6** (a hand-authored recursive skill-tree query): there is no HTTP endpoint anywhere in
+  this system for submitting an already-written Rule directly for admission (`POST /propose` only
+  ever anti-unifies two existing Job traces, which can only ever produce a Capability-wrapping Rule,
+  never recursion — an explicit non-goal of the 6p-i design spec's own §3), and every tenant this demo
+  can construct via HTTP already has a Capability-shaped Rule admitted, which `POST /query` refuses to
+  evaluate by design (confirmed live via a real 422 `{:unsafe_rule, _}`). Reframed as an honest
+  demonstration of the real `/query` endpoint on a fresh, Capability-rule-free tenant.
+
+Implementing and end-to-end-verifying every Chapter — not just once, but through a full visual
+verification pass (a scratch Playwright screenshot script driving the real flow and inspecting each
+payoff, not just checking elements appear) — surfaced five more real, previously-uncaught bugs, none
+of them demo-only issues, each fixed with its own TDD test:
+
+- `GET /streams/:id/subscribe` rejected any real browser's `Accept: text/event-stream` header via
+  unrelated content-negotiation, and a client's first-ever subscribe (no prior `Last-Event-ID`)
+  silently skipped all backlog instead of replaying it (`RaMachine.get_since/2`'s `nil` cursor is a
+  real, separately-tested live-tail-only mode, conflated with "no cursor sent yet").
+- A tenant owner had no way to invoke a Capability she herself registered in her own tenant
+  (`Accounts.sign_up/3` only granted `:read`/`:write`), and the policies API had no way to grant
+  `:invoke` to anyone at all — the only production path for it was tests writing straight to
+  `Store.TenantFacts`, bypassing HTTP entirely.
+- `GET /discovery/search`'s Turtle response had no way to carry a discovered entry's real,
+  addressable node id (required for `POST /install`), since `RuleRDFCodec.to_rdf/1` mints a fresh
+  blank node every call and the underlying Turtle writer renders an unreferenced blank-node subject
+  anonymously, dropping the label entirely.
+- **The most significant**: a Rule generalized purely from Capability-invocation Traces has a free
+  variable no caller-supplied facts could ever bind (`AntiUnifier.generalize/2` never synthesizes a
+  `FactPattern` to bind one), but `Discovery.find/2` still matches such a Rule by keyword — correctly,
+  it's a real Catalog entry — and `TaskController` was silently routing Tasks to it anyway, writing
+  Jobs doomed to fail with `{:unbound_variable, _}` every time. Even
+  `tenant_execution_surface_capstone_test.exs`'s own "exit criterion" test had this exact gap: it
+  asserted the resolution mechanism (`resolved_via == :discovery`) but never checked the resulting
+  Job's own completion status, so it passed while its own Job silently failed underneath it. Fixed
+  with a new `ExecuteInterpreter.invokable_via_facts?/1` safety check, used by `TaskController` to
+  skip past any Discovery match that could never be satisfied, falling through to LLMFallback
+  instead.
+- Two UI-level bugs in the live "public noticeboard" pane (Chapter 4): subscribing before the read
+  grant existed got a terminal 403 a browser's `EventSource` never retries past even once the grant
+  later existed, and — once reachable — the pane dumped raw N3.js-internal blank-node labels instead
+  of anything meaningful.
+
+Two of these reframing decisions (Chapters 4 and 6, above) were made without the operator's live
+input — `AskUserQuestion` failed with a stream error on every attempt during this phase's own
+execution, confirmed not content-related via a minimal repro — flagged in their own commits for
+review rather than presented as pre-confirmed.
+
+**Status**: Phase 6p-iii shipped 2026-09-03. This closes out the primary spine and every side-track
+that had a defined exit criterion — remaining open work across Sub-project 6 is #80 (Capability
+grant/OAuth), #69 (6g-ii, deferred), and #63/#77 (6c-iii-a/b, Track B).
