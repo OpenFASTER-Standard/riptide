@@ -1,0 +1,12 @@
+{
+  "name": "guild-demo",
+  "private": true,
+  "description": "Verification tooling for the Sub-project 6 guild demo page — the demo page itself (index.html) has no dependencies at all; this package.json exists only so smoke-test.mjs can resolve Playwright.",
+  "type": "module",
+  "scripts": {
+    "smoke-test": "node smoke-test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  }
+}

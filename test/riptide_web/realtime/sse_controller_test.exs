@@ -84,6 +84,27 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
     assert conn.resp_body =~ "id: 1\n"
   end
 
+  test "subscribing with no Last-Event-ID header still delivers events already written BEFORE the subscribe (backlog, not live-tail-only)" do
+    stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    StreamSupervisor.ensure_ready(stream_id)
+
+    # Written and already committed before anyone subscribes — this is the case a real
+    # browser's EventSource always hits on its very first connection to an existing stream (it
+    # never sends Last-Event-ID until it has previously received at least one event), which
+    # `last_event_id/1` must treat the same as an explicit "from the very start" cursor, not as
+    # opting in to `RaMachine.get_since/2`'s own separate, deliberate live-tail-only semantics.
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+    conn =
+      :get
+      |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "id: 1\n"
+  end
+
   test "subscribing with a cursor older than the retention window returns 409 with a gap signal" do
     stream_id =
       ResourceController.stream_id_for({:tenant, "sse-gap-test-tenant"}, [
@@ -111,6 +132,28 @@ defmodule RiptideWeb.Realtime.SseControllerTest do
 
     assert conn.status == 409
     assert Jason.decode!(conn.resp_body) == %{"oldestAvailable" => 2}
+  end
+
+  test "a real browser's EventSource, which always sends Accept: text/event-stream, is not rejected by content negotiation" do
+    stream_id = unique_stream_id()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    StreamSupervisor.ensure_ready(stream_id)
+
+    task =
+      Task.async(fn ->
+        :get
+        |> conn("/streams/#{URI.encode_www_form(stream_id)}/subscribe")
+        |> put_req_header("accept", "text/event-stream")
+        |> RiptideWeb.Endpoint.call(@opts)
+      end)
+
+    assert eventually(fn -> Registry.lookup(Riptide.PubSub, "stream:" <> stream_id) != [] end)
+    StreamServer.append(stream_id, Event.new(stream_id, :replace, RDF.Graph.new()))
+
+    conn = Task.await(task, 3_000)
+
+    assert conn.status == 200
+    assert get_resp_header(conn, "content-type") == ["text/event-stream"]
   end
 
   describe "authentication" do

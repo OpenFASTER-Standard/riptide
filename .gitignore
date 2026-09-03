@@ -54,3 +54,8 @@ k8s/secret.yaml
 # Written at runtime by test/bench/http_server_test.exs (see bench/README.md)
 # for wrk's PUT benchmarks to read — regenerated every run, not source.
 test/bench/put_body.ttl
+
+# examples/guild-demo's own verification tooling (Playwright) — the demo page itself
+# (index.html) has zero dependencies; only smoke-test.mjs needs this installed locally.
+examples/guild-demo/node_modules/
+examples/guild-demo/package-lock.json

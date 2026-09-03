@@ -9,7 +9,10 @@ import Config
 config :riptide, RiptideWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
-  http: [ip: {127, 0, 0, 1}],
+  # PORT is optional (defaults to Phoenix's own 4000) — lets a second local instance run
+  # alongside another one already bound to the default port (e.g. examples/guild-demo's own
+  # smoke-test.mjs, which needs a real dev server it fully controls the lifecycle of).
+  http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT") || "4000")],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,
@@ -19,6 +22,14 @@ config :riptide, RiptideWeb.Endpoint,
 # Fine as a fixed, checked-in value for local dev only — see config/runtime.exs for the
 # prod-required RIPTIDE_PASSWORD_AUTH_SIGNING_KEY env var this does NOT apply to.
 config :riptide, password_auth_signing_key: "dev-only-insecure-password-auth-signing-key"
+
+# WRITE_RATE_LIMIT is optional (defaults to Riptide.WriteRateLimit's own built-in 10/minute) —
+# examples/guild-demo's own smoke-test.mjs drives far more than 10 writes against Guild A's single
+# tenant well within a minute (every Chapter's own admits/proposals/policy grants, run back to
+# back by Playwright, add up to well over 10 — confirmed live via a real 429 on Chapter 5's own
+# second concurrent Task submission), which a human clicking through the same demo over several
+# minutes would never hit. Raises the limit for the smoke test's own fully-controlled instance only.
+config :riptide, write_rate_limit: String.to_integer(System.get_env("WRITE_RATE_LIMIT") || "10")
 
 # ## SSL Support
 #

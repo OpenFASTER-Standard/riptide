@@ -40,7 +40,7 @@ defmodule Riptide.Accounts do
 
         owner_policy = %Riptide.Authz.Policy{
           effect: :allow,
-          modes: [:read, :write],
+          modes: [:read, :write, :invoke],
           matcher: {:agent, sub}
         }
 

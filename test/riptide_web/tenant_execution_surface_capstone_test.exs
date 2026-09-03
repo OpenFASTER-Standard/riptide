@@ -67,7 +67,7 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
       )
   end
 
-  test "exit criterion: Task -> LLMFallback -> propose -> approve -> Task -> Discovery, zero LLM calls" do
+  test "exit criterion: Task -> LLMFallback -> propose -> approve -> Task -> Discovery declines an unsafe match, falls back to LLMFallback safely" do
     tenant_id = "tenant-surface-capstone-" <> Uniq.UUID.uuid4()
 
     :ok =
@@ -116,20 +116,37 @@ defmodule RiptideWeb.TenantExecutionSurfaceCapstoneTest do
     assert approve_conn.status == 200
     assert {:ok, [{_node, _entry}]} = Catalog.list_entries({:tenant, tenant_id})
 
-    # 5. A third, similar Task now resolves via Discovery — zero LLMFallback calls.
-    # `Discovery.tokenize/1` (the query side) only lowercases/splits on
-    # non-alphanumeric — unlike `camel_words/1` (the predicate side), it does
-    # NOT split camelCase — so a space-separated phrase is needed for the
-    # query to word-match the "capstoneDone" predicate's own split words
-    # ["capstone", "done"] (confirmed against Riptide.Derivation.Discovery
-    # directly: "capstoneDone" as a query tokenizes to the single word
-    # "capstonedone", which never overlaps).
-    job3_node = submit_task(tenant_id, "capstone done", [], "discovery")
+    # 5. A third, similar Task: Discovery DOES find the admitted capstoneDone pattern by keyword
+    # (`Discovery.tokenize/1`, the query side, only lowercases/splits on non-alphanumeric — unlike
+    # `camel_words/1`, the predicate side, it does NOT split camelCase — so a space-separated
+    # phrase is needed for the query to word-match "capstoneDone"'s own split words ["capstone",
+    # "done"], confirmed against Riptide.Derivation.Discovery directly), but that pattern's own
+    # body is a bare CapabilityReference with no FactPattern literal at all — AntiUnifier.generalize/2
+    # never synthesizes one — so its own free Var can never be bound by any facts a caller
+    # supplies. TaskController now recognizes this (ExecuteInterpreter.invokable_via_facts?/1) and
+    # safely falls through to LLMFallback instead of writing a Job that would silently fail every
+    # time — confirmed live before this fix existed: {:unbound_variable, _} on every attempt.
+    job3_node = submit_task(tenant_id, "capstone done", [], "llm_fallback")
 
-    {:ok, jobs} = Catalog.list_jobs(Catalog.job_stream_id(tenant_id))
-    {_node, job3} = Enum.find(jobs, fn {n, _j} -> RDF.BlankNode.value(n) == job3_node end)
-    assert job3.resolved_via == :discovery
-    assert job3.trace == nil
+    assert eventually(fn ->
+             {:ok, jobs} = Catalog.list_jobs(Catalog.job_stream_id(tenant_id))
+             {_node, job} = Enum.find(jobs, fn {n, _j} -> RDF.BlankNode.value(n) == job3_node end)
+             job.status == :done
+           end)
+  end
+
+  defp eventually(fun, attempts_left \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      attempts_left <= 1 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        eventually(fun, attempts_left - 1)
+    end
   end
 
   defp submit_task(tenant_id, description, facts, expected_resolved_via) do

@@ -78,6 +78,7 @@ defmodule RiptideWeb.Authz.PolicyController do
 
   defp parse_mode("read"), do: :read
   defp parse_mode("write"), do: :write
+  defp parse_mode("invoke"), do: :invoke
   defp parse_mode(_other), do: :error
 
   defp parse_matcher("public"), do: {:ok, :public}
