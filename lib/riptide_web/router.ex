@@ -88,4 +88,11 @@ defmodule RiptideWeb.Router do
     post "/capability-reviews/:node_id/approve", RiptideWeb.TenantCapabilityController, :approve
     post "/capability-reviews/:node_id/decline", RiptideWeb.TenantCapabilityController, :decline
   end
+
+  scope "/tenants/:tenant_id" do
+    pipe_through [:api, :tenant, :auth]
+
+    put "/blobs", RiptideWeb.BlobController, :create
+    get "/blobs/:hash", RiptideWeb.BlobController, :show
+  end
 end
