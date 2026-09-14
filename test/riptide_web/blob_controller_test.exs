@@ -64,4 +64,47 @@ defmodule RiptideWeb.BlobControllerTest do
 
     assert conn.status == 401
   end
+
+  test "PUT without any Authorization header is rejected" do
+    conn =
+      :put
+      |> conn("/tenants/#{tenant_id()}/blobs", "some bytes")
+      |> put_req_header("content-type", "application/octet-stream")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 401
+  end
+
+  test "GET without any Authorization header is rejected" do
+    conn =
+      :get
+      |> conn("/tenants/#{tenant_id()}/blobs/#{String.duplicate("0", 64)}")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert conn.status == 401
+  end
+
+  test "PUT with large body over 8MB round-trips correctly" do
+    tenant_id = tenant_id()
+    bytes = :crypto.strong_rand_bytes(9 * 1024 * 1024)
+
+    put_conn =
+      :put
+      |> conn("/tenants/#{tenant_id}/blobs", bytes)
+      |> put_req_header("content-type", "application/octet-stream")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert put_conn.status == 200
+    assert %{"hash" => hash} = Jason.decode!(put_conn.resp_body)
+
+    get_conn =
+      :get
+      |> conn("/tenants/#{tenant_id}/blobs/#{hash}")
+      |> put_req_header("authorization", "Bearer owner-token")
+      |> RiptideWeb.Endpoint.call(@opts)
+
+    assert get_conn.status == 200
+    assert get_conn.resp_body == bytes
+  end
 end
