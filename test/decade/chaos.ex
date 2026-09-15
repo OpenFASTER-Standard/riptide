@@ -50,6 +50,33 @@ defmodule Riptide.Decade.Chaos do
         {pid, node, ordinal}
       end
 
+    # Everything past this point (connect_node, :ra startup, genesis
+    # placement, PubSub/Placement/ReplicaHealer start) can fail partway
+    # through on a real, already-spawned peer fleet — mirroring the
+    # reference file's own `on_exit` registered immediately after its
+    # peer-spawn loop, before any of these same failure-prone steps, so a
+    # partial failure there still reaps every peer process and its on-disk
+    # Ra data dir. Here, `start_cluster/1` returning is what lets a caller
+    # register that `on_exit`, so the same safety has to live inside this
+    # try/rescue/catch instead: clean up whatever was already spawned, then
+    # re-raise (`reraise`/`:erlang.raise/3`, both preserving the original
+    # stacktrace) so the caller still sees a real failure, not a silently
+    # swallowed one.
+    try do
+      bootstrap_peers(peers)
+      peers
+    rescue
+      e ->
+        stop_cluster(peers, peer_specs)
+        reraise e, __STACKTRACE__
+    catch
+      kind, reason ->
+        stop_cluster(peers, peer_specs)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp bootstrap_peers(peers) do
     nodes = Enum.map(peers, fn {_pid, node, _ordinal} -> node end)
 
     for {_pid, node, _ordinal} <- peers do
@@ -102,7 +129,7 @@ defmodule Riptide.Decade.Chaos do
       {:ok, _} = start_unlinked(node, Riptide.Stream.ReplicaHealer, :start_link, [[]])
     end
 
-    peers
+    :ok
   end
 
   @spec stop_cluster([started_peer()], [peer_spec()]) :: :ok
