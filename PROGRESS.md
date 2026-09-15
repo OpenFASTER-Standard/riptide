@@ -1774,3 +1774,40 @@ review rather than presented as pre-confirmed.
 **Status**: Phase 6p-iii shipped 2026-09-03. This closes out the primary spine and every side-track
 that had a defined exit criterion — remaining open work across Sub-project 6 is #80 (Capability
 grant/OAuth), #69 (6g-ii, deferred), and #63/#77 (6c-iii-a/b, Track B).
+
+### 7 — Decade Simulation Testing
+
+**Shipped 2026-09-15** — see
+`docs/superpowers/specs/2026-09-15-phase-7-decade-simulation-testing-design.md` and
+`docs/superpowers/plans/2026-09-15-phase-7-decade-simulation-testing.md`. Direct origin: a
+request to test Riptide against ten years of simulated usage, decomposed during brainstorming
+into four composable layers rather than a literal ten-year run.
+
+Found and fixed a real bug during the research phase, before any new code was written:
+`Riptide.Stream.RaMachine` stored an `:infinity`-retention stream's events in a plain list
+appended via `events ++ [x]` — O(n) per append, O(n^2) over a stream's lifetime, invisible at
+test scale. Fixed by switching internal storage to Erlang's `:queue` (O(1) amortized append),
+proven with a scaling-ratio regression test at both the pure-state-machine level and, via the
+new volume-seed layer, at the real `Riptide.Stream.StreamServer`/Ra-consensus level.
+
+Four new permanent, on-demand (never CI-wired, per explicit decision) test capabilities, each
+independently runnable:
+- `Riptide.Clock` — a swappable wall-clock indirection (`Riptide.Clock.System` default,
+  `Riptide.Clock.Virtual` test-only) wired into the one production call site that read
+  `System.system_time/1` directly. Minimal today, deliberately — cheap now, expensive to
+  retrofit once Phase 6a's bitemporal fact shape lands.
+- `Riptide.Decade.VolumeSeed` — fast-forwards a stream to realistic decade-scale event volume
+  against the real `StreamServer`, recording latency samples to catch growth-proportional
+  regressions directly.
+- `Riptide.Decade.Model` — a PropCheck stateful model of LDP resource semantics (PUT/PATCH/
+  DELETE/tenant creation), checked against the real in-process HTTP surface after every
+  generated step.
+- `Riptide.Decade.Chaos` — reusable node kill/restart, extracted from the existing
+  `replica_healer_leadership_gate_test.exs` `:peer`-bootstrap pattern rather than inventing a
+  new one, driving the real production `ReplicaHealer` repair path.
+
+`test/decade/decade_simulation_test.exs` (tag `:decade_simulation`) composes all four into one
+scenario. Explicitly out of scope, per the design spec: CI wiring, network-partition chaos, and
+dependency/OTP version-drift simulation (a real but different concern from usage simulation).
+
+**Status**: Phase 7 shipped 2026-09-15.
