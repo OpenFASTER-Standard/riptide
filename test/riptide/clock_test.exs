@@ -7,8 +7,15 @@ defmodule Riptide.ClockTest do
   end
 
   setup do
-    previous = Application.get_env(:riptide, :clock)
-    on_exit(fn -> Application.put_env(:riptide, :clock, previous) end)
+    previous = Application.fetch_env(:riptide, :clock)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:riptide, :clock, value)
+        :error -> Application.delete_env(:riptide, :clock)
+      end
+    end)
+
     :ok
   end
 
