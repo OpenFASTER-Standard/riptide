@@ -17,6 +17,22 @@ defmodule Riptide.Stream.RaMachine do
   # command log and in machine-state snapshots), so it must stay in the versioned
   # format regardless of whether this stream's Ra cluster ever triggers a snapshot.
   # See Phase 3a design spec, §4.
+  #
+  # `events`' own shape changed from a plain `[map()]` to `:queue.queue(map())` (Phase
+  # 7 Task 1, fixing an O(n)-per-append list-concat bug). This same `state` map is
+  # exactly what gets written as a Ra snapshot via `{:release_cursor, index, state}`
+  # (see `release_cursor_effects/3` below), so restoring a pre-fix, list-shaped
+  # snapshot under this post-fix, queue-shaped `apply/3` would crash on replay — no
+  # Ra machine version bump accompanied this change. This is safe *today* only
+  # because every production write path hardcodes `retention: :infinity`
+  # (`Riptide.Stream.StreamSupervisor.ensure_ready/1`), and `:infinity`-retention
+  # streams never trim (`trim/2` below is a no-op for them) and therefore never
+  # snapshot. `Riptide.Stream.StreamServer.start_link/1` does accept an arbitrary
+  # `retention:` option as public API, though — so if finite retention is ever
+  # exposed to real traffic, a rolling upgrade that crosses this exact code change
+  # would need either a Ra machine version bump or a defensive `is_list`-normalization
+  # in `init/1`/`apply/3` before deploying; neither exists yet, deliberately (YAGNI —
+  # no finite-retention snapshot can exist today for this code to ever encounter).
   @type state :: %{
           next_sequence: pos_integer(),
           events: :queue.queue(map()),

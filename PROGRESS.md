@@ -1798,8 +1798,10 @@ test scale. Fixed by switching internal storage to Erlang's `:queue` (O(1) amort
 proven with a scaling-ratio regression test at both the pure-state-machine level and, via the
 new volume-seed layer, at the real `Riptide.Stream.StreamServer`/Ra-consensus level.
 
-Four new permanent, on-demand (never CI-wired, per explicit decision) test capabilities, each
-independently runnable:
+Four new permanent test capabilities, each independently runnable. Three are on-demand only,
+never CI-wired, per explicit decision (`:benchmark`/`:decade_simulation`-tagged and excluded by
+`test_helper.exs`); the fourth — Chaos's own correctness test — is deliberately the exception,
+untagged and running in ordinary CI same as its reference precedent (see below):
 - `Riptide.Clock` — a swappable wall-clock indirection (`Riptide.Clock.System` default,
   `Riptide.Clock.Virtual` test-only) wired into the one production call site that read
   `System.system_time/1` directly. Minimal today, deliberately — cheap now, expensive to
@@ -1812,7 +1814,10 @@ independently runnable:
   generated step.
 - `Riptide.Decade.Chaos` — reusable node kill/restart, extracted from the existing
   `replica_healer_leadership_gate_test.exs` `:peer`-bootstrap pattern rather than inventing a
-  new one, driving the real production `ReplicaHealer` repair path.
+  new one, driving the real production `ReplicaHealer` repair path. Its own correctness test
+  (`chaos_test.exs`) is left untagged, matching that same reference file's untagged precedent —
+  it's fast enough to run in normal CI and is genuine correctness coverage, not a
+  decade-scale/benchmark concern like the other three capabilities' heavy tests.
 
 `test/decade/decade_simulation_test.exs` (tag `:decade_simulation`) composes all four into one
 scenario. Explicitly out of scope, per the design spec: CI wiring, network-partition chaos, and

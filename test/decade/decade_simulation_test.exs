@@ -47,9 +47,7 @@ defmodule Riptide.Decade.SimulationTest do
 
   test "a decade of usage: volume, diverse operations, and chaos, all at once" do
     {:ok, _clock} = start_supervised({Riptide.Clock.Virtual, System.system_time(:second)})
-    previous_clock_config = Application.get_env(:riptide, :clock)
-    Application.put_env(:riptide, :clock, Riptide.Clock.Virtual)
-    on_exit(fn -> Application.put_env(:riptide, :clock, previous_clock_config) end)
+    Riptide.AppEnvTestHelpers.put_env(:riptide, :clock, Riptide.Clock.Virtual)
 
     all_specs = @peers ++ @spares
     peers = Chaos.start_cluster(all_specs)
@@ -93,9 +91,8 @@ defmodule Riptide.Decade.SimulationTest do
 
       Riptide.Clock.Virtual.advance(@seconds_per_chaos_round)
 
-      # Always kill a still-live *original* member (node_a keeps
-      # orchestrating via :erpc from the origin, so never kill it).
-      target = Enum.find(current_members, &(&1 != node_a))
+      target = safe_kill_target(current_members, original_nodes, node_a)
+      assert target != nil, "no kill target available without breaking placement quorum"
       Chaos.kill_node(peers, target)
 
       survivors = current_members -- [target]
@@ -116,5 +113,28 @@ defmodule Riptide.Decade.SimulationTest do
       :erpc.call(node_a, Riptide.Stream.StreamServer, :get_since, [remote_stream_id, 0])
 
     assert length(final_events) == 2
+  end
+
+  # PlacementMachine's own Ra consensus cluster is fixed at genesis to
+  # exactly the 3 core peers (`original_nodes` here) — spares are never
+  # voting members of it (see Task 6's own `Enum.take(peers, 3)` fix) — so
+  # its raft quorum needs >= 2 of *those three specifically* to stay alive
+  # at all times, no matter which physical nodes currently host the
+  # stream's own replica list at a given moment. This deliberately does
+  # NOT rely on `PlacementMachine.replace_in_list/3` substituting a
+  # repaired-in spare at the dead member's old list position (an
+  # implementation detail this test shouldn't depend on) — it explicitly
+  # computes, for each killable candidate, how many of the 3 genesis
+  # peers would remain alive afterward, and only picks one that keeps
+  # that count >= 2. `node_a` is never a candidate since it keeps
+  # orchestrating via :erpc from the origin for the rest of the test.
+  defp safe_kill_target(current_members, original_nodes, node_a) do
+    Enum.find(current_members, fn candidate ->
+      candidate != node_a and
+        current_members
+        |> Enum.filter(&(&1 in original_nodes))
+        |> List.delete(candidate)
+        |> length() >= 2
+    end)
   end
 end
