@@ -8,11 +8,17 @@ import Config
 # to bundle .js and .css sources.
 config :riptide, RiptideWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
-  # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
+  # BIND_ALL_INTERFACES=true switches to `{0, 0, 0, 0}` — needed to reach a local dev
+  # instance from outside the host it runs on (e.g. this box's own Service port-forward for
+  # examples/guild-demo, so an operator's own browser can reach it).
   # PORT is optional (defaults to Phoenix's own 4000) — lets a second local instance run
   # alongside another one already bound to the default port (e.g. examples/guild-demo's own
   # smoke-test.mjs, which needs a real dev server it fully controls the lifecycle of).
-  http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT") || "4000")],
+  http: [
+    ip:
+      if(System.get_env("BIND_ALL_INTERFACES") == "true", do: {0, 0, 0, 0}, else: {127, 0, 0, 1}),
+    port: String.to_integer(System.get_env("PORT") || "4000")
+  ],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,

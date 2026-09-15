@@ -1,6 +1,6 @@
 # Riptide — Production Readiness Roadmap
 
-**Last updated:** 2026-09-03
+**Last updated:** 2026-09-15
 
 This tracks Riptide's path from "working reference implementation" (shipped: see
 [PR #1](https://github.com/OpenFASTER-Standard/riptide/pull/1)) to "production-grade centerpiece
@@ -17,6 +17,7 @@ first place to check for current status, not a historical log.
 | 4 | Security & multi-tenancy (auth, ACP, TLS) | **Shipped** (phases 4a-4d) — see below |
 | 5 | Observability & operability (metrics, logging, health probes) | **Shipped** (phases 5a-5c) — see below |
 | 6 | Derivation and execution layer | **6c-i-a, 6c-i-b, 6b-i, 6d-i, 6e-i, 6e-ii, 6e-iii, 6f, 6g-i, 6a, 6b-ii, 6h-i, 6h-ii, 6c-ii, 6i, 6j, 6k, 6l, 6d-ii, 6m, 6n, 6o, 6p-i, 6p-ii, 6q, 6r, 6p-iii shipped** (Rule/Signature representation and parser; fact-pattern matching and joins; WASI execution substrate; mechanical wiring; anti-unification algorithm; Generalization Fidelity replay harness; DedupGate orchestration; LLM fallback loop; exact/keyword Discovery; bitemporal fact shape; supervised long-running process primitive; Pattern Hub threat model; Pattern Hub deployment; recursion and fixpoint evaluation; ontology Crosswalks and Installation; large object/blob storage; dynamic Capability registration; reactive Job-triggering; concurrent-effects design spike; Tenant-Scoped Execution Surface; Hub Resource Lifecycle; Username/Password Authentication; Demo Backend Additions; Demo WASM Components; Tenant Sovereignty — Hub collapse; Generic OpenAI-Compatible LLM Client; the Sub-project 6 demo page) — the primary spine and every side-track that had a defined exit criterion are now complete; remaining open work is #80 (Capability grant/OAuth), #69 (6g-ii, hybrid keyword+embedding Discovery, deferred — no exit criterion defined yet), #63/#77 (6c-iii-a/b, aggregation + ValidTime-aware querying, Track B) — see issue #58 (being updated alongside this file — it still showed 6o as "the demo, not yet started" as of 2026-09-01, predating 6o's own reassignment to Username/Password Authentication and 6p-i/6p-ii/6q/6r/6p-iii all shipping since), see `docs/superpowers/specs/2026-08-27-derivation-and-execution-layer-design.md` |
+| 7 | Decade Simulation Testing | **Shipped** — see below |
 
 Sequencing rationale: persistence first, since clustering/HA are meaningless without durable
 storage to replicate, and every other sub-project assumes data actually survives a restart.
@@ -1774,3 +1775,57 @@ review rather than presented as pre-confirmed.
 **Status**: Phase 6p-iii shipped 2026-09-03. This closes out the primary spine and every side-track
 that had a defined exit criterion — remaining open work across Sub-project 6 is #80 (Capability
 grant/OAuth), #69 (6g-ii, deferred), and #63/#77 (6c-iii-a/b, Track B).
+
+## 7. Decade Simulation Testing — shipped
+
+**Scope for this sub-project**: exercise Riptide against realistic long-horizon usage — high
+event volume, wall-clock-dependent behavior, and node-failure/repair — without literally running
+the server for ten years. See
+`docs/superpowers/specs/2026-09-15-phase-7-decade-simulation-testing-design.md` §1.
+
+### 7 — Decade Simulation Testing
+
+**Shipped 2026-09-15** — see
+`docs/superpowers/specs/2026-09-15-phase-7-decade-simulation-testing-design.md` and
+`docs/superpowers/plans/2026-09-15-phase-7-decade-simulation-testing.md`. Direct origin: a
+request to test Riptide against ten years of simulated usage, decomposed during brainstorming
+into four composable layers rather than a literal ten-year run.
+
+Found and fixed a real bug during the research phase, before any new code was written:
+`Riptide.Stream.RaMachine` stored an `:infinity`-retention stream's events in a plain list
+appended via `events ++ [x]` — O(n) per append, O(n^2) over a stream's lifetime, invisible at
+test scale. Fixed by switching internal storage to Erlang's `:queue` (O(1) amortized append),
+proven with a scaling-ratio regression test at both the pure-state-machine level and, via the
+new volume-seed layer, at the real `Riptide.Stream.StreamServer`/Ra-consensus level.
+
+Four new permanent test capabilities, each independently runnable. Three are on-demand only,
+never CI-wired, per explicit decision (`:benchmark`/`:decade_simulation`-tagged and excluded by
+`test_helper.exs`); the fourth — Chaos's own correctness test — is deliberately the exception,
+untagged and running in ordinary CI same as its reference precedent (see below):
+- `Riptide.Clock` — a swappable wall-clock indirection (`Riptide.Clock.System` default,
+  `Riptide.Clock.Virtual` test-only) wired into the one production call site that read
+  `System.system_time/1` directly. Minimal today, deliberately — cheap now, expensive to
+  retrofit once Phase 6a's bitemporal fact shape lands.
+- `Riptide.Decade.VolumeSeed` — fast-forwards a stream to realistic decade-scale event volume
+  against the real `StreamServer`, recording latency samples to catch growth-proportional
+  regressions directly.
+- `Riptide.Decade.Model` — a PropCheck stateful model of LDP resource semantics (PUT/PATCH/
+  DELETE/tenant creation), checked against the real in-process HTTP surface after every
+  generated step.
+- `Riptide.Decade.Chaos` — reusable node kill/restart, extracted from the existing
+  `replica_healer_leadership_gate_test.exs` `:peer`-bootstrap pattern rather than inventing a
+  new one, driving the real production `ReplicaHealer` repair path. Its own correctness test
+  (`chaos_test.exs`) is left untagged, matching that same reference file's untagged precedent —
+  it's fast enough to run in normal CI and is genuine correctness coverage, not a
+  decade-scale/benchmark concern like the other three capabilities' heavy tests.
+
+`test/decade/decade_simulation_test.exs` (tag `:decade_simulation`) composes all four into one
+scenario. Explicitly out of scope, per the design spec: CI wiring, network-partition chaos, and
+dependency/OTP version-drift simulation (a real but different concern from usage simulation).
+Known, disclosed limitation: the virtual clock does not yet reach the chaos-tested `:peer` nodes
+(each is a separate BEAM process with its own independent `Application` env), so the umbrella
+scenario's clock-advance calls don't yet exercise time-dependent behavior on those nodes — not a
+bug, just a real gap between what the composition currently proves and what it narratively
+suggests.
+
+**Status**: Phase 7 shipped 2026-09-15.

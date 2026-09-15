@@ -17,15 +17,31 @@ defmodule Riptide.Stream.RaMachine do
   # command log and in machine-state snapshots), so it must stay in the versioned
   # format regardless of whether this stream's Ra cluster ever triggers a snapshot.
   # See Phase 3a design spec, §4.
+  #
+  # `events`' own shape changed from a plain `[map()]` to `:queue.queue(map())` (Phase
+  # 7 Task 1, fixing an O(n)-per-append list-concat bug). This same `state` map is
+  # exactly what gets written as a Ra snapshot via `{:release_cursor, index, state}`
+  # (see `release_cursor_effects/3` below), so restoring a pre-fix, list-shaped
+  # snapshot under this post-fix, queue-shaped `apply/3` would crash on replay — no
+  # Ra machine version bump accompanied this change. This is safe *today* only
+  # because every production write path hardcodes `retention: :infinity`
+  # (`Riptide.Stream.StreamSupervisor.ensure_ready/1`), and `:infinity`-retention
+  # streams never trim (`trim/2` below is a no-op for them) and therefore never
+  # snapshot. `Riptide.Stream.StreamServer.start_link/1` does accept an arbitrary
+  # `retention:` option as public API, though — so if finite retention is ever
+  # exposed to real traffic, a rolling upgrade that crosses this exact code change
+  # would need either a Ra machine version bump or a defensive `is_list`-normalization
+  # in `init/1`/`apply/3` before deploying; neither exists yet, deliberately (YAGNI —
+  # no finite-retention snapshot can exist today for this code to ever encounter).
   @type state :: %{
           next_sequence: pos_integer(),
-          events: [map()],
+          events: :queue.queue(map()),
           retention: :infinity | pos_integer()
         }
 
   @impl :ra_machine
   def init(%{retention: retention}) do
-    %{next_sequence: 1, events: [], retention: retention}
+    %{next_sequence: 1, events: :queue.new(), retention: retention}
   end
 
   @impl :ra_machine
@@ -34,7 +50,7 @@ defmodule Riptide.Stream.RaMachine do
       {:ok, event} ->
         stamped = Event.with_sequence(event, state.next_sequence)
         stamped_wire = Event.encode(stamped)
-        {events, trimmed?} = trim(state.events ++ [stamped_wire], state.retention)
+        {events, trimmed?} = trim(:queue.in(stamped_wire, state.events), state.retention)
         new_state = %{state | next_sequence: state.next_sequence + 1, events: events}
         {new_state, stamped, release_cursor_effects(trimmed?, meta, new_state)}
 
@@ -104,12 +120,20 @@ defmodule Riptide.Stream.RaMachine do
   def get_since(_state, nil), do: {:ok, []}
 
   def get_since(state, cursor) do
-    oldest = List.first(state.events) |> then(&(&1 && &1.sequence))
+    oldest =
+      case :queue.peek(state.events) do
+        {:value, event} -> event.sequence
+        :empty -> nil
+      end
 
     if oldest != nil and cursor < oldest - 1 do
       {:gap, oldest}
     else
-      {:ok, state.events |> Enum.filter(&(&1.sequence > cursor)) |> Enum.map(&Event.decode/1)}
+      state.events
+      |> :queue.to_list()
+      |> Enum.filter(&(&1.sequence > cursor))
+      |> Enum.map(&Event.decode/1)
+      |> then(&{:ok, &1})
     end
   end
 
@@ -118,12 +142,15 @@ defmodule Riptide.Stream.RaMachine do
   defp trim(events, :infinity), do: {events, false}
 
   defp trim(events, retention) when is_integer(retention) do
-    count = length(events)
+    count = :queue.len(events)
 
     if count > retention do
-      {Enum.drop(events, count - retention), true}
+      {drop_n(events, count - retention), true}
     else
       {events, false}
     end
   end
+
+  defp drop_n(queue, 0), do: queue
+  defp drop_n(queue, n) when n > 0, do: drop_n(:queue.drop(queue), n - 1)
 end

@@ -85,7 +85,7 @@ defmodule Riptide.Placement do
   # clock inside a Ra machine callback would break replica determinism.
   @spec claim_repair(String.t(), node()) :: :claimed | :already_claimed
   def claim_repair(stream_id, dead_node) do
-    now_ts = System.system_time(:second)
+    now_ts = Riptide.Clock.now()
 
     with_current_members(fn server_id ->
       RaCluster.process_command(
