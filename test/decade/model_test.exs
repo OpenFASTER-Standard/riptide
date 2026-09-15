@@ -32,6 +32,17 @@ defmodule Riptide.Decade.ModelTest do
     forall cmds <- commands(Model) do
       {history, state, result} = run_commands(Model, cmds)
 
+      # Every command run creates a real, disk-persisted Ra cluster plus a
+      # permanent BEAM atom (see `Riptide.Decade.Model`'s moduledoc "Stream
+      # cleanup" section and `test/support/ra_test_helpers.ex`) — clean up
+      # everything this exact `run_commands/2` call touched right away,
+      # rather than deferring to an `on_exit`, since `forall` evaluates its
+      # body up to ~100 times per property run (plus shrinking retries) in
+      # the same process, not once.
+      for stream_id <- Model.drain_stream_ids() do
+        Riptide.RaTestHelpers.cleanup_stream(stream_id)
+      end
+
       (result == :ok)
       |> when_fail(
         IO.puts("""
