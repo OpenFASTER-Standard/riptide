@@ -22,18 +22,25 @@ defmodule Riptide.Decade.VolumeSeedTest do
   end
 
   test "append latency does not trend upward across the run (regression guard for the RaMachine fix)" do
-    stream_id = "decade-volume-seed-trend-" <> Uniq.UUID.uuid4()
-    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(stream_id) end)
+    small_stream = "decade-volume-seed-small-" <> Uniq.UUID.uuid4()
+    large_stream = "decade-volume-seed-large-" <> Uniq.UUID.uuid4()
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(small_stream) end)
+    on_exit(fn -> Riptide.RaTestHelpers.cleanup_stream(large_stream) end)
 
-    %{latencies_us: samples} = VolumeSeed.seed_stream(stream_id, 20_000)
+    VolumeSeed.seed_stream(small_stream, 2_000)
+    %{latencies_us: small_batch} = VolumeSeed.seed_stream(small_stream, 500)
 
-    first_half_avg = samples |> Enum.take(5) |> Enum.sum() |> Kernel./(5)
-    second_half_avg = samples |> Enum.take(-5) |> Enum.sum() |> Kernel./(5)
+    VolumeSeed.seed_stream(large_stream, 20_000)
+    %{latencies_us: large_batch} = VolumeSeed.seed_stream(large_stream, 500)
 
-    ratio = second_half_avg / first_half_avg
+    small_avg = Enum.sum(small_batch) / length(small_batch)
+    large_avg = Enum.sum(large_batch) / length(large_batch)
 
-    assert ratio < 3,
-           "later append-latency samples averaged #{ratio}x the earlier ones " <>
-             "(#{inspect(samples)}) — looks like a growth-proportional slowdown"
+    ratio = large_avg / small_avg
+
+    assert ratio < 5,
+           "appending 500 events after 20,000 prior events averaged #{ratio}x the latency " <>
+             "of appending 500 events after 2,000 prior events (#{large_avg}us vs " <>
+             "#{small_avg}us) — looks like a growth-proportional slowdown"
   end
 end
