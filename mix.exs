@@ -61,6 +61,7 @@ defmodule Riptide.MixProject do
       # bench/ only (see bench/README.md) — not needed to build, test, or
       # run Riptide itself.
       {:benchee, "~> 1.3", only: [:dev, :test], runtime: false},
+      {:propcheck, "~> 1.4", only: [:test]},
       {:cors_plug, "~> 3.0"}
     ]
   end
