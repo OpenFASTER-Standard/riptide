@@ -46,7 +46,7 @@ defmodule Riptide.Decade.SimulationTest do
   end
 
   test "a decade of usage: volume, diverse operations, and chaos, all at once" do
-    {:ok, _clock} = Riptide.Clock.Virtual.start_link(System.system_time(:second))
+    {:ok, _clock} = start_supervised({Riptide.Clock.Virtual, System.system_time(:second)})
     previous_clock_config = Application.get_env(:riptide, :clock)
     Application.put_env(:riptide, :clock, Riptide.Clock.Virtual)
     on_exit(fn -> Application.put_env(:riptide, :clock, previous_clock_config) end)

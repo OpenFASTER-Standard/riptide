@@ -8,7 +8,13 @@ ExUnit.start()
 # Benchee run, the other blocks forever on purpose. `:benchmark`-tagged
 # tests are excluded by default; run them explicitly with
 # `mix test test/bench/some_test.exs --include benchmark`.
-ExUnit.configure(exclude: [:benchmark])
+#
+# `test/decade/decade_simulation_test.exs` (Phase 7's umbrella decade-usage
+# simulation — real multi-node `:peer` chaos + a decade-scale volume seed)
+# is the same story: on-demand only, per that phase's own design spec,
+# never CI-wired. Excluded the same way; run explicitly with
+# `mix test test/decade/decade_simulation_test.exs --include decade_simulation`.
+ExUnit.configure(exclude: [:benchmark, :decade_simulation])
 
 # SIDE-FIX (2026-08-25): give the test-runner BEAM a stable, real distributed
 # identity ONCE, here, before the placement-cluster bootstrap below ever
