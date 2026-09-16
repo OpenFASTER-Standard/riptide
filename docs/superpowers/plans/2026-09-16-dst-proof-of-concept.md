@@ -382,6 +382,8 @@ git commit -m "DST PoC Task 2: in-memory peer-addressed network, no fault inject
 - Modify: `lib/sim/network.ml`
 - Modify: `lib/sim/network.mli`
 - Test: `test/test_sim_faults.ml`
+- Modify: `test/test_sim_network.ml` (Task 2's tests — their `Network.create`/`send` call sites
+  break under this task's signature changes; see Step 6)
 - Modify: `test/test_riptide.ml`
 
 **Interfaces:**
