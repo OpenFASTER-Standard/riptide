@@ -44,6 +44,19 @@ let test_corrupt_probability_one_always_applies_corruption_fn () =
   Network.pump_all net;
   Alcotest.(check string) "corruption function applied" "HELLO" (Network.receive net "b")
 
+let test_corruption_applied_at_delivery_not_at_send () =
+  Eio_main.run @@ fun _env ->
+  let prng = Prng.create 6 in
+  let net = Network.create ~faults:{ Network.default_fault_config with corrupt_probability = 1.0 } prng () in
+  Network.register net "a";
+  Network.register net "b";
+  let applied = ref false in
+  let corrupt msg = applied := true; msg in
+  Network.send corrupt net ~from_:"a" ~to_:"b" "hello";
+  Alcotest.(check bool) "corrupt fn not yet invoked right after send" false !applied;
+  Network.pump_all net;
+  Alcotest.(check bool) "corrupt fn invoked once pump_all delivers" true !applied
+
 let test_same_seed_same_fault_decisions () =
   let run seed =
     Eio_main.run @@ fun _env ->
@@ -69,5 +82,7 @@ let tests =
     ("drop_probability=1.0 drops everything", `Quick, test_drop_probability_one_means_never_delivered);
     ("duplicate_probability=1.0 duplicates", `Quick, test_duplicate_probability_one_means_delivered_twice);
     ("corrupt_probability=1.0 applies corruption fn", `Quick, test_corrupt_probability_one_always_applies_corruption_fn);
+    ("corruption fn is invoked at delivery (pump_all), not at send", `Quick,
+      test_corruption_applied_at_delivery_not_at_send);
     ("same seed reproduces identical fault decisions", `Quick, test_same_seed_same_fault_decisions)
   ]
