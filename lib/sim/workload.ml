@@ -60,11 +60,21 @@ let peer_name i = Printf.sprintf "peer%d" i
    receiver loop *never suspends*, so it cannot surface those traps by construction. What this
    workload *does* prove is reproducibility (identical seed -> identical trace, including all
    fault decisions) under an adversarial, unstructured generator - a real and separate property
-   from genuine concurrent fiber/network interleaving. That latter property - fibers genuinely
-   blocking on `Network.receive` and actually interleaving with `pump_one`/`pump_all` mid-flight -
-   is proven separately, by Task 2's `test/test_sim_network.ml` (see e.g. its "deterministic
-   two-fiber exchange" test), which predates fault injection and does not go through this module
-   at all. *)
+   from genuine concurrent fiber/network interleaving.
+
+   That latter property - fibers genuinely blocking on `Network.receive` and actually interleaving
+   with `pump_one`/`pump_all` mid-flight - is proven elsewhere, but not by the disjoint pieces this
+   note used to point to. `test/test_sim_network.ml`'s "deterministic two-fiber exchange" test
+   proves genuine interleaving, but with faults off (`default_fault_config`); it does *not* predate
+   fault injection (Task 3 rewrote it onto the fault-injecting `Network.create ~faults ...`), it
+   just runs with all fault probabilities at zero, so on its own it doesn't cover interleaving
+   *combined with* active faults. The composite property - interleaving *and* active fault
+   injection *and* determinism, all at once, which is what the real consensus protocol will depend
+   on in every interaction - is proven by `test/test_sim_network.ml`'s
+   "interleaving + active fault injection + determinism, combined" test: three receiver fibers
+   genuinely blocking on `Network.receive` while a driver interleaves sends with `pump_one` calls
+   under nonzero duplicate/corrupt/delay probabilities, asserting a byte-identical trace across two
+   same-seed runs. *)
 let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create seed in
@@ -91,7 +101,8 @@ let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   (* Phase 2: each peer, as its own Eio fiber, drains exactly what ended up in its inbox. Never
      suspends (no blocking receive, no Fiber.yield), so peers run fully sequentially, one after
      another - no genuine fiber/network interleaving here; see the disclosure note above
-     `run_toy_cluster` and Task 2's `test/test_sim_network.ml` for that property instead. *)
+     `run_toy_cluster` and `test/test_sim_network.ml`'s "interleaving + active fault injection +
+     determinism, combined" test for that property instead. *)
   Eio.Fiber.all
     (List.map
        (fun peer () ->

@@ -63,8 +63,11 @@ against this project's real installed OCaml 5 / Eio toolchain rather than by ass
 - `Workload`: a toy multi-fiber cluster with a randomly-generated (not fixed-script) workload,
   proving that identical seeds reproduce byte-for-byte identical traces even with fault injection
   enabled. (Note: this toy cluster resolves the network fully before any peer fiber runs, so it
-  doesn't itself exercise genuine concurrent fiber/network interleaving — `test/test_sim_network.ml`
-  proves that property.)
+  doesn't itself exercise genuine concurrent fiber/network interleaving. That composite property —
+  fibers genuinely blocking on `Network.receive`, interleaved with *active* fault injection
+  (nonzero duplicate/corrupt/delay), still reproducing byte-identically from the same seed — is
+  proven by `test/test_sim_network.ml`'s "interleaving + active fault injection + determinism,
+  combined" test.)
 
 **What this does NOT yet build:** the real VSR-derived consensus protocol, atomic multi-entity
 commit, or a production (real-socket) network implementation — those are separate, later

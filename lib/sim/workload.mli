@@ -17,6 +17,8 @@ val run_toy_cluster :
     order - not interleaved by actual delivery time across peers - because the network is fully
     resolved and flushed before any peer starts draining (see the implementation's disclosure
     note in [workload.ml] for why this workload does not exercise genuine concurrent
-    fiber/network interleaving; [test/test_sim_network.ml] covers that property instead). Two
+    fiber/network interleaving; [test/test_sim_network.ml]'s "interleaving + active fault
+    injection + determinism, combined" test covers that property, together with active fault
+    injection, instead). Two
     calls with identical arguments always return identical results, including identical
     [Received] grouping and order. *)

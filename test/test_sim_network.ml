@@ -76,6 +76,89 @@ let test_fiber_suspends_on_virtual_clock_and_wakes_via_pump () =
     ]
     (List.rev !events)
 
+type event =
+  | Sent of { to_ : string; payload : string }
+  | Received of { by : string; payload : string }
+
+let test_interleaving_with_active_fault_injection_is_deterministic () =
+  (* The one composite property none of this PoC's other tests prove: fibers genuinely blocking
+     on Network.receive (not receive_nonblocking), interleaved with an active, multi-axis fault
+     config (nonzero duplicate/corrupt/delay - the exact fault types the real consensus protocol
+     will depend on in every interaction), reproducing byte-identically from the same seed.
+     Config mirrors the reviewer's own independently-verified scratch probe (duplicate 0.4,
+     corrupt 0.3, delay 0.1-5.0), which produced a byte-identical 24-event trace across 3 runs
+     with corruption and delay-reordering both visibly firing. *)
+  let faults =
+    { Network.default_fault_config with
+      duplicate_probability = 0.4; corrupt_probability = 0.3; min_delay = 0.1; max_delay = 5.0 }
+  in
+  let peers = [ "p0"; "p1"; "p2" ] in
+  let message_count = 9 in
+  let guaranteed_per_peer = message_count / List.length peers in
+  let run seed =
+    Eio_mock.Backend.run @@ fun () ->
+    let prng = Prng.create seed in
+    let net = Network.create ~faults prng () in
+    List.iter (Network.register net) peers;
+    let events = ref [] in
+    let record ev = events := ev :: !events in
+    let receiver peer () =
+      (* drop_probability is 0 here, so every raw send addressed to [peer] is guaranteed at
+         least one delivery - these [guaranteed_per_peer] blocking receives are what proves
+         genuine suspend/resume interleaving with the driver below, not just a scheduling
+         artifact. *)
+      for _ = 1 to guaranteed_per_peer do
+        let payload = Network.receive net peer in
+        record (Received { by = peer; payload })
+      done
+    in
+    let driver () =
+      for i = 1 to message_count do
+        let to_ = List.nth peers ((i - 1) mod List.length peers) in
+        let payload = Printf.sprintf "m%d" i in
+        Network.send String.uppercase_ascii net ~from_:"driver" ~to_ payload;
+        record (Sent { to_; payload });
+        (* One message at a time, yielding between pumps, so receiver fibers genuinely interleave
+           with in-flight delivery instead of the whole network resolving before any receiver
+           gets a chance to run. *)
+        ignore (Network.pump_one net);
+        Eio.Fiber.yield ()
+      done;
+      (* Flush anything still pending (later-delayed deliveries, including duplicate extras). *)
+      Network.pump_all net
+    in
+    Eio.Fiber.all (driver :: List.map receiver peers);
+    (* By the time Fiber.all returns, every fiber above (including the driver's final pump_all)
+       has completed, so the network is guaranteed fully flushed - drain any duplicate extras
+       (stochastic, not required for the property under test, but makes the trace reflect
+       duplication too) sequentially rather than risk a receiver racing the driver's last flush. *)
+    List.iter
+      (fun peer ->
+        let rec drain_extras () =
+          match Network.receive_nonblocking net peer with
+          | Some payload ->
+            record (Received { by = peer; payload });
+            drain_extras ()
+          | None -> ()
+        in
+        drain_extras ())
+      peers;
+    List.rev !events
+  in
+  let trace_a = run 2024 and trace_b = run 2024 in
+  Alcotest.(check bool)
+    "same seed, under active duplicate/corrupt/delay fault injection with genuine fiber/network \
+     interleaving, produces a byte-identical trace across two separate runs"
+    true (trace_a = trace_b);
+  Alcotest.(check bool) "corruption actually fired at least once (an uppercased payload was received)"
+    true
+    (List.exists
+       (function Received { payload; _ } -> String.uppercase_ascii payload = payload | Sent _ -> false)
+       trace_a);
+  Alcotest.(check bool) "duplication actually fired at least once (more than message_count receives)"
+    true
+    (List.length (List.filter (function Received _ -> true | Sent _ -> false) trace_a) > message_count)
+
 let test_receive_nonblocking_empty () =
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
@@ -88,5 +171,7 @@ let tests =
     ("deterministic two-fiber exchange", `Quick, test_deterministic_two_fiber_exchange);
     ("fiber suspends on virtual clock and wakes via pump", `Quick,
       test_fiber_suspends_on_virtual_clock_and_wakes_via_pump);
+    ("interleaving + active fault injection + determinism, combined", `Quick,
+      test_interleaving_with_active_fault_injection_is_deterministic);
     ("receive_nonblocking is empty with nothing sent", `Quick, test_receive_nonblocking_empty)
   ]
