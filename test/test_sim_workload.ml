@@ -38,8 +38,27 @@ let test_generator_covers_unstructured_workload () =
   Alcotest.(check bool) "generator produces more than one distinct (sender, receiver) pairing across seeds"
     true (List.length pairs_seen > 1)
 
+let test_terminates_and_delivers_nothing_when_everything_is_dropped () =
+  (* Regression test for the termination-logic fix (see workload.ml's design note): under a
+     literal reading of "give each peer its own expected-count target from the driver's intended
+     addressing" (the brief's option (b) as originally worded), a peer whose only intended
+     message is dropped would busy-poll forever waiting for a delivery that will never arrive.
+     drop_probability = 1.0 is the sharpest case of that: every single message is dropped, so no
+     peer should ever receive anything - and the call must still terminate (this test itself
+     would hang, rather than fail an assertion, if the old bug were reintroduced). *)
+  let faults = { Network.default_fault_config with drop_probability = 1.0 } in
+  let trace = Workload.run_toy_cluster ~seed:7 ~peer_count:5 ~message_count:50 ~faults in
+  let sent, received =
+    List.partition (function Workload.Sent _ -> true | Workload.Received _ -> false) trace
+  in
+  Alcotest.(check int) "all 50 sends are still recorded (send is attempted regardless of drop)" 50
+    (List.length sent);
+  Alcotest.(check int) "nothing was ever received" 0 (List.length received)
+
 let tests =
   [ ("identical seed reproduces identical trace", `Quick, test_same_seed_reproduces_identical_trace);
     ("different seeds are not artificially constant", `Quick, test_different_seeds_can_diverge);
-    ("generator covers unstructured (sender, receiver) pairings", `Quick, test_generator_covers_unstructured_workload)
+    ("generator covers unstructured (sender, receiver) pairings", `Quick, test_generator_covers_unstructured_workload);
+    ("terminates and delivers nothing when drop_probability = 1.0", `Quick,
+      test_terminates_and_delivers_nothing_when_everything_is_dropped)
   ]

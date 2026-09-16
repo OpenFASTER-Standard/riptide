@@ -42,7 +42,29 @@ let peer_name i = Printf.sprintf "peer%d" i
 
    This also means no reconciliation is needed for the unstructured-workload test: since delivery
    is still genuinely point-to-point (not broadcast), the `to_` recorded on each `Sent` event is
-   already exactly the workload generator's randomly chosen intended target. *)
+   already exactly the workload generator's randomly chosen intended target.
+
+   --- Disclosure: what this design does NOT exercise ---
+
+   A direct consequence of the phase split above: Phase 1 fully resolves and flushes the network
+   (one `pump_all` call) *before* any Phase 2 peer fiber starts, and Phase 2's `drain` loop never
+   calls `Network.receive` (blocking) or `Eio.Fiber.yield` - `receive_nonblocking` never suspends
+   the fiber. So each peer fiber below runs to completion, start to finish, before
+   `Eio.Fiber.all` moves on to the next one: there is zero real interleaving between peer fibers,
+   or between a peer fiber and in-flight network activity, in this workload. That matters here
+   specifically because this whole proof-of-concept exists to catch traps that, per this plan's
+   own design spec (`docs/superpowers/specs/2026-09-16-distributed-consensus-design.md`,
+   Decision 2 - "GC pauses interacting badly with virtual time, `Domain`-crossing nondeterminism,
+   a transitive dependency that doesn't cooperate with Eio's effect handlers") "can only appear in
+   code that never suspends" is exactly the wrong description of code like this: this workload's
+   receiver loop *never suspends*, so it cannot surface those traps by construction. What this
+   workload *does* prove is reproducibility (identical seed -> identical trace, including all
+   fault decisions) under an adversarial, unstructured generator - a real and separate property
+   from genuine concurrent fiber/network interleaving. That latter property - fibers genuinely
+   blocking on `Network.receive` and actually interleaving with `pump_one`/`pump_all` mid-flight -
+   is proven separately, by Task 2's `test/test_sim_network.ml` (see e.g. its "deterministic
+   two-fiber exchange" test), which predates fault injection and does not go through this module
+   at all. *)
 let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   Eio_main.run @@ fun _env ->
   let prng = Prng.create seed in
@@ -66,7 +88,10 @@ let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
     record (Sent { from_; to_; payload })
   done;
   Network.pump_all net;
-  (* Phase 2: each peer, as its own Eio fiber, drains exactly what ended up in its inbox. *)
+  (* Phase 2: each peer, as its own Eio fiber, drains exactly what ended up in its inbox. Never
+     suspends (no blocking receive, no Fiber.yield), so peers run fully sequentially, one after
+     another - no genuine fiber/network interleaving here; see the disclosure note above
+     `run_toy_cluster` and Task 2's `test/test_sim_network.ml` for that property instead. *)
   Eio.Fiber.all
     (List.map
        (fun peer () ->

@@ -9,8 +9,14 @@ type trace_event =
 val run_toy_cluster :
   seed:int -> peer_count:int -> message_count:int -> faults:Network.fault_config -> trace_event list
 (** [run_toy_cluster ~seed ~peer_count ~message_count ~faults] runs [peer_count] peers (named
-    ["peer0"], ["peer1"], ...) as concurrent fibers over a faulty {!Network} seeded from [seed].
-    A driver generates [message_count] messages with randomly chosen sender, receiver, and
-    payload (drawn from the same seeded source), sends them, pumps the network to completion, and
-    returns the full trace in the order events actually occurred. Two calls with identical
-    arguments always return identical results. *)
+    ["peer0"], ["peer1"], ...) as Eio fibers over a faulty {!Network} seeded from [seed]. A
+    driver generates [message_count] messages with randomly chosen sender, receiver, and payload
+    (drawn from the same seeded source), sends them, and pumps the network to completion; each
+    peer fiber then drains whatever ended up in its own inbox. [Sent] events appear in the trace
+    in actual send order. [Received] events appear grouped per peer, in each peer's own drain
+    order - not interleaved by actual delivery time across peers - because the network is fully
+    resolved and flushed before any peer starts draining (see the implementation's disclosure
+    note in [workload.ml] for why this workload does not exercise genuine concurrent
+    fiber/network interleaving; [test/test_sim_network.ml] covers that property instead). Two
+    calls with identical arguments always return identical results, including identical
+    [Received] grouping and order. *)
