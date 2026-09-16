@@ -1,4 +1,5 @@
 (test
  (name test_riptide)
- (libraries riptide riptide_sim golden_fixtures alcotest qcheck-core qcheck-alcotest eio eio.mock)
+ (libraries riptide riptide_sim golden_fixtures alcotest qcheck-core qcheck-alcotest eio eio.mock
+   unix)
  (deps ../spec/golden/vectors.txt))

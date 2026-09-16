@@ -108,8 +108,15 @@ let test_terminates_and_delivers_nothing_when_everything_is_dropped () =
      addressing" (the brief's option (b) as originally worded), a peer whose only intended
      message is dropped would busy-poll forever waiting for a delivery that will never arrive.
      drop_probability = 1.0 is the sharpest case of that: every single message is dropped, so no
-     peer should ever receive anything - and the call must still terminate (this test itself
-     would hang, rather than fail an assertion, if the old bug were reintroduced). *)
+     peer should ever receive anything - and the call must still terminate. If the old bug were
+     reintroduced, this test would no longer hang silently forever: `Eio_mock.Backend` cannot
+     detect a busy-poll livelock as a deadlock (nothing ever truly suspends), but
+     `test_riptide.ml`'s suite-wide watchdog timer now catches exactly this shape and fails the
+     test fast with a real `Suite_timeout` exception instead - verified live by temporarily
+     reintroducing this exact bug into `run_toy_cluster`'s drain loop: every affected
+     `sim_workload` test (this one included) failed within one watchdog tick rather than hanging,
+     and the suite as a whole still terminated instead of hanging forever. See M1 in
+     `.superpowers/sdd/2026-09-16-dst-proof-of-concept/final-fix-review-round2-report.md`. *)
   let faults = { Network.default_fault_config with drop_probability = 1.0 } in
   let trace = Workload.run_toy_cluster ~seed:7 ~peer_count:5 ~message_count:50 ~faults in
   let sent, received =
