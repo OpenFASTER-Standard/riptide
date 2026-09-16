@@ -35,7 +35,7 @@ Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the ch
 
 ### 3.2. Design the concurrency model for simulation-testability as a day-one input
 
-**Status:** pending  
+**Status:** in-progress  
 **Dependencies:** None  
 
 Choose an effect-mediated or actor-style concurrency model (algebraic effect handlers, per OCaml 5/Eio's real 2025 production adoption, are a live candidate) specifically because it's what makes full-system deterministic simulation possible, not because it's fashionable.
@@ -43,6 +43,8 @@ Choose an effect-mediated or actor-style concurrency model (algebraic effect han
 **Details:**
 
 Test: the exact same code path must run identically against a real network and a simulated one.
+
+ PoC complete (merged to main, commits c78c698..93fc798): OCaml 5 / Eio (single-domain, effect-handler-based) confirmed as the right substrate for this. Concretely validated with real, running, tested code (not by inference): Eio's cooperative fiber scheduling is deterministic (an explicit maintainer guarantee, empirically re-confirmed); a from-scratch fault-injecting network (delay/drop/duplicate/byte-level-corrupt, seeded PRNG) composes correctly with genuinely blocking fibers under active faults, reproducing byte-identical traces; a fiber can genuinely sleep on simulated virtual time and be woken only by the simulation's own delivery mechanism (not a parallel clock); and the whole thing runs correctly under Eio_mock.Backend (Eio's own deterministic no-IO backend) rather than a real OS backend, which is what any real DST harness must use. Full design spec: docs/superpowers/specs/2026-09-16-distributed-consensus-design.md (Decision 2). Full plan + code: docs/superpowers/plans/2026-09-16-dst-proof-of-concept.md, lib/sim/. This closes the PoC/de-risking step only - the REAL concurrency model for the actual VSR-derived protocol (subtask 3.1) still needs to be designed and built against this now-validated substrate; this subtask is not done, the highest-risk unknown blocking it is.
 
 ### 3.3. Implement atomic multi-entity commit
 

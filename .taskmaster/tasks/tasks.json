@@ -9,7 +9,7 @@
         "priority": "high",
         "dependencies": [],
         "details": "Grounded in the Multics/OSI/Palladium/CORBA vs WASM/LLVM/HTTP/Kubernetes-CRD research: OSI failed because ISO ratified paper designs before any implementation existed ('too risky and untested' rejection of a working 1975 proposal); IETF's 'rough consensus and running code' was coined directly against this. CORBA is the sharpest warning: it started with real running code and small ambition and STILL failed, because its mechanism didn't stay small - it ballooned into committee-driven policy (naming/trading/notification services, security, versioning all bolted on). The rule for this project: (1) a small, aligned group who will each actually ship code decides Layer 0's design, never a broad multi-stakeholder process; (2) no formal rule for Layer 0 ever exists as spec-only - working, tested code implementing it ships in the same cycle, no exceptions, ever; (3) expect and budget for the first version of any extension mechanism to need real revision once real usage exposes what's wrong (the ThirdPartyResources to CRD lesson) - that's healthy, not failure.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -46,7 +46,7 @@
           "1"
         ],
         "details": "Per the mechanism/policy (Hydra/seL4) test, this is unambiguously Layer 0: every module needs deterministic ordering and a tamper-evident audit trail, and it must be fully formalizable with zero implementation-defined gaps (the POSIX/SQL/HTTP-request-smuggling lesson - anything left 'implementation-defined' is where real bugs cluster later). Directly fixes two confirmed Riptide/StreamLD defects: StreamLD's spec never mentions actor/provenance/causality at all, and Riptide's own implementation resolves identity at the HTTP layer then drops it before the event is built.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -101,7 +101,7 @@
           "2"
         ],
         "details": "This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale for skipping this: retrofitting a virtual clock onto an existing concurrency model meant it still can't reach the chaos-tested peer nodes, because the concurrency model wasn't built for simulation from the start. FoundationDB's Flow actor model exists specifically to make full-system deterministic simulation possible - that has to be a day-one architectural input here, not bolted on later. TigerBeetle chose a VSR-derived protocol over Raft specifically for storage-fault-awareness; that tradeoff needs a real decision here too, not a default.\n\n Carried forward from Layer 0 seed (Task 2)'s final review: Envelope.content_hash reuses Value.content_hash directly (Envelope.content_hash e = Value.content_hash (Envelope.to_value e)), so there is no domain separation between an envelope's event_id and a plain payload Value's hash - a crafted payload Value can collide with a real event_id. Harmless today because verify_chain_list always recomputes from actual envelopes, but this task is where event_id first gets asked to carry real security/consensus meaning (e.g. as a vote/reference target) - decide explicitly at the start of this task whether domain separation (e.g. a leading domain tag before hashing) is needed, rather than inheriting the Layer 0 seed's reuse-one-encoding choice by default.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -117,9 +117,9 @@
             "id": 2,
             "title": "Design the concurrency model for simulation-testability as a day-one input",
             "description": "Choose an effect-mediated or actor-style concurrency model (algebraic effect handlers, per OCaml 5/Eio's real 2025 production adoption, are a live candidate) specifically because it's what makes full-system deterministic simulation possible, not because it's fashionable.",
-            "status": "pending",
+            "status": "in-progress",
             "dependencies": [],
-            "details": "Test: the exact same code path must run identically against a real network and a simulated one.",
+            "details": "Test: the exact same code path must run identically against a real network and a simulated one.\n\n PoC complete (merged to main, commits c78c698..93fc798): OCaml 5 / Eio (single-domain, effect-handler-based) confirmed as the right substrate for this. Concretely validated with real, running, tested code (not by inference): Eio's cooperative fiber scheduling is deterministic (an explicit maintainer guarantee, empirically re-confirmed); a from-scratch fault-injecting network (delay/drop/duplicate/byte-level-corrupt, seeded PRNG) composes correctly with genuinely blocking fibers under active faults, reproducing byte-identical traces; a fiber can genuinely sleep on simulated virtual time and be woken only by the simulation's own delivery mechanism (not a parallel clock); and the whole thing runs correctly under Eio_mock.Backend (Eio's own deterministic no-IO backend) rather than a real OS backend, which is what any real DST harness must use. Full design spec: docs/superpowers/specs/2026-09-16-distributed-consensus-design.md (Decision 2). Full plan + code: docs/superpowers/plans/2026-09-16-dst-proof-of-concept.md, lib/sim/. This closes the PoC/de-risking step only - the REAL concurrency model for the actual VSR-derived protocol (subtask 3.1) still needs to be designed and built against this now-validated substrate; this subtask is not done, the highest-risk unknown blocking it is.",
             "testStrategy": "",
             "parentId": "undefined"
           },
@@ -165,7 +165,7 @@
           "3"
         ],
         "details": "Directly, structurally fixes the single defect two independent investigations found in the old Riptide from different angles: every read replayed the entire event history. CRDTs/lattices are the one piece of this whole stack that's already fully mainstream (Riak, Redis CRDTs, Automerge) - no unproven bet required. Redaction-with-preserved-hash also belongs here: it can't be retrofitted later without a hard-fork-shaped migration touching every existing record, so it has to be structural from this step.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -219,7 +219,7 @@
           "4"
         ],
         "details": "This is 'the boundary' category from the mechanism/policy analysis: a trusted, frozen CHECK-POINT whose CONTENT is pluggable. WASM Components are genuinely production-mature (2025-2026, WASI 0.3 shipped native async I/O). Isolation must be UNIFORM strong (SFI baseline everywhere, since it needs no hardware virtualization and is proven down to Cortex-M0 microcontrollers; hardware-virtualization microVM as an optional stronger tier where available) - NEVER tiered by trust level, per the corrected finding: AWS Lambda's real production philosophy is one strong boundary for everyone, and Cloudflare's trust-tiered Workers model had a real demonstrated Spectre leak as the direct cost of that shortcut.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -283,7 +283,7 @@
           "5"
         ],
         "details": "The single most important sequencing lesson from the entire historical-precedent research: WASM proved itself on real C/C++-via-Emscripten workloads for ~2 years before WASI opened it to genuinely diverse use; Kubernetes' CRD mechanism proved itself on real Prometheus/cert-manager/Istio deployments. Building for several imagined domains simultaneously, before any one is real, is the specific pattern that failed in every historical case researched (Multics, OSI, Palladium). Domain-agnostic ambition was never the problem - policy accumulating ahead of real running code was.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -337,7 +337,7 @@
           "6"
         ],
         "details": "This is the expected, healthy version of 'the first mechanism needs revision' - not evidence of failure. Once this lands, the boundary is the thing that gets genuinely frozen; everything before this task was provisional by design.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -381,7 +381,7 @@
           "7"
         ],
         "details": "Building this earlier would be securing an empty building. Node tiering (consensus-voting / workload-execution-only-non-voting / pure leaf) is directly precedented by k3s's server/agent split and Raft's own formal 'learner' node concept - a genuinely different axis from trust-based isolation tiering, which was explicitly rejected. Attestation must be pluggable (SPIFFE/SPIRE, TPM where available, join-token fallback elsewhere, honestly labeled as a weaker trust tier) since TPM coverage is real but not universal, especially on Pi-Zero-class and industrial/embedded hardware.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -445,7 +445,7 @@
           "6"
         ],
         "details": "Deferred until Task 6 gives it a real schema to generate against - building this earlier means designing against imagined data shapes. Mirrors the proven EventStoreDB/Marten/Axon pattern (event log to projection to conventional queryable store to REST/GraphQL layer) and Kubernetes' own OpenAPI-generated-from-types-plus-mandatory-conformance-suite discipline, applied one layer up from Layer 0's own SpecTec-style pattern.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -500,7 +500,7 @@
           "9"
         ],
         "details": "The honest version of 'designing for any critical infrastructure' - arrived at backwards from how this whole design process initially approached it. Real cross-domain pressure here (not imagined) is what should inform any further Layer 0 boundary changes, following the same Task 7 discipline if changes turn out to be needed.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
@@ -535,7 +535,7 @@
           "10"
         ],
         "details": "Furthest from the correctness-critical core and least urgent - extends reach, doesn't establish trust. Per-region independent consensus groups (Spanner, CockroachDB, TiDB, Oracle all do this) is genuinely industry-standard; extending epoch-barrier coupling from control-plane/data-plane to region-to-region is a plausible but NOVEL extension of proven patterns, not itself directly precedented - treat it as needing its own validation, not assumed to work by analogy alone.",
-        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
         "subtasks": [
           {
             "id": 1,
