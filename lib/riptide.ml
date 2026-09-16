@@ -2,3 +2,4 @@
 
 module Value = Value
 module Envelope = Envelope
+module Log = Log
