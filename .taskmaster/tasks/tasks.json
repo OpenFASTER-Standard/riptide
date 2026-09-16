@@ -1,0 +1,534 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": 1,
+        "title": "Lock in process discipline before any code",
+        "description": "Establish the governance rule that determined every historical success/failure researched: small aligned team, real running code always paired with any formal rule, never policy accumulated ahead of implementation.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [],
+        "details": "Grounded in the Multics/OSI/Palladium/CORBA vs WASM/LLVM/HTTP/Kubernetes-CRD research: OSI failed because ISO ratified paper designs before any implementation existed ('too risky and untested' rejection of a working 1975 proposal); IETF's 'rough consensus and running code' was coined directly against this. CORBA is the sharpest warning: it started with real running code and small ambition and STILL failed, because its mechanism didn't stay small - it ballooned into committee-driven policy (naming/trading/notification services, security, versioning all bolted on). The rule for this project: (1) a small, aligned group who will each actually ship code decides Layer 0's design, never a broad multi-stakeholder process; (2) no formal rule for Layer 0 ever exists as spec-only - working, tested code implementing it ships in the same cycle, no exceptions, ever; (3) expect and budget for the first version of any extension mechanism to need real revision once real usage exposes what's wrong (the ThirdPartyResources to CRD lesson) - that's healthy, not failure.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "1.1",
+            "title": "Define and document the 'no spec without running code' rule",
+            "description": "Write the actual project-level rule (e.g. in a CONTRIBUTING or CLAUDE.md-equivalent doc) that no Layer 0 formal rule may be merged without a working, tested implementation in the same change.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "This is the single variable that separated every historical success from every failure researched. Write it down where it can't be quietly bypassed under time pressure.",
+            "testStrategy": ""
+          },
+          {
+            "id": "1.2",
+            "title": "Establish the small-aligned-group governance model for Layer 0 changes",
+            "description": "Define who can propose/approve changes to Layer 0 specifically, keeping the group small and requiring each approver to have actually implemented against the change.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Mirrors WASM's CG (four browser vendors, each shipping) vs OSI's sprawling committee; mirrors IETF's running-code requirement for standards-track advancement.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Layer 0 seed: event envelope + content-addressed value universe (single node, no replication)",
+        "description": "Build the smallest possible real slice of Layer 0: the event envelope format and the base algebraic value universe, as one real, running, single-node append-only log. Proves the data model and audit-trail primitives against real code before distributed consensus is layered on.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          1
+        ],
+        "details": "Per the mechanism/policy (Hydra/seL4) test, this is unambiguously Layer 0: every module needs deterministic ordering and a tamper-evident audit trail, and it must be fully formalizable with zero implementation-defined gaps (the POSIX/SQL/HTTP-request-smuggling lesson - anything left 'implementation-defined' is where real bugs cluster later). Directly fixes two confirmed Riptide/StreamLD defects: StreamLD's spec never mentions actor/provenance/causality at all, and Riptide's own implementation resolves identity at the HTTP layer then drops it before the event is built.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "2.1",
+            "title": "Define the content-addressed algebraic value universe",
+            "description": "Scalars, records, sums, sequences, finite maps - a small typed core category (schemas as categories, instances as functors, per Spivak's functorial data model) that RDF, JSON, or any other domain payload becomes ONE instance of, not the universal substrate.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Directly fixes the RDF-only limitation the euro-office bridge integration hit (had to build a whole separate JSON codec). Borrow the schema-morphism IDEA from CQL/Conexus without adopting the full boutique tooling wholesale.",
+            "testStrategy": ""
+          },
+          {
+            "id": "2.2",
+            "title": "Define the event envelope: actor, causation, correlation, predecessor hash, sequence - all mandatory",
+            "description": "Every field is required, none optional, none droppable at any layer. This is the audit-trail fix for both Riptide's actual bug and StreamLD's total silence on provenance.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Validate: an event literally cannot be constructed without a real actor identity - not merely a documented best practice.",
+            "testStrategy": ""
+          },
+          {
+            "id": "2.3",
+            "title": "Implement single-node append-only log with hash-chaining",
+            "description": "No replication yet. Tamper-evidence (Merkle/hash-chain linkage) is structural from the first commit, not retrofitted - Riptide's `force_delete` had zero production safeguards because this wasn't designed in from the start.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: any single-byte alteration anywhere in history is detectable via hash-chain verification.",
+            "testStrategy": ""
+          },
+          {
+            "id": "2.4",
+            "title": "Build the SpecTec-style single formal source generating spec + reference implementation + conformance tests",
+            "description": "One formal definition of the envelope format generates the prose spec, a reference interpreter, and the test suite - never three hand-maintained artifacts drifting apart. This is what let WASM's formal semantics catch a real pre-standardization type-soundness bug; Ethereum's weaker 'executable reference implementation as spec' model is what let it ship two real spec-level chain-splitting bugs.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Verify: changing the formal definition regenerates all three artifacts with no manual sync step.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Distributed consensus, deterministic-simulation-tested from the first commit",
+        "description": "Turn the single-node log into a genuinely replicated system: TLA+-specified consensus/replication protocol, atomic multi-entity commit, with deterministic simulation testing (virtual clock, seeded fault injection) built into the concurrency model from day one.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          2
+        ],
+        "details": "This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale for skipping this: retrofitting a virtual clock onto an existing concurrency model meant it still can't reach the chaos-tested peer nodes, because the concurrency model wasn't built for simulation from the start. FoundationDB's Flow actor model exists specifically to make full-system deterministic simulation possible - that has to be a day-one architectural input here, not bolted on later. TigerBeetle chose a VSR-derived protocol over Raft specifically for storage-fault-awareness; that tradeoff needs a real decision here too, not a default.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "3.1",
+            "title": "Choose and TLA+-specify the consensus/replication protocol",
+            "description": "VSR-derived (TigerBeetle's choice, storage-fault-aware) vs Raft (simpler, larger ecosystem) - make the call explicitly, with the tradeoff reasoning documented, and get it model-checked before implementation, the way AWS's TLA+ practice found 35-step bugs that survived design review, code review, and testing.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the checked state space.",
+            "testStrategy": ""
+          },
+          {
+            "id": "3.2",
+            "title": "Design the concurrency model for simulation-testability as a day-one input",
+            "description": "Choose an effect-mediated or actor-style concurrency model (algebraic effect handlers, per OCaml 5/Eio's real 2025 production adoption, are a live candidate) specifically because it's what makes full-system deterministic simulation possible, not because it's fashionable.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: the exact same code path must run identically against a real network and a simulated one.",
+            "testStrategy": ""
+          },
+          {
+            "id": "3.3",
+            "title": "Implement atomic multi-entity commit",
+            "description": "Real cross-resource transactions - fixes the confirmed Riptide defect where the only multi-resource write pattern was a best-effort saga logging 'manual cleanup needed' on failure.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a delta touching N entities either all commits or none does, verified under injected mid-commit node failure.",
+            "testStrategy": ""
+          },
+          {
+            "id": "3.4",
+            "title": "Build the deterministic simulation harness (VOPR-style) as a first-class artifact",
+            "description": "Entire cluster runs as real code in one process, virtual clock, seed-reproducible fault injection, ~1000x speed - TigerBeetle's actual discipline, treated as more load-bearing than unit tests, not a testing afterthought.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Verify: any discovered failure is perfectly reproducible from its seed.",
+            "testStrategy": ""
+          },
+          {
+            "id": "3.5",
+            "title": "Choose the transport carrier (QUIC recommended) behind an abstract network interface",
+            "description": "Per every top-tier system researched (TigerBeetle, FoundationDB, CockroachDB, DFINITY): formalize the message semantics riding on the wire, treat the literal carrier as swappable and verified by simulation/fuzzing, not proof. QUIC has a real production consensus precedent (DFINITY's Internet Computer) for exactly the head-of-line-blocking and lossy-network reasons relevant here.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: swapping the transport carrier implementation must not require touching the application-level protocol code.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Lattice merge-law contract and incremental materialized state",
+        "description": "Define the rule that mergeable types must satisfy join-semilattice laws, and build the incremental-projection mechanism so reads never replay the full log from sequence zero.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          3
+        ],
+        "details": "Directly, structurally fixes the single defect two independent investigations found in the old Riptide from different angles: every read replayed the entire event history. CRDTs/lattices are the one piece of this whole stack that's already fully mainstream (Riak, Redis CRDTs, Automerge) - no unproven bet required. Redaction-with-preserved-hash also belongs here: it can't be retrofitted later without a hard-fork-shaped migration touching every existing record, so it has to be structural from this step.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "4.1",
+            "title": "Define and formally specify the join-semilattice law contract",
+            "description": "The RULE that any type claiming to be mergeable must satisfy commutative/associative/idempotent join - this is Layer 0 mechanism. Which concrete lattice a given domain module uses for its own data is Layer 2 policy.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Property-test: merge is order-independent and repeat-safe for any type claiming the contract.",
+            "testStrategy": ""
+          },
+          {
+            "id": "4.2",
+            "title": "Build the incremental-projection (CQRS) mechanism",
+            "description": "Log is source of truth; every read hits a materialized, incrementally-maintained projection, never a full replay. Mirrors the proven EventStoreDB/Marten/Axon pattern.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Benchmark: read latency must stay flat as total log history grows, unlike the old Riptide's O(total history) get_since/2.",
+            "testStrategy": ""
+          },
+          {
+            "id": "4.3",
+            "title": "Implement redaction-with-preserved-hash (tombstone) capability",
+            "description": "The mechanism to redact a record's payload while preserving its leaf hash - structural GDPR-erasure-vs-immutability answer, following the crypto-shredding/pseudonymization pattern researched. WHO is allowed to invoke it is Layer 2 policy; that the capability exists safely is Layer 0.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a redacted record's hash-chain integrity is unaffected; the payload is genuinely unrecoverable.",
+            "testStrategy": ""
+          },
+          {
+            "id": "4.4",
+            "title": "Add encryption at rest and mTLS in transit as non-optional infrastructure",
+            "description": "Every byte that hits disk or the wire is encrypted, no escape hatch - directly fixes the old Riptide's total absence of encryption at rest and edge-only TLS.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: inspect raw disk/wire bytes under test harness, confirm no plaintext domain data ever appears.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Define the Layer 0/Layer 2 boundary - treat it as provisional",
+        "description": "The WASM Component loading ABI, session-type protocol checking, SFI-sandbox-baseline isolation with optional microVM tier, and the mandatory admission/conformance gate. Per the ThirdPartyResources to CRD lesson, expect this to need real revision after Task 6 - that's healthy, not failure.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          4
+        ],
+        "details": "This is 'the boundary' category from the mechanism/policy analysis: a trusted, frozen CHECK-POINT whose CONTENT is pluggable. WASM Components are genuinely production-mature (2025-2026, WASI 0.3 shipped native async I/O). Isolation must be UNIFORM strong (SFI baseline everywhere, since it needs no hardware virtualization and is proven down to Cortex-M0 microcontrollers; hardware-virtualization microVM as an optional stronger tier where available) - NEVER tiered by trust level, per the corrected finding: AWS Lambda's real production philosophy is one strong boundary for everyone, and Cloudflare's trust-tiered Workers model had a real demonstrated Spectre leak as the direct cost of that shortcut.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "5.1",
+            "title": "Define the WASM Component loading ABI (WIT interfaces)",
+            "description": "The frozen, stable surface modules plug into. Strictly downward-only dependencies enforced structurally, not by convention - the OSGi/'distributed monolith' microservices lesson: physical separation alone doesn't prevent dependency hell.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a module cannot depend on anything not explicitly exposed through this interface.",
+            "testStrategy": ""
+          },
+          {
+            "id": "5.2",
+            "title": "Implement session-type protocol checking for module/core interaction",
+            "description": "Local, compositional, compile-time conformance checking for message-sequencing - genuinely more practical than coalgebra/bisimulation, which even MongoDB found impractical against real running code. Session types only check sequencing safety, not business invariants - that stays a separate, Layer 2 concern.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a module violating its declared interaction protocol is rejected at load time, not at runtime.",
+            "testStrategy": ""
+          },
+          {
+            "id": "5.3",
+            "title": "Implement uniform SFI-sandbox isolation with optional hardware-virtualization microVM tier",
+            "description": "WASM's own software-fault-isolation is the universal baseline (proven on Cortex-M0/M3/M4 with zero virtualization silicon); hardware-virtualization microVM (Firecracker-style, AOT-compile-once-snapshot-restore-in-milliseconds) is an optional STRONGER tier used wherever hardware supports it - never a weaker tier for 'trusted' code. No module ever shares a heap with the core or with another module.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a module that would crash the host under weaker isolation must be contained under the chosen isolation model on every supported hardware tier.",
+            "testStrategy": ""
+          },
+          {
+            "id": "5.4",
+            "title": "Implement the mandatory admission/conformance gate",
+            "description": "OCI-artifact distribution by content digest (not mutable tag), Sigstore/cosign keyless signing, SLSA/in-toto build provenance, verified before ANY module loads - reusing wasmCloud's real, working reference pipeline for exactly this. A failing artifact never enters the log.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: an unsigned or provenance-failing artifact is rejected at the gate, not at runtime.",
+            "testStrategy": ""
+          },
+          {
+            "id": "5.5",
+            "title": "Implement the mandatory authorization decision point (mechanism only, no policy)",
+            "description": "Every write/read passes a mandatory checkpoint, and the decision itself is a logged, causally-linked fact. The actual policy model (RBAC/ABAC/ReBAC) is Layer 2, built against this checkpoint, not baked into it - this was stated too strongly as an RBAC/ABAC mandate earlier in design; corrected here to just the checkpoint being mandatory.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: no write can bypass the checkpoint under any code path, verified by exhaustive call-site audit plus fuzzing.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Build one real, demanding Layer 2 module end to end",
+        "description": "Pick ONE genuine, demanding real use case - not several imagined ones - and build it fully against the Task 5 boundary. This is what actually proves or breaks the boundary design.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          5
+        ],
+        "details": "The single most important sequencing lesson from the entire historical-precedent research: WASM proved itself on real C/C++-via-Emscripten workloads for ~2 years before WASI opened it to genuinely diverse use; Kubernetes' CRD mechanism proved itself on real Prometheus/cert-manager/Istio deployments. Building for several imagined domains simultaneously, before any one is real, is the specific pattern that failed in every historical case researched (Multics, OSI, Palladium). Domain-agnostic ambition was never the problem - policy accumulating ahead of real running code was.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "6.1",
+            "title": "Choose the first real, demanding domain and use case",
+            "description": "DECISION NEEDED from the project owner - must be a genuine, currently-real need, not a demonstration of generality. Candidates already surfaced across this design process include a real ledger/accounting use case (TigerBeetle-style double-entry, directly informed by the extensive banking-readiness research already done) but this must be a real, owned need, not chosen for architectural symmetry.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Not test-strategy-applicable - this is a decision gate, not an implementation step.",
+            "testStrategy": ""
+          },
+          {
+            "id": "6.2",
+            "title": "Design and formally specify the module's own domain invariant",
+            "description": "TigerBeetle's lesson: the invariant is domain-specific by design, not domain-agnostic - do not try to make it generalize prematurely. Give it its own conformance suite, following the mandatory-certification discipline from Task 5.5.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: the invariant cannot be violated by any sequence of valid-looking module operations.",
+            "testStrategy": ""
+          },
+          {
+            "id": "6.3",
+            "title": "Build the module's schema using Task 2.1's functorial value universe",
+            "description": "A concrete domain schema, not the mechanism itself - built using the schema-morphism machinery, not extending it.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: schema evolution within this module is checked via the morphism mechanism, never an unchecked migration script.",
+            "testStrategy": ""
+          },
+          {
+            "id": "6.4",
+            "title": "Integrate against the Task 5 boundary and run real production-shaped load",
+            "description": "This is the actual pressure test. Document every friction point, every place the boundary made something harder than it should have been - this record feeds directly into Task 7.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: the module operates correctly under the deterministic simulation harness from Task 3.4, including injected node failures.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Revise the Layer 0/Layer 2 boundary based on real usage",
+        "description": "Redesign whatever Task 6 exposed as wrong or awkward in the boundary, following the ThirdPartyResources-to-CustomResourceDefinition pattern: fast, driven by real usage, not accumulated imagined requirements.",
+        "status": "pending",
+        "priority": "medium",
+        "dependencies": [
+          6
+        ],
+        "details": "This is the expected, healthy version of 'the first mechanism needs revision' - not evidence of failure. Once this lands, the boundary is the thing that gets genuinely frozen; everything before this task was provisional by design.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "7.1",
+            "title": "Catalog every friction point Task 6 surfaced",
+            "description": "A concrete list, grounded in what actually broke or was awkward while building a real module - not speculative future requirements.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Deliverable: a written record, not a code change.",
+            "testStrategy": ""
+          },
+          {
+            "id": "7.2",
+            "title": "Redesign the specific broken pieces of the boundary",
+            "description": "Scoped fixes only - do not use this as an opportunity to add speculative generality for domains that don't exist yet.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: re-run Task 6's module against the revised boundary with no regression.",
+            "testStrategy": ""
+          },
+          {
+            "id": "7.3",
+            "title": "Freeze the boundary and document the freeze",
+            "description": "Once 7.2 is verified, this boundary now gets the same 'changes require re-verification' discipline as the rest of Layer 0.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Deliverable: a versioned, documented boundary spec, treated as stable going forward.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Distribution, deployment, and heterogeneous-hardware infrastructure",
+        "description": "OCI/cosign/SLSA supply chain, bootc-based minimal bootstrap image, SPIFFE/SPIRE pluggable attestation, the 3-tier node model, and the constrained-hardware module story - all deferred until there's a real module worth distributing at scale.",
+        "status": "pending",
+        "priority": "medium",
+        "dependencies": [
+          7
+        ],
+        "details": "Building this earlier would be securing an empty building. Node tiering (consensus-voting / workload-execution-only-non-voting / pure leaf) is directly precedented by k3s's server/agent split and Raft's own formal 'learner' node concept - a genuinely different axis from trust-based isolation tiering, which was explicitly rejected. Attestation must be pluggable (SPIFFE/SPIRE, TPM where available, join-token fallback elsewhere, honestly labeled as a weaker trust tier) since TPM coverage is real but not universal, especially on Pi-Zero-class and industrial/embedded hardware.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "8.1",
+            "title": "Build the bootc-based minimal immutable bootstrap image",
+            "description": "Kernel + systemd + WASM-component-capable runtime + a tiny bootstrap agent, nothing else mutable - mirrors what a real Kubernetes node has baked in before everything else arrives as a pulled workload.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: the image boots and joins the control-plane consensus group with zero manual configuration.",
+            "testStrategy": ""
+          },
+          {
+            "id": "8.2",
+            "title": "Wire the OCI + cosign + SLSA supply-chain pipeline",
+            "description": "Reuse wasmCloud's real, working reference wiring for WASM components specifically, rather than re-deriving it.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: an artifact missing any part of the chain (digest, signature, provenance) is refused by the admission gate from Task 5.4.",
+            "testStrategy": ""
+          },
+          {
+            "id": "8.3",
+            "title": "Implement SPIFFE/SPIRE pluggable node attestation",
+            "description": "TPM/vTPM plugin where available, cloud-instance-identity plugins for cloud VMs, join-token fallback for bare metal/ICS/embedded hardware with no hardware root - explicitly label the join-token tier as weaker trust, not equivalent.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a node attested via each available plugin type receives a correctly-scoped workload identity credential.",
+            "testStrategy": ""
+          },
+          {
+            "id": "8.4",
+            "title": "Implement the 3-tier node model with separate control-plane consensus group",
+            "description": "Tier 1 (voting, control-plane-capable) / Tier 2 (workload-execution-only, non-voting, Raft learner) / Tier 3 (pure leaf, no code execution). Control-plane state lives in its OWN consensus group (same underlying code, separate instance from domain-data groups), coupled to the data log by an epoch-barrier reference, not shared consensus - avoiding etcd's well-documented single-Raft-leader scaling ceiling and the real blast-radius incidents (e.g. OpenAI's Dec 2024 outage) from coupling control-plane and data-plane state.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a Tier 1 outage does not prevent Tier 2/3 nodes from continuing to serve already-committed data; a data-plane overload does not strand the control plane's ability to reconfigure.",
+            "testStrategy": ""
+          },
+          {
+            "id": "8.5",
+            "title": "Build the constrained-hardware (Pi-Zero-class) module deployment path",
+            "description": "Componentize normally with full WIT/Component Model rigor on capable build infrastructure, then for Tier 2/3 targets: `wasm-tools component unbundle` + generated Canonical-ABI-lowering glue + Binaryen `wasm-merge`, producing one flat core-WASM module runnable on WAMR/wasm3 with no Component-Model-aware runtime needed on-device. Distribute through the same OCI/cosign/SLSA pipeline unchanged - OCI already has a distinct media type for plain core modules.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a flattened module built this way passes the same admission gate and runs correctly on a genuinely constrained target (Cortex-M-class or Pi-Zero-class hardware).",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Client-facing API layer",
+        "description": "Generate a GraphQL-shaped query surface and protobuf-style versioned command surface directly from the functorial schema, exposing only materialized/lattice-projected views - never the raw log.",
+        "status": "pending",
+        "priority": "medium",
+        "dependencies": [
+          6
+        ],
+        "details": "Deferred until Task 6 gives it a real schema to generate against - building this earlier means designing against imagined data shapes. Mirrors the proven EventStoreDB/Marten/Axon pattern (event log to projection to conventional queryable store to REST/GraphQL layer) and Kubernetes' own OpenAPI-generated-from-types-plus-mandatory-conformance-suite discipline, applied one layer up from Layer 0's own SpecTec-style pattern.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "9.1",
+            "title": "Generate a GraphQL-shaped query surface from the functorial schema",
+            "description": "Schema objects/fields map to GraphQL types/fields, morphisms map to resolvers - introspection and client codegen come free.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: any schema change is reflected in the generated GraphQL surface with no manual sync step.",
+            "testStrategy": ""
+          },
+          {
+            "id": "9.2",
+            "title": "Expose mutations as versioned, protobuf-style commands",
+            "description": "Field-number-style permanent identifiers and explicit forward/backward compatibility rules for command payloads.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: an old client's command remains valid against a newer server version, and vice versa within the documented compatibility window.",
+            "testStrategy": ""
+          },
+          {
+            "id": "9.3",
+            "title": "Ensure clients only ever see materialized, lattice-projected views",
+            "description": "Never the raw content-addressed log - matches the proven event-sourced-system client-API pattern exactly.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: no client-facing code path can read the raw log directly.",
+            "testStrategy": ""
+          },
+          {
+            "id": "9.4",
+            "title": "Make the generated API surface a mandatory conformance artifact",
+            "description": "Kubernetes-conformance-suite style: any server implementation must pass a test suite generated from the functorial schema to claim compatibility.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a server implementation missing any generated-surface guarantee fails the conformance suite.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Second real domain module",
+        "description": "Chosen because it genuinely needs the platform, not to demonstrate generality. This is where the boundary gets legitimately pulled wider by real cross-domain pressure.",
+        "status": "pending",
+        "priority": "low",
+        "dependencies": [
+          7,
+          9
+        ],
+        "details": "The honest version of 'designing for any critical infrastructure' - arrived at backwards from how this whole design process initially approached it. Real cross-domain pressure here (not imagined) is what should inform any further Layer 0 boundary changes, following the same Task 7 discipline if changes turn out to be needed.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "10.1",
+            "title": "Choose the second domain and use case based on genuine need",
+            "description": "DECISION NEEDED from the project owner when this becomes real, not before.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Not test-strategy-applicable - this is a decision gate.",
+            "testStrategy": ""
+          },
+          {
+            "id": "10.2",
+            "title": "Build it against the frozen Task 7 boundary",
+            "description": "If it doesn't fit the boundary, that is real signal - route back through the Task 7 discipline (catalog friction, scoped fix, re-verify) rather than special-casing this one module.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: same conformance/isolation/attestation requirements as Task 6's module, no exceptions.",
+            "testStrategy": ""
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Multi-region and further hardware-heterogeneity extensions",
+        "description": "Per-region independent consensus groups with async cross-region replication, geo-partitioning for data residency, and any further extension of the epoch-barrier coupling pattern to region-to-region coupling.",
+        "status": "pending",
+        "priority": "low",
+        "dependencies": [
+          8,
+          10
+        ],
+        "details": "Furthest from the correctness-critical core and least urgent - extends reach, doesn't establish trust. Per-region independent consensus groups (Spanner, CockroachDB, TiDB, Oracle all do this) is genuinely industry-standard; extending epoch-barrier coupling from control-plane/data-plane to region-to-region is a plausible but NOVEL extension of proven patterns, not itself directly precedented - treat it as needing its own validation, not assumed to work by analogy alone.",
+        "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
+        "subtasks": [
+          {
+            "id": "11.1",
+            "title": "Implement per-region independent consensus groups with async replication",
+            "description": "Each region runs its own Tier 1 consensus group; cross-region coupling is async, never synchronous global consensus.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: a regional outage does not block writes in other regions; cross-region reads have a defined, bounded staleness.",
+            "testStrategy": ""
+          },
+          {
+            "id": "11.2",
+            "title": "Implement geo-partitioning for data residency",
+            "description": "Tag data/tenants with a locality key, pin storage and consensus replicas to matching region(s) - CockroachDB's REGIONAL BY ROW is the concrete proven mechanism to match.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: data tagged to a jurisdiction never physically replicates outside it.",
+            "testStrategy": ""
+          },
+          {
+            "id": "11.3",
+            "title": "Validate (don't assume) the epoch-barrier pattern extended to region coupling",
+            "description": "This is explicitly new synthesis, not established practice - budget real validation effort, potentially including its own TLA+ model, before trusting it the way Task 3's core consensus protocol is trusted.",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Test: under simulated region partition, verify the coupling mechanism's actual guarantees match what's claimed, not just that it superficially works in the happy path.",
+            "testStrategy": ""
+          }
+        ]
+      }
+    ],
+    "metadata": {
+      "created": "2026-09-16T00:00:00.000Z",
+      "updated": "2026-09-16T00:00:00.000Z",
+      "description": "Riptide v2: from-scratch, general-purpose, ultra-rigorous critical-infrastructure data/event platform. Full design history in this project's conversation record - see task details for the specific research finding backing each decision."
+    }
+  }
+}
