@@ -23,3 +23,8 @@ node_modules/
 
 # OS specific
 .DS_Store
+
+# OCaml/dune specific
+_build/
+*.install
+.merlin

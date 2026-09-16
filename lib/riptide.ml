@@ -1,0 +1,2 @@
+(* Placeholder — real modules (Value, Envelope, Log) are added in Tasks 2-4. *)
+let () = ()

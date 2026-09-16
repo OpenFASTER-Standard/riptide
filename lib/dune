@@ -1,0 +1,4 @@
+(library
+ (name riptide)
+ (public_name riptide)
+ (libraries digestif))
