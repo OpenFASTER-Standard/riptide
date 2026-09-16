@@ -2,7 +2,7 @@
 
 **Title:** Lock in process discipline before any code
 
-**Status:** pending
+**Status:** done
 
 **Dependencies:** None
 
@@ -22,7 +22,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ### 1.1. Define and document the 'no spec without running code' rule
 
-**Status:** pending  
+**Status:** done  
 **Dependencies:** None  
 
 Write the actual project-level rule (e.g. in a CONTRIBUTING or CLAUDE.md-equivalent doc) that no Layer 0 formal rule may be merged without a working, tested implementation in the same change.
@@ -33,7 +33,7 @@ This is the single variable that separated every historical success from every f
 
 ### 1.2. Establish the small-aligned-group governance model for Layer 0 changes
 
-**Status:** pending  
+**Status:** done  
 **Dependencies:** None  
 
 Define who can propose/approve changes to Layer 0 specifically, keeping the group small and requiring each approver to have actually implemented against the change.

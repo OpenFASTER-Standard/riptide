@@ -2,9 +2,9 @@
 
 **Title:** Layer 0 seed: event envelope + content-addressed value universe (single node, no replication)
 
-**Status:** pending
+**Status:** done
 
-**Dependencies:** 1
+**Dependencies:** 1 ✓
 
 **Priority:** high
 

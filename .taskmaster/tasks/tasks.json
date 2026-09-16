@@ -40,7 +40,7 @@
         "id": "2",
         "title": "Layer 0 seed: event envelope + content-addressed value universe (single node, no replication)",
         "description": "Build the smallest possible real slice of Layer 0: the event envelope format and the base algebraic value universe, as one real, running, single-node append-only log. Proves the data model and audit-trail primitives against real code before distributed consensus is layered on.",
-        "status": "pending",
+        "status": "done",
         "priority": "high",
         "dependencies": [
           "1"
@@ -88,7 +88,8 @@
             "testStrategy": "",
             "parentId": "undefined"
           }
-        ]
+        ],
+        "updatedAt": "2026-09-16T09:39:14.999Z"
       },
       {
         "id": "3",
@@ -99,7 +100,7 @@
         "dependencies": [
           "2"
         ],
-        "details": "This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale for skipping this: retrofitting a virtual clock onto an existing concurrency model meant it still can't reach the chaos-tested peer nodes, because the concurrency model wasn't built for simulation from the start. FoundationDB's Flow actor model exists specifically to make full-system deterministic simulation possible - that has to be a day-one architectural input here, not bolted on later. TigerBeetle chose a VSR-derived protocol over Raft specifically for storage-fault-awareness; that tradeoff needs a real decision here too, not a default.",
+        "details": "This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale for skipping this: retrofitting a virtual clock onto an existing concurrency model meant it still can't reach the chaos-tested peer nodes, because the concurrency model wasn't built for simulation from the start. FoundationDB's Flow actor model exists specifically to make full-system deterministic simulation possible - that has to be a day-one architectural input here, not bolted on later. TigerBeetle chose a VSR-derived protocol over Raft specifically for storage-fault-awareness; that tradeoff needs a real decision here too, not a default.\n\n Carried forward from Layer 0 seed (Task 2)'s final review: Envelope.content_hash reuses Value.content_hash directly (Envelope.content_hash e = Value.content_hash (Envelope.to_value e)), so there is no domain separation between an envelope's event_id and a plain payload Value's hash - a crafted payload Value can collide with a real event_id. Harmless today because verify_chain_list always recomputes from actual envelopes, but this task is where event_id first gets asked to carry real security/consensus meaning (e.g. as a vote/reference target) - decide explicitly at the start of this task whether domain separation (e.g. a leading domain tag before hashing) is needed, rather than inheriting the Layer 0 seed's reuse-one-encoding choice by default.",
         "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements — never spec-only.",
         "subtasks": [
           {
@@ -571,9 +572,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-16T07:59:56.436Z",
+      "lastModified": "2026-09-16T09:39:14.999Z",
       "taskCount": 11,
-      "completedCount": 1,
+      "completedCount": 2,
       "tags": [
         "master"
       ]

@@ -4,7 +4,7 @@
 
 **Status:** pending
 
-**Dependencies:** 2
+**Dependencies:** 2 ✓
 
 **Priority:** high
 
@@ -13,6 +13,8 @@
 **Details:**
 
 This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale for skipping this: retrofitting a virtual clock onto an existing concurrency model meant it still can't reach the chaos-tested peer nodes, because the concurrency model wasn't built for simulation from the start. FoundationDB's Flow actor model exists specifically to make full-system deterministic simulation possible - that has to be a day-one architectural input here, not bolted on later. TigerBeetle chose a VSR-derived protocol over Raft specifically for storage-fault-awareness; that tradeoff needs a real decision here too, not a default.
+
+ Carried forward from Layer 0 seed (Task 2)'s final review: Envelope.content_hash reuses Value.content_hash directly (Envelope.content_hash e = Value.content_hash (Envelope.to_value e)), so there is no domain separation between an envelope's event_id and a plain payload Value's hash - a crafted payload Value can collide with a real event_id. Harmless today because verify_chain_list always recomputes from actual envelopes, but this task is where event_id first gets asked to carry real security/consensus meaning (e.g. as a vote/reference target) - decide explicitly at the start of this task whether domain separation (e.g. a leading domain tag before hashing) is needed, rather than inheriting the Layer 0 seed's reuse-one-encoding choice by default.
 
 **Test Strategy:**
 
