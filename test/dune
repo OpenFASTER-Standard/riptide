@@ -1,4 +1,4 @@
 (test
  (name test_riptide)
- (libraries riptide golden_fixtures alcotest qcheck-core qcheck-alcotest)
+ (libraries riptide riptide_sim golden_fixtures alcotest qcheck-core qcheck-alcotest)
  (deps ../spec/golden/vectors.txt))
