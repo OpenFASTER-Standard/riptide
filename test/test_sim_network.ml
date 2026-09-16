@@ -36,17 +36,23 @@ let test_deterministic_two_fiber_exchange () =
 
 let test_fiber_suspends_on_virtual_clock_and_wakes_via_pump () =
   (* Proves the virtual clock exposed by [Network.clock] is genuinely load-bearing: a fiber that
-     calls [Eio.Time.sleep_until] on it actually suspends, and is woken only once a later
-     [pump_one]/[pump_all]-driven [Eio_mock.Clock.set_time] call advances [net]'s own clock past
-     the sleep target - not by any parallel counter, and not synchronously. If [Network.clock]
-     ever stopped being the single source of truth [net] itself schedules against (e.g. reverted
-     to a disconnected clock, or a plain float doing the real work again), this would either hang
-     (and Eio_mock.Backend would raise Deadlock_detected instead of the assertion below ever
-     running) or wake at the wrong point in the interleaving, breaking the exact order asserted
-     here. *)
+     calls [Eio.Time.sleep_until] on it actually suspends, and is woken *only* as a consequence of
+     a real, delayed message delivery going through [Network.pump_one]/[pump_all] - never by a
+     direct [Eio_mock.Clock.set_time] call from the test itself (the type of [Network.clock] no
+     longer even exposes [set_time] to callers - see network.mli), and not by a parallel counter.
+     The fault config forces every delivery to take exactly 6.0s, so the scheduled delivery time
+     for the message sent below is strictly after the sleeper's 5.0 target; [pump_all] must
+     actually process that delayed delivery (network.ml's [pump_one] calling
+     [Eio_mock.Clock.set_time net.clock at] internally) to advance the clock past 5.0 and wake the
+     sleeper. If [pump_one] ever stopped advancing the clock (e.g. the call were deleted, or a
+     disconnected/parallel clock did the real bookkeeping again), the sleeper would never wake and
+     [Eio_mock.Backend] would raise [Deadlock_detected] instead of the assertion below ever
+     running - verified live while developing this test: deleting that call from [pump_one]
+     turns this exact test red. *)
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let faults = { Network.default_fault_config with min_delay = 6.0; max_delay = 6.0 } in
+  let net = Network.create ~faults prng () in
   Network.register net "a";
   Network.register net "b";
   let events = ref [] in
@@ -56,22 +62,18 @@ let test_fiber_suspends_on_virtual_clock_and_wakes_via_pump () =
       Eio.Time.sleep_until (Network.clock net) 5.0;
       record "sleeper woken")
     (fun () ->
-      record "driver: sending an immediate (zero-delay) message";
+      record "driver: sending a message with a fixed 6.0s delivery delay (past the sleeper's 5.0 target)";
       Network.send Fun.id net ~from_:"a" ~to_:"b" "tick";
+      record "driver: about to pump the delayed delivery";
       Network.pump_all net;
-      (* net's clock is now at 0.0 (the delivered message's time) - nowhere near the sleeper's
-         5.0 target, so the sleeper must still be suspended at this point. *)
-      record "driver: pumped the zero-delay send, sleeper must still be waiting";
-      (* Directly advancing the clock past 5.0 stands in for a later scheduled delivery reaching
-         that time; this is the same [Eio_mock.Clock.set_time] call [pump_one] itself makes. *)
-      Eio_mock.Clock.set_time (Network.clock net) 5.0;
-      record "driver: advanced the clock to 5.0");
+      record "driver: pumped - net's clock is now at 6.0, past the sleeper's target");
   Alcotest.(check (list string))
-    "sleeper only resumes after the clock reaches 5.0, and resumption is deferred (queued), not \
-     synchronous with the set_time call"
-    [ "driver: sending an immediate (zero-delay) message";
-      "driver: pumped the zero-delay send, sleeper must still be waiting";
-      "driver: advanced the clock to 5.0";
+    "sleeper only resumes as a consequence of pump_all actually delivering the delayed message \
+     (which advances net's clock past 5.0), and resumption is deferred (queued), not synchronous \
+     with the pump_all call"
+    [ "driver: sending a message with a fixed 6.0s delivery delay (past the sleeper's 5.0 target)";
+      "driver: about to pump the delayed delivery";
+      "driver: pumped - net's clock is now at 6.0, past the sleeper's target";
       "sleeper woken"
     ]
     (List.rev !events)
