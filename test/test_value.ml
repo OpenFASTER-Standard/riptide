@@ -41,6 +41,23 @@ let test_float_nan_collisions_fixed () =
   Alcotest.(check bool) "different NaN bit patterns encode differently"
     false (Value.canonical_encode canonical_nan = Value.canonical_encode alternate_nan)
 
+let test_float_zero_and_negative_zero_hash_differently () =
+  (* M5: 0.0 and -0.0 are equal under both OCaml `=` and `compare`, but
+     Float is content-addressed by its raw IEEE-754 bit pattern (see
+     value.mli's Float doc comment), and the sign bit differs between
+     them - so they must hash (and encode) differently here, regardless of
+     what OCaml's own equality operators say. This is the behavior a
+     replicated log actually needs pinned: two nodes deriving -0.0 vs 0.0
+     from different arithmetic paths must not silently agree that they
+     wrote "the same" event. *)
+  let zero = Value.Scalar (Value.Float 0.0) in
+  let negative_zero = Value.Scalar (Value.Float (-0.0)) in
+  Alcotest.(check bool) "0.0 and -0.0 are OCaml-equal (sanity check on the premise)" true (0.0 = -0.0);
+  Alcotest.(check bool) "0.0 and -0.0 encode to different bytes" false
+    (Value.canonical_encode zero = Value.canonical_encode negative_zero);
+  Alcotest.(check bool) "0.0 and -0.0 have different content_hash" false
+    (Value.content_hash zero = Value.content_hash negative_zero)
+
 let value_gen =
   let open QCheck2.Gen in
   let scalar_gen =
@@ -166,6 +183,7 @@ let tests =
     ("content_hash deterministic", `Quick, test_content_hash_deterministic);
     ("content_hash differs for different values", `Quick, test_content_hash_differs_for_different_values);
     ("float nan collisions fixed", `Quick, test_float_nan_collisions_fixed);
+    ("float zero and negative zero hash differently", `Quick, test_float_zero_and_negative_zero_hash_differently);
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop
