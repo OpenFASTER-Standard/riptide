@@ -51,6 +51,22 @@ let test_random_byte_flip_empty_string_unchanged () =
   let prng = Prng.create 5 in
   Alcotest.(check string) "empty string returned unchanged" "" (Workload.random_byte_flip prng "")
 
+let test_random_payload_is_deterministic () =
+  let run () = Workload.random_payload (Prng.create 8) in
+  Alcotest.(check string) "identical seed produces identical payload" (run ()) (run ())
+
+let test_random_payload_varies_in_length_and_content () =
+  (* One PRNG, many successive draws - if random_payload silently degenerated back to a fixed
+     shape (e.g. always the same length, or the same bytes), this would catch it directly, unlike
+     test_generator_covers_unstructured_workload which only observes it indirectly through a full
+     run_toy_cluster call. *)
+  let prng = Prng.create 9 in
+  let payloads = List.init 30 (fun _ -> Workload.random_payload prng) in
+  let lengths_seen = List.sort_uniq compare (List.map String.length payloads) in
+  let payloads_seen = List.sort_uniq compare payloads in
+  Alcotest.(check bool) "lengths vary across draws" true (List.length lengths_seen > 1);
+  Alcotest.(check bool) "content varies across draws" true (List.length payloads_seen > 1)
+
 let test_different_seeds_can_diverge () =
   let faults =
     { Network.drop_probability = 0.2; duplicate_probability = 0.2; corrupt_probability = 0.0;
@@ -63,19 +79,28 @@ let test_different_seeds_can_diverge () =
 let test_generator_covers_unstructured_workload () =
   (* Directly guards against the exact blind spot that caused a real, Jepsen-found bug in
      TigerBeetle: a generator that only ever produces one fixed, pre-registered message shape.
-     Run many seeds and confirm the sender/receiver pairing varies, not just the payload. *)
+     Run many seeds and confirm both the sender/receiver pairing *and* the payload shape/content
+     vary - not just addressing. (Previously this only checked (sender, receiver) pairings, which
+     is structurally incapable of catching a regression back to a fixed "msg-%d" payload; the
+     payload-side assertions below close that gap.) *)
   let faults = Network.default_fault_config in
-  let pairs_seen =
+  let sent_events =
     List.init 40 (fun seed ->
       Workload.run_toy_cluster ~seed ~peer_count:4 ~message_count:5 ~faults
       |> List.filter_map (function
-        | Workload.Sent { from_; to_; _ } -> Some (from_, to_)
+        | Workload.Sent { from_; to_; payload } -> Some (from_, to_, payload)
         | Workload.Received _ -> None))
     |> List.concat
-    |> List.sort_uniq compare
   in
+  let pairs_seen = List.sort_uniq compare (List.map (fun (f, t, _) -> (f, t)) sent_events) in
+  let payloads_seen = List.sort_uniq compare (List.map (fun (_, _, p) -> p) sent_events) in
+  let lengths_seen = List.sort_uniq compare (List.map String.length payloads_seen) in
   Alcotest.(check bool) "generator produces more than one distinct (sender, receiver) pairing across seeds"
-    true (List.length pairs_seen > 1)
+    true (List.length pairs_seen > 1);
+  Alcotest.(check bool) "generator produces more than one distinct payload across seeds"
+    true (List.length payloads_seen > 1);
+  Alcotest.(check bool) "generator produces more than one distinct payload length across seeds"
+    true (List.length lengths_seen > 1)
 
 let test_terminates_and_delivers_nothing_when_everything_is_dropped () =
   (* Regression test for the termination-logic fix (see workload.ml's design note): under a
@@ -103,5 +128,8 @@ let tests =
     ("random_byte_flip mutates exactly one byte", `Quick, test_random_byte_flip_mutates_exactly_one_byte);
     ("random_byte_flip is deterministic from seed", `Quick, test_random_byte_flip_is_deterministic);
     ("random_byte_flip leaves the empty string unchanged", `Quick,
-      test_random_byte_flip_empty_string_unchanged)
+      test_random_byte_flip_empty_string_unchanged);
+    ("random_payload is deterministic from seed", `Quick, test_random_payload_is_deterministic);
+    ("random_payload varies in length and content across draws", `Quick,
+      test_random_payload_varies_in_length_and_content)
   ]

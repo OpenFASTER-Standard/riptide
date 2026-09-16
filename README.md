@@ -61,7 +61,8 @@ against this project's real installed OCaml 5 / Eio toolchain rather than by ass
   network, built directly on `Eio.Stream` and `Eio_mock.Clock` (`Eio_mock.Net` was evaluated and
   rejected — it is a scripted single-endpoint mock, not shaped for an N-peer simulated topology).
 - `Workload`: a toy multi-fiber cluster with a randomly-generated (not fixed-script) workload
-  (sender and receiver drawn from the seeded PRNG), proving that identical seeds
+  (sender, receiver, and payload shape/content all drawn from the seeded PRNG), proving that
+  identical seeds
   reproduce byte-for-byte identical traces even with fault injection enabled - including genuine
   byte-level corruption (`Workload.random_byte_flip` mutates exactly one byte of a payload, per
   the design spec's explicit "not just whole-message" requirement; `Network`'s corruption

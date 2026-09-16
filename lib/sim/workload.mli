@@ -13,6 +13,13 @@ val random_byte_flip : Prng.t -> string -> string
     just whole-message" requirement - unlike a whole-message transform such as
     [String.uppercase_ascii], this can corrupt part of a payload while leaving the rest intact. *)
 
+val random_payload : Prng.t -> string
+(** [random_payload prng] is a payload of random length (1-16 bytes) and random (printable-ASCII)
+    byte content, both drawn from [prng]. Used by {!run_toy_cluster} to generate message payloads,
+    so the generator exercises unstructured message *shape*, not just unstructured addressing -
+    the axis the plan's own Global Constraints cite as TigerBeetle's real Jepsen-found blind
+    spot (a generator that only ever produces one fixed, pre-registered message shape). *)
+
 val run_toy_cluster :
   seed:int -> peer_count:int -> message_count:int -> faults:Network.fault_config -> trace_event list
 (** [run_toy_cluster ~seed ~peer_count ~message_count ~faults] runs [peer_count] peers (named

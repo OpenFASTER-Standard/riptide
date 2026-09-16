@@ -19,6 +19,21 @@ let random_byte_flip prng s =
     Bytes.to_string bytes
   end
 
+let random_payload prng =
+  (* Random length (1-16 bytes) and random byte content, both drawn from [prng] - the exact axis
+     the plan's own Global Constraints cite as TigerBeetle's real Jepsen-found blind spot (a
+     generator that only ever exercises structured, pre-registered shapes). Bytes are drawn from
+     the printable-ASCII range (not arbitrary 0-255) purely so a failing test's trace is readable;
+     that's a debuggability choice, not a coverage narrowing - the point under test is that shape
+     and content vary randomly, not that every byte value is reachable. Built with an explicit
+     left-to-right loop (not [String.init]) so draw order from [prng] is unambiguous. *)
+  let len = 1 + Prng.int prng 16 in
+  let bytes = Bytes.create len in
+  for i = 0 to len - 1 do
+    Bytes.set bytes i (Char.chr (32 + Prng.int prng 95))
+  done;
+  Bytes.to_string bytes
+
 (* --- Termination-logic design note (resolving the gap flagged in the Task 4 brief) ---
 
    The brief's reference sketch has each peer fiber busy-poll `receive_nonblocking` until its own
@@ -106,9 +121,9 @@ let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   (* Phase 1: driver sends everything and flushes the network. Deliberately a plain sequential
      loop, not a fiber - see the design note above for why every scheduled delivery must be fully
      resolved before any peer starts draining its inbox. *)
-  for i = 1 to message_count do
+  for _ = 1 to message_count do
     let from_ = random_peer () and to_ = random_peer () in
-    let payload = Printf.sprintf "msg-%d" i in
+    let payload = random_payload prng in
     (* Genuine byte-level corruption (not just whole-message), per spec: mutates exactly one byte
        of the payload when the network's should_corrupt decision fires at delivery. *)
     Network.send (random_byte_flip prng) net ~from_ ~to_ payload;
