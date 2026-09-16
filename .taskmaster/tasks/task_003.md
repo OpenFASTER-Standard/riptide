@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 3.3.1. Choose and TLA+-specify the consensus/replication protocol
+### 3.1. Choose and TLA+-specify the consensus/replication protocol
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ VSR-derived (TigerBeetle's choice, storage-fault-aware) vs Raft (simpler, larger
 
 Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the checked state space.
 
-### 3.3.2. Design the concurrency model for simulation-testability as a day-one input
+### 3.2. Design the concurrency model for simulation-testability as a day-one input
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Choose an effect-mediated or actor-style concurrency model (algebraic effect han
 
 Test: the exact same code path must run identically against a real network and a simulated one.
 
-### 3.3.3. Implement atomic multi-entity commit
+### 3.3. Implement atomic multi-entity commit
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ Real cross-resource transactions - fixes the confirmed Riptide defect where the 
 
 Test: a delta touching N entities either all commits or none does, verified under injected mid-commit node failure.
 
-### 3.3.4. Build the deterministic simulation harness (VOPR-style) as a first-class artifact
+### 3.4. Build the deterministic simulation harness (VOPR-style) as a first-class artifact
 
 **Status:** pending  
 **Dependencies:** None  
@@ -64,7 +64,7 @@ Entire cluster runs as real code in one process, virtual clock, seed-reproducibl
 
 Verify: any discovered failure is perfectly reproducible from its seed.
 
-### 3.3.5. Choose the transport carrier (QUIC recommended) behind an abstract network interface
+### 3.5. Choose the transport carrier (QUIC recommended) behind an abstract network interface
 
 **Status:** pending  
 **Dependencies:** None  

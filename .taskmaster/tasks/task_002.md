@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 2.2.1. Define the content-addressed algebraic value universe
+### 2.1. Define the content-addressed algebraic value universe
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ Scalars, records, sums, sequences, finite maps - a small typed core category (sc
 
 Directly fixes the RDF-only limitation the euro-office bridge integration hit (had to build a whole separate JSON codec). Borrow the schema-morphism IDEA from CQL/Conexus without adopting the full boutique tooling wholesale.
 
-### 2.2.2. Define the event envelope: actor, causation, correlation, predecessor hash, sequence - all mandatory
+### 2.2. Define the event envelope: actor, causation, correlation, predecessor hash, sequence - all mandatory
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Every field is required, none optional, none droppable at any layer. This is the
 
 Validate: an event literally cannot be constructed without a real actor identity - not merely a documented best practice.
 
-### 2.2.3. Implement single-node append-only log with hash-chaining
+### 2.3. Implement single-node append-only log with hash-chaining
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ No replication yet. Tamper-evidence (Merkle/hash-chain linkage) is structural fr
 
 Test: any single-byte alteration anywhere in history is detectable via hash-chain verification.
 
-### 2.2.4. Build the SpecTec-style single formal source generating spec + reference implementation + conformance tests
+### 2.4. Build the SpecTec-style single formal source generating spec + reference implementation + conformance tests
 
 **Status:** pending  
 **Dependencies:** None  

@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 7.7.1. Catalog every friction point Task 6 surfaced
+### 7.1. Catalog every friction point Task 6 surfaced
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ A concrete list, grounded in what actually broke or was awkward while building a
 
 Deliverable: a written record, not a code change.
 
-### 7.7.2. Redesign the specific broken pieces of the boundary
+### 7.2. Redesign the specific broken pieces of the boundary
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Scoped fixes only - do not use this as an opportunity to add speculative general
 
 Test: re-run Task 6's module against the revised boundary with no regression.
 
-### 7.7.3. Freeze the boundary and document the freeze
+### 7.3. Freeze the boundary and document the freeze
 
 **Status:** pending  
 **Dependencies:** None  

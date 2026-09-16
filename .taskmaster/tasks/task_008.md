@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 8.8.1. Build the bootc-based minimal immutable bootstrap image
+### 8.1. Build the bootc-based minimal immutable bootstrap image
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ Kernel + systemd + WASM-component-capable runtime + a tiny bootstrap agent, noth
 
 Test: the image boots and joins the control-plane consensus group with zero manual configuration.
 
-### 8.8.2. Wire the OCI + cosign + SLSA supply-chain pipeline
+### 8.2. Wire the OCI + cosign + SLSA supply-chain pipeline
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Reuse wasmCloud's real, working reference wiring for WASM components specificall
 
 Test: an artifact missing any part of the chain (digest, signature, provenance) is refused by the admission gate from Task 5.4.
 
-### 8.8.3. Implement SPIFFE/SPIRE pluggable node attestation
+### 8.3. Implement SPIFFE/SPIRE pluggable node attestation
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ TPM/vTPM plugin where available, cloud-instance-identity plugins for cloud VMs, 
 
 Test: a node attested via each available plugin type receives a correctly-scoped workload identity credential.
 
-### 8.8.4. Implement the 3-tier node model with separate control-plane consensus group
+### 8.4. Implement the 3-tier node model with separate control-plane consensus group
 
 **Status:** pending  
 **Dependencies:** None  
@@ -64,7 +64,7 @@ Tier 1 (voting, control-plane-capable) / Tier 2 (workload-execution-only, non-vo
 
 Test: a Tier 1 outage does not prevent Tier 2/3 nodes from continuing to serve already-committed data; a data-plane overload does not strand the control plane's ability to reconfigure.
 
-### 8.8.5. Build the constrained-hardware (Pi-Zero-class) module deployment path
+### 8.5. Build the constrained-hardware (Pi-Zero-class) module deployment path
 
 **Status:** pending  
 **Dependencies:** None  

@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 9.9.1. Generate a GraphQL-shaped query surface from the functorial schema
+### 9.1. Generate a GraphQL-shaped query surface from the functorial schema
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ Schema objects/fields map to GraphQL types/fields, morphisms map to resolvers - 
 
 Test: any schema change is reflected in the generated GraphQL surface with no manual sync step.
 
-### 9.9.2. Expose mutations as versioned, protobuf-style commands
+### 9.2. Expose mutations as versioned, protobuf-style commands
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Field-number-style permanent identifiers and explicit forward/backward compatibi
 
 Test: an old client's command remains valid against a newer server version, and vice versa within the documented compatibility window.
 
-### 9.9.3. Ensure clients only ever see materialized, lattice-projected views
+### 9.3. Ensure clients only ever see materialized, lattice-projected views
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ Never the raw content-addressed log - matches the proven event-sourced-system cl
 
 Test: no client-facing code path can read the raw log directly.
 
-### 9.9.4. Make the generated API surface a mandatory conformance artifact
+### 9.4. Make the generated API surface a mandatory conformance artifact
 
 **Status:** pending  
 **Dependencies:** None  

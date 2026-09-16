@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 10.10.1. Choose the second domain and use case based on genuine need
+### 10.1. Choose the second domain and use case based on genuine need
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ DECISION NEEDED from the project owner when this becomes real, not before.
 
 Not test-strategy-applicable - this is a decision gate.
 
-### 10.10.2. Build it against the frozen Task 7 boundary
+### 10.2. Build it against the frozen Task 7 boundary
 
 **Status:** pending  
 **Dependencies:** None  

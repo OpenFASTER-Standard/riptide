@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 1.1.1. Define and document the 'no spec without running code' rule
+### 1.1. Define and document the 'no spec without running code' rule
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ Write the actual project-level rule (e.g. in a CONTRIBUTING or CLAUDE.md-equival
 
 This is the single variable that separated every historical success from every failure researched. Write it down where it can't be quietly bypassed under time pressure.
 
-### 1.1.2. Establish the small-aligned-group governance model for Layer 0 changes
+### 1.2. Establish the small-aligned-group governance model for Layer 0 changes
 
 **Status:** pending  
 **Dependencies:** None  

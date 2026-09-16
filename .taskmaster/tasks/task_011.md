@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 11.11.1. Implement per-region independent consensus groups with async replication
+### 11.1. Implement per-region independent consensus groups with async replication
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ Each region runs its own Tier 1 consensus group; cross-region coupling is async,
 
 Test: a regional outage does not block writes in other regions; cross-region reads have a defined, bounded staleness.
 
-### 11.11.2. Implement geo-partitioning for data residency
+### 11.2. Implement geo-partitioning for data residency
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Tag data/tenants with a locality key, pin storage and consensus replicas to matc
 
 Test: data tagged to a jurisdiction never physically replicates outside it.
 
-### 11.11.3. Validate (don't assume) the epoch-barrier pattern extended to region coupling
+### 11.3. Validate (don't assume) the epoch-barrier pattern extended to region coupling
 
 **Status:** pending  
 **Dependencies:** None  

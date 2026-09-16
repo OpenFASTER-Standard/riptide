@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 6.6.1. Choose the first real, demanding domain and use case
+### 6.1. Choose the first real, demanding domain and use case
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ DECISION NEEDED from the project owner - must be a genuine, currently-real need,
 
 Not test-strategy-applicable - this is a decision gate, not an implementation step.
 
-### 6.6.2. Design and formally specify the module's own domain invariant
+### 6.2. Design and formally specify the module's own domain invariant
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ TigerBeetle's lesson: the invariant is domain-specific by design, not domain-agn
 
 Test: the invariant cannot be violated by any sequence of valid-looking module operations.
 
-### 6.6.3. Build the module's schema using Task 2.1's functorial value universe
+### 6.3. Build the module's schema using Task 2.1's functorial value universe
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ A concrete domain schema, not the mechanism itself - built using the schema-morp
 
 Test: schema evolution within this module is checked via the morphism mechanism, never an unchecked migration script.
 
-### 6.6.4. Integrate against the Task 5 boundary and run real production-shaped load
+### 6.4. Integrate against the Task 5 boundary and run real production-shaped load
 
 **Status:** pending  
 **Dependencies:** None  

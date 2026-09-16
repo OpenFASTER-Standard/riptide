@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 5.5.1. Define the WASM Component loading ABI (WIT interfaces)
+### 5.1. Define the WASM Component loading ABI (WIT interfaces)
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ The frozen, stable surface modules plug into. Strictly downward-only dependencie
 
 Test: a module cannot depend on anything not explicitly exposed through this interface.
 
-### 5.5.2. Implement session-type protocol checking for module/core interaction
+### 5.2. Implement session-type protocol checking for module/core interaction
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Local, compositional, compile-time conformance checking for message-sequencing -
 
 Test: a module violating its declared interaction protocol is rejected at load time, not at runtime.
 
-### 5.5.3. Implement uniform SFI-sandbox isolation with optional hardware-virtualization microVM tier
+### 5.3. Implement uniform SFI-sandbox isolation with optional hardware-virtualization microVM tier
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ WASM's own software-fault-isolation is the universal baseline (proven on Cortex-
 
 Test: a module that would crash the host under weaker isolation must be contained under the chosen isolation model on every supported hardware tier.
 
-### 5.5.4. Implement the mandatory admission/conformance gate
+### 5.4. Implement the mandatory admission/conformance gate
 
 **Status:** pending  
 **Dependencies:** None  
@@ -64,7 +64,7 @@ OCI-artifact distribution by content digest (not mutable tag), Sigstore/cosign k
 
 Test: an unsigned or provenance-failing artifact is rejected at the gate, not at runtime.
 
-### 5.5.5. Implement the mandatory authorization decision point (mechanism only, no policy)
+### 5.5. Implement the mandatory authorization decision point (mechanism only, no policy)
 
 **Status:** pending  
 **Dependencies:** None  

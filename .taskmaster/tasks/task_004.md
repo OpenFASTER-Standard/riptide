@@ -20,7 +20,7 @@ See subtask-level test strategy; each subtask must ship with real, running, test
 
 ## Subtasks
 
-### 4.4.1. Define and formally specify the join-semilattice law contract
+### 4.1. Define and formally specify the join-semilattice law contract
 
 **Status:** pending  
 **Dependencies:** None  
@@ -31,7 +31,7 @@ The RULE that any type claiming to be mergeable must satisfy commutative/associa
 
 Property-test: merge is order-independent and repeat-safe for any type claiming the contract.
 
-### 4.4.2. Build the incremental-projection (CQRS) mechanism
+### 4.2. Build the incremental-projection (CQRS) mechanism
 
 **Status:** pending  
 **Dependencies:** None  
@@ -42,7 +42,7 @@ Log is source of truth; every read hits a materialized, incrementally-maintained
 
 Benchmark: read latency must stay flat as total log history grows, unlike the old Riptide's O(total history) get_since/2.
 
-### 4.4.3. Implement redaction-with-preserved-hash (tombstone) capability
+### 4.3. Implement redaction-with-preserved-hash (tombstone) capability
 
 **Status:** pending  
 **Dependencies:** None  
@@ -53,7 +53,7 @@ The mechanism to redact a record's payload while preserving its leaf hash - stru
 
 Test: a redacted record's hash-chain integrity is unaffected; the payload is genuinely unrecoverable.
 
-### 4.4.4. Add encryption at rest and mTLS in transit as non-optional infrastructure
+### 4.4. Add encryption at rest and mTLS in transit as non-optional infrastructure
 
 **Status:** pending  
 **Dependencies:** None  
