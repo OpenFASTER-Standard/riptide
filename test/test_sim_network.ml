@@ -2,7 +2,7 @@
 open Riptide_sim
 
 let test_send_and_receive () =
-  Eio_main.run @@ fun _env ->
+  Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
   let net = Network.create prng () in
   Network.register net "a";
@@ -12,7 +12,7 @@ let test_send_and_receive () =
   Alcotest.(check string) "b receives a's message" "hello" (Network.receive net "b")
 
 let test_deterministic_two_fiber_exchange () =
-  Eio_main.run @@ fun _env ->
+  Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
   let net = Network.create prng () in
   Network.register net "a";
@@ -35,7 +35,7 @@ let test_deterministic_two_fiber_exchange () =
     !trace
 
 let test_receive_nonblocking_empty () =
-  Eio_main.run @@ fun _env ->
+  Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
   let net = Network.create prng () in
   Network.register net "a";
