@@ -1,3 +1,3 @@
 (library
  (name riptide_sim)
- (libraries eio eio.mock))
+ (libraries eio eio.mock eio_main))

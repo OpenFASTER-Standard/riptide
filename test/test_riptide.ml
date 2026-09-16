@@ -8,4 +8,5 @@ let () =
       ("sim_prng", Test_sim_prng.tests);
       ("sim_network", Test_sim_network.tests);
       ("sim_faults", Test_sim_faults.tests);
+      ("sim_workload", Test_sim_workload.tests);
     ]
