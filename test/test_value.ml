@@ -32,6 +32,15 @@ let test_content_hash_differs_for_different_values () =
   Alcotest.(check bool) "different values hash differently"
     false (Value.content_hash v1 = Value.content_hash v2)
 
+let test_float_nan_collisions_fixed () =
+  (* Two different NaN bit patterns must encode differently.
+     This validates the fix: Float encoding uses Int64.bits_of_float,
+     not Printf.sprintf "%h" which collapses all NaNs to "nan". *)
+  let canonical_nan = Value.Scalar (Value.Float nan) in
+  let alternate_nan = Value.Scalar (Value.Float (Int64.float_of_bits 0x7ff8000000000001L)) in
+  Alcotest.(check bool) "different NaN bit patterns encode differently"
+    false (Value.canonical_encode canonical_nan = Value.canonical_encode alternate_nan)
+
 (* Property: for any two QCheck-generated values, if they encode to the
    same canonical bytes, they must be structurally equal (no accidental
    collisions from the encoding scheme itself — this is checked over the
@@ -43,6 +52,7 @@ let value_gen =
     oneof
       [ map (fun b -> Value.Scalar (Value.Bool b)) bool;
         map (fun i -> Value.Scalar (Value.Int (Int64.of_int i))) int_small;
+        map (fun f -> Value.Scalar (Value.Float f)) float;
         map (fun s -> Value.Scalar (Value.String s)) (string_size (int_range 0 8))
       ]
   in
@@ -57,7 +67,11 @@ let value_gen =
                  map
                    (fun l -> Value.Record l)
                    (list_size (int_range 0 3) (pair (string_size (int_range 1 4)) (self (n / 2)))) );
-               (1, map (fun l -> Value.Sequence l) (list_size (int_range 0 3) (self (n / 2))))
+               (1, map (fun l -> Value.Sequence l) (list_size (int_range 0 3) (self (n / 2))));
+               (1, map (fun (tag, v) -> Value.Sum (tag, v))
+                  (pair (string_size (int_range 1 4)) (self (n / 2))));
+               (1, map (fun l -> Value.Map l)
+                  (list_size (int_range 0 3) (pair (self (n / 2)) (self (n / 2)))))
              ]))
 
 let value_arb = QCheck2.Test.make ~name:"canonical_encode is injective on generated values" ~count:200
@@ -71,5 +85,6 @@ let tests =
     ("no concatenation ambiguity", `Quick, test_no_concatenation_ambiguity);
     ("content_hash deterministic", `Quick, test_content_hash_deterministic);
     ("content_hash differs for different values", `Quick, test_content_hash_differs_for_different_values);
+    ("float nan collisions fixed", `Quick, test_float_nan_collisions_fixed);
     QCheck_alcotest.to_alcotest value_arb
   ]

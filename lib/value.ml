@@ -50,7 +50,11 @@ let rec encode_into buf v =
     done
   | Scalar (Float f) ->
     Buffer.add_char buf tag_scalar_float;
-    buf_add_len_prefixed buf (Printf.sprintf "%h" f)
+    let bits = Int64.bits_of_float f in
+    for shift = 56 downto 0 do
+      if shift mod 8 = 0 then
+        Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits shift) 0xffL)))
+    done
   | Scalar (String s) ->
     Buffer.add_char buf tag_scalar_string;
     buf_add_len_prefixed buf s
