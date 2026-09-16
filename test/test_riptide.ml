@@ -1,1 +1,1 @@
-let () = Alcotest.run "riptide" []
+let () = Alcotest.run "riptide" [ ("value", Test_value.tests) ]
