@@ -35,13 +35,17 @@ type 'msg t = {
   faults : fault_config;
   prng : Prng.t;
   clock : Eio_mock.Clock.t;
-  mutable now : float;  (* virtual clock time, advanced only by pump_one *)
+  (* Virtual clock time lives solely in [clock] (read via [Eio.Time.now], advanced only by
+     [pump_one] via [Eio_mock.Clock.set_time]) - deliberately not duplicated in a parallel plain
+     field, so that a fiber sleeping on [clock] (e.g. via [Eio.Time.sleep_until]) is genuinely
+     woken by delivery, not just by a bookkeeping side effect. *)
   mutable pending : 'msg pending_delivery list;  (* sorted ascending by delivery time *)
 }
 
 let create ?(faults = default_fault_config) prng () =
-  { inboxes = Hashtbl.create 8; faults; prng; clock = Eio_mock.Clock.make (); now = 0.0;
-    pending = [] }
+  { inboxes = Hashtbl.create 8; faults; prng; clock = Eio_mock.Clock.make (); pending = [] }
+
+let clock net = net.clock
 
 let inbox_of net id =
   match Hashtbl.find_opt net.inboxes id with
@@ -58,7 +62,7 @@ let schedule net ~to_ ~corrupt ~should_corrupt msg =
     if net.faults.max_delay <= net.faults.min_delay then net.faults.min_delay
     else net.faults.min_delay +. Prng.float net.prng (net.faults.max_delay -. net.faults.min_delay)
   in
-  let at = net.now +. delay in
+  let at = Eio.Time.now net.clock +. delay in
   let entry = { at; to_; msg; should_corrupt; corrupt } in
   net.pending <- List.merge (fun a b -> compare a.at b.at) net.pending [ entry ]
 
@@ -83,7 +87,8 @@ let pump_one net =
   | [] -> false
   | { at; to_; msg; should_corrupt; corrupt } :: rest ->
     net.pending <- rest;
-    net.now <- at;
+    (* Advancing the virtual clock is what wakes any fiber blocked in Eio.Time.sleep_until on this
+       clock for a time <= [at] - this is the mechanism, not a bookkeeping side effect. *)
     Eio_mock.Clock.set_time net.clock at;
     let msg = if should_corrupt then corrupt msg else msg in
     Eio.Stream.add (inbox_of net to_) msg;
