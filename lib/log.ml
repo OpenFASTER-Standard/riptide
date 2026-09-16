@@ -19,12 +19,12 @@ let append log ~actor ~causation ~correlation ~payload =
 let to_list log = List.rev log.entries
 
 let verify_chain_list entries =
-  let rec check expected_pred = function
+  let rec check index expected_pred = function
     | [] -> true
     | (e : Envelope.envelope) :: rest ->
-      if e.predecessor_hash <> expected_pred then false
-      else check (Envelope.content_hash e) rest
+      if e.predecessor_hash <> expected_pred || e.sequence <> Int64.of_int index then false
+      else check (index + 1) (Envelope.content_hash e) rest
   in
-  check Envelope.genesis_marker entries
+  check 1 Envelope.genesis_marker entries
 
 let verify_chain log = verify_chain_list (to_list log)

@@ -67,11 +67,67 @@ let test_mutating_original_bytes_buffer_does_not_corrupt_committed_entry () =
   Alcotest.(check bool) "chain still verifies after mutating the caller's original buffer" true
     (Log.verify_chain log)
 
+let test_verify_chain_list_rejects_out_of_order_sequences () =
+  (* M6: verify_chain_list previously only checked predecessor_hash links,
+     so a hand-built list with arbitrary sequence numbers (not the 1, 2,
+     3, ... that Log.append itself always assigns) passed verification.
+     Build two entries whose predecessor_hash links are genuinely correct
+     (so only the sequence check can be what rejects this), but whose
+     sequence numbers are swapped/wrong. *)
+  let e1 : Envelope.envelope =
+    {
+      actor = "a";
+      causation = Envelope.genesis_marker;
+      correlation = Envelope.genesis_marker;
+      predecessor_hash = Envelope.genesis_marker;
+      sequence = 99L (* wrong: should be 1 *);
+      payload = Value.Scalar (Value.Int 1L);
+    }
+  in
+  let e2 : Envelope.envelope =
+    {
+      actor = "a";
+      causation = Envelope.content_hash e1;
+      correlation = Envelope.content_hash e1;
+      predecessor_hash = Envelope.content_hash e1;
+      sequence = 7L (* wrong: should be 2 *);
+      payload = Value.Scalar (Value.Int 2L);
+    }
+  in
+  Alcotest.(check bool) "chain with correct hash links but wrong sequence numbers is rejected" false
+    (Log.verify_chain_list [ e1; e2 ])
+
+let test_verify_chain_list_rejects_truncated_prefix () =
+  (* M6: a chain missing its first entries (i.e. starting mid-chain) has a
+     first entry whose predecessor_hash does not point at
+     Envelope.genesis_marker - verify_chain_list must reject that, since it
+     is not a chain that could have started from Log.create (). Note this
+     is a *leading* truncation, which verify_chain_list can and does
+     detect - see log.mli for why *trailing* truncation is a different,
+     inherently undetectable case. *)
+  let log = Log.create () in
+  let e1 = Log.append log ~actor:"a" ~causation:Envelope.genesis_marker ~correlation:Envelope.genesis_marker
+      ~payload:(Value.Scalar (Value.Int 1L)) in
+  let e2 = Log.append log ~actor:"a" ~causation:(Envelope.content_hash e1) ~correlation:(Envelope.content_hash e1)
+      ~payload:(Value.Scalar (Value.Int 2L)) in
+  let _e3 = Log.append log ~actor:"a" ~causation:(Envelope.content_hash e2) ~correlation:(Envelope.content_hash e2)
+      ~payload:(Value.Scalar (Value.Int 3L)) in
+  let full_chain = Log.to_list log in
+  let second_half = List.filteri (fun i _ -> i >= 1) full_chain in
+  Alcotest.(check bool) "chain truncated of its leading entries is rejected" false
+    (Log.verify_chain_list second_half)
+
 let tests =
   [ ("append computes sequence and predecessor", `Quick, test_append_computes_sequence_and_predecessor);
     ("verify_chain accepts untampered log", `Quick, test_verify_chain_accepts_untampered_log);
     ("verify_chain rejects tampered payload", `Quick, test_verify_chain_rejects_tampered_payload);
     ( "mutating original bytes buffer does not corrupt committed entry",
       `Quick,
-      test_mutating_original_bytes_buffer_does_not_corrupt_committed_entry )
+      test_mutating_original_bytes_buffer_does_not_corrupt_committed_entry );
+    ( "verify_chain_list rejects out-of-order sequences",
+      `Quick,
+      test_verify_chain_list_rejects_out_of_order_sequences );
+    ( "verify_chain_list rejects truncated prefix",
+      `Quick,
+      test_verify_chain_list_rejects_truncated_prefix )
   ]
