@@ -32,3 +32,19 @@ single most important sequencing lesson from the research: build one real, deman
 end-to-end (Task 6) before generalizing further, the same way WebAssembly proved itself on real
 C/C++ workloads before WASI opened it to genuinely diverse use, and Kubernetes' CRD mechanism
 proved itself on real Prometheus/cert-manager/Istio deployments before being trusted as settled.
+
+## Documentation
+
+Layer 0's `.mli` files are the authoritative specification (see `CLAUDE.md`'s "no spec without
+running code" rule) — generate readable docs from them with:
+
+    dune build @doc
+
+Output lands in `_build/default/_doc/_html/riptide/`.
+
+## Conformance
+
+`spec/golden/vectors.txt` is a golden-vector conformance artifact: fixed canonical encodings and
+content hashes for a representative set of values and one envelope, regenerated via
+`dune exec spec/golden/generate.exe` and checked for regression in `test/test_golden.ml`. A future
+second, independent implementation of Layer 0 should be checkable against this same file.

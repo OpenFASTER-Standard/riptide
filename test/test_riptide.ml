@@ -1,3 +1,8 @@
 let () =
   Alcotest.run "riptide"
-    [ ("value", Test_value.tests); ("envelope", Test_envelope.tests); ("log", Test_log.tests) ]
+    [
+      ("value", Test_value.tests);
+      ("envelope", Test_envelope.tests);
+      ("log", Test_log.tests);
+      ("golden", Test_golden.tests);
+    ]
