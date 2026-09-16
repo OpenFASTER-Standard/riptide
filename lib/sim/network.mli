@@ -25,13 +25,16 @@ val register : 'msg t -> peer_id -> unit
 (** [register net id] gives [id] an inbox on [net]. Sending to or receiving from an
     unregistered [id] raises [Invalid_argument]. *)
 
-val clock : 'msg t -> Eio_mock.Clock.t
+val clock : 'msg t -> float Eio.Time.clock_ty Eio.Std.r
 (** [clock net] is [net]'s virtual clock - the sole source of truth for [net]'s notion of "now"
     (used by {!schedule} to compute delivery times, advanced only by {!pump_one}/{!pump_all}).
     Exposed so a caller can genuinely suspend a fiber on simulated time, e.g. via
     [Eio.Time.sleep_until (clock net) t] or [Eio.Time.sleep (clock net) d]: such a fiber is woken
     only when a later {!pump_one}/{!pump_all} call advances [net]'s clock at or past [t], not by
-    any parallel mechanism. *)
+    any parallel mechanism. Deliberately typed as a plain read/sleep-only {!Eio.Time.clock}
+    (rather than the full {!Eio_mock.Clock.t}) so that [set_time]/[advance] are simply not
+    reachable through this accessor - the "advanced only by [pump_one]/[pump_all]" claim above is
+    therefore enforced by the type checker, not just asserted in this comment. *)
 
 val send : ('msg -> 'msg) -> 'msg t -> from_:peer_id -> to_:peer_id -> 'msg -> unit
 (** [send corrupt net ~from_ ~to_ msg] schedules [msg] for delivery to [to_], subject to this

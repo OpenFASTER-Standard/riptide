@@ -45,7 +45,7 @@ type 'msg t = {
 let create ?(faults = default_fault_config) prng () =
   { inboxes = Hashtbl.create 8; faults; prng; clock = Eio_mock.Clock.make (); pending = [] }
 
-let clock net = net.clock
+let clock net : float Eio.Time.clock_ty Eio.Std.r = (net.clock :> float Eio.Time.clock_ty Eio.Std.r)
 
 let inbox_of net id =
   match Hashtbl.find_opt net.inboxes id with
