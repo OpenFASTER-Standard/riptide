@@ -6,4 +6,5 @@ let () =
       ("log", Test_log.tests);
       ("golden", Test_golden.tests);
       ("sim_prng", Test_sim_prng.tests);
+      ("sim_network", Test_sim_network.tests);
     ]
