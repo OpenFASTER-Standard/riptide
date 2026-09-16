@@ -5,7 +5,7 @@ type scalar =
   | Int of int64
   | Float of float
   | String of string
-  | Bytes of bytes
+  | Bytes of string
 
 type value =
   | Scalar of scalar
@@ -60,10 +60,10 @@ let rec encode_into buf v =
     buf_add_len_prefixed buf s
   | Scalar (Bytes b) ->
     Buffer.add_char buf tag_scalar_bytes;
-    buf_add_len_prefixed buf (Bytes.to_string b)
+    buf_add_len_prefixed buf b
   | Record fields ->
     Buffer.add_char buf tag_record;
-    let sorted = List.sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
+    let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
     let count = List.length sorted in
     for i = 7 downto 0 do
       Buffer.add_char buf (Char.chr ((count lsr (8 * i)) land 0xff))
@@ -92,7 +92,7 @@ let rec encode_into buf v =
         (Buffer.contents kb, v))
         entries
     in
-    let sorted = List.sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
+    let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
     let count = List.length sorted in
     for i = 7 downto 0 do
       Buffer.add_char buf (Char.chr ((count lsr (8 * i)) land 0xff))

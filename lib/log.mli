@@ -18,6 +18,7 @@ val append :
   payload:Value.value ->
   Envelope.envelope
 
+(** Returns the log's entries in append order (oldest first). *)
 val to_list : log -> Envelope.envelope list
 
 (** Pure: checks that each entry's [predecessor_hash] equals the content

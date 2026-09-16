@@ -16,9 +16,9 @@ let to_value (e : envelope) : Value.value =
   Value.Record
     [
       ("actor", Value.Scalar (Value.String e.actor));
-      ("causation", Value.Scalar (Value.Bytes (Bytes.of_string e.causation)));
-      ("correlation", Value.Scalar (Value.Bytes (Bytes.of_string e.correlation)));
-      ("predecessor_hash", Value.Scalar (Value.Bytes (Bytes.of_string e.predecessor_hash)));
+      ("causation", Value.Scalar (Value.Bytes e.causation));
+      ("correlation", Value.Scalar (Value.Bytes e.correlation));
+      ("predecessor_hash", Value.Scalar (Value.Bytes e.predecessor_hash));
       ("sequence", Value.Scalar (Value.Int e.sequence));
       ("payload", e.payload);
     ]

@@ -1,4 +1,4 @@
-(* Placeholder — real modules (Value, Envelope, Log) are added in Tasks 2-4. *)
+(* Top-level library entry point: re-exports the Layer 0 modules. *)
 
 module Value = Value
 module Envelope = Envelope

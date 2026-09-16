@@ -13,7 +13,7 @@ type scalar =
   | Int of int64
   | Float of float
   | String of string
-  | Bytes of bytes
+  | Bytes of string
 
 (** [Record] fields and [Map] entries need not be pre-sorted by the
     caller — {!canonical_encode} sorts them, so two values built with
@@ -36,4 +36,7 @@ val canonical_encode : value -> string
 (** SHA-256 of {!canonical_encode}. *)
 val content_hash : value -> hash
 
+(** Renders a raw {!hash} as lowercase hex for display/logging. Raises
+    [Invalid_argument] if [h] is not exactly 32 bytes (the shape any real
+    {!content_hash} always has). *)
 val hash_to_hex : hash -> string
