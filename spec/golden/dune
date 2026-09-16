@@ -1,3 +1,9 @@
+(library
+ (name golden_fixtures)
+ (modules golden_fixtures)
+ (libraries riptide))
+
 (executable
  (name generate)
- (libraries riptide digestif))
+ (modules generate)
+ (libraries riptide golden_fixtures))
