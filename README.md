@@ -60,9 +60,14 @@ against this project's real installed OCaml 5 / Eio toolchain rather than by ass
 - `Network`: an in-memory, peer-addressed, fault-injecting (delay/drop/duplicate/corrupt) message
   network, built directly on `Eio.Stream` and `Eio_mock.Clock` (`Eio_mock.Net` was evaluated and
   rejected — it is a scripted single-endpoint mock, not shaped for an N-peer simulated topology).
-- `Workload`: a toy multi-fiber cluster with a randomly-generated (not fixed-script) workload,
-  proving that identical seeds reproduce byte-for-byte identical traces even with fault injection
-  enabled. (Note: this toy cluster resolves the network fully before any peer fiber runs, so it
+- `Workload`: a toy multi-fiber cluster with a randomly-generated (not fixed-script) workload
+  (sender and receiver drawn from the seeded PRNG), proving that identical seeds
+  reproduce byte-for-byte identical traces even with fault injection enabled - including genuine
+  byte-level corruption (`Workload.random_byte_flip` mutates exactly one byte of a payload, per
+  the design spec's explicit "not just whole-message" requirement; `Network`'s corruption
+  interface is a caller-supplied `'msg -> 'msg` function, so byte-level corruption is a choice of
+  function, not a `Network`-level feature). (Note: this toy cluster resolves the network fully
+  before any peer fiber runs, so it
   doesn't itself exercise genuine concurrent fiber/network interleaving. That composite property —
   fibers genuinely blocking on `Network.receive`, interleaved with *active* fault injection
   (nonzero duplicate/corrupt/delay), still reproducing byte-identically from the same seed — is

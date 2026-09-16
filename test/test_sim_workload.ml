@@ -3,14 +3,53 @@ open Riptide_sim
 
 let test_same_seed_reproduces_identical_trace () =
   let faults =
-    { Network.drop_probability = 0.1; duplicate_probability = 0.1; corrupt_probability = 0.0;
+    { Network.drop_probability = 0.1; duplicate_probability = 0.1; corrupt_probability = 0.3;
       min_delay = 0.0; max_delay = 1.0 }
   in
   let run () = Workload.run_toy_cluster ~seed:12345 ~peer_count:3 ~message_count:30 ~faults in
   let trace_a = run () in
   let trace_b = run () in
   Alcotest.(check bool) "identical seed produces byte-for-byte identical trace" true
-    (trace_a = trace_b)
+    (trace_a = trace_b);
+  (* corrupt_probability > 0.0 here specifically closes the review's H2 finding that "the headline
+     reproducibility proof never corrupts anything at all" - this asserts corruption genuinely
+     fired, not just that nothing crashed. drop/duplicate never invent new payload content (a
+     duplicate is a second copy of the same bytes), so any received payload that doesn't match any
+     sent payload can only be explained by corruption having mutated it in transit. *)
+  let sent_payloads =
+    List.filter_map
+      (function Workload.Sent { payload; _ } -> Some payload | Workload.Received _ -> None)
+      trace_a
+    |> List.sort_uniq compare
+  in
+  Alcotest.(check bool)
+    "byte-level corruption actually fired: at least one received payload matches no sent payload"
+    true
+    (List.exists
+       (function
+         | Workload.Received { payload; _ } -> not (List.mem payload sent_payloads)
+         | Workload.Sent _ -> false)
+       trace_a)
+
+let test_random_byte_flip_mutates_exactly_one_byte () =
+  let prng = Prng.create 5 in
+  let original = "hello world" in
+  let corrupted = Workload.random_byte_flip prng original in
+  Alcotest.(check int) "same length" (String.length original) (String.length corrupted);
+  let differing_positions =
+    List.filter
+      (fun i -> original.[i] <> corrupted.[i])
+      (List.init (String.length original) Fun.id)
+  in
+  Alcotest.(check int) "exactly one byte differs" 1 (List.length differing_positions)
+
+let test_random_byte_flip_is_deterministic () =
+  let run () = Workload.random_byte_flip (Prng.create 5) "hello world" in
+  Alcotest.(check string) "identical seed produces identical mutation" (run ()) (run ())
+
+let test_random_byte_flip_empty_string_unchanged () =
+  let prng = Prng.create 5 in
+  Alcotest.(check string) "empty string returned unchanged" "" (Workload.random_byte_flip prng "")
 
 let test_different_seeds_can_diverge () =
   let faults =
@@ -60,5 +99,9 @@ let tests =
     ("different seeds are not artificially constant", `Quick, test_different_seeds_can_diverge);
     ("generator covers unstructured (sender, receiver) pairings", `Quick, test_generator_covers_unstructured_workload);
     ("terminates and delivers nothing when drop_probability = 1.0", `Quick,
-      test_terminates_and_delivers_nothing_when_everything_is_dropped)
+      test_terminates_and_delivers_nothing_when_everything_is_dropped);
+    ("random_byte_flip mutates exactly one byte", `Quick, test_random_byte_flip_mutates_exactly_one_byte);
+    ("random_byte_flip is deterministic from seed", `Quick, test_random_byte_flip_is_deterministic);
+    ("random_byte_flip leaves the empty string unchanged", `Quick,
+      test_random_byte_flip_empty_string_unchanged)
   ]

@@ -4,6 +4,21 @@ type trace_event =
 
 let peer_name i = Printf.sprintf "peer%d" i
 
+let random_byte_flip prng s =
+  let len = String.length s in
+  if len = 0 then s
+  else begin
+    let bytes = Bytes.of_string s in
+    let i = Prng.int prng len in
+    let original = Bytes.get_uint8 bytes i in
+    (* XOR with a random *nonzero* byte in [1, 255], so the mutated byte is guaranteed to differ
+       from the original - a corruption function that could silently no-op would be a weaker
+       fault than the spec's "byte-level corruption" calls for. *)
+    let flip = 1 + Prng.int prng 255 in
+    Bytes.set_uint8 bytes i (original lxor flip);
+    Bytes.to_string bytes
+  end
+
 (* --- Termination-logic design note (resolving the gap flagged in the Task 4 brief) ---
 
    The brief's reference sketch has each peer fiber busy-poll `receive_nonblocking` until its own
@@ -94,7 +109,9 @@ let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   for i = 1 to message_count do
     let from_ = random_peer () and to_ = random_peer () in
     let payload = Printf.sprintf "msg-%d" i in
-    Network.send Fun.id net ~from_ ~to_ payload;
+    (* Genuine byte-level corruption (not just whole-message), per spec: mutates exactly one byte
+       of the payload when the network's should_corrupt decision fires at delivery. *)
+    Network.send (random_byte_flip prng) net ~from_ ~to_ payload;
     record (Sent { from_; to_; payload })
   done;
   Network.pump_all net;
