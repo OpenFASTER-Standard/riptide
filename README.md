@@ -48,3 +48,26 @@ Output lands in `_build/default/_doc/_html/riptide/`.
 content hashes for a representative set of values and one envelope, regenerated via
 `dune exec spec/golden/generate.exe` and checked for regression in `test/test_golden.ml`. A future
 second, independent implementation of Layer 0 should be checkable against this same file.
+
+## Deterministic simulation substrate (proof-of-concept)
+
+`lib/sim/` (`riptide_sim` library) is a proof-of-concept proving the substrate a real
+deterministic-simulation-testing (DST) harness will be built on, per
+`docs/superpowers/specs/2026-09-16-distributed-consensus-design.md`'s Decision 2. It proves,
+against this project's real installed OCaml 5 / Eio toolchain rather than by assumption:
+
+- `Prng`: every random decision in this library flows through one explicitly-seeded source.
+- `Network`: an in-memory, peer-addressed, fault-injecting (delay/drop/duplicate/corrupt) message
+  network, built directly on `Eio.Stream` and `Eio_mock.Clock` (`Eio_mock.Net` was evaluated and
+  rejected — it is a scripted single-endpoint mock, not shaped for an N-peer simulated topology).
+- `Workload`: a toy multi-fiber cluster with a randomly-generated (not fixed-script) workload,
+  proving that identical seeds reproduce byte-for-byte identical traces even with fault injection
+  enabled. (Note: this toy cluster resolves the network fully before any peer fiber runs, so it
+  doesn't itself exercise genuine concurrent fiber/network interleaving — `test/test_sim_network.ml`
+  proves that property.)
+
+**What this does NOT yet build:** the real VSR-derived consensus protocol, atomic multi-entity
+commit, or a production (real-socket) network implementation — those are separate, later
+task-master subtasks (3.1, 3.3, 3.5) that will be built against this validated substrate, per the
+spec's own required sequencing (this proof-of-concept exists specifically to happen *before* that
+work is architected).
