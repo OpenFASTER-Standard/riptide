@@ -337,6 +337,17 @@ CommitNumberNeverHigherThanOpNumber ==
 LogLengthMatchesOpNumber ==
     \A r \in replicas : Len(rep_log[r]) = rep_op_number[r]
 
+(* README.md, "What the ValidDvc filter is actually doing here": rep_recv_dvc[r] can carry stale
+   (no-longer-valid) entries forward across a view bump that ReceiveSV performs without clearing
+   it, but only while rep_status[r] = "Normal" -- the sole reader, SendSV, is guarded on
+   rep_status[r] = "ViewChange", and both actions that reach that status (TimerSendSVC,
+   ReceiveHigherSVC) reset rep_recv_dvc[r] first. This invariant is the regression check for that
+   argument: re-run it before assuming the ValidDvc filter in SendSV is still inert, if the
+   view-transition actions (especially ReceiveSV's reset discipline) ever change. *)
+RecvDvcValidWhenViewChange ==
+    \A r \in replicas :
+        rep_status[r] = "ViewChange" => \A m \in rep_recv_dvc[r] : ValidDvc(r, m)
+
 (* research §5.5: guarded by commit_number on BOTH replicas -- the unguarded version is
    wrong, because uncommitted log suffixes are allowed to diverge. Do not remove the guard. *)
 NoLogDivergence ==
