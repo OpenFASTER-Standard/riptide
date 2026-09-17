@@ -1,9 +1,8 @@
 ---- MODULE VSR ----
-(* Core VSR safety protocol: normal-case operation plus view change (this module fragment
-   builds view-change state and the STARTVIEWCHANGE/DOVIEWCHANGE collection machinery; Task 4
-   of this plan adds the DVC-selection and view-completion logic on top). Message names, field
-   lists, and quorum thresholds are verbatim from Liskov & Cowling, "Viewstamped Replication
-   Revisited" (2012), per this plan's research file, research §1.3-§1.5, §2.4-§2.5.
+(* Core VSR safety protocol: normal-case operation plus view change, including DVC selection
+   and STARTVIEW completion (Task 4 of this plan). Message names, field lists, and quorum
+   thresholds are verbatim from Liskov & Cowling, "Viewstamped Replication Revisited" (2012),
+   per this plan's research file, research §1.3-§1.5, §2.4-§2.5.
 
    Deliberately excluded from this spec (see this plan's Global Constraints and
    research §7.3): state-transfer, storage-fault-aware recovery, crash modeling,
@@ -215,6 +214,71 @@ ReceiveDVC ==
                         aux_client_acked, rep_view_number, rep_status, rep_last_normal_view,
                         rep_recv_svc, aux_svc_count >>
 
+(* research §2.4 step 3 ("selects as the new log the one contained in the message with the
+   largest v'; if several messages have the same v' it selects the one among them with the
+   largest n") and §5.7's explicit warning that HighestCommitNumber is a SEPARATE maximum, not
+   derived from the winning DVC. Adapted directly (only variable-naming changes) from
+   Vanlightly's own published, already-TLC-verified WinningDVC/SendSV (research §5.7, quoted
+   verbatim there). *)
+WinningDVC(r) ==
+    CHOOSE m \in rep_recv_dvc[r] :
+        /\ ValidDvc(r, m)
+        /\ ~ \E m1 \in rep_recv_dvc[r] :
+            /\ ValidDvc(r, m1)
+            /\ \/ m1.last_normal_view > m.last_normal_view
+               \/ /\ m1.last_normal_view = m.last_normal_view
+                  /\ m1.n > m.n
+
+HighestCommitNumber(r) ==
+    LET valid_dvcs == { m \in rep_recv_dvc[r] : ValidDvc(r, m) }
+    IN CHOOSE k \in { m.k : m \in valid_dvcs } :
+        ~ \E m \in valid_dvcs : m.k > k
+
+(* research §2.4 step 3 and §2.5 ("f+1 DOVIEWCHANGE from different replicas, including
+   itself"). *)
+SendSV ==
+    \E r \in replicas :
+        LET f == (ReplicaCount - 1) \div 2 IN
+        /\ rep_status[r] = "ViewChange"
+        /\ r = Primary(View(r))
+        /\ Cardinality({ m \in rep_recv_dvc[r] : ValidDvc(r, m) }) >= f + 1
+        /\ LET winner == WinningDVC(r)
+               new_k == HighestCommitNumber(r)
+           IN /\ rep_log' = [rep_log EXCEPT ![r] = winner.log]
+              /\ rep_op_number' = [rep_op_number EXCEPT ![r] = winner.n]
+              /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = new_k]
+              /\ rep_status' = [rep_status EXCEPT ![r] = "Normal"]
+              /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = View(r)]
+              /\ Broadcast([type |-> "StartView", v |-> View(r), log |-> winner.log,
+                            n |-> winner.n, k |-> new_k, dest |-> r], r)
+        /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_view_number,
+                        rep_recv_svc, rep_recv_dvc, aux_svc_count >>
+
+(* research §2.4 step 5 (simplified for this plan's scope: skip re-sending PREPAREOK for
+   uncommitted entries, since that requires the primary to re-track post-view-change acks --
+   out of scope here, noted in Task 6's documentation as a known simplification, not a silent
+   omission).
+
+   Note the "IF m.k > @ THEN m.k ELSE @" guard on rep_commit_number -- this is research §5.7
+   Part 4's documented commit-number-monotonicity fix ("the fix is to ensure that the
+   commit-number is only updated if the [message]'s commit-number is higher"). Applying m.k
+   unconditionally is a REAL, documented defect (it caused a double-application-of-an-operation
+   bug in Vanlightly's own spec) -- do not simplify this back to unconditional assignment. *)
+ReceiveSV ==
+    \E r \in replicas, m \in DOMAIN messages :
+        /\ ReceivableMsg(m, "StartView", r)
+        /\ m.v >= View(r)
+        /\ rep_log' = [rep_log EXCEPT ![r] = m.log]
+        /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.n]
+        /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] =
+                                    IF m.k > @ THEN m.k ELSE @]  \* research §5.7 Part 4: monotonic only
+        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.v]
+        /\ rep_status' = [rep_status EXCEPT ![r] = "Normal"]
+        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.v]
+        /\ Discard(m)
+        /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_recv_svc, rep_recv_dvc,
+                        aux_svc_count >>
+
 Next ==
     \/ \E v \in Values : ReceiveClientRequest(v)
     \/ ReceivePrepareMsg
@@ -225,6 +289,8 @@ Next ==
     \/ ReceiveMatchingSVC
     \/ SendDVC
     \/ ReceiveDVC
+    \/ SendSV
+    \/ ReceiveSV
 
 Spec == Init /\ [][Next]_vars
 
