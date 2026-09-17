@@ -2,8 +2,8 @@
 (* Core VSR safety protocol: normal-case operation plus view change, including DVC selection
    and STARTVIEW completion. Message names, field lists, and quorum thresholds are verbatim
    from Liskov & Cowling, "Viewstamped Replication Revisited" (2012); "research §x.y" citations
-   throughout refer to that paper's mechanics as catalogued in the accompanying research file,
-   research §1.3-§1.5, §2.4-§2.5.
+   throughout refer to that paper's mechanics as catalogued in a research file external to this
+   repo (not committed -- see spec/tla/README.md), research §1.3-§1.5, §2.4-§2.5.
 
    Deliberately excluded from this spec (see spec/tla/README.md and
    research §7.3): state-transfer, storage-fault-aware recovery, crash modeling,

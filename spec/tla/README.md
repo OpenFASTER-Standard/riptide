@@ -30,8 +30,8 @@ Finished in 23s
 `0 states left on queue` is the part that matters: the entire reachable state space at this bound
 was explored, and all five invariants (`TypeOK`, `CommitNumberNeverHigherThanOpNumber`,
 `LogLengthMatchesOpNumber`, `NoLogDivergence`, `AcknowledgedWritesExistOnMajority`) hold on every
-reachable state. See the caveat below on how much two of those five actually discriminate at
-`Values = {v1}`.
+reachable state. See the caveat below on how much of that is real evidence — three of the five
+discriminate less than they look at `Values = {v1}`.
 
 Every documented defect in the original VSR paper (Liskov & Cowling, 2012) that this scope touches
 is pre-fixed, not left for TLC to (re)discover: the `ValidDvc` view-filtered DVC quorum counting
@@ -41,7 +41,8 @@ is actually doing here" below for exactly how much verification evidence backs t
 against *this* spec, as opposed to against the original research.
 
 **Known simplifications, not omissions.** Both are liveness-only: neither can lose a committed
-entry, and neither of this scope's two headline safety invariants depends on either.
+entry, and neither `NoLogDivergence` nor `AcknowledgedWritesExistOnMajority` — this scope's two
+headline safety invariants — depends on either.
 
 1. **No `PREPAREOK` re-send on `STARTVIEW`.** `ReceiveSV` does not re-send `PREPAREOK` for
    uncommitted entries carried into the new view (the paper's own §4.2 step 5 final clause). A
@@ -73,7 +74,8 @@ entry, and neither of this scope's two headline safety invariants depends on eit
    liveness checking should model this path properly rather than inherit the simplification.
 
 **Known limitation of the shipped bound, disclosed rather than silently accepted:**
-`NoLogDivergence` is one of this scope's two headline safety invariants, but at
+`NoLogDivergence` is one of this scope's two headline safety invariants (the other is
+`AcknowledgedWritesExistOnMajority`), but at
 `Values = {v1}` — a bound originally chosen for tractability, for reasons the last section of this
 file shows were a misdiagnosis — it is structurally unfalsifiable: with only one possible value
 anywhere in the system, two committed log entries can never actually disagree with each other, so
@@ -131,8 +133,9 @@ Model checking completed. No error has been found.
 ```
 
 Those are the *same* counts, state for state, as the unmodified spec quoted at the top of this
-file. At this bound the weakened spec and the correct spec have the same reachable state graph:
-removing the filter changes nothing, exhaustively.
+file — and, as the next paragraph shows, that is a proof rather than a coincidence: at this bound
+the weakened spec and the correct spec have the same reachable state graph, so removing the filter
+changes nothing, exhaustively.
 
 **Why — and the reason is more interesting than "stale DVCs can never accumulate".** That simpler
 explanation is false, and TLC says so. A temporary invariant asserting that `rep_recv_dvc[r]` only
