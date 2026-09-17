@@ -1,10 +1,11 @@
 ---- MODULE VSR ----
 (* Core VSR safety protocol: normal-case operation plus view change, including DVC selection
-   and STARTVIEW completion (Task 4 of this plan). Message names, field lists, and quorum
-   thresholds are verbatim from Liskov & Cowling, "Viewstamped Replication Revisited" (2012),
-   per this plan's research file, research §1.3-§1.5, §2.4-§2.5.
+   and STARTVIEW completion. Message names, field lists, and quorum thresholds are verbatim
+   from Liskov & Cowling, "Viewstamped Replication Revisited" (2012); "research §x.y" citations
+   throughout refer to that paper's mechanics as catalogued in the accompanying research file,
+   research §1.3-§1.5, §2.4-§2.5.
 
-   Deliberately excluded from this spec (see this plan's Global Constraints and
+   Deliberately excluded from this spec (see spec/tla/README.md and
    research §7.3): state-transfer, storage-fault-aware recovery, crash modeling,
    reconfiguration, the client-table, and COMMIT messages (pure liveness optimization). *)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
@@ -31,11 +32,17 @@ VARIABLES
                             \* from rep_view_number, an omission in the paper's own Figure 2
     rep_recv_svc,           \* [replica -> SUBSET replicas] -- STARTVIEWCHANGE senders for current view
     rep_recv_dvc,           \* [replica -> SUBSET [message]] -- DOVIEWCHANGE messages received
+    rep_sent_dvc,           \* [replica -> BOOLEAN] -- TRUE once this replica has sent its
+                            \* DOVIEWCHANGE for the CURRENT view-change episode; cleared
+                            \* whenever a new episode starts. Without it SendDVC re-enables
+                            \* itself forever (nothing it reads changes when it fires), each
+                            \* firing producing a distinct state that differs only in the
+                            \* message bag's count -- an infinite reachable state space.
     aux_svc_count           \* [replica -> Nat] -- bounds TimerSendSVC, research §6.3 point 4
 
 vars == << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number, messages,
             aux_client_acked, rep_status, rep_view_number, rep_last_normal_view,
-            rep_recv_svc, rep_recv_dvc, aux_svc_count >>
+            rep_recv_svc, rep_recv_dvc, rep_sent_dvc, aux_svc_count >>
 
 View(r) == rep_view_number[r]
 IsNormalPrimary(r) == /\ rep_status[r] = "Normal" /\ Primary(View(r)) = r
@@ -73,6 +80,7 @@ Init ==
     /\ rep_last_normal_view = [r \in replicas |-> 0]
     /\ rep_recv_svc = [r \in replicas |-> {}]
     /\ rep_recv_dvc = [r \in replicas |-> {}]
+    /\ rep_sent_dvc = [r \in replicas |-> FALSE]
     /\ aux_svc_count = [r \in replicas |-> 0]
 
 (* ---- normal-case actions, research §1.4 steps 1-7 (generalized to the current primary of
@@ -91,7 +99,7 @@ ReceiveClientRequest(v) ==
                             k |-> rep_commit_number[r], dest |-> r], r)
     /\ UNCHANGED << rep_commit_number, rep_peer_op_number, aux_client_acked, rep_status,
                     rep_view_number, rep_last_normal_view, rep_recv_svc, rep_recv_dvc,
-                    aux_svc_count >>
+                    rep_sent_dvc, aux_svc_count >>
 
 (* research §1.5 point 7: backups process PREPARE strictly in op-number order.
    research §1.4 step 7: a backup advances its commit-number to m.k whenever higher --
@@ -112,7 +120,7 @@ ReceivePrepareMsg ==
                               dest |-> Primary(View(r))])
         /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_status,
                         rep_view_number, rep_last_normal_view, rep_recv_svc, rep_recv_dvc,
-                        aux_svc_count >>
+                        rep_sent_dvc, aux_svc_count >>
 
 (* research §1.5 point 2: PREPAREOK is cumulative, so peer state is a single high-water mark. *)
 ReceivePrepareOkMsg ==
@@ -125,7 +133,7 @@ ReceivePrepareOkMsg ==
         /\ Discard(m)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, aux_client_acked, rep_status,
                         rep_view_number, rep_last_normal_view, rep_recv_svc, rep_recv_dvc,
-                        aux_svc_count >>
+                        rep_sent_dvc, aux_svc_count >>
 
 (* research §1.5 point 1: f PREPAREOKs from OTHER replicas = f+1 counting the primary itself. *)
 IsCommitted(r, op_number) ==
@@ -144,7 +152,7 @@ PrimaryExecuteOp ==
               /\ aux_client_acked' = [aux_client_acked EXCEPT ![rep_log[r][next]] = TRUE]
     /\ UNCHANGED << rep_log, rep_op_number, rep_peer_op_number, messages, rep_status,
                     rep_view_number, rep_last_normal_view, rep_recv_svc, rep_recv_dvc,
-                    aux_svc_count >>
+                    rep_sent_dvc, aux_svc_count >>
 
 (* ---- view-change actions, research §2.1, §2.4-§2.5 ----
    research §2.1: do not model real timeouts -- an unconditional, always-enabled action,
@@ -159,13 +167,19 @@ TimerSendSVC ==
               /\ rep_status' = [rep_status EXCEPT ![r] = "ViewChange"]
               /\ rep_recv_svc' = [rep_recv_svc EXCEPT ![r] = {}]
               /\ rep_recv_dvc' = [rep_recv_dvc EXCEPT ![r] = {}]
+              /\ rep_sent_dvc' = [rep_sent_dvc EXCEPT ![r] = FALSE]
               /\ aux_svc_count' = [aux_svc_count EXCEPT ![r] = @ + 1]
               /\ Broadcast([type |-> "StartViewChange", v |-> v, i |-> r, dest |-> r], r)
     /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number,
                     aux_client_acked, rep_last_normal_view >>
 
 (* research §2.4 step 1 (2nd half): a replica also starts a view change on a HIGHER-view
-   SVC/DVC than its own -- assume-mode (research Global Constraints), not increment-mode. *)
+   message than its own -- assume-mode (research Global Constraints), not increment-mode.
+   Scope note: only a higher-view STARTVIEWCHANGE triggers this here. There is deliberately no
+   analogous action for a higher-view DOVIEWCHANGE -- ReceiveDVC is gated on ValidDvc, so a
+   DOVIEWCHANGE carrying a higher view than the recipient's is matched by no action and stays
+   in the bag. See spec/tla/README.md's known-simplifications list for why this is safe at
+   this scope (it costs liveness, not safety). *)
 ReceiveHigherSVC ==
     \E r \in replicas, m \in DOMAIN messages :
         /\ ReceivableMsg(m, "StartViewChange", r)
@@ -174,6 +188,7 @@ ReceiveHigherSVC ==
         /\ rep_status' = [rep_status EXCEPT ![r] = "ViewChange"]
         /\ rep_recv_svc' = [rep_recv_svc EXCEPT ![r] = {m.i}]
         /\ rep_recv_dvc' = [rep_recv_dvc EXCEPT ![r] = {}]
+        /\ rep_sent_dvc' = [rep_sent_dvc EXCEPT ![r] = FALSE]
         /\ Discard(m)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number,
                         aux_client_acked, rep_last_normal_view, aux_svc_count >>
@@ -187,17 +202,27 @@ ReceiveMatchingSVC ==
         /\ Discard(m)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number,
                         aux_client_acked, rep_view_number, rep_status, rep_last_normal_view,
-                        rep_recv_dvc, aux_svc_count >>
+                        rep_recv_dvc, rep_sent_dvc, aux_svc_count >>
 
-(* research §2.4 step 2, §2.5: "f STARTVIEWCHANGE from other replicas". *)
+(* research §2.4 step 2, §2.5: "f STARTVIEWCHANGE from other replicas".
+
+   The rep_sent_dvc one-shot flag is a modeling device, not protocol logic: a replica sends its
+   DOVIEWCHANGE once per view-change episode. Without it this action's own effect leaves every
+   one of its guards true, so it re-enables itself indefinitely and each firing yields a distinct
+   state (one more copy of the same message in the bag) -- an infinite reachable state space that
+   no exhaustive TLC run at any bound can terminate on. The flag mirrors how aux_svc_count already
+   bounds TimerSendSVC (research §6.3 point 4), and is cleared by both actions that begin a new
+   view-change episode. *)
 SendDVC ==
     \E r \in replicas :
         LET f == (ReplicaCount - 1) \div 2 IN
         /\ rep_status[r] = "ViewChange"
+        /\ ~rep_sent_dvc[r]
         /\ Cardinality(rep_recv_svc[r]) >= f
         /\ Send([type |-> "DoViewChange", v |-> View(r), log |-> rep_log[r],
                   last_normal_view |-> rep_last_normal_view[r], n |-> rep_op_number[r],
                   k |-> rep_commit_number[r], i |-> r, dest |-> Primary(View(r))])
+        /\ rep_sent_dvc' = [rep_sent_dvc EXCEPT ![r] = TRUE]
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number,
                         aux_client_acked, rep_view_number, rep_status, rep_last_normal_view,
                         rep_recv_svc, rep_recv_dvc, aux_svc_count >>
@@ -212,7 +237,7 @@ ReceiveDVC ==
         /\ Discard(m)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_peer_op_number,
                         aux_client_acked, rep_view_number, rep_status, rep_last_normal_view,
-                        rep_recv_svc, aux_svc_count >>
+                        rep_recv_svc, rep_sent_dvc, aux_svc_count >>
 
 (* research §2.4 step 3 ("selects as the new log the one contained in the message with the
    largest v'; if several messages have the same v' it selects the one among them with the
@@ -252,12 +277,12 @@ SendSV ==
               /\ Broadcast([type |-> "StartView", v |-> View(r), log |-> winner.log,
                             n |-> winner.n, k |-> new_k, dest |-> r], r)
         /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_view_number,
-                        rep_recv_svc, rep_recv_dvc, aux_svc_count >>
+                        rep_recv_svc, rep_recv_dvc, rep_sent_dvc, aux_svc_count >>
 
-(* research §2.4 step 5 (simplified for this plan's scope: skip re-sending PREPAREOK for
+(* research §2.4 step 5 (simplified for this spec's scope: skip re-sending PREPAREOK for
    uncommitted entries, since that requires the primary to re-track post-view-change acks --
-   out of scope here, noted in Task 6's documentation as a known simplification, not a silent
-   omission).
+   out of scope here, and disclosed in spec/tla/README.md as a known simplification, not a
+   silent omission).
 
    Note the "IF m.k > @ THEN m.k ELSE @" guard on rep_commit_number -- this is research §5.7
    Part 4's documented commit-number-monotonicity fix ("the fix is to ensure that the
@@ -277,7 +302,7 @@ ReceiveSV ==
         /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.v]
         /\ Discard(m)
         /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_recv_svc, rep_recv_dvc,
-                        aux_svc_count >>
+                        rep_sent_dvc, aux_svc_count >>
 
 Next ==
     \/ \E v \in Values : ReceiveClientRequest(v)
@@ -300,9 +325,17 @@ TypeOK ==
     /\ \A r \in replicas : rep_commit_number[r] \in Nat
     /\ \A r \in replicas : rep_view_number[r] \in Nat
     /\ \A r \in replicas : rep_status[r] \in {"Normal", "ViewChange"}
+    /\ \A r \in replicas : rep_sent_dvc[r] \in BOOLEAN
 
 CommitNumberNeverHigherThanOpNumber ==
     \A r \in replicas : rep_commit_number[r] <= rep_op_number[r]
+
+(* The structural relationship NoLogDivergence implicitly relies on: it indexes
+   rep_log[r][op_number] guarded only by op_number <= rep_commit_number[r], which is
+   in-domain only because the log's length tracks the op-number exactly. Asserted
+   explicitly rather than assumed. *)
+LogLengthMatchesOpNumber ==
+    \A r \in replicas : Len(rep_log[r]) = rep_op_number[r]
 
 (* research §5.5: guarded by commit_number on BOTH replicas -- the unguarded version is
    wrong, because uncommitted log suffixes are allowed to diverge. Do not remove the guard. *)

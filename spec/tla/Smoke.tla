@@ -11,5 +11,4 @@ Next == n < 9 /\ n' = n + 1
 Spec == Init /\ [][Next]_n
 
 TypeOK == n \in Nat
-Bounded == n <= 3
 ====
