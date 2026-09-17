@@ -506,7 +506,19 @@ IsNormalBackup(r)   == /\ rep_status[r] = "Normal" /\ Primary(View(r)) # r
 **Replace all four of Task 2's actions with these updated versions** (generalizing from the fixed
 `Primary(0)` to the current primary of whatever view is active, and adding the view-match
 precondition from research §1.5 point 3: "Replicas only process normal protocol messages containing
-a view-number that matches the view-number they know"):
+a view-number that matches the view-number they know"). This also completes a real gap Task 2's own
+review found: the plan's Global Constraints say commit-knowledge propagates to backups "via the `k`
+field riding on the next PREPARE" (research §1.4 step 6), but Task 2's version of `ReceivePrepareMsg`
+never actually read `m.k` — backups' `rep_commit_number` was provably stuck at 0 throughout that
+task's own reachable states, making `NoLogDivergence`'s cross-replica comparison vacuously true
+within that fragment (Task 2 remains correct and approved for what it does check; this just means it
+never got to check the interesting cross-replica case). **`ReceivePrepareMsg` below now advances
+`rep_commit_number[r]` to `m.k` whenever higher**, per research §1.4 step 7 ("when a backup learns of
+a commit... it increments its commit-number"). This is safe unconditionally, with no extra guard
+needed: a normal `PREPARE`'s `k` is always the primary's commit-number *from before* the request
+carried by this same message was appended (research §1.4 step 3), so `m.k < m.n`, and by the time a
+backup processes this message its own `rep_op_number` has just been set to `m.n` — meaning every
+entry up to `m.k` is already guaranteed present in its log.
 
 ```tla
 ReceiveClientRequest(v) ==
@@ -530,9 +542,10 @@ ReceivePrepareMsg ==
         /\ rep_op_number[r] + 1 = m.n
         /\ rep_log' = [rep_log EXCEPT ![r] = Append(@, m.v)]
         /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.n]
+        /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = IF m.k > @ THEN m.k ELSE @]
         /\ DiscardAndSend(m, [type |-> "PrepareOk", view |-> View(r), n |-> m.n, i |-> r,
                               dest |-> Primary(View(r))])
-        /\ UNCHANGED << rep_commit_number, rep_peer_op_number, aux_client_acked, rep_status,
+        /\ UNCHANGED << rep_peer_op_number, aux_client_acked, rep_status,
                         rep_view_number, rep_last_normal_view, rep_recv_svc, rep_recv_dvc,
                         aux_svc_count >>
 
