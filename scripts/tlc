@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs TLC against a TLA+ module. Usage: scripts/tlc <module-basename>
+# (looks for spec/tla/<module-basename>.tla and spec/tla/<module-basename>.cfg)
+set -euo pipefail
+if [ $# -ne 1 ]; then
+  echo "usage: scripts/tlc <module-basename>" >&2
+  exit 1
+fi
+MODULE="$1"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TLA_DIR="$REPO_ROOT/spec/tla"
+TLA2TOOLS="/work/toolchain/tla/tla2tools.jar"
+if [ ! -f "$TLA2TOOLS" ]; then
+  echo "error: $TLA2TOOLS not found. Install per cloud-admin-box's own CLAUDE.md TLA+ toolchain note (mirrors the OCaml toolchain durability pattern)." >&2
+  exit 1
+fi
+cd "$TLA_DIR"
+exec java -jar "$TLA2TOOLS" -config "${MODULE}.cfg" "${MODULE}.tla"
