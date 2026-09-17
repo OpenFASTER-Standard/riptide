@@ -439,18 +439,28 @@ timer-triggered view changes, 0 crashes, 0 storage faults — the config every o
 SPECIFICATION Spec
 CONSTANTS
     ReplicaCount = 3
-    Values = {v1, v2}
-    StartViewOnTimerLimit = 2
+    Values = {v1}
+    StartViewOnTimerLimit = 1
 INVARIANT TypeOK
 INVARIANT CommitNumberNeverHigherThanOpNumber
 INVARIANT NoLogDivergence
 INVARIANT AcknowledgedWritesExistOnMajority
 CHECK_DEADLOCK FALSE
+SYMMETRY ValuesSymmetry
 ```
 
-Note `Values` shrinks from 3 to 2 and a new `StartViewOnTimerLimit` constant appears — view-change
-adds enough new state that the Task 2 bound (3 values, no view-change limit) is no longer the right
-default; this matches research §6.3 point 1 exactly.
+Note `Values` shrinks all the way to a single value and `StartViewOnTimerLimit` (a new constant)
+is set to 1 — **this bound is deliberately much smaller than research §6.3's cited "3 replicas, 2
+values, 2 view changes, known to terminate."** The controller independently tried that exact bound
+against this exact spec (before finalizing this plan) and it did not terminate quickly — nor did
+`Values = {v1}, StartViewOnTimerLimit = 1` within a 100-second budget, even with `SYMMETRY` added.
+This is not a sign of a bug: view-change's message-bag interleaving combinatorics grow fast even at
+trivial bounds for this whole class of spec — Vanlightly's own most complete VSR spec (research
+§6.2) failed to terminate under brute force at "3 replicas, 2 view changes, 1 crash, 1 operation"
+even after 41 hours and 3.6 trillion states. **Treat any clean run at this bound as a real, positive
+result — and treat "still running, no errors yet, states still growing" as inconclusive-but-not-bad,
+not as a failure requiring a smaller bound to chase.** See Step 7 below for exactly how to run and
+interpret this.
 
 - [ ] **Step 2: Add replica state and the derived `View`/`IsPrimary` predicates to `VSR.tla`**
 
@@ -467,6 +477,14 @@ VARIABLES
     rep_recv_svc,          \* [replica -> SUBSET replicas] -- STARTVIEWCHANGE senders for current view
     rep_recv_dvc,          \* [replica -> SUBSET [message]] -- DOVIEWCHANGE messages received
     aux_svc_count          \* [replica -> Nat] -- bounds TimerSendSVC, research §6.3 point 4
+```
+
+Also add, anywhere at module top level (this is what `VSR.cfg`'s `SYMMETRY ValuesSymmetry` line
+refers to — per research §6.3 point 6, safe for safety-only checking since this plan's `Next`
+disjunction includes no fairness/liveness properties):
+
+```tla
+ValuesSymmetry == Permutations(Values)
 ```
 
 Add these to `vars` (replacing Task 2's `vars` definition):
@@ -669,14 +687,33 @@ Next ==
 Also add `\A r \in replicas : rep_view_number[r] \in Nat` and `\A r \in replicas : rep_status[r] \in
 {"Normal", "ViewChange"}` to `TypeOK`.
 
-Run: `scripts/tlc VSR`
-Expected: clean (`Model checking completed. No error has been found.`) — this task doesn't yet
-complete a view change (no `SendSV`/`ReceiveSV`, so replicas that enter `"ViewChange"` status stay
-there; primaries can't process further requests from a stuck-in-view-change backup, but nothing here
-should violate `NoLogDivergence` or `AcknowledgedWritesExistOnMajority`, since no log is ever
-overwritten yet — that risk starts in Task 4). If TLC reports a deadlock despite `CHECK_DEADLOCK
-FALSE`, or any invariant violation, stop and diagnose before proceeding — don't carry a broken
-foundation into Task 4.
+Run: `scripts/tlc VSR`, with a generous timeout on the command itself (10 minutes — pass this
+directly to your Bash tool's own timeout parameter if it has one; do not background this command,
+you're a single continuous execution, not something spanning multiple conversation turns, so running
+it in the foreground and just waiting is correct here).
+
+**Set your expectations from real precedent, not from how fast Task 1/2's TLC runs were.** This
+spec's state space grows fast once view-change actions exist, even at the tiny bound above — the
+controller who wrote this plan independently confirmed this by testing several bounds (including
+one even smaller than this task's) before finalizing it, and none terminated within a couple of
+minutes. This is expected for this entire class of spec (see the note under Task 3 Step 1's `.cfg`
+for the exact research citation), not a sign your transcription is wrong.
+
+- **If it finishes within 10 minutes**: expected outcome is clean (`Model checking completed. No
+  error has been found.`) — this task doesn't yet complete a view change (no `SendSV`/`ReceiveSV`,
+  so replicas that enter `"ViewChange"` status stay there), but nothing here should violate
+  `NoLogDivergence` or `AcknowledgedWritesExistOnMajority`, since no log is ever overwritten yet
+  (that risk starts in Task 4). If it finds a real invariant violation instead, stop and diagnose
+  before proceeding — don't carry a broken foundation into Task 4.
+- **If it's still running with no error after 10 minutes** (states still being generated, no
+  `Error:` line): this is a legitimate, expected outcome for this spec class, not a failure. Stop
+  the run, report in your task report exactly what you observed (the last few `Progress(...)` lines
+  TLC printed — states generated, distinct states found, states left on queue) as evidence that no
+  violation was found in the portion of the state space actually explored, and proceed to commit and
+  move on. Do not keep re-running with smaller and smaller bounds chasing a "clean and complete"
+  result — the plan's own bound is already close to the smallest one that still exercises real
+  view-change machinery, and further shrinking trades away meaningful coverage for a false sense of
+  completeness.
 
 - [ ] **Step 8: Commit**
 
@@ -795,19 +832,29 @@ Next ==
     \/ ReceiveSV
 ```
 
-- [ ] **Step 5: Run TLC at the Task 3 bound, expect clean**
+- [ ] **Step 5: Run TLC at the Task 3 bound**
 
-Run: `scripts/tlc VSR`
-Expected: `Model checking completed. No error has been found.` at `ReplicaCount=3, Values={v1,v2},
-StartViewOnTimerLimit=2`. This is genuinely the deliverable moment for this plan (task-master
-subtask 3.1's stated deliverable: "a TLA+ spec, model-checked, with no known counterexamples in the
-checked state space") — do not treat a clean run here as optional or skippable.
+Run: `scripts/tlc VSR`, foreground, with a generous timeout (10+ minutes) on the command itself —
+same reasoning as Task 3 Step 7: you're one continuous execution, not spanning turns, so waiting in
+the foreground is correct and you don't need to background it.
 
-If TLC finds a counterexample, do not guess a fix — read the trace TLC prints (each state's variable
-values, in order) and compare against the exact mechanism research §5.7 documents (wrong-view DVC
-counting is the single most likely cause of a `NoLogDivergence` or `AcknowledgedWritesExistOnMajority`
-violation at this stage). Report what you found in your task report rather than silently patching
-around it.
+This is genuinely the deliverable moment for this plan (task-master subtask 3.1's stated
+deliverable: "a TLA+ spec, model-checked, with no known counterexamples in the checked state
+space") — treat it with real weight, but apply the same realistic timing expectation Task 3 Step 7
+set: this spec class's state space is large even at this small bound (real precedent cited there),
+so "still running, no errors, states still growing after 10 minutes" is an acceptable, reportable
+outcome, not a failure requiring you to shrink the bound further.
+
+- **If TLC finds a real counterexample**: do not guess a fix — read the trace TLC prints (each
+  state's variable values, in order) and compare against the exact mechanism research §5.7
+  documents (wrong-view DVC counting is the single most likely cause of a `NoLogDivergence` or
+  `AcknowledgedWritesExistOnMajority` violation at this stage). Report what you found in your task
+  report rather than silently patching around it.
+- **If it completes clean within the timeout**: `Model checking completed. No error has been
+  found.` — report the exact distinct-state count.
+- **If it's still running with no error at the timeout**: stop it, report the last few
+  `Progress(...)` lines as evidence of the portion actually explored, and proceed to commit —
+  matching Task 3 Step 7's guidance exactly.
 
 - [ ] **Step 6: Commit**
 
@@ -859,37 +906,48 @@ quorum-counting site, the specific one research §5.7's counterexample hinges on
 - [ ] **Step 3: Write `spec/tla/VSR-broken-dvc-filter.cfg`**
 
 Use a bound with enough view churn to give TLC room to find the violation — per research §6.2's
-documented "3 replicas, 3 view changes" as the minimum that exposed a related class of defect:
+documented "3 replicas, 3 view changes" as the minimum that exposed a related class of defect. Keep
+`Values` at a single element (this bug is about which *view* a DVC came from, not about value
+content, so this dimension doesn't need to be wide) and include `SYMMETRY`/`ValuesSymmetry` (defined
+in Task 3 Step 2) for consistency, even though its effect is minimal with only one value:
 
 ```
 SPECIFICATION Spec
 CONSTANTS
     ReplicaCount = 3
-    Values = {v1, v2}
+    Values = {v1}
     StartViewOnTimerLimit = 3
 INVARIANT TypeOK
 INVARIANT CommitNumberNeverHigherThanOpNumber
 INVARIANT NoLogDivergence
 INVARIANT AcknowledgedWritesExistOnMajority
 CHECK_DEADLOCK FALSE
+SYMMETRY ValuesSymmetry
 ```
 
 - [ ] **Step 4: Run TLC against the weakened spec**
 
 Run: `java -jar /work/toolchain/tla/tla2tools.jar -config VSR-broken-dvc-filter.cfg VSR.tla` (from
-`spec/tla/`)
+`spec/tla/`), foreground, with a generous timeout (10+ minutes) — same reasoning as Task 3 Step 7
+and Task 4 Step 5: you're one continuous execution, waiting in the foreground is correct.
 
 Expected: TLC finds a real invariant violation (most likely `NoLogDivergence` or
-`AcknowledgedWritesExistOnMajority`) with a full counterexample trace. This may take longer than
-Task 4's run (more view churn in the bound) — let it run; if it genuinely doesn't terminate in a
-reasonable time (say, 10+ minutes), that itself is useful information to report, but first try
-`StartViewOnTimerLimit = 2` before concluding it won't reproduce, since a smaller bound sometimes
-finds the same class of bug faster.
+`AcknowledgedWritesExistOnMajority`) with a full counterexample trace — `StartViewOnTimerLimit = 3`
+means more view churn than Tasks 3-4's own default bound, so per the same real-precedent timing
+note from Task 3 Step 1, this may well still be running with no result at 10 minutes even though
+the bug is genuinely present in the weakened spec; that's expected, not a sign the attempt failed.
 
-**If TLC does NOT find a violation at either bound**, do not treat that as success — it means either
-this spec's structure differs from Vanlightly's in some way that happens to avoid the bug (report
-this honestly, with your reasoning about why), or the bound is too small to expose it (try widening
-`Values`/`StartViewOnTimerLimit` once, report what you tried). This task's job is to honestly probe
+- **If TLC finds a violation within the timeout**: that's the expected, positive result — capture
+  the trace for your report.
+- **If it's still running with no error at 10 minutes**: stop it, and before concluding anything,
+  try `StartViewOnTimerLimit = 2` once (smaller bound, still has real view churn, sometimes finds
+  the same class of bug faster with less state to explore) — same 10-minute foreground budget.
+- **If TLC does NOT find a violation at either bound, or neither terminates in time**, do not treat
+  that as success — it means one of: this spec's structure differs from Vanlightly's in some way
+  that happens to avoid the bug (report this honestly, with your reasoning about why), the bound is
+  too small to expose it, or the bound is large enough to expose it but too large to *finish*
+  exploring in the time available (a real, reportable "inconclusive," not a silent pass). This task's
+  job is to honestly probe
 for the failure, not to manufacture a clean report either way.
 
 - [ ] **Step 5: Revert the temporary change and the throwaway config**
@@ -933,13 +991,17 @@ the real, final scope description:
 ## Scope
 
 `VSR.tla` specifies VSR's **core safety protocol**: normal-case replication and view change,
-model-checked clean (zero counterexamples) at `ReplicaCount=3, Values={v1,v2},
-StartViewOnTimerLimit=2` (`spec/tla/VSR.cfg`). Every documented defect in the original VSR paper
-(Liskov & Cowling, 2012) that this scope touches is pre-fixed, not left for TLC to (re)discover:
-the `ValidDvc` view-filtered DVC quorum counting (fixes a real, published 114-step safety
-counterexample), and commit-number monotonicity on `STARTVIEW` (fixes a real, published
-double-application defect). Task 5's adversarial verification (`git log` for its commit) proves
-the `ValidDvc` fix is load-bearing against this exact spec, not just against the original research.
+model-checked at `ReplicaCount=3, Values={v1}, StartViewOnTimerLimit=1` (`spec/tla/VSR.cfg`) — zero
+counterexamples in whatever portion of the state space Task 3/4's own runs actually completed
+exploring (see their task reports for the exact outcome: a full clean exhaustive run, or a
+bounded-time partial exploration with no violations found so far; both are legitimate per this
+plan's own Task 3 Step 1 note on real precedent for this spec class's state-space size). Every
+documented defect in the original VSR paper (Liskov & Cowling, 2012) that this scope touches is
+pre-fixed, not left for TLC to (re)discover: the `ValidDvc` view-filtered DVC quorum counting (fixes
+a real, published 114-step safety counterexample), and commit-number monotonicity on `STARTVIEW`
+(fixes a real, published double-application defect). Task 5's adversarial verification (`git log`
+for its commit) proves the `ValidDvc` fix is load-bearing against this exact spec, not just against
+the original research.
 
 **Known simplification, not an omission:** `ReceiveSV` does not re-send `PREPAREOK` for uncommitted
 entries carried into the new view (the paper's own §4.2 step 5 final clause). A replica that starts
@@ -979,6 +1041,17 @@ of these are settled by prior art, and none are needed by this plan's own scope)
    (recommended starting point: uniform — flexible quorums are a real latency win but triple the
    number of quorum constants and every intersection argument; this spec's `f`-based thresholds
    already assume uniform quorums throughout and would need generalizing).
+
+**A concrete, empirically-confirmed constraint for whoever plans the follow-up:** this plan's own
+Tasks 3-5 needed to shrink their bounds all the way to `Values = {v1}, StartViewOnTimerLimit = 1`
+(down from the research's own cited "3 replicas, 2 values, 2 view changes, known to terminate") and
+even that bound did not reliably finish exhaustively within a 10-minute budget on this box. Adding
+storage-fault recovery — nack bitsets, present bitsets, the multi-step interruptible view-change
+completion (open decision 3 above) — will only grow the state space further. Budget the follow-up
+plan's own model-checking tasks for simulation-mode-only verification (research §6.3 point 3) as the
+realistic default, not exhaustive brute-force checking, and set the same "bounded-time,
+inconclusive-is-a-legitimate-outcome" expectation in that plan's own task text from the start,
+rather than rediscovering this the way this plan's own author did mid-authoring.
 ```
 
 - [ ] **Step 2: Commit**
@@ -1012,3 +1085,17 @@ git commit -m "TLA+ Task 6: document scope, simplifications, and follow-up-plan 
   plan; Task 4 Step 5 and Task 5 both require the implementer to independently re-verify the
   transcription against this exact box's TLC, which is the right level of verification for adapted
   (not self-authored) protocol logic.
+- **State-space reality check, found and fixed during self-review, not left for an implementer to
+  discover mid-task:** the first draft of this plan set Tasks 3-5's bound to "3 replicas, 2 values, 2
+  view changes" on the strength of research §6.3 calling that bound "known to terminate" — but that
+  characterization was of Vanlightly's own (differently structured) specs, not this one. Before
+  finalizing, the controller actually ran the combined Tasks 2-4 spec at that bound and at
+  successively smaller ones (down to a single value, a single view-change limit, with `SYMMETRY`
+  added) against this box's real TLC, and none terminated within a short window — consistent with,
+  not contradicting, the research's own repeated real-world data (Vanlightly's own most complete spec
+  aborted after 41 hours and 3.6 trillion states at a comparably small bound). Fixed by: lowering the
+  plan's own default bound to `Values={v1}, StartViewOnTimerLimit=1`, adding `SYMMETRY` (real if
+  modest benefit), and rewriting every task step that runs TLC (Task 3 Step 7, Task 4 Step 5, Task 5
+  Steps 3-4) to set honest timing expectations and give concrete, actionable guidance for a
+  bounded-time run that's still running with no error rather than implying a fast, complete,
+  clean-or-broken result is the only legitimate outcome.
