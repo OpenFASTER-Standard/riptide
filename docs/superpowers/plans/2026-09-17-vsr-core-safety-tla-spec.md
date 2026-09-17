@@ -944,9 +944,17 @@ Run: `java -jar /work/toolchain/tla/tla2tools.jar -config VSR-broken-dvc-filter.
 `spec/tla/`), foreground, with a generous timeout (10+ minutes) — same reasoning as Task 3 Step 7
 and Task 4 Step 5: you're one continuous execution, waiting in the foreground is correct.
 
-Expected: TLC finds a real invariant violation (most likely `NoLogDivergence` or
-`AcknowledgedWritesExistOnMajority`) with a full counterexample trace — `StartViewOnTimerLimit = 3`
-means more view churn than Tasks 3-4's own default bound, so per the same real-precedent timing
+Expected: TLC finds a real invariant violation with a full counterexample trace.
+**`NoLogDivergence` cannot be the one that fires — this is now confirmed, not just unlikely.**
+Task 4's own reviewer proved that at this plan's bound (`Values = {v1}`), `NoLogDivergence` is
+structurally vacuous: with only one possible value in the whole system, two committed log entries
+can never actually disagree with each other, so the invariant is permanently true regardless of
+whether the protocol logic is correct. **Watch `AcknowledgedWritesExistOnMajority` instead** — that
+one doesn't depend on log *content* being distinguishable, only on which *replicas* hold an entry,
+so it remains a genuine discriminator even with one value. Task 4's reviewer independently
+pre-tested this exact mutation at `StartViewOnTimerLimit = 1` (not caught within 240 seconds) and
+confirmed this task's own bound of `3` is well-chosen for actually catching it. `StartViewOnTimerLimit
+= 3` means more view churn than Tasks 3-4's own default bound, so per the same real-precedent timing
 note from Task 3 Step 1, this may well still be running with no result at 10 minutes even though
 the bug is genuinely present in the weakened spec; that's expected, not a sign the attempt failed.
 
@@ -1023,6 +1031,21 @@ re-replicated by ordinary `PREPARE` traffic once the new primary resumes accepti
 rather than on an explicit re-ack step. This is safe for this scope (no entry is ever lost by it —
 `NoLogDivergence`/`AcknowledgedWritesExistOnMajority` do not depend on it) but may cost extra
 round-trips in practice; revisit if a later plan needs tighter liveness bounds.
+
+**Known limitation of the shipped bound, disclosed rather than silently accepted:**
+`NoLogDivergence` is one of this scope's two headline safety invariants, but at
+`Values = {v1}` (chosen for tractability — see Task 3 Step 1's own note on this spec class's
+state-space size) it is structurally unfalsifiable: with only one possible value anywhere in the
+system, two committed log entries can never actually disagree with each other, so the invariant is
+permanently true regardless of whether the underlying protocol logic is correct. Task 4's reviewer
+found and proved this precisely (confirmed by mutation-testing: inverting the safety-critical
+`WinningDVC` comparison is still caught in seconds — but by `CommitNumberNeverHigherThanOpNumber`,
+not by `NoLogDivergence`). **The real evidence this scope's model-checking provides comes from the
+other three invariants** (`TypeOK`, `CommitNumberNeverHigherThanOpNumber`,
+`AcknowledgedWritesExistOnMajority` — the last of these does remain a genuine discriminator, since
+it depends on which replicas hold an entry, not on distinguishing entry content). A follow-up plan
+that wants `NoLogDivergence` to mean something should widen `Values` to at least 2 elements for
+that specific check — expect the state-space cost documented throughout this plan when doing so.
 
 **Explicitly out of scope, for a follow-up plan (not this one):**
 - **State-transfer** (`GETSTATE`/`NEWSTATE`) — the paper's own version has a documented, real
