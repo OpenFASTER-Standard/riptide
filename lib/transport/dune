@@ -1,0 +1,3 @@
+(library
+ (name riptide_transport)
+ (libraries eio eio.unix))
