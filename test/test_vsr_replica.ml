@@ -236,8 +236,9 @@ let test_prepare_addressed_to_primary_itself_dropped () =
      commit failed the suite; the same mutation at this test's own prior version passed). With the
      view matching, a disabled is_primary guard would fall through to accept this as a normal
      backup Prepare (appending to the log and sending a Prepare_ok reply), so this version's
-     assertions genuinely fail if that guard is disabled -- confirmed below the test list via
-     mutation, per this file's own verification pass. *)
+     assertions genuinely fail if that guard is disabled -- confirmed via mutation testing
+     (disabling is_primary here makes this test fail; re-enabling it passes again), not just
+     asserted. *)
   let send, sent = capturing_send () in
   let t = create_at_view_1 ~my_id:1 ~replica_count:3 ~send in
   let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "x"; k = 0 }) in
