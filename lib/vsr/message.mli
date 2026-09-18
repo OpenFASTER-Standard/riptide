@@ -64,4 +64,10 @@ val encode : t -> string
 val decode : string -> t
 (** [decode s] is the inverse of {!encode}. Raises {!Malformed_message} on any malformed
     or adversarial input, per that exception's own doc comment above — never raises
-    [Invalid_argument], never loops, never crashes with an unhandled exception. *)
+    [Invalid_argument], never loops, never crashes with an unhandled exception.
+
+    An unrecognized EXTRA field in an otherwise well-formed [Record] is silently ignored,
+    not rejected — [decode] only requires that every field this constructor actually reads
+    be present with the right shape; it does not require the [Record] to contain nothing
+    else. This is a deliberate forward-compatibility choice, not an oversight: a future
+    protocol version could safely add a field an older [decode] simply drops. *)
