@@ -201,7 +201,13 @@ let run_connection t ~is_dialer ~owns_flow peer_id flow r =
   (match !writer_cell, Hashtbl.find_opt t.writers peer_id with
    | Some w, Some w' when w == w' -> Hashtbl.remove t.writers peer_id
    | _ -> ());
-  if owns_flow then (try Eio.Flow.close flow with _ -> ())
+  if owns_flow then (
+    try Eio.Flow.close flow with
+    | End_of_file | Eio.Io _ -> ()
+    (* [Eio.Cancel.Cancelled] is deliberately NOT caught here either, for the same reason
+       [writer_body]/[reader_body] leave it uncaught above: if this cleanup itself is running
+       inside an outer cancellation (e.g. the whole transport's [sw] tearing down), swallowing
+       that signal here would stop it from propagating to whatever is waiting on it. *))
 
 let handle_accepted t flow =
   let r = Eio.Buf_read.of_flow flow ~max_size:max_message_size in

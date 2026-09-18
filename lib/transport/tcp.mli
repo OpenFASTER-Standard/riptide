@@ -48,6 +48,16 @@
     otherwise leave a still-running writer holding (or, worse, attempting to write to) a flow the
     rest of this module has already treated as gone.
 
+    Two consequences of this coupling, both intended, neither previously written down anywhere
+    but the source: a peer that half-closes its side of the connection (shuts down its write
+    direction but leaves its read direction open, a valid TCP operation this module does not
+    otherwise distinguish from a full close) is treated as fully dead -- the reader's
+    [End_of_file] stops the writer too, even though the peer might still have been able to
+    receive. And any bytes already handed to {!send} but not yet flushed to the OS at the moment
+    the reader side notices the connection is dead are discarded, not delivered -- consistent
+    with {!Transport_intf.S.send}'s own "no delivery guarantee" documentation, but worth stating
+    plainly here since this is the specific mechanism that can trigger it.
+
     {2 Send failures}
 
     {!send} raises [Invalid_argument] (never any other exception type) in three cases:
