@@ -699,6 +699,26 @@ let test_check_timeout_bounded_by_svc_limit () =
   Alcotest.(check int) "no additional StartViewChange broadcast for the blocked timeout" sent_before_third
     (List.length (sent ()))
 
+let test_check_timeout_resets_recv_svc_across_episodes () =
+  (* task-2-review.md's M2: check_timeout's own [recv_svc <- Int_set.empty] reset (VSR.tla:168)
+     had zero coverage -- deleting it left the whole suite green. VSR.tla's SendSV (:280) and
+     ReceiveSV (:304) both leave [rep_recv_svc] UNCHANGED, so once Task 3 lands, a replica
+     returning to Normal still has its PREVIOUS episode's senders in [recv_svc]; without this
+     reset, the next check_timeout would start a new view-change episode already "at quorum" and
+     fire a premature DoViewChange nobody else has asked for. Simulates that return-to-Normal via
+     [for_test_set_view] (matching test_check_timeout_bounded_by_svc_limit's own convention). *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~svc_limit:5 ~send in
+  Replica.check_timeout t;
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
+  let n_after_episode1 = List.length (sent ()) in
+  Replica.for_test_set_view t ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
+  Replica.check_timeout t;
+  Alcotest.(check int)
+    "new episode sends only the 4 StartViewChange broadcasts, no premature DoViewChange"
+    (n_after_episode1 + 4) (List.length (sent ()))
+
 (* ---- Start_view_change dispatch: ReceiveHigherSVC (VSR.tla:183-194) / ReceiveMatchingSVC
    (VSR.tla:196-205) / SendDVC (VSR.tla:216-228) ---- *)
 
@@ -828,6 +848,29 @@ let test_start_view_change_forged_out_of_range_i_dropped () =
     true
     (Replica.status t = Replica.View_change && Replica.view_number t = 5)
 
+let test_start_view_change_self_addressed_i_dropped () =
+  (* task-2-review.md's M1: unlike the forged-out-of-range case above, a StartViewChange naming
+     THIS replica's own id (i = my_id) is not a forgery at all -- VSR.tla's own BroadcastFunc
+     (VSR.tla:56) makes m.i = r structurally unreachable for a correct replica's own broadcast,
+     but lib/sim/network.ml has no self-delivery special case, so an ordinary broadcast loops
+     back into the sender's own dispatch loop in real running code. Without excluding i = my_id,
+     that self-addressed message would count toward this replica's own SendDVC quorum for free --
+     reproduced here at replica_count=5 (f=2): one genuine other id plus a self-addressed id must
+     NOT reach the f=2 threshold, since only one real corroborator exists. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  Replica.check_timeout t;
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
+  let sent_after_one_genuine = List.length (sent ()) in
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 1 }));
+  Alcotest.(check int) "a self-addressed StartViewChange (i = my_id) sends no DoViewChange: only \
+                         one real corroborator exists, below the f=2 threshold"
+    sent_after_one_genuine (List.length (sent ()));
+  (* a second genuine, distinct other id (i=3) DOES complete real quorum *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
+  Alcotest.(check int) "a second genuine corroborator completes real quorum (one DoViewChange sent)"
+    (sent_after_one_genuine + 1) (List.length (sent ()))
+
 (* ---- for_test_set_view (test-support surface) ---- *)
 
 let test_for_test_set_view_round_trips_independently () =
@@ -915,6 +958,9 @@ let tests =
       `Quick,
       test_check_timeout_noop_when_already_view_change );
     ("Task 2: check_timeout is bounded by svc_limit", `Quick, test_check_timeout_bounded_by_svc_limit);
+    ( "Task 2: check_timeout resets recv_svc across episodes (task-2-review.md's M2)",
+      `Quick,
+      test_check_timeout_resets_recv_svc_across_episodes );
     (* Task 2: Start_view_change dispatch (ReceiveHigherSVC / ReceiveMatchingSVC / SendDVC) *)
     ( "Task 2: ReceiveHigherSVC adopts the higher view, seeds recv_svc, and resets the episode",
       `Quick,
@@ -931,6 +977,9 @@ let tests =
     ( "Task 2: a StartViewChange with a forged out-of-range i is dropped wholesale",
       `Quick,
       test_start_view_change_forged_out_of_range_i_dropped );
+    ( "Task 2: a self-addressed StartViewChange (i = my_id) is dropped (task-2-review.md's M1)",
+      `Quick,
+      test_start_view_change_self_addressed_i_dropped );
     (* Task 2: for_test_set_view (test-support surface) *)
     ( "Task 2: for_test_set_view round-trips status/view_number/last_normal_view independently",
       `Quick,

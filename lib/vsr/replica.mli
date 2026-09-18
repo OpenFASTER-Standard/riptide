@@ -367,15 +367,18 @@ val handle_message : t -> string -> unit
          [status t = Normal] — no episode is running here to join) — not enabled by anything,
          dropped, the same "no buffering/retry" discipline already established for an out-of-order
          [Prepare].}}
-      {b Also gated on [m.i] being a valid replica id in [1, replica_count]}, for both branches —
-      not itself a VSR.tla guard (the abstract model's own [Broadcast] can only ever produce a
-      well-formed [i]), but the same defense-in-depth this function's own [Prepare_ok] handling
-      above applies to [m.i]: a decoded [Start_view_change] naming no real replica must never be
+      {b Also gated on [m.i] being a valid replica id in [1, replica_count], EXCLUDING this
+      replica's own id}, for both branches — not itself a VSR.tla guard (the abstract model's own
+      [Broadcast] can only ever produce a well-formed, non-self [i]), but the same defense-in-depth
+      this function's own [Prepare_ok] handling above applies to [m.i]: a decoded
+      [Start_view_change] naming no real replica, OR naming this replica itself, must never be
       allowed into [recv_svc], which [SendDVC]'s own [Cardinality(recv_svc) >= f] check below
-      treats as a raw member count — left unchecked, a single forged message would inflate that
-      count for free. A [m.i] failing this check drops the WHOLE message (no state change at all,
-      not even adopting a higher [m.v]) — same "guard failure ⇒ total no-op" convention as every
-      other guard in this module.
+      treats as a raw member count — left unchecked, either would inflate that count for free
+      (the self-addressed case is not even a forgery: this codebase's simulated transport has no
+      self-delivery special case, so an ordinary broadcast genuinely loops back into the sender's
+      own dispatch loop). A [m.i] failing this check drops the WHOLE message (no state change at
+      all, not even adopting a higher [m.v]) — same "guard failure ⇒ total no-op" convention as
+      every other guard in this module.
 
       {b [SendDVC] (VSR.tla:216-228) has no separate entry point of its own} — like
       [PrimaryExecuteOp] (see {!propose}'s own doc comment for the precedent), its guard

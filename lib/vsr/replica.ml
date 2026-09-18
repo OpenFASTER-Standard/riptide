@@ -24,17 +24,16 @@ module Int_set = Set.Make (Int)
 type t = {
   my_id : int;
   replica_count : int;
-  svc_limit : int; (* StartViewOnTimerLimit -- bounds check_timeout, a later plan's own concern;
-                       stored now (Architecture) but not yet read by anything in this plan's
-                       scope. *)
+  svc_limit : int; (* StartViewOnTimerLimit -- bounds check_timeout; read by check_timeout
+                       itself, below in this same file. *)
   log : Replica_log.t;
   mutable status : status; (* VSR.tla's [rep_status[r]] (VSR.tla:29). *)
   mutable view_number : int; (* VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. *)
   mutable last_normal_view : int;
   (* VSR.tla's [rep_last_normal_view[r]] (VSR.tla:31) -- the paper's [v'], deliberately NOT
-     derivable from [view_number]. Not yet written or read by anything in this plan's scope
-     (view-change hasn't landed yet); stored now per Architecture so later plans don't need to
-     restructure [t] again. *)
+     derivable from [view_number]. Read by try_send_dvc (below, DoViewChange's own
+     last_normal_view field); still only ever WRITTEN by test-support code in this task's own
+     scope -- SendSV/ReceiveSV (a later task) are the real writers. *)
   mutable commit_number : int;
   mutable recv_svc : Int_set.t;
   (* VSR.tla's [rep_recv_svc[r]] (VSR.tla:33) -- STARTVIEWCHANGE senders for the current
@@ -142,8 +141,9 @@ let entries t = Replica_log.to_list t.log
 
 (* ---- Test-support surface: NOT part of the protocol. ----
    [t] is abstract, and the real protocol never lets anything other than the view-change actions
-   themselves (TimerSendSVC / ReceiveHigherSVC / ReceiveMatchingSVC / SendSV / ReceiveSV -- later
-   plans) move [view_number]. Tests, though, need a way to put a chosen replica id at [primary t]
+   themselves (TimerSendSVC / ReceiveHigherSVC / ReceiveMatchingSVC, implemented below in this
+   same file; SendSV / ReceiveSV, a later task) move [view_number]. Tests, though, need a way to
+   put a chosen replica id at [primary t]
    without either hand-deriving [Primary(v)] at every call site or waiting for view-change to
    exist. See replica.mli's own doc comment on this function for the exact convention it
    establishes (view_number = 1 always makes replica id 1 the primary, regardless of
@@ -162,9 +162,9 @@ let entries t = Replica_log.to_list t.log
    reads [last_normal_view] (this task's own scope), but Task 2/3's [WinningDVC] (VSR.tla:248-255)
    selects the surviving log by [last_normal_view] FIRST, so a falsely-stale value there would
    corrupt exactly the highest-risk logic in the whole plan. Keeping the two fields in sync by
-   default is the only reachable choice; a future test that genuinely needs them to differ (e.g.
-   to construct a mid-view-change state once [status] itself is settable) should get its own,
-   separate test-support constructor rather than repurposing this one. *)
+   default is the only reachable choice; a test that genuinely needs them to differ (e.g. to
+   construct a mid-view-change state) should use {!for_test_set_view} below, its own, separate
+   test-support constructor, rather than repurposing this one. *)
 let for_test_set_view_number t v =
   t.view_number <- v;
   t.last_normal_view <- v
@@ -393,7 +393,7 @@ let check_timeout t =
    [handle_message]'s own [Start_view_change] dispatch below decides which of these two (if
    either) is enabled for a given decoded message. *)
 let handle_start_view_change t ~(v : int) ~(i : int) =
-  if i < 1 || i > t.replica_count then
+  if i < 1 || i > t.replica_count || i = t.my_id then
     () (* Defense-in-depth, not itself a VSR.tla guard -- mirrors [handle_prepare_ok]'s own [m.i]
           check (see [peer_op_number]'s doc comment above for the general rationale): VSR.tla:15's
           own [replicas == 1..ReplicaCount] domain restriction means [rep_recv_svc[r]] can never
@@ -403,11 +403,20 @@ let handle_start_view_change t ~(v : int) ~(i : int) =
           wire has no such guarantee. Left unchecked, a single forged [StartViewChange] naming a
           non-existent replica id would inflate [Cardinality(recv_svc)] -- the exact same quorum-
           inflation bug class M1 (task-1-review.md) fixed for [Prepare_ok]'s own [i] field, just
-          feeding [SendDVC]'s threshold instead of [is_committed_quorum]'s. Dropped WHOLESALE (no
-          state change at all -- view_number/status untouched even if [v > view_number] would
-          otherwise adopt it), exactly like a wrong-[i] [Prepare_ok]: simpler to reason about than
-          applying every effect except the [recv_svc] write, and consistent with this module's
-          established "guard failure => total no-op" convention. *)
+          feeding [SendDVC]'s threshold instead of [is_committed_quorum]'s. [i = t.my_id] is
+          excluded too: VSR.tla's own [BroadcastFunc] (VSR.tla:56, [replicas \ {source}]) makes
+          [m.i = r] structurally unreachable for a [StartViewChange] a correct replica ever
+          produces, but this codebase's simulated transport has no self-delivery special case
+          ([lib/sim/network.ml]'s [send]/[pump_one] place a self-addressed message straight into
+          the sender's own inbox) -- so without this exclusion, a self-addressed [StartViewChange]
+          (not even a forgery, just an ordinary broadcast looping back) would count toward this
+          replica's own quorum for free (task-2-review.md's M1, reproduced live: one genuine other
+          plus one self-addressed message reached [SendDVC]'s threshold with only one real
+          corroborator). Dropped WHOLESALE (no state change at all -- view_number/status untouched
+          even if [v > view_number] would otherwise adopt it), exactly like a wrong-[i]
+          [Prepare_ok]: simpler to reason about than applying every effect except the [recv_svc]
+          write, and consistent with this module's established "guard failure => total no-op"
+          convention. *)
   else if v > t.view_number then begin
     (* ReceiveHigherSVC (VSR.tla:183-194): a higher view than our own -- assume-mode, adopt it
        unconditionally (no majority needed to START a view change this way; see VSR.tla's own
