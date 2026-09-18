@@ -6,20 +6,21 @@ open Riptide
 (* VSR.tla's own [rep_status] (VSR.tla:29): {"Normal", "ViewChange"}. Renamed [View_change] here
    only for OCaml's own constructor-casing convention -- no semantic change from the spec's own
    string literal. [View_change] is unused within THIS plan's scope (nothing here ever transitions
-   [status] away from [Normal] -- that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]), hence
-   the warning suppression; it exists now, per Architecture, so [t]'s shape doesn't need to change
-   again once that plan lands. *)
+   [status] away from [Normal] -- that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]); it
+   exists now, per Architecture, so [t]'s shape doesn't need to change again once that plan lands. *)
 type status = Normal | View_change
 
 (* Nothing in THIS plan's scope ever constructs [View_change] -- no action here moves [status]
    away from [Normal] (that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]). [Normal] is
    constructed for real, in [create]; [View_change] exists on the type now, per Architecture, so
    [t]'s shape doesn't need to change again once that later plan lands. This unused, never-called
-   binding exists solely so the compiler sees [View_change] actually built somewhere (warning 37,
-   unused-constructor, fires on a constructor that's never used to build a value, not one that's
-   merely unmatched) -- deliberately not blanket-disabling the warning for the whole file, so a
-   FUTURE genuinely-dead constructor would still be caught. *)
-let _view_change_witness = View_change [@warning "-32"]
+   binding (the underscore prefix already suppresses warning 32, unused-value, on its own -- no
+   attribute needed for that) exists solely so the compiler sees [View_change] actually built
+   somewhere: warning 37 (unused-constructor) fires on a constructor that's never used to build a
+   value, not one that's merely unmatched, and removing this binding reproduces that error
+   directly. Deliberately not blanket-disabled for the whole file, so a FUTURE genuinely-dead
+   constructor would still be caught. *)
+let _view_change_witness = View_change
 
 type t = {
   my_id : int;
@@ -73,6 +74,12 @@ let create ~my_id ~replica_count ~svc_limit ~send =
        ReplicaCount, and VSR.cfg never instantiates an even count";
   if my_id < 1 || my_id > replica_count then
     invalid_arg "Replica.create: my_id must be in [1, replica_count] (VSR.tla's replicas == 1..ReplicaCount)";
+  if svc_limit < 1 then
+    invalid_arg
+      "Replica.create: svc_limit must be >= 1 -- VSR.tla:163's own [aux_svc_count[r] < \
+       StartViewOnTimerLimit] guard on TimerSendSVC is never satisfiable at aux_svc_count[r] = 0 \
+       (Init's own starting value) for a non-positive limit, which would permanently and silently \
+       disable view-change from ever starting on this replica";
   {
     my_id;
     replica_count;
@@ -105,6 +112,7 @@ let is_primary t = t.my_id = primary t
 let op_number t = Replica_log.length t.log
 let commit_number t = t.commit_number
 let view_number t = t.view_number
+let last_normal_view t = t.last_normal_view
 let entries t = Replica_log.to_list t.log
 
 (* ---- Test-support surface: NOT part of the protocol. ----
@@ -114,8 +122,27 @@ let entries t = Replica_log.to_list t.log
    without either hand-deriving [Primary(v)] at every call site or waiting for view-change to
    exist. See replica.mli's own doc comment on this function for the exact convention it
    establishes (view_number = 1 always makes replica id 1 the primary, regardless of
-   replica_count, since Primary(1) = 1 + ((1-1) mod replica_count) = 1 for any replica_count). *)
-let for_test_set_view_number t v = t.view_number <- v
+   replica_count, since Primary(1) = 1 + ((1-1) mod replica_count) = 1 for any replica_count).
+
+   Also sets [last_normal_view] to the same value [v] -- NOT left untouched. Fix-round finding M3
+   (task-1-review.md): a fresh TLC run of a copy of VSR.tla with the added invariant
+   [status[r] = "Normal" => last_normal_view[r] = view_number[r]] found ZERO violations across
+   264,376 distinct reachable states, so [status = Normal /\ last_normal_view <> view_number] is
+   genuinely unreachable in the real protocol -- every spec action that (re-)enters "Normal"
+   ([SendSV], VSR.tla:275-276; [ReceiveSV], VSR.tla:301-302) sets [rep_last_normal_view] to the
+   new view in the SAME step, and every action that raises [view_number] moves [status] to
+   "ViewChange" first (VSR.tla:166-167, 187-188), so the two are never allowed to be Normal and
+   mismatched simultaneously. Leaving [last_normal_view] stale here would let every test built on
+   this setter silently validate against a protocol-impossible state -- harmless while nothing
+   reads [last_normal_view] (this task's own scope), but Task 2/3's [WinningDVC] (VSR.tla:248-255)
+   selects the surviving log by [last_normal_view] FIRST, so a falsely-stale value there would
+   corrupt exactly the highest-risk logic in the whole plan. Keeping the two fields in sync by
+   default is the only reachable choice; a future test that genuinely needs them to differ (e.g.
+   to construct a mid-view-change state once [status] itself is settable) should get its own,
+   separate test-support constructor rather than repurposing this one. *)
+let for_test_set_view_number t v =
+  t.view_number <- v;
+  t.last_normal_view <- v
 
 (* [Value.value] identity for dedup/is_committed purposes: canonical-encoding equality, not
    OCaml's structural [=] -- see replica.mli's own doc comment on [propose] for why (lib/value.mli's

@@ -37,6 +37,92 @@ let create_at_view_1 ~my_id ~replica_count ~send =
   Replica.for_test_set_view_number t 1;
   t
 
+(* ---- Primary(v) (VSR.tla:18) and view_number/last_normal_view (fix-round findings M2, M3) ----
+
+   Neither `Replica.primary` nor `Replica.view_number` had any direct test before this fix round
+   (task-1-review.md's M2 finding): every OTHER test in this file only ever exercises view 1 (via
+   create_at_view_1, where Primary(1) = 1 for every replica_count) or view 0 at replica_count = 1
+   (where Primary is 1 for every v) -- neither exercises the negative-dividend branch the
+   Euclidean-modulo normalization in replica.ml exists for. Concretely, the reviewer confirmed by
+   mutation that BOTH the naive, un-normalized formula (which gives the wrong Primary(0) = 0, an
+   id outside [1, replica_count]) AND a fully gutted `primary` function pass the full suite without
+   these tests. *)
+
+let test_primary_formula_matches_tlc () =
+  let primary_of ~replica_count ~view_number =
+    let t = Replica.create ~my_id:1 ~replica_count ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+    Replica.for_test_set_view_number t view_number;
+    Replica.primary t
+  in
+  (* TLC 2.19 against VSR.tla:18's own formula at ReplicaCount = 3 -- this session's own
+     independently re-verified table (both in the original task-1 report and again by the
+     reviewer): Primary(0..4) = 3, 1, 2, 3, 1. The v=0 case is the trap this whole test exists to
+     pin: Primary(0) = replica_count = 3, NEITHER 0 (the naive un-normalized-modulo bug) NOR 1
+     (the "view 0 means replica 1" assumption replica.mli explicitly warns against). *)
+  List.iter2
+    (fun view_number expected ->
+      Alcotest.(check int)
+        (Printf.sprintf "Primary(%d) at replica_count=3 matches TLC" view_number)
+        expected
+        (primary_of ~replica_count:3 ~view_number))
+    [ 0; 1; 2; 3; 4 ] [ 3; 1; 2; 3; 1 ];
+  (* A second replica_count generalizes the check beyond n=3 specifically -- TLC's own periodicity
+     (Primary(v) = Primary(v + replica_count)) at n=5: Primary(0..5) = 5, 1, 2, 3, 4, 5. *)
+  List.iter2
+    (fun view_number expected ->
+      Alcotest.(check int)
+        (Printf.sprintf "Primary(%d) at replica_count=5 matches TLC" view_number)
+        expected
+        (primary_of ~replica_count:5 ~view_number))
+    [ 0; 1; 2; 3; 4; 5 ] [ 5; 1; 2; 3; 4; 5 ];
+  (* The trap named explicitly: view 0's primary is replica_count, never 0 (the un-normalized-
+     modulo bug) and never 1 (the "view 0 means replica 1" assumption). *)
+  Alcotest.(check int) "Primary(0) = replica_count, not 0 or 1"
+    3
+    (primary_of ~replica_count:3 ~view_number:0)
+
+let test_is_primary_agrees_with_primary_formula () =
+  (* is_primary t is documented as exactly [t.my_id = primary t] -- confirm both the true and
+     false case at a view where the "natural" (view 0) primary is NOT replica 1. *)
+  let t3 = Replica.create ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check bool) "replica 3 is primary at the default view_number=0 (Primary(0)=3)" true (Replica.is_primary t3);
+  let t1 = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check bool) "replica 1 is NOT primary at the default view_number=0" false (Replica.is_primary t1)
+
+let test_view_number_round_trips_for_test_set_view_number () =
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check int) "view_number starts at 0 (VSR.tla's own Init)" 0 (Replica.view_number t);
+  Replica.for_test_set_view_number t 7;
+  Alcotest.(check int) "view_number round-trips for_test_set_view_number" 7 (Replica.view_number t)
+
+(* ---- M3 fix-round regression test: for_test_set_view_number must keep last_normal_view in sync
+   ----
+
+   Before the fix, for_test_set_view_number only moved view_number, leaving last_normal_view
+   behind at its Init value of 0. The reviewer proved by a fresh TLC run (264,376 distinct
+   reachable states, `NormalImpliesLastNormalViewMatches` added as an invariant, no error found)
+   that [status = "Normal" => last_normal_view = view_number] is a genuine invariant of
+   spec/tla/VSR.tla -- so the old helper silently built every calling test (both in this file and
+   in test_vsr_replica_cluster.ml) on top of a protocol-UNREACHABLE state. Harmless today (nothing
+   in this plan's scope reads last_normal_view yet), but load-bearing the moment Task 2/3's
+   WinningDVC (VSR.tla:248-255) starts selecting the surviving log by last_normal_view first. This
+   test pins the invariant directly against the helper's own output, and would fail against the
+   old (pre-fix) version of for_test_set_view_number, which left last_normal_view at 0 here
+   instead of advancing it to 5. *)
+let test_for_test_set_view_number_keeps_last_normal_view_in_sync () =
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check int) "last_normal_view starts at 0 (VSR.tla's own Init)" 0 (Replica.last_normal_view t);
+  Replica.for_test_set_view_number t 5;
+  Alcotest.(check int) "view_number advances to 5" 5 (Replica.view_number t);
+  Alcotest.(check int)
+    "last_normal_view advances IN LOCKSTEP with view_number -- the spec's own \
+     NormalImpliesLastNormalViewMatches invariant, status=Normal here, requires last_normal_view = \
+     view_number, not the stale 0 an earlier version of this helper left behind"
+    5 (Replica.last_normal_view t);
+  (* Called again at a different value -- confirms this isn't a one-shot initialization quirk. *)
+  Replica.for_test_set_view_number t 12;
+  Alcotest.(check int) "last_normal_view tracks a SECOND call too" 12 (Replica.last_normal_view t)
+
 (* ---- propose (ReceiveClientRequest, VSR.tla:91-102) ---- *)
 
 let test_primary_propose_broadcasts_prepare () =
@@ -139,13 +225,22 @@ let test_prepare_wrong_view_dropped () =
 
 let test_prepare_addressed_to_primary_itself_dropped () =
   (* IsNormalBackup(r) requires Primary(View(r)) <> r -- a Prepare somehow handed to the primary's
-     own handle_message must not be treated as a backup receiving it. The is_primary check fires
-     before the view check (see handle_prepare's own guard order), so the message's own [view]
-     value here is irrelevant -- it is left at 0 rather than bumped to 1, to keep this test
-     minimal and focused on exactly the guard it's pinning. *)
+     own handle_message must not be treated as a backup receiving it.
+
+     Fix-round finding M1 (task-1-review.md): this message's [view] MUST match t's real
+     view_number (1, from create_at_view_1) -- NOT be left at a mismatched 0 as an earlier version
+     of this test did. With a mismatched view, disabling the is_primary guard entirely still left
+     the test passing (op_number unchanged, no reply sent), because the SEPARATE view guard
+     rejects the message for an unrelated reason and masks the role guard from ever being
+     exercised -- the reviewer proved this by mutation (disabling is_primary at the pre-fix parent
+     commit failed the suite; the same mutation at this test's own prior version passed). With the
+     view matching, a disabled is_primary guard would fall through to accept this as a normal
+     backup Prepare (appending to the log and sending a Prepare_ok reply), so this version's
+     assertions genuinely fail if that guard is disabled -- confirmed below the test list via
+     mutation, per this file's own verification pass. *)
   let send, sent = capturing_send () in
   let t = create_at_view_1 ~my_id:1 ~replica_count:3 ~send in
-  let prepare = Message.encode (Message.Prepare { view = 0; n = 1; v = v "x"; k = 0 }) in
+  let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "x"; k = 0 }) in
   Replica.handle_message t prepare;
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "no reply sent" true (sent () = [])
@@ -429,7 +524,18 @@ let test_prepare_ok_n_boundary_is_exactly_op_number () =
    never configured), so there is no longer any argument for that validation to apply to. This is
    a real removal of a test whose own precondition no longer exists, not a loosening of a
    surviving guard -- every other L1 case below (replica_count parity/positivity, my_id range)
-   still applies unchanged and is still pinned. *)
+   still applies unchanged and is still pinned.
+
+   Fix-round finding L2 (task-1-review.md): [svc_limit] -- the parameter that structurally
+   REPLACED [primary_id] in [create]'s signature -- was left completely unvalidated by the
+   original Task 1 commit, even though [create] validates every one of its other numeric
+   parameters. A non-positive [svc_limit] would silently and permanently disable [TimerSendSVC]
+   once Task 2 implements it (VSR.tla:163's own guard, [aux_svc_count[r] < StartViewOnTimerLimit],
+   is unsatisfiable at a non-positive limit since [aux_svc_count[r]] starts at 0 and never goes
+   negative) -- a "no view change happened" failure mode indistinguishable from "nothing triggered
+   one" without this check. [create] now rejects [svc_limit < 1]; the two cases below restore this
+   list to having a validated-numeric-argument case for every one of [create]'s parameters, the
+   same structural shape the list had before [primary_id] was removed. *)
 
 let expect_invalid_arg name (f : unit -> Replica.t) =
   ( name,
@@ -452,7 +558,22 @@ let create_invalid_arg_tests =
         Replica.create ~my_id:0 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
     expect_invalid_arg "my_id above replica_count is rejected" (fun () ->
         Replica.create ~my_id:4 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+    (* L2 fix-round regression tests *)
+    expect_invalid_arg "svc_limit = 0 is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:0 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "negative svc_limit is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:(-1) ~send:(fun ~to_:_ _ -> ()));
   ]
+
+(* L2 fix-round regression test: svc_limit = 1 (the smallest LEGAL value) must still be accepted
+   -- the fix must not overshoot into rejecting a genuinely valid, if minimal, configuration.
+   [svc_limit] itself has no reader in this task's scope (Task 2's [check_timeout] is its first),
+   so there is no accessor to assert its stored value against -- the only observable thing this
+   test can pin is that [create] does not raise, and that the resulting replica is otherwise a
+   perfectly normal, usable [Init] state. *)
+let test_svc_limit_boundary_one_is_accepted () =
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:1 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check int) "op_number starts at 0, same as any other valid create" 0 (Replica.op_number t)
 
 let test_create_accepts_a_valid_single_replica_cluster () =
   (* replica_count = 1 is odd and >= 1 -- a legitimate (if degenerate) configuration, not to be
@@ -505,6 +626,15 @@ let test_handle_message_out_of_scope_types_ignored () =
 
 let tests =
   [
+    (* Fix-round M2/M3 (task-1-review.md): Primary(v)/view_number/last_normal_view coverage *)
+    ("Fix-round M2: Primary(v) formula matches TLC's own table, at two replica_counts", `Quick, test_primary_formula_matches_tlc);
+    ("Fix-round M2: is_primary agrees with the Primary(v) formula", `Quick, test_is_primary_agrees_with_primary_formula);
+    ( "Fix-round M2: view_number round-trips for_test_set_view_number",
+      `Quick,
+      test_view_number_round_trips_for_test_set_view_number );
+    ( "Fix-round M3: for_test_set_view_number keeps last_normal_view in sync with view_number",
+      `Quick,
+      test_for_test_set_view_number_keeps_last_normal_view_in_sync );
     ("primary propose broadcasts Prepare to every other replica", `Quick, test_primary_propose_broadcasts_prepare);
     ("propose is a no-op on a non-primary replica", `Quick, test_propose_is_noop_on_non_primary);
     ("a duplicate client value is rejected the second time", `Quick, test_propose_duplicate_value_rejected_second_time);
@@ -558,5 +688,7 @@ let tests =
       test_propose_commits_immediately_in_single_replica_cluster );
     ("handle_message: malformed bytes are silently dropped, never raise", `Quick, test_handle_message_malformed_bytes_dropped);
     ("handle_message: out-of-scope message types are silently ignored", `Quick, test_handle_message_out_of_scope_types_ignored);
+    (* Fix-round L2 (task-1-review.md): svc_limit boundary *)
+    ("Fix-round L2: svc_limit = 1 (the smallest legal value) is accepted", `Quick, test_svc_limit_boundary_one_is_accepted);
   ]
   @ create_invalid_arg_tests

@@ -63,17 +63,24 @@ val create : my_id:int -> replica_count:int -> svc_limit:int -> send:(to_:int ->
     primary is gone; which replica id is primary is now always computed from {!view_number} via
     {!primary} (see this module's own top-level scope note). [svc_limit] is VSR.tla's own
     [StartViewOnTimerLimit] (VSR.tla:13) — stored on [t] now, per this plan's own Architecture, but
-    not yet read by anything in this plan's scope (a later plan's [check_timeout] is its first
-    reader).
+    not yet READ by anything in this plan's scope (a later plan's [check_timeout] is its first
+    reader), though it IS validated at {!create} time (see below) — [svc_limit] is the parameter
+    that structurally replaced the removed [primary_id] in this signature, and its own range needs
+    the same kind of cheap sanity check [primary_id] used to get.
 
     Raises [Invalid_argument] if [replica_count < 1]; if [replica_count] is even (VSR.tla:140's
     own comment assumes [2f+1 = ReplicaCount], i.e. an odd count — [spec/tla/VSR.cfg] never
-    instantiates an even one, and this module doesn't either); or if [my_id] falls outside
-    [1, replica_count] (VSR.tla's own [replicas == 1..ReplicaCount], VSR.tla:15). These are cheap,
-    deliberate sanity checks on {!create}'s own arguments, not a defense against adversarial
-    network input (that's {!handle_message}'s job — see its own doc comment below); a
-    [replica_count = 1] cluster is accepted (it is odd and [>= 1]) and behaves per VSR.tla's own
-    degenerate [f = 0] case — see {!propose}'s own doc comment for what that implies.
+    instantiates an even one, and this module doesn't either); if [my_id] falls outside
+    [1, replica_count] (VSR.tla's own [replicas == 1..ReplicaCount], VSR.tla:15); or if
+    [svc_limit < 1] — VSR.tla:163's own [TimerSendSVC] guard is [aux_svc_count[r] <
+    StartViewOnTimerLimit], and [aux_svc_count[r]] starts at [0] ([Init]) and is never negative, so
+    a non-positive [svc_limit] would make that guard permanently unsatisfiable, silently disabling
+    view-change from ever starting on this replica — a failure mode indistinguishable from "no view
+    change happened because nothing triggered one" without this check. These are cheap, deliberate
+    sanity checks on {!create}'s own arguments, not a defense against adversarial network input
+    (that's {!handle_message}'s job — see its own doc comment below); a [replica_count = 1] cluster
+    is accepted (it is odd and [>= 1]) and behaves per VSR.tla's own degenerate [f = 0] case — see
+    {!propose}'s own doc comment for what that implies.
 
     [send] is a closure over some transport handle's own [send : t -> to_:int -> string -> unit]
     (see {!Riptide_transport.Transport_intf.S.send}) with the handle itself and [~to_]'s type
@@ -136,10 +143,22 @@ val commit_number : t -> int
 
 val view_number : t -> int
 (** [view_number t] is VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. Starts at [0]
-    (VSR.tla's own [Init]) and, within this plan's scope, never changes — nothing in this module
-    yet implements any action that advances it (view-change is a later plan's scope; see this
-    module's own top-level note). Exposed read-only, the same way {!op_number}/{!commit_number}
-    are, since it is genuine protocol state, not a test-only concern. *)
+    (VSR.tla's own [Init]) and, within this plan's scope, only changes via
+    {!for_test_set_view_number} — nothing in this module yet implements any REAL action that
+    advances it (view-change is a later plan's scope; see this module's own top-level note).
+    Exposed read-only, the same way {!op_number}/{!commit_number} are, since it is genuine protocol
+    state, not a test-only concern. *)
+
+val last_normal_view : t -> int
+(** [last_normal_view t] is VSR.tla's [rep_last_normal_view[r]] (VSR.tla:31) — the paper's own
+    [v'], deliberately NOT derivable from {!view_number} in general (see [replica.ml]'s own doc
+    comment on the field). Within this plan's scope it only ever changes in lockstep with
+    {!view_number}, via {!for_test_set_view_number} — see that function's own doc comment for why
+    keeping the two synchronized is the only choice consistent with a genuine spec invariant,
+    confirmed by TLC: [status = "Normal" => last_normal_view = view_number] holds in every one of
+    VSR.tla's 264,376 distinct reachable states. Exposed read-only for the same reason
+    {!view_number} is: genuine protocol state a caller (in particular, a future Task 2/3 test
+    asserting this invariant, or [WinningDVC]'s own eventual consumer) may need to inspect. *)
 
 val entries : t -> Riptide.Value.value list
 (** [entries t] is this replica's log in append order (op-number 1 first) — a thin wrapper over
@@ -281,13 +300,26 @@ val handle_message : t -> string -> unit
     above. *)
 
 val for_test_set_view_number : t -> int -> unit
-(** [for_test_set_view_number t v] directly sets [t]'s [view_number] to [v], leaving every other
-    field (including [status], which stays [Normal]) untouched. Exists because {!create} no longer
-    takes a [primary_id] parameter — which replica id is primary is now always {!primary}, a pure
-    function of [view_number] — so a test that needs a SPECIFIC replica id to play the primary
-    role (the overwhelming majority of {!propose}/{!handle_message} tests, which are normal-case
-    tests with no path to move [view_number] any other way in this plan's scope) has no way to get
-    there other than this direct setter.
+(** [for_test_set_view_number t v] sets [t]'s [view_number] AND [last_normal_view] to [v]
+    (previously, before fix-round finding M3 in `task-1-review.md`, it left [last_normal_view]
+    behind at its Init value of [0] — see the two fields' own doc comments above, and
+    [replica.ml]'s doc comment on this function, for why that was a real bug in the test-support
+    surface itself: [status = Normal /\ last_normal_view <> view_number] is UNREACHABLE in the real
+    protocol, TLC-confirmed across all 264,376 distinct reachable states of `spec/tla/VSR.tla`, so
+    the old version silently built every calling test on top of a state the spec can never actually
+    be in). [status] is left untouched (stays [Normal], its only value in this plan's scope).
+    Exists because {!create} no longer takes a [primary_id] parameter — which replica id is primary
+    is now always {!primary}, a pure function of [view_number] — so a test that needs a SPECIFIC
+    replica id to play the primary role (the overwhelming majority of
+    {!propose}/{!handle_message} tests, which are normal-case tests with no path to move
+    [view_number] any other way in this plan's scope) has no way to get there other than this
+    direct setter.
+
+    {b If a future test genuinely needs [view_number] and [last_normal_view] to differ} (e.g. to
+    construct a mid-view-change state, once {!create}/a future setter can put [status] into
+    [View_change]), it should get its OWN, separate, explicitly-named test-support constructor
+    (e.g. [for_test_set_view : t -> status:... -> view_number:int -> last_normal_view:int -> unit])
+    rather than repurposing this one — keeping this one's default reachable is the point.
 
     {b Convention this module's own test suite uses}: [for_test_set_view_number t 1] always makes
     replica id [1] the primary, for ANY [replica_count] — [Primary(1) = 1 + ((1-1) %
