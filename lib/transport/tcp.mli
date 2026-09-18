@@ -91,6 +91,14 @@
     unrecoverable, at which point the failure is raised on [sw] rather than retried silently
     forever -- this module has no other channel to report it on.
 
+    Because there is no cap on the number of concurrent accepted connections, any party able to
+    reach this listener's port can drive it into fd exhaustion (and therefore the unrecoverable
+    case above) simply by opening connections and never sending a valid preamble. Real
+    authentication and connection-count limiting are out of scope for the same single-operator-
+    cluster reason given elsewhere in this file -- noted here because this is the specific
+    mechanism by which that trust assumption becomes a liveness concern, not just an
+    authenticity one.
+
     {2 Send failures}
 
     {!send} raises [Invalid_argument] (never any other exception type) in three cases:
@@ -208,12 +216,17 @@ val create :
         handshaken): raised once the separate ~20s mesh-formation budget is spent, listing every
         still-missing peer id.
 
-      Worst-case wall-clock time before raising is therefore
-      [~20s * (number of peers with an id greater than my_id) + ~20s], because dialing is
-      {e sequential}: each higher-id peer's full retry budget is spent before the next one is
-      dialed at all, and only then does the mesh-formation wait begin. For a two-peer cluster
-      that is the ~40s the two budgets suggest; for the lowest peer of a five-peer cluster it is
-      ~100s.
+      Dialing is {e sequential}, one higher-id peer at a time -- but a peer's exhausted dial
+      budget now raises {e immediately} for that peer, it does not wait for any remaining
+      higher-id peers to also be dialed first. So the worst-case time before a dial-side failure
+      is raised is bounded by (successful-connect time for whichever higher-id peers were dialed
+      before the one that never showed up, typically fast) plus that one peer's own ~20s budget --
+      not the peer count. [~20s * (number of higher-id peers) + ~20s] is only a real bound on the
+      OTHER raise case (a lower-id peer that never dials in): that one waits out the full
+      mesh-formation budget regardless of how the (already-successful) dial phase went, so ~20s
+      dial time per successfully-dialed higher-id peer plus the ~20s mesh-formation wait is the
+      right worst case there. For a two-peer cluster that is close to the ~40s the two budgets
+      suggest either way; the two failure modes diverge more as peer count grows.
 
       A failed [create] does not clean up whatever it had already started (see "No shutdown path"
       above) -- a known, undone gap, not a claim that it does. *)
