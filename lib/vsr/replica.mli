@@ -5,24 +5,36 @@
     {b Scope}: normal-case operation only. View-change ([TimerSendSVC] through [ReceiveSV],
     VSR.tla:161-305) is out of scope for this module — [primary_id] is fixed at {!create} time
     and never changes, matching VSR.tla's own incremental history (its normal-case actions were
-    modeled with a fixed [Primary(0)] before view-change was added). A [Start_view_change] /
+    modeled with a fixed primary before view-change was added). A [Start_view_change] /
     [Do_view_change] / [Start_view] message reaching {!handle_message} is silently ignored, not
     an error — a later plan adds real handling once view-change exists.
 
     {b View number}: every message this module sends or accepts carries view [0] (VSR.tla's own
     [View(r)] is [rep_view_number[r]], which starts at [0] at [Init] and this module never
     changes it, matching the fixed-primary scope above). {!handle_message} enforces VSR.tla's own
-    [m.view = View(r)] guard by dropping any message whose [view]/[view] field isn't exactly [0]
-    — a real guard, not a no-op, so this module's message-level behavior stays faithful to the
-    spec even though the value never varies within this plan's scope.
+    [m.view = View(r)] guard by dropping any in-scope message — a [Prepare] or a [Prepare_ok],
+    the two types that carry a [view] field — whose [view] isn't exactly [0]. (The out-of-scope
+    view-change types name their own field [v], not [view]; they are dropped wholesale, without a
+    view check, per the scope note above.) A real guard, not a no-op, so this module's
+    message-level behavior stays faithful to the spec even though the value never varies within
+    this plan's scope.
 
     {b Replica identity}: replica ids are [1..replica_count], matching VSR.tla's own
-    [replicas == 1..ReplicaCount] and [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:15-18).
-    This module does not itself implement [Primary(v)] — since the primary never changes within
-    this plan's scope, {!create}'s caller simply passes the id that formula would have produced
-    for view 0 ([primary_id = 1] for the fixed view-0 case, i.e. [Primary(0) = 1 + ((0-1) mod
-    ReplicaCount)]; in practice callers just pass [1] as VSR.cfg's own convention does — see
-    [replica.ml] for a note on why [Primary(0) = 1] specifically).
+    [replicas == 1..ReplicaCount] (VSR.tla:15). [primary_id] is an arbitrary, explicitly-configured
+    constant supplied by {!create}'s caller: it is NOT derived from, and is NOT required to match,
+    VSR.tla's own [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18) — this module never
+    implements, calls, or depends on that formula anywhere, because the only thing that needs it
+    (view-change) is out of scope per the note above. With the primary fixed and [view] pinned to
+    [0], which id is primary is a pure relabeling: the normal-case fragment is symmetric under any
+    permutation of replica ids, so this module's own tests and callers conventionally pass [1].
+
+    {b Forward note for the view-change plan — do NOT carry "view 0 ⇒ primary 1" forward from
+    here}: TLA+'s [%] is mathematical (Euclidean) modulo, not a truncating remainder, so
+    [(0-1) % ReplicaCount] is [ReplicaCount - 1] and [Primary(0)] is [ReplicaCount], NOT [1].
+    Verified directly with TLC 2.19 against VSR.tla:18's own formula at [ReplicaCount = 3]:
+    [Primary(0) = 3], [Primary(1) = 1], [Primary(2) = 2]. A view-change implementation must
+    evaluate [Primary(v)] literally rather than inherit this module's conventional [1], or it will
+    silently disagree with the spec at exactly the view the spec starts in.
 
     {b [dest] and message delivery}: {!Riptide_vsr.Message.t} deliberately omits the TLA+ spec's
     own [dest] field (see [message.mli]) because the transport layer's own destination argument
@@ -66,8 +78,10 @@ val create :
     {!propose}/{!handle_message} too. *)
 
 val is_primary : t -> bool
-(** [is_primary t] is [Primary(View(t)) = t] — whether this replica IS the (fixed, for this
-    module's scope) primary, i.e. [my_id = primary_id] as passed to {!create}. *)
+(** [is_primary t] is this module's stand-in for VSR.tla's own [r = Primary(View(r))] test — with
+    the primary fixed for this module's whole scope, [primary_id] stands in for [Primary(v)]
+    (which this module never evaluates; see the Replica identity note above), so this is exactly
+    [my_id = primary_id] as passed to {!create}. *)
 
 val op_number : t -> int
 (** [op_number t] is VSR.tla's [rep_op_number[r]] (VSR.tla:24). Always equals the number of
@@ -92,12 +106,19 @@ val commit_number : t -> int
     [Prepare] there is produced by [ReceiveClientRequest] itself, which guarantees [m.k < m.n]
     (VSR.tla:106-109's own comment) — a precondition that does not hold for a [Prepare] decoded
     off {!Riptide_transport.Transport_intf.S}'s own "no payload integrity" wire. {!handle_message}
-    re-establishes it explicitly by REJECTING (not capping/clamping) a [Prepare]'s [k] once it
+    bounds it explicitly by REJECTING (not capping/clamping) a [Prepare]'s [k] once it
     would exceed [op_number t] (this replica's own log length, which the [Prepare] being
     processed has just extended to [m.n]) — [commit_number] is left at its prior, legitimately-
-    established value rather than substituted with a different one, on the reasoning that a [k]
-    this far outside the well-formed range is a signal the whole message is suspect, not just
-    that one field. See {!handle_message}'s own doc comment below for the exact bound, and the
+    established value rather than substituted with a different one.
+
+    {b Only that one field's effect is discarded — the message itself is NOT treated as suspect}:
+    [m.v] is still appended at [m.n] and a [Prepare_ok{n = m.n}] is still unicast back to the
+    primary, exactly as for any in-order [Prepare]. Dropping the whole message instead would open
+    a gap in this replica's log that nothing in this plan's scope (no state transfer, no retry)
+    could ever repair. Rejecting rather than CLAMPING the [k] update is the real point of the
+    design: a clamp would target [op_number t], i.e. the maximum legal value, so a single
+    corrupted integer would let a backup declare its entire log committed — invariant-preserving
+    and still completely wrong. See {!handle_message}'s own doc comment below for the exact bound, and the
     analogous, independently-established bound on a [Prepare_ok]'s own [n] field (a genuine ack
     can never claim to have acked an op-number this primary hasn't itself assigned). *)
 
@@ -173,9 +194,13 @@ val handle_message : t -> string -> unit
       become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k > @ THEN m.k ELSE @]), and
       never lets it exceed what this replica's own log actually contains, even for a [Prepare]
       whose [k] a corrupted/forged network delivery has pushed past [n] (VSR.tla's own [m.k < m.n]
-      precondition, VSR.tla:106-109, holds for every [Prepare] the TLA+ model itself can produce
-      but is re-checked explicitly here rather than trusted — see {!commit_number}'s own doc
-      comment) — then unicasts [Prepare_ok{view=0; n=m.n; i=my_id}] back to the primary.
+      precondition, VSR.tla:106-109, holds for every [Prepare] the TLA+ model itself can produce,
+      but rather than trust it this module enforces its own explicit bound, [m.k <= m.n] —
+      deliberately one step wider than that precondition, which would exclude [m.k = m.n]; see
+      {!commit_number}'s own doc comment and [replica.ml]'s comment at the bound itself for why
+      the extra step is a harmless defense-in-depth margin here, and why tightening it is the
+      safer direction once view-change lands) — then unicasts [Prepare_ok{view=0; n=m.n;
+      i=my_id}] back to the primary.
     - A [Prepare_ok] message drives VSR.tla's [ReceivePrepareOkMsg] (VSR.tla:126-136): a
       primary-side handler ([IsNormalPrimary(r)] — a no-op if [t] is not the primary), gated on
       [m.view = 0] AND on [m.i] being a valid replica id in [1, replica_count] — VSR.tla:141's own

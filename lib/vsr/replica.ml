@@ -22,8 +22,12 @@ type t = {
      table is always a valid replica id in [1, replica_count] (VSR.tla's own [replicas ==
      1..ReplicaCount], VSR.tla:15) -- a decoded [Prepare_ok]'s [i] field that falls outside that
      range is rejected before it ever reaches this table, never merely filtered out later when
-     read (see the fix-round report for why an id-range check belongs at the point of insertion,
-     not scattered across every reader). *)
+     read. Enforcing at the single point of INSERTION rather than at each read is deliberate: it
+     gives the invariant exactly one enforcement site that a new reader cannot forget to repeat,
+     so [is_committed_quorum] below (and any future reader -- view-change will add more) may take
+     "every key here is a real replica id" as given instead of re-deriving it. A range check
+     scattered across readers is one missed reader away from the same quorum-inflation bug it was
+     added to prevent. *)
   peer_op_number : (int, int) Hashtbl.t;
   send : to_:int -> string -> unit;
 }
@@ -143,11 +147,25 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
          because a well-formed [Prepare] always has [m.k < m.n] -- a property only true of
          messages produced by the spec's OWN actions, which a decoded, possibly network-corrupted
          message is not guaranteed to have. [k <= op_number t] (== [m.n], just appended above)
-         re-establishes that precondition explicitly instead of trusting it, so a corrupted/forged
-         [k] can never push commit_number past what this replica's own log actually contains --
+         bounds [k] explicitly instead of trusting that precondition, so a corrupted/forged [k]
+         can never push commit_number past what this replica's own log actually contains --
          preserving [CommitNumberNeverHigherThanOpNumber] (VSR.tla:330-331) for every input, not
          just well-formed ones. A genuinely higher, in-range [k] from a well-formed message is
-         still applied exactly as before. *)
+         still applied exactly as before.
+
+         This bound is deliberately ONE STEP WIDER than the spec's own precondition, and does NOT
+         re-establish it exactly: it admits [k = n], which VSR.tla:106-109's [m.k < m.n] excludes
+         and no correct primary ever sends ([m.k] is its commit-number from strictly BEFORE this
+         request was appended). The extra step is a defense-in-depth margin against off-by-one
+         edge cases, and is harmless in this plan's scope -- at [k = n] the entry at [n] exists
+         and [commit_number = op_number], so [CommitNumberNeverHigherThanOpNumber] and
+         [NoLogDivergence] both still hold. test_vsr_replica.ml's own k-boundary tests pin all
+         three of [k = n-1] (well-formed, accepted), [k = n] (the widened margin, accepted) and
+         [k = n+1] (rejected), so the exact bound is pinned by tests, not just by this comment.
+         FORWARD NOTE: tightening to [k < op_number t] is the safer direction once view-change
+         lands -- a backup's commit_number stops being purely local there, since it is sent as
+         [DoViewChange.k] and feeds [HighestCommitNumber] (VSR.tla:257-260), so a
+         falsely-inflated-by-one backup commit_number becomes load-bearing rather than benign. *)
       if k > t.commit_number && k <= op_number t then t.commit_number <- k;
       let reply = Message.encode (Message.Prepare_ok { view = normal_view; n; i = t.my_id }) in
       t.send ~to_:t.primary_id reply

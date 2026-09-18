@@ -224,8 +224,10 @@ commit a value when driven over a real (simulated, for determinism) transport.
    plan's replica has a known gap against reordering/loss, so this test must not exercise that
    gap yet), build a small cluster: 3 `Riptide_vsr.Replica.t` instances (matching
    `spec/tla/VSR.cfg`'s own `ReplicaCount = 3` bound), each wired to its own `Sim_transport.t`
-   handle sharing one underlying `Network.t`, with a fixed primary (replica 1, matching
-   `Primary(0) = 1` per `VSR.tla`'s own `Primary` formula).
+   handle sharing one underlying `Network.t`, with a fixed primary (replica 1 — an arbitrary,
+   explicitly-configured constant, **not** derived from `VSR.tla`'s own `Primary(v)` formula,
+   which this plan never implements or calls; see the Self-Review Notes below for why
+   `Primary(0)` is in fact `ReplicaCount`, not `1`).
 2. Run each replica's receive-and-dispatch loop as its own Eio fiber (`let rec loop () = let msg =
    Sim_transport.receive handle in Replica.handle_message replica msg; loop ()`), all under one
    `Eio_mock.Backend.run`, alongside explicit `Network.pump_all` calls driving delivery — matching
@@ -273,3 +275,35 @@ commit a value when driven over a real (simulated, for determinism) transport.
   surprised by needing to touch this plan's own `replica.ml` again. This is expected, healthy
   incremental-extension cost, not a design mistake in this plan (per `CLAUDE.md`'s own "expect the
   first extension mechanism to need real revision" principle).
+- **`Primary(0)` is `ReplicaCount`, NOT `1` — do not inherit this plan's conventional
+  `primary_id = 1` as if it came from the formula.** `VSR.tla:18`'s own
+  `Primary(v) == 1 + ((v-1) % ReplicaCount)` uses TLA+'s `%`, which is mathematical (Euclidean)
+  modulo, not a truncating remainder: `(0-1) % ReplicaCount = ReplicaCount - 1`, so
+  `Primary(0) = ReplicaCount`. Verified directly with TLC 2.19 against that formula at
+  `ReplicaCount = 3`: `Primary(0) = 3`, `Primary(1) = 1`, `Primary(2) = 2`. This plan is
+  unaffected — `primary_id` is an explicit `create` parameter and the formula is never
+  implemented, called, or relied on anywhere in `lib/vsr/replica.ml`; with a fixed primary and
+  `view` pinned to `0` the choice of id is a pure relabeling (the normal-case fragment is
+  symmetric under permutation of replica ids). But the view-change plan **must** evaluate
+  `Primary(v)` literally. Since `rep_view_number` starts at `0` at `Init` (VSR.tla:79), the
+  spec's own initial-state primary is replica `ReplicaCount`, and any code or test carried
+  forward from here that assumes "view 0 ⇒ primary 1" will silently disagree with the spec — and
+  will surface as a view-change bug, not a documentation bug.
+- **`Sim_transport`'s virtual clock never advances at `default_fault_config` — a real blocker for
+  view-change's `TimerSendSVC`, which the next plan's research-grounding phase must address
+  head-on.** `lib/sim/network.ml`'s `default_fault_config` sets `min_delay = max_delay = 0.0`;
+  `schedule` computes each delivery's time as `at = Eio.Time.now net.clock +. delay`, i.e. `now`
+  exactly; and the *only* place the clock ever moves is `pump_one`, which does
+  `Eio_mock.Clock.set_time net.clock at` — setting it to the value it already had. So under this
+  plan's own cluster-test configuration the virtual clock never leaves `t = 0.0`, and a fiber
+  sleeping via `Eio.Time.sleep_until (Network.clock net) t` for any `t > 0.0` will never wake.
+  This is by design, not a bug: `network.mli`'s own `clock` accessor is deliberately typed as a
+  plain read/sleep-only `Eio.Time.clock` precisely so that `set_time`/`advance` are unreachable
+  and "advanced only by `pump_one`/`pump_all`" is enforced by the type checker. The consequence
+  for view-change: a timeout-driven action (`TimerSendSVC`, VSR.tla:161+) cannot fire at all in a
+  simulated cluster built this way. That plan needs an explicit decision up front — run with a
+  non-zero `min_delay`/`max_delay` fault config so `pump_one` genuinely advances the clock, drive
+  timeouts by an explicit test-side trigger rather than by simulated time, or extend
+  `lib/sim/network.ml` with a way to advance time independently of pending deliveries (a real
+  change to an already-merged, already-reviewed module, hence a decision, not an implementation
+  detail).
