@@ -56,6 +56,34 @@ type value =
     for [0.0]/[-0.0] and for NaN). *)
 val canonical_encode : value -> string
 
+(** The structural inverse of {!canonical_encode}: decodes a [value] from
+    its canonical byte encoding.
+
+    Round-trip relationship: for any [v], [canonical_decode (canonical_encode
+    v)] reproduces [v]'s logical content, but {b not necessarily its exact
+    OCaml representation} — decoding re-encodes [Record] fields and [Map]
+    entries into the same canonical (sorted) order {!canonical_encode} would
+    have chosen, which is not necessarily the order the original value was
+    constructed with if that value's fields/entries were out of sorted order
+    to begin with. The property that actually holds unconditionally is
+    [canonical_encode (canonical_decode (canonical_encode v)) =
+    canonical_encode v] - i.e. round-tripping through decode is a no-op once
+    a value has already been through one canonical encoding.
+
+    Raises [Invalid_argument] if: the input is empty; an unknown tag byte is
+    encountered; any length or count prefix - a string/bytes length, or a
+    [Record]/[Sequence]/[Map] element/entry count - would require reading
+    past the end of the input; or bytes remain in the input after a
+    complete value has been decoded (a well-formed prefix followed by
+    trailing garbage is rejected as a whole, not accepted as "the first
+    well-formed value found"). Every length/count prefix is checked against
+    the bytes actually remaining in the input before being trusted, so
+    malformed or adversarial input (this decoder is intended for bytes
+    arriving over a network with no integrity guarantee) raises cleanly
+    rather than reading out of bounds, looping unboundedly, or crashing with
+    an unhandled exception. *)
+val canonical_decode : string -> value
+
 (** SHA-256 of {!canonical_encode}. *)
 val content_hash : value -> hash
 

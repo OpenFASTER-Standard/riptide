@@ -1,0 +1,3 @@
+(library
+ (name riptide_vsr)
+ (libraries riptide))

@@ -176,6 +176,125 @@ let map_permutation_invariance_prop =
     map_permutation_gen (fun (entries, shuffled) ->
         Value.canonical_encode (Value.Map entries) = Value.canonical_encode (Value.Map shuffled))
 
+(* ---- canonical_decode ----
+
+   Raw byte-level helpers to hand-construct encodings independently of
+   [Value.canonical_encode] itself, so the decode tests below check against
+   the wire format (as documented by [encode_into]'s tag bytes and 8-byte
+   big-endian length/count prefixes), not just "whatever the encoder
+   happens to produce." *)
+
+let u64_be (n : int) : string =
+  let b = Bytes.create 8 in
+  for i = 0 to 7 do
+    Bytes.set b (7 - i) (Char.chr ((n lsr (8 * i)) land 0xff))
+  done;
+  Bytes.to_string b
+
+let i64_be (v : int64) : string =
+  let b = Bytes.create 8 in
+  for i = 0 to 7 do
+    Bytes.set b (7 - i) (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical v (8 * i)) 0xffL)))
+  done;
+  Bytes.to_string b
+
+let len_prefixed (s : string) : string = u64_be (String.length s) ^ s
+
+let raw_bool b = "\x00" ^ (if b then "\x01" else "\x00")
+let raw_int i = "\x01" ^ i64_be i
+let raw_float f = "\x02" ^ i64_be (Int64.bits_of_float f)
+let raw_string s = "\x03" ^ len_prefixed s
+let raw_bytes b = "\x04" ^ len_prefixed b
+
+let test_decode_bool () =
+  Alcotest.(check bool) "decodes Bool" true (Value.canonical_decode (raw_bool true) = Value.Scalar (Value.Bool true))
+
+let test_decode_int () =
+  Alcotest.(check bool) "decodes Int" true
+    (Value.canonical_decode (raw_int 42L) = Value.Scalar (Value.Int 42L))
+
+let test_decode_float () =
+  let decoded = Value.canonical_decode (raw_float 3.5) in
+  Alcotest.(check bool) "decodes Float" true (decoded = Value.Scalar (Value.Float 3.5))
+
+let test_decode_string () =
+  Alcotest.(check bool) "decodes String" true
+    (Value.canonical_decode (raw_string "hello") = Value.Scalar (Value.String "hello"))
+
+let test_decode_bytes () =
+  Alcotest.(check bool) "decodes Bytes" true
+    (Value.canonical_decode (raw_bytes "\x00\x01\x02") = Value.Scalar (Value.Bytes "\x00\x01\x02"))
+
+let test_decode_record () =
+  (* Fields already in sorted order ("a" < "b"), so this is unambiguous
+     regardless of any canonicalization decode might or might not do. *)
+  let raw = "\x05" ^ u64_be 2 ^ len_prefixed "a" ^ raw_bool true ^ len_prefixed "b" ^ raw_string "x" in
+  let expected = Value.Record [ ("a", Value.Scalar (Value.Bool true)); ("b", Value.Scalar (Value.String "x")) ] in
+  Alcotest.(check bool) "decodes Record" true (Value.canonical_decode raw = expected)
+
+let test_decode_sum () =
+  let raw = "\x06" ^ len_prefixed "Envelope" ^ raw_bool true in
+  let expected = Value.Sum ("Envelope", Value.Scalar (Value.Bool true)) in
+  Alcotest.(check bool) "decodes Sum" true (Value.canonical_decode raw = expected)
+
+let test_decode_sequence () =
+  let raw = "\x07" ^ u64_be 2 ^ raw_bool true ^ raw_int 5L in
+  let expected = Value.Sequence [ Value.Scalar (Value.Bool true); Value.Scalar (Value.Int 5L) ] in
+  Alcotest.(check bool) "decodes Sequence" true (Value.canonical_decode raw = expected)
+
+let test_decode_map () =
+  (* A Map entry's key is stored as a length-prefixed blob containing the
+     key's OWN recursively-encoded bytes, not encoded inline - this is the
+     asymmetry the brief calls out as the easiest place to get wrong. *)
+  let key_encoded = raw_string "k" in
+  let raw = "\x08" ^ u64_be 1 ^ len_prefixed key_encoded ^ raw_int 7L in
+  let expected = Value.Map [ (Value.Scalar (Value.String "k"), Value.Scalar (Value.Int 7L)) ] in
+  Alcotest.(check bool) "decodes Map" true (Value.canonical_decode raw = expected)
+
+(* Malformed-input tests: each of these must raise [Invalid_argument]
+   promptly - never read out of bounds, loop, or crash with some other
+   unhandled exception. *)
+let expect_invalid_argument name (f : unit -> Value.value) =
+  ( name,
+    `Quick,
+    fun () ->
+      match f () with
+      | (_ : Value.value) -> Alcotest.failf "%s: expected Invalid_argument, but decode succeeded with a value" name
+      | exception Invalid_argument _ -> ()
+      | exception exn -> Alcotest.failf "%s: expected Invalid_argument, got %s" name (Printexc.to_string exn) )
+
+let malformed_input_tests =
+  [ expect_invalid_argument "empty input" (fun () -> Value.canonical_decode "");
+    expect_invalid_argument "truncated mid-length-prefix (string)" (fun () ->
+        Value.canonical_decode ("\x03" ^ "\x00\x00\x00"));
+    expect_invalid_argument "truncated mid-count-prefix (record)" (fun () ->
+        Value.canonical_decode ("\x05" ^ "\x00\x00\x00"));
+    expect_invalid_argument "truncated mid-payload (string body shorter than claimed length)" (fun () ->
+        Value.canonical_decode ("\x03" ^ u64_be 10 ^ "abc"));
+    expect_invalid_argument "claimed length exceeds remaining bytes" (fun () ->
+        Value.canonical_decode ("\x04" ^ u64_be 1_000_000 ^ "x"));
+    expect_invalid_argument "claimed count exceeds remaining bytes (sequence)" (fun () ->
+        Value.canonical_decode ("\x07" ^ u64_be 1_000_000));
+    expect_invalid_argument "unknown tag byte" (fun () -> Value.canonical_decode "\xff");
+    expect_invalid_argument "trailing garbage after a complete value" (fun () ->
+        Value.canonical_decode (raw_bool true ^ "\xff"));
+    expect_invalid_argument "truncated int payload" (fun () -> Value.canonical_decode ("\x01" ^ "\x00\x00\x00"));
+    expect_invalid_argument "invalid bool byte" (fun () -> Value.canonical_decode ("\x00" ^ "\x02"));
+    expect_invalid_argument "trailing garbage inside a map key blob" (fun () ->
+        (* The key blob claims to hold one extra byte beyond a complete
+           encoded value - decode_value_exact must reject this even though
+           the outer stream's own bookkeeping stays consistent. *)
+        let key_encoded_plus_garbage = raw_string "k" ^ "\xff" in
+        Value.canonical_decode ("\x08" ^ u64_be 1 ^ len_prefixed key_encoded_plus_garbage ^ raw_int 7L))
+  ]
+
+let round_trip_prop =
+  QCheck2.Test.make ~name:"canonical_decode inverts canonical_encode (round-trips to the same bytes)" ~count:200
+    value_gen (fun v ->
+        let encoded = Value.canonical_encode v in
+        let decoded = Value.canonical_decode encoded in
+        Value.canonical_encode decoded = encoded)
+
 let tests =
   [ ("encode deterministic", `Quick, test_encode_deterministic);
     ("record field order independent", `Quick, test_record_field_order_independent);
@@ -184,7 +303,18 @@ let tests =
     ("content_hash differs for different values", `Quick, test_content_hash_differs_for_different_values);
     ("float nan collisions fixed", `Quick, test_float_nan_collisions_fixed);
     ("float zero and negative zero hash differently", `Quick, test_float_zero_and_negative_zero_hash_differently);
+    ("decode bool", `Quick, test_decode_bool);
+    ("decode int", `Quick, test_decode_int);
+    ("decode float", `Quick, test_decode_float);
+    ("decode string", `Quick, test_decode_string);
+    ("decode bytes", `Quick, test_decode_bytes);
+    ("decode record", `Quick, test_decode_record);
+    ("decode sum", `Quick, test_decode_sum);
+    ("decode sequence", `Quick, test_decode_sequence);
+    ("decode map", `Quick, test_decode_map);
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
-    QCheck_alcotest.to_alcotest map_permutation_invariance_prop
+    QCheck_alcotest.to_alcotest map_permutation_invariance_prop;
+    QCheck_alcotest.to_alcotest round_trip_prop
   ]
+  @ malformed_input_tests
