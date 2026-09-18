@@ -302,6 +302,88 @@ let test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops () =
   Alcotest.(check int) "the forged, out-of-range ack does not commit op1 by itself" 0 (Replica.commit_number t);
   Alcotest.(check bool) "op1 is NOT committed" false (Replica.is_committed t (v "op1"))
 
+(* ---- I2 boundary pins: the exact first-REJECTED and last-ACCEPTED value of each of the three
+   safety guards (replica.ml's [i < 1 || i > t.replica_count], [k <= op_number t], and
+   [n > op_number t]).
+
+   Why these are separate from the M1/M2/M3 regression tests above: every one of those uses an
+   obviously-forged value (i = 42, i = 99, k = 9999, n = 1_000_000), and a guard loosened by
+   exactly one token still rejects all of them. They therefore pin that each guard EXISTS, not
+   WHERE it sits. The final whole-branch review demonstrated this concretely: loosening any single
+   guard by one ([i > replica_count + 1], [k <= op_number t + 1], [n > op_number t + 1]) left the
+   entire 137-test suite green while fully reopening the original vulnerability it was added for.
+   Each test below therefore asserts BOTH directions -- the first illegal value is still rejected
+   (so the guard cannot be silently widened) AND the last legal value is still accepted (so it
+   cannot be over-tightened into rejecting legitimate traffic either). ---- *)
+
+let test_prepare_ok_i_boundary_is_exactly_replica_count () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  (* i = replica_count + 1 = 4 is the FIRST id past VSR.tla:15's own [replicas == 1..ReplicaCount]
+     range -- the exact value [i > t.replica_count] must still reject. Loosened to
+     [i > t.replica_count + 1], this single forged ack commits op 1 in a 3-replica cluster
+     (f = 1) with zero real backup acknowledgements. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 4 }));
+  Alcotest.(check int) "i = replica_count + 1 (the first out-of-range id) does not commit" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed by a boundary-adjacent forged id" false (Replica.is_committed t (v "op1"));
+  (* The last IN-range id, i = replica_count = 3, must still be accepted: the guard must not be
+     over-tightened to [i >= t.replica_count] either. This is a real backup in this cluster, so
+     its ack alone reaches the f = 1 quorum. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 3 }));
+  Alcotest.(check int) "i = replica_count (the last legal id) is accepted and reaches quorum" 1 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is committed by the genuine boundary-valued ack" true (Replica.is_committed t (v "op1"))
+
+let test_prepare_k_boundary_is_exactly_op_number () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  (* k = 2 on a Prepare with n = 1: after the append, op_number = 1, so this is exactly
+     [op_number t + 1] -- the FIRST value [k <= op_number t] must reject. Loosened to
+     [k <= op_number t + 1] it is applied, yielding commit_number = 2 > op_number = 1: a direct
+     violation of CommitNumberNeverHigherThanOpNumber (VSR.tla:330-331), which replica.mli's own
+     [commit_number] doc comment claims holds for EVERY reachable state, adversarial input
+     included. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 2 }));
+  Alcotest.(check int) "the Prepare itself is still accepted -- only the k field's effect is dropped" 1
+    (Replica.op_number t);
+  Alcotest.(check int) "k = op_number + 1 (the first out-of-bound k) is rejected" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number <= op_number still holds" true (Replica.commit_number t <= Replica.op_number t);
+  (* The last ACCEPTED value is k = n (== op_number t after this Prepare's own append), NOT
+     k = n - 1: the implemented bound is deliberately ONE STEP WIDER than VSR.tla:106-109's own
+     [m.k < m.n] precondition (see replica.ml's comment at the bound, and
+     test_prepare_k_within_bound_still_advances_normally above for the genuinely well-formed
+     k = n - 1 case). k = n is accepted here even though no correct primary ever sends it --
+     pinned so the widening stays a visible, deliberate choice rather than drift.
+     NOTE for a future plan: if the bound is tightened to [k < op_number t] (the review's
+     recommended direction, once view-change makes a backup's commit_number load-bearing via
+     DoViewChange.k / HighestCommitNumber, VSR.tla:257-260), THIS expectation is the one to
+     update -- it pins a deliberate margin, not a safety property. The k = n + 1 assertion above
+     is the safety one and must never be loosened. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 2 }));
+  Alcotest.(check int) "k = op_number (the deliberately widened, still-accepted boundary) advances commit_number" 2
+    (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number <= op_number still holds at the widened boundary too" true
+    (Replica.commit_number t <= Replica.op_number t)
+
+let test_prepare_ok_n_boundary_is_exactly_op_number () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Alcotest.(check int) "op_number is 0 before anything is proposed" 0 (Replica.op_number t);
+  (* With op_number = 0, n = 1 is exactly [op_number t + 1] -- the FIRST value [n > op_number t]
+     must reject. Loosened to [n > op_number t + 1] it is recorded, pre-acking an op that does not
+     exist yet; the very next propose then commits with zero genuine acks. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Replica.propose t (v "op1");
+  Alcotest.(check int) "n = op_number + 1 (pre-acking the next op) does not commit it" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed by the boundary-adjacent forged ack" false (Replica.is_committed t (v "op1"));
+  (* The last ACCEPTED value, n = op_number t exactly, must still count -- a genuine ack for the
+     op this primary really has assigned is the single most common message in the protocol and
+     must not be rejected by the same guard. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "n = op_number (a genuine ack for the current op) is accepted and commits" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is committed by the genuine boundary-valued ack" true (Replica.is_committed t (v "op1"))
+
 (* ---- L1 fix-round regression tests: create validates its numeric arguments ---- *)
 
 let expect_invalid_arg name (f : unit -> Replica.t) =
@@ -409,6 +491,16 @@ let tests =
     ( "M3: a forged PrepareOk.n from a real replica id does not pre-ack future ops",
       `Quick,
       test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops );
+    (* I2 boundary pins: the exact first-rejected/last-accepted value of each safety guard *)
+    ( "I2 boundary: PrepareOk's i guard sits exactly at replica_count (i+1 rejected, i accepted)",
+      `Quick,
+      test_prepare_ok_i_boundary_is_exactly_replica_count );
+    ( "I2 boundary: Prepare's k guard sits exactly at op_number (k+1 rejected, k accepted)",
+      `Quick,
+      test_prepare_k_boundary_is_exactly_op_number );
+    ( "I2 boundary: PrepareOk's n guard sits exactly at op_number (n+1 rejected, n accepted)",
+      `Quick,
+      test_prepare_ok_n_boundary_is_exactly_op_number );
     (* L1 fix-round regression tests *)
     ("L1: create accepts a valid, degenerate single-replica cluster", `Quick, test_create_accepts_a_valid_single_replica_cluster);
     (* L2 fix-round regression test *)

@@ -4,7 +4,8 @@
    Every other VSR test in this suite (test_vsr_replica.ml) drives Replica.handle_message
    directly with hand-constructed, hand-encoded bytes -- useful for pinning down one guard/effect
    at a time, but it never proves that real replica processes, talking over a real transport, can
-   actually reach agreement. This file does: three real Riptide_vsr.Replica.t instances, each
+   actually reach agreement. This file does: three (or, for the f >= 2 test below, five) real
+   Riptide_vsr.Replica.t instances, each
    wired to its own Sim_transport.t handle sharing one underlying (reliable-delivery)
    Riptide_sim.Network.t, each running its OWN receive-and-dispatch loop as its own Eio fiber --
    exactly the shape a real replica process's main loop would have. The only thing this test
@@ -17,16 +18,37 @@
    (reliable, immediate, single delivery) deliberately, NOT a lossy/reordering config: Task 1's
    replica has a known, disclosed gap against out-of-order or dropped Prepare messages (see
    replica.mli's own handle_message doc comment, "This is a real, disclosed liveness gap, not a
-   defect") -- exercising that gap is out of this test's scope. *)
+   defect") -- exercising that gap is out of this test's scope.
+
+   COVERAGE LAYERING (deliberate, not an oversight -- recorded here because a reader could
+   otherwise read the split as a gap): safety-guard coverage lives entirely at the UNIT layer
+   (test_vsr_replica.ml), which can hand-feed a replica any forged/adversarial message directly;
+   this integration layer owns realistic-cluster real-message-flow coverage instead, and none of
+   the three safety guards' mutations is caught here. One consequence is worth naming precisely.
+   The unit layer's own test_primary_advances_commit_number_by_exactly_one_never_skips
+   discriminates the "check only the arriving message's own n" bug family by having the message
+   that completes op 1's quorum carry n = 2 -- which requires a backup's ack for op 2 to arrive
+   BEFORE its own ack for op 1. That is message REORDERING, and at Network.default_fault_config
+   this fabric delivers every peer's messages in send order, so that exact interleaving is
+   unreachable here by construction, not merely unexercised. What this layer CAN and now does add
+   at f >= 2 is the quorum threshold itself over real wire traffic -- see
+   test_five_replica_cluster_needs_two_real_acks_before_committing below, which delivers acks one
+   at a time and pins that the primary does not commit until the second genuine ack arrives. *)
 
 open Riptide
 open Riptide_vsr
 open Riptide_sim
 
-(* Matches spec/tla/VSR.cfg's own ReplicaCount = 3, with a fixed primary = replica 1, matching
-   VSR.tla's own Primary(0) = 1 formula (see replica.mli's own top-level comment on why callers
-   just pass 1 directly rather than this module computing Primary(v) itself). *)
-let replica_count = 3
+(* The default cluster size matches spec/tla/VSR.cfg's own ReplicaCount = 3; the f >= 2 test
+   below overrides it to 5 (see its own comment).
+
+   The primary is fixed at replica 1: an arbitrary, explicitly-configured constant, NOT derived
+   from VSR.tla's own Primary(v) formula -- Replica never implements or calls that formula at all
+   (see replica.mli's own "Replica identity" note). In particular, do NOT read this 1 as
+   "Primary(0)": TLA+'s % is mathematical modulo, so VSR.tla:18's Primary(0) is actually
+   ReplicaCount (= 3 here), not 1. With a fixed primary and view pinned to 0, which id is primary
+   is a pure relabeling, so 1 is just the convention this suite uses. *)
+let default_replica_count = 3
 let primary_id = 1
 
 exception Cluster_test_done
@@ -44,10 +66,15 @@ let record_value name =
       ("payload", Value.Sequence [ Value.Scalar (Value.Int 1L); Value.Scalar (Value.Int 2L); Value.Scalar (Value.Int 3L) ])
     ]
 
-(* Builds a fresh 3-replica cluster sharing one Sim_transport network (peer ids "1".."3",
-   matching VSR.tla's own 1-indexed replica ids -- deliberately NOT Sim_transport.create_cluster's
-   own convenience wrapper, which indexes peers 0..n-1 and would collide with that), starts each
-   replica's own receive-and-dispatch fiber, runs [body], then tears the cluster's fibers down.
+(* Builds a fresh [replica_count]-replica cluster (default 3) sharing one Sim_transport network
+   (peer ids "1".."replica_count", matching VSR.tla's own 1-indexed replica ids -- deliberately
+   NOT Sim_transport.create_cluster's own convenience wrapper, which indexes peers 0..n-1 and
+   would collide with that), starts each replica's own receive-and-dispatch fiber, runs [body],
+   then tears the cluster's fibers down.
+
+   [body] also receives the underlying [net] itself, so a test that needs finer control than
+   [settle] can drive delivery message-by-message (Network.pump_one) instead of pumping to
+   quiescence -- used by the f >= 2 test below to deliver acknowledgements one at a time.
 
    [body]'s own [settle] argument is a bounded-round quiescence driver: alternates "delivers
    everything currently scheduled" (Network.pump_one, looped) with "yield so woken
@@ -59,8 +86,16 @@ let record_value name =
    one doesn't. A round budget (not an unconditional loop) is a deliberate safety net against a
    genuine non-termination bug, not a magic number tuned to any one test's message count: normal-
    case VSR traffic in this module's scope is acyclic (Prepare -> PrepareOk, nothing further), so
-   real runs converge within 2-3 rounds per proposed value; 20 is generous headroom. *)
-let with_cluster (body : replicas:Replica.t array -> settle:(unit -> unit) -> unit) =
+   real runs converge within 2-3 rounds per proposed value; 20 is generous headroom.
+
+   Maintenance note (measured, not assumed, during the final whole-branch review): the yield COUNT
+   here is headroom too, and is not verified-minimal. Dropping to zero yields correctly fails both
+   of this file's original tests; dropping from two to one still passes them. Keeping two is the
+   right call -- a suspended fiber that needs a second scheduling round is exactly the kind of
+   thing a later change could introduce -- but do not cite "2 yields" as a mutation-tested
+   minimum, because it isn't one. *)
+let with_cluster ?(replica_count = default_replica_count)
+    (body : replicas:Replica.t array -> settle:(unit -> unit) -> net:string Network.t -> unit) =
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create 1 in
   let net = Network.create prng () (* faults default to Network.default_fault_config *) in
@@ -105,7 +140,7 @@ let with_cluster (body : replicas:Replica.t array -> settle:(unit -> unit) -> un
                 in
                 dispatch_loop ()))
           replicas;
-        body ~replicas ~settle;
+        body ~replicas ~settle ~net;
         Eio.Switch.fail sw Cluster_test_done)
   with Cluster_test_done -> ()
 
@@ -142,7 +177,8 @@ let check_entries msg expected actual = Alcotest.(check (list value_testable)) m
 
 (* Answers the brief's own open question empirically rather than guessing at it: does a backup's
    commit_number genuinely need a SECOND Prepare to piggyback on (per ReceivePrepareMsg's own
-   k-field-driven advancement, replica.mli:171-178) before it advances past 0, even once the
+   k-field-driven advancement -- see replica.mli's own handle_message doc comment, its [Prepare]
+   bullet) before it advances past 0, even once the
    value itself is safely replicated to a majority?
 
    This test proves the answer is YES, by direct observation of running code, not by reasoning
@@ -153,7 +189,8 @@ let check_entries msg expected actual = Alcotest.(check (list value_testable)) m
    But BOTH backups' commit_number is still 0 at this point -- not because replication failed
    (their log already holds the value), but because the only avenue by which a backup's
    commit_number can ever move at all is a Prepare's own k field (ReceivePrepareMsg,
-   replica.mli:171-178), and the one Prepare this test has sent so far necessarily carried k=0
+   see replica.mli's own handle_message doc comment, its [Prepare] bullet), and the one Prepare
+   this test has sent so far necessarily carried k=0
    (the primary's own commit_number at the moment IT was broadcast, which was before any
    PrepareOk had come back). This is Task 1's own explicit, spec-faithful design, not a bug this
    test papers over: VSR's normal-case protocol has no separate "commit" message in this module's
@@ -168,7 +205,7 @@ let check_entries msg expected actual = Alcotest.(check (list value_testable)) m
    not to 2 (the second value's own op-number) -- because ITS OWN commit confirmation has, by the
    same logic, not yet piggybacked onto any further Prepare. *)
 let test_single_propose_replicates_then_second_propose_advances_backup_commit () =
-  with_cluster (fun ~replicas ~settle ->
+  with_cluster (fun ~replicas ~settle ~net:_ ->
       let primary = replicas.(0) and backup2 = replicas.(1) and backup3 = replicas.(2) in
       let v1 = record_value "v1" in
       Replica.propose primary v1;
@@ -234,7 +271,7 @@ let test_single_propose_replicates_then_second_propose_advances_backup_commit ()
    none of the intervening Prepares had a chance to be individually observed and piggybacked on
    in turn) -- do not read this test as proving "backups always lag by one" in general. *)
 let test_multiple_proposes_converge_with_backups_lagging_by_exactly_one () =
-  with_cluster (fun ~replicas ~settle ->
+  with_cluster (fun ~replicas ~settle ~net:_ ->
       let primary = replicas.(0) and backup2 = replicas.(1) and backup3 = replicas.(2) in
       let values = List.init 4 (fun i -> record_value (Printf.sprintf "seq-%d" (i + 1))) in
       List.iter
@@ -276,6 +313,62 @@ let test_multiple_proposes_converge_with_backups_lagging_by_exactly_one () =
           end)
         values)
 
+(* ---- f >= 2: the quorum threshold itself, exercised over real wire traffic (M6 from the final
+   whole-branch review) ----
+
+   Every other test in this file runs at replica_count = 3 (f = 1), where a SINGLE backup
+   acknowledgement already satisfies every op-number's quorum -- so no amount of real message flow
+   at that size can distinguish "commits on a real majority" from "commits on the first ack that
+   shows up". This test runs a genuine 5-replica cluster (f = (5-1)/2 = 2) and, instead of pumping
+   to quiescence, delivers the backups' acknowledgements ONE AT A TIME: after the first genuine
+   ack the primary must still be uncommitted; only the second one may commit op 1.
+
+   Note what this does and does not add over the unit layer (see this file's own COVERAGE
+   LAYERING note at the top): the unit layer already pins the f = 2 arithmetic with hand-fed
+   messages. What is new here is that the acks are real, encoded Prepare_ok messages produced by
+   four independent backup replicas' own dispatch fibers in response to real Prepare broadcasts,
+   crossing a real transport -- i.e. the threshold holds for traffic the cluster generated itself,
+   not only for messages a test wrote by hand. The one thing this layer still cannot reach is the
+   reordered-ack discriminator, for the by-construction reason given in that same note. *)
+let test_five_replica_cluster_needs_two_real_acks_before_committing () =
+  with_cluster ~replica_count:5 (fun ~replicas ~settle ~net ->
+      let primary = replicas.(0) in
+      let v1 = record_value "five-replica-v1" in
+      Replica.propose primary v1;
+      Alcotest.(check int) "propose alone never commits when f >= 1" 0 (Replica.commit_number primary);
+      (* Release all four Prepares, then yield so each backup's own fiber processes its copy and
+         schedules its own Prepare_ok. Nothing has been delivered back to the primary yet: the
+         network's pending queue now holds exactly those four acks. *)
+      Network.pump_all net;
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      Array.iteri
+        (fun i r ->
+          check_entries (Printf.sprintf "replica %d's log holds v1 at op 1" (i + 1)) [ v1 ] (Replica.entries r))
+        replicas;
+      Alcotest.(check int) "no acknowledgement has reached the primary yet, so nothing is committed" 0
+        (Replica.commit_number primary);
+      (* Exactly ONE real acknowledgement. f = 2, so this is one short of quorum. *)
+      Alcotest.(check bool) "an acknowledgement is pending delivery" true (Network.pump_one net);
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      Alcotest.(check int) "ONE genuine ack is one short of the f=2 quorum -- still not committed" 0
+        (Replica.commit_number primary);
+      Alcotest.(check bool) "v1 is NOT committed on a single real ack in a 5-replica cluster" false
+        (Replica.is_committed primary v1);
+      (* The second one completes it. *)
+      Alcotest.(check bool) "a second acknowledgement is pending delivery" true (Network.pump_one net);
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      Alcotest.(check int) "the SECOND genuine ack reaches the f=2 quorum and commits op 1" 1
+        (Replica.commit_number primary);
+      Alcotest.(check bool) "v1 is committed once a real majority has acked" true (Replica.is_committed primary v1);
+      (* The two remaining acks are redundant: they must not push commit_number past op_number. *)
+      settle ();
+      Alcotest.(check int) "op_number is still 1 after the cluster quiesces" 1 (Replica.op_number primary);
+      Alcotest.(check int) "the two redundant acks do not advance commit_number past op_number" 1
+        (Replica.commit_number primary))
+
 let tests =
   [ ( "single propose: real replication over Sim_transport, primary commits, backup commit-lag \
        finding proven and then resolved by a second propose",
@@ -284,5 +377,9 @@ let tests =
     ( "multiple sequential proposes: logs converge identically across all 3 replicas, backups lag \
        the primary's commit_number by exactly one throughout",
       `Quick,
-      test_multiple_proposes_converge_with_backups_lagging_by_exactly_one )
+      test_multiple_proposes_converge_with_backups_lagging_by_exactly_one );
+    ( "5-replica cluster (f=2): real, self-generated acks delivered one at a time -- the primary \
+       commits only once a genuine majority has acked, not on the first ack",
+      `Quick,
+      test_five_replica_cluster_needs_two_real_acks_before_committing )
   ]
