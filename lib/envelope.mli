@@ -30,4 +30,13 @@ val genesis_marker : Value.hash
     second, separately-specified encoding. *)
 val to_value : envelope -> Value.value
 
+(** The domain tag {!content_hash} wraps {!to_value}'s output in (via
+    [Value.Sum (domain_tag, to_value e)]) before hashing, so an envelope's
+    hash space can never collide with a plain payload [Value.value]'s hash
+    space: [Sum] and [Record] have distinct leading tag bytes in
+    {!Value.canonical_encode}, so this holds by construction. Exposed so
+    tests can construct the exact preimage {!content_hash} uses internally
+    without duplicating the tag string. *)
+val domain_tag : string
+
 val content_hash : envelope -> event_id
