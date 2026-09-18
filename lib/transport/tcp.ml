@@ -8,14 +8,18 @@
    machine or a handful of nearby ones. *)
 let connect_retry_delay = 0.1
 let connect_max_retries = 200
+let dial_timeout = connect_retry_delay *. float_of_int connect_max_retries
 
-(* Bound on how long [create] will wait for the rest of the mesh implied by [peers] to finish
-   connecting+handshaking, once dialing itself has either succeeded or exhausted its own retries
-   above. Reuses the dial loop's own total budget (also ~20s): if every dial that was going to
-   succeed has already done so well within that window, waiting much longer for the *accepting*
-   side to complete isn't buying anything -- it just turns a misconfigured/late cluster into an
-   unexplained hang instead of a clear error (see [Mesh_formation_timeout] below). *)
-let mesh_formation_timeout = connect_retry_delay *. float_of_int connect_max_retries
+(* Bound on how long [create] will wait, after dialing itself has either succeeded or exhausted
+   its own retries above, for the rest of the mesh implied by [peers] to finish
+   connecting+handshaking. Reuses the dial loop's own total budget (also ~20s): if every dial that
+   was going to succeed has already done so well within that window, waiting much longer for the
+   *accepting* side to complete isn't buying anything -- it just turns a misconfigured/late
+   cluster into an unexplained hang instead of a clear error. Note this is a SECOND, independent
+   ~20s budget stacked after the dial loop's own: [create]'s real worst-case wall-clock time is
+   [dial_timeout +. mesh_formation_timeout] (~40s total), not just this constant on its own -- see
+   the [@raise Failure] note on [create] in tcp.mli. *)
+let mesh_formation_timeout = dial_timeout
 
 (* Backlog for the listening socket. This is a small, fixed cluster, so a generous constant is
    simpler than trying to size it from [peers]. *)
@@ -25,27 +29,33 @@ let listen_backlog = 64
    claims a frame longer than this gets rejected via [Frame_too_large] below, rather than this
    process trying to allocate an unbounded buffer for it), and [send]'s own cap on outgoing
    messages so the two sides agree on the limit instead of a sender being able to "successfully"
-   queue something the receiver is guaranteed to reject (see M1 in the fix-round report). Generous
-   since [Transport.S] payloads are arbitrary caller-encoded bytes (e.g. whole VSR log entries)
-   with no size negotiation at this layer. *)
+   queue something the receiver is guaranteed to reject. Generous since [Transport.S] payloads are
+   arbitrary caller-encoded bytes (e.g. whole VSR log entries) with no size negotiation at this
+   layer. *)
 let max_message_size = 64 * 1024 * 1024
 
 (* Raised by [read_frame] when a peer's declared frame length is negative (possible via
    [Int64.to_int] truncation of a hostile or corrupt 8-byte length prefix) or exceeds
-   [max_message_size]. Caught by [run_reader] right next to it, so this never needs to escape this
-   module -- it exists as a named exception (rather than e.g. reusing [End_of_file]) purely so a
-   [Tcp: connection error] log line can say *why* a connection was dropped instead of looking
+   [max_message_size]. Caught by [reader_body] right next to it, so this never needs to escape
+   this module -- it exists as a named exception (rather than e.g. reusing [End_of_file]) purely
+   so a [Tcp: connection error] log line can say *why* a connection was dropped instead of looking
    identical to an ordinary disconnect. *)
 exception Frame_too_large of int
 
 type t = {
   my_id : int;
   inbox : string Eio.Stream.t;
-  (* One entry per live outbound connection, keyed by the *remote* peer's id: the [Eio.Buf_write.t]
-     to write framed messages to in order to reach that peer. Populated by both the dialing path
-     (connect_to) and the accepting path (handle_accepted) as connections come up, and removed by
-     [run_writer] once it detects that connection is dead (see the fix-round report's H1/M3
-     discussion for why cleanup lives there and not in [run_reader]). *)
+  (* One entry per live connection, keyed by the *remote* peer's id: the [Eio.Buf_write.t] to
+     write framed messages to in order to reach that peer. Populated by both the dialing path
+     (connect_to) and the accepting path (handle_accepted) as connections come up, via
+     [register_writer]. An entry is trusted, not verified: nothing checks that the peer id a
+     handshake preamble claims is genuine (real authentication is out of scope for this module,
+     per Decision 1's single-operator-cluster framing -- see tcp.mli), and a second connection
+     claiming an id already present here silently replaces the first via [Hashtbl.replace]. An
+     entry is removed by [run_connection] once that connection's reader and writer fibers have
+     BOTH confirmed the connection is dead -- see [run_connection] for why cleanup only happens
+     there, coupled, rather than independently in whichever of the reader/writer notices death
+     first. *)
   writers : (int, Eio.Buf_write.t) Hashtbl.t;
   (* Broadcast every time an entry is added to [writers], so [create] can block until the whole
      mesh implied by [peers] is up without busy-polling [writers]'s length. *)
@@ -82,58 +92,59 @@ let register_writer t peer_id w =
   Hashtbl.replace t.writers peer_id w;
   Eio.Condition.broadcast t.writer_added
 
-(* Runs for the lifetime of the connection to [peer_id]: owns the Eio.Buf_write.t for that
-   connection (registering it in [t.writers] as soon as it exists, so [send] can find it), sends
-   the handshake preamble first if this is the dialing side, then just keeps the connection's
-   write side alive until either the enclosing switch tears it down or the connection dies.
+(* The write side of one connection's lifetime. Always returns [unit] -- every fault this function
+   knows how to handle is caught internally, never re-raised -- so that it composes correctly with
+   [Eio.Fiber.first] in [run_connection]: returning (for any reason) means "this side is done",
+   which is exactly the signal [run_connection] needs to also stop the reader side and clean up.
+   [Eio.Cancel.Cancelled] is deliberately NOT caught: that's [run_connection] itself cancelling
+   this fiber because the READER side finished first, and must be allowed to propagate so
+   [Eio.Fiber.first] can tell the two cases apart.
 
-   [Eio.Buf_write.with_flow]'s own background copy fiber is what actually performs the socket
-   writes as data is buffered here -- and critically, if *that* fiber's write fails (e.g. the peer
-   crashed: [Eio.Io Net Connection_reset], "broken pipe"), the exception propagates out of
-   [with_flow] itself, not just out of some inner callback. Before this fix-round, that exception
-   propagated all the way out of the bare [Eio.Fiber.fork] this runs in and failed the *caller's*
-   switch -- i.e. one crashed peer's write failure killed this entire process, and every other
-   still-healthy connection with it (H1 in the fix-round report). [End_of_file]/[Eio.Io] are
-   caught here for exactly that reason, mirroring [run_reader]'s existing handling of the same
-   fault class. [Eio.Cancel.Cancelled] is deliberately NOT caught: that means the enclosing switch
-   itself is shutting down, which must be allowed to propagate normally rather than being
-   swallowed.
+   [w] is exposed via [writer_cell] as soon as it exists (before this function can block), so
+   [run_connection] can find and remove this connection's own [t.writers] entry once both sides
+   are confirmed done -- see [run_connection] for why "this connection's own" matters (evicting a
+   different, newer connection's entry for the same peer id would be a real bug, not a cosmetic
+   one).
 
-   Once the connection is confirmed dead (by either exception, not by a graceful [with_flow]
-   return, since this fiber's body -- [Eio.Fiber.await_cancel ()] -- never returns normally), the
-   stale [t.writers] entry is removed so a subsequent [send] to this peer gets the existing,
-   synchronous, catchable "no connection to peer N" [Invalid_argument] (tcp.ml, [send], below)
-   instead of silently buffering into a writer that will never reach the peer again (M3 in the
-   fix-round report). Meant to be run in its own forked fiber. *)
-let run_writer t ~is_dialer peer_id flow =
-  (try
-     Eio.Buf_write.with_flow flow (fun w ->
-         if is_dialer then write_preamble w t.my_id;
-         register_writer t peer_id w;
-         Eio.Fiber.await_cancel ())
-   with
-   | End_of_file -> ()
-   | Eio.Io _ -> ());
-  Hashtbl.remove t.writers peer_id
+   Catches:
+   - [End_of_file]/[Eio.Io _]: the peer died or the connection reset. [Eio.Buf_write.with_flow]'s
+     own background copy fiber is what actually performs the socket writes as data is buffered
+     here, and if THAT fiber's write fails, the exception propagates out of [with_flow] itself,
+     not out of some inner callback -- this is what makes catching it here, rather than deeper
+     inside, both necessary and sufficient.
+   - [Failure _]: specifically [Eio.Buf_write]'s own "cannot write to closed writer", reachable if
+     [w] gets closed (by [with_flow]'s own unwind, once this function's [fn] argument is
+     cancelled) in the narrow window before a concurrent [send] call on it completes -- see
+     [send]'s own [Eio.Buf_write.is_closed] guard below, which is the caller-facing half of
+     closing this same race. *)
+let writer_body t ~is_dialer peer_id flow writer_cell =
+  try
+    Eio.Buf_write.with_flow flow (fun w ->
+        writer_cell := Some w;
+        if is_dialer then write_preamble w t.my_id;
+        register_writer t peer_id w;
+        Eio.Fiber.await_cancel ())
+  with
+  | End_of_file -> ()
+  | Eio.Io _ -> ()
+  | Failure _ -> ()
 
-(* Runs for the lifetime of a connection's read side: loops decoding length-prefixed frames and
-   pushing their payload bytes onto the shared inbox for this local peer. Ends quietly (this
-   module does not try to re-establish a dead connection -- see tcp.mli) on:
+(* The read side of one connection's lifetime: loops decoding length-prefixed frames and pushing
+   their payload bytes onto the shared inbox for this local peer. Like [writer_body], always
+   returns [unit] (never re-raises a fault it catches) so it composes with [Eio.Fiber.first] the
+   same way; [Eio.Cancel.Cancelled] is likewise left uncaught, for the same reason.
+
+   Ends on:
    - [End_of_file]/[Eio.Io _]: the connection closed or reset;
    - [Frame_too_large]: the peer's declared frame length was negative or over [max_message_size];
    - [Buf_read.Buffer_limit_exceeded]/[Invalid_argument]: defense in depth for the same class of
      malformed-length input as [Frame_too_large], in case some other path into this loop ever
      produces it directly instead of going through [read_frame]'s own check.
 
-   This same function is used for both accepted and dialed connections' read sides. Before this
-   fix-round only the accepted side was effectively protected against non-[End_of_file]/[Eio.Io]
-   failures -- not by anything in this function, but incidentally, because [accept_fork]'s
-   [~on_error] wraps the whole connection handler. The dialed side's reader is a bare
-   [Eio.Fiber.fork] with no equivalent wrapper, so the same malformed input that an accepted
-   connection survived was fatal on a dialed one (H2 in the fix-round report). Catching the full
-   set here, in the shared function, fixes both call sites at once and makes them symmetric by
-   construction rather than by relying on which side happens to have an outer guard. *)
-let run_reader t r =
+   This same function is used for both accepted and dialed connections' read sides -- both go
+   through [run_connection], so both get identical fault handling and identical connection
+   teardown by construction, not by accident of which side happens to have an outer guard. *)
+let reader_body t r =
   try
     while true do
       let payload = read_frame r in
@@ -148,11 +159,54 @@ let run_reader t r =
   | Eio.Buf_read.Buffer_limit_exceeded | Invalid_argument _ as exn ->
     Eio.traceln "Tcp: connection error: %s; dropping connection" (Printexc.to_string exn)
 
-let handle_accepted t ~sw flow =
+(* Runs one connection's whole lifetime, coupling its reader and writer fibers so that neither can
+   outlive the other's knowledge that the connection is dead.
+
+   Earlier in this fix round, the writer was forked bare onto the OUTER, whole-process switch
+   while the reader ran inline inside whatever called this connection's handler (for an accepted
+   connection, that's [Eio.Net.accept_fork]'s own per-connection handler). That meant whichever
+   side noticed death first left the other unaware: on a dialed connection this "only" leaked an
+   open, unused flow forever (the flow is owned by the outer switch, never otherwise closed); on
+   an ACCEPTED connection it was worse, because [accept_fork] closes the flow itself, exactly
+   once, the moment its handler returns (`Flow.close flow` right after `handle flow addr`
+   completes) -- so a reader that returned quietly on EOF let [accept_fork] close the fd out from
+   under a writer that was still alive on the outer switch, and that writer's next write hit
+   [Invalid_argument "writev: file descriptor used after calling close!"], a shape neither this nor
+   the round-1 fix's [End_of_file]/[Eio.Io] guard caught -- a real process crash, for exactly the
+   scenario H1 was filed about, on every peer holding an ACCEPTED connection to a peer that died
+   (which, given this module's own "lower id dials, higher id accepts" topology, means every
+   surviving peer with a higher id than the one that died).
+
+   [Eio.Fiber.first] is what actually couples the two fibers: it runs [writer_body flow] and
+   [reader_body r] concurrently in a private cancellation sub-context, and as soon as EITHER one
+   finishes (both are written to always return normally rather than raise, for exactly this
+   reason), the other is cancelled and [first] returns. Only once both sides have therefore
+   actually stopped does this function proceed to:
+   - remove this connection's [t.writers] entry, but only if the table's current entry for
+     [peer_id] is still the exact writer THIS connection itself installed (via [writer_cell]) --
+     otherwise a slow-to-notice OLDER connection's cleanup could evict a NEWER connection's live
+     entry for the same id, which is reachable in principle since [register_writer] uses
+     [Hashtbl.replace] and this module does not prevent a second connection from claiming an
+     already-known id (see the [writers] field's own doc comment above);
+   - close the flow ITSELF, but only if [owns_flow] -- true for a dialed connection (whose flow is
+     owned by the long-lived outer [sw] and would otherwise never be closed at all), false for an
+     accepted connection (whose flow [accept_fork] itself closes exactly once, automatically, the
+     moment the function calling [run_connection] -- [handle_accepted] -- returns; closing it a
+     second time here would race that automatic close instead of cooperating with it). *)
+let run_connection t ~is_dialer ~owns_flow peer_id flow r =
+  let writer_cell = ref None in
+  Eio.Fiber.first
+    (fun () -> writer_body t ~is_dialer peer_id flow writer_cell)
+    (fun () -> reader_body t r);
+  (match !writer_cell, Hashtbl.find_opt t.writers peer_id with
+   | Some w, Some w' when w == w' -> Hashtbl.remove t.writers peer_id
+   | _ -> ());
+  if owns_flow then (try Eio.Flow.close flow with _ -> ())
+
+let handle_accepted t flow =
   let r = Eio.Buf_read.of_flow flow ~max_size:max_message_size in
   let peer_id = read_preamble r in
-  Eio.Fiber.fork ~sw (fun () -> run_writer t ~is_dialer:false peer_id flow);
-  run_reader t r
+  run_connection t ~is_dialer:false ~owns_flow:false peer_id flow r
 
 let connect_to t ~sw ~net ~clock ~host ~port peer_id =
   let addr = addr_of_host_port host port in
@@ -167,10 +221,9 @@ let connect_to t ~sw ~net ~clock ~host ~port peer_id =
       end
   in
   let flow = attempt connect_max_retries in
-  Eio.Fiber.fork ~sw (fun () -> run_writer t ~is_dialer:true peer_id flow);
   Eio.Fiber.fork ~sw (fun () ->
       let r = Eio.Buf_read.of_flow flow ~max_size:max_message_size in
-      run_reader t r)
+      run_connection t ~is_dialer:true ~owns_flow:true peer_id flow r)
 
 let create ~sw ~net ~clock ~my_id ~peers =
   let my_host, my_port =
@@ -193,7 +246,7 @@ let create ~sw ~net ~clock ~my_id ~peers =
       while true do
         Eio.Net.accept_fork ~sw listener
           ~on_error:(fun exn -> Eio.traceln "Tcp: connection error: %s" (Printexc.to_string exn))
-          (fun flow _addr -> handle_accepted t ~sw flow)
+          (fun flow _addr -> handle_accepted t flow)
       done);
   List.iter
     (fun (peer_id, host, port) ->
@@ -214,6 +267,10 @@ let create ~sw ~net ~clock ~my_id ~peers =
           (fun (id, _, _) -> if id <> my_id && not (Hashtbl.mem t.writers id) then Some id else None)
           peers
       in
+      (* Known gap (documented, not fixed this round): the listener and any connections already
+         established before this timeout fired stay attached to [sw] with no handle for this
+         function to reach them and tear them down -- see tcp.mli's "No shutdown path" section,
+         which this is one more concrete instance of. *)
       failwith
         (Printf.sprintf
            "Tcp.create: timed out after %.1fs waiting for the mesh to form; still missing connection(s) to peer(s) [%s]"
@@ -229,8 +286,8 @@ let send t ~to_ bytes =
          (String.length bytes) max_message_size)
   else
     match Hashtbl.find_opt t.writers to_ with
-    | Some w -> write_frame w bytes
-    | None -> invalid_arg (Printf.sprintf "Tcp.send: no connection to peer %d" to_)
+    | Some w when not (Eio.Buf_write.is_closed w) -> write_frame w bytes
+    | Some _ | None -> invalid_arg (Printf.sprintf "Tcp.send: no connection to peer %d" to_)
 
 let receive t = Eio.Stream.take t.inbox
 let receive_nonblocking t = Eio.Stream.take_nonblocking t.inbox

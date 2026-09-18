@@ -39,6 +39,32 @@
     which raises an opaque [Failure "inet_addr_of_string"] on a DNS name like ["localhost"] rather
     than resolving it. Resolving hostnames (e.g. via {!Eio.Net.getaddrinfo}) is not implemented.
 
+    Each connection's reader and writer are coupled for as long as the connection lives: whichever
+    one first discovers the connection is dead (peer disconnected, socket reset, or a malformed
+    frame -- see {!max_message_size}) causes the other to be stopped too, before this module's own
+    per-peer connection table is updated or the underlying flow is closed. This matters because
+    the two directions of a single TCP connection do not fail independently and at the same
+    moment in practice -- without this coupling, a reader that quietly notices a dead peer can
+    otherwise leave a still-running writer holding (or, worse, attempting to write to) a flow the
+    rest of this module has already treated as gone.
+
+    {2 Send failures}
+
+    {!send} raises [Invalid_argument] (never any other exception type) in three cases:
+    - the payload exceeds {!max_message_size};
+    - [to_] is not present in the membership table {!create} was given;
+    - this peer's connection to [to_] is known to be dead -- either it was never established, or
+      it was established and has since been confirmed dead by that connection's reader or writer
+      (see "Connection topology" above). A send that races the exact moment a connection dies may
+      still appear to succeed once (the bytes are buffered, matching the "no delivery guarantee"
+      documented on {!Transport_intf.S.send}) before this exception starts being raised on
+      subsequent sends to the same peer.
+
+    Nothing in {!Transport_intf.S} requires an implementation to behave this way -- a caller that
+    wants to be portable across implementations (e.g. the simulated-network adapter, in a later
+    task) should treat "the destination is known to be gone" as, at most, an opportunistic signal
+    this implementation happens to offer, not a contract {!Transport_intf.S} itself promises.
+
     {2 Explicitly out of scope}
 
     No reconnection/retry once a connection has been established (only the initial "wait for the
@@ -62,7 +88,10 @@
     substitutability test, which needs to tear down a cluster between test cases -- but adding a
     [close] deliberately wasn't done as part of this fix round: it belongs at the
     {!Transport_intf.S} level (so the simulated-network adapter can satisfy the same contract),
-    not improvised per-implementation here. *)
+    not improvised per-implementation here. A concrete instance of this same gap: if {!create}
+    itself fails (see its [@raise Failure] below), the listener and any connections already
+    established before the failure stay attached to [sw] with no handle for {!create} to reach
+    them and tear them down before raising -- also not fixed this round, for the same reason. *)
 
 type t
 
@@ -72,12 +101,14 @@ val max_message_size : int
     checks:
     - {!send} raises [Invalid_argument] immediately if [String.length bytes > max_message_size],
       rather than letting an oversized message appear to succeed and then fail later, silently,
-      when the receiver rejects it (which used to also crash the sender's own process before this
-      fix round -- see the fix-round report's M1/H1).
+      when the receiver rejects it.
     - On the receive side, a connection whose peer declares a frame longer than this (or a
       negative length, which a corrupt or hostile 8-byte prefix can produce via [Int64.to_int]
       truncation) is dropped rather than this process attempting to allocate an unbounded buffer
-      for it -- logged as a [Tcp: connection error], not fatal (see the fix-round report's H2). *)
+      for it -- logged as a [Tcp: connection error], not fatal. A message of exactly
+      [max_message_size] bytes is accepted on both sides -- the send-side check and the
+      receive-side check agree exactly, with no off-by-one gap where one side would accept
+      something the other rejects. *)
 
 val create :
   sw:Eio.Switch.t ->
@@ -90,12 +121,15 @@ val create :
 
     - Starts a listener on [my_id]'s own [(host, port)] entry in [peers].
     - Dials every peer in [peers] with an id greater than [my_id] (retrying with a short sleep,
-      driven by [clock], for a bounded number of attempts -- this is only for the "wait for the
-      rest of a small, fixed cluster to finish starting up" case, not general reconnection).
+      driven by [clock], for a bounded number of attempts, up to ~20s total -- this is only for
+      the "wait for the rest of a small, fixed cluster to finish starting up" case, not general
+      reconnection).
     - Accepts connections from every peer in [peers] with an id less than [my_id], reading the
       handshake preamble documented above to learn which peer each accepted socket belongs to.
-    - Forks one background writer fiber and one background reader fiber (onto [sw]) per
-      connection, matching this module's wire format above.
+    - For each connection, runs a coupled reader/writer pair (see "Connection topology" above)
+      matching this module's wire format. A dialed connection's pair runs in one fiber forked onto
+      [sw]; an accepted connection's pair runs directly inside the fiber
+      {!Eio.Net.accept_fork} itself creates for that connection.
 
     [peers] is the full membership table, including an entry for [my_id] itself. [create] blocks
     until this peer has an outbound path ready to every other peer in [peers] (i.e.
@@ -111,8 +145,12 @@ val create :
     are attached to it.
 
     @raise Invalid_argument if [my_id] is not present in [peers].
-    @raise Failure if the mesh has not finished forming within a bounded timeout (matching the
-      dial loop's own ~20s retry budget) -- e.g. because some other peer in [peers] never started.
-      The error message names which peer id(s) are still missing a connection. *)
+    @raise Failure if the mesh has not finished forming within a bounded timeout, once dialing
+      itself has finished -- e.g. because some other peer in [peers] never started. The error
+      message names which peer id(s) are still missing a connection. This timeout is itself ~20s,
+      stacked AFTER the ~20s dial budget above, so [create]'s real worst-case wall-clock time
+      before raising is closer to ~40s total, not the ~20s either budget alone might suggest. A
+      failed [create] does not clean up whatever it had already started (see "No shutdown path"
+      above) -- a known, undone gap, not a claim that it does. *)
 
 include Transport_intf.S with type t := t

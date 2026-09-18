@@ -20,7 +20,16 @@ module type S = sig
       delivery) -- NOT once the peer has received them. Delivery order across different senders is
       NOT guaranteed (neither real TCP-across-multiple-connections nor the simulated fabric
       promises it) -- callers needing ordering must encode it in the message itself, which VSR's
-      own message records already do (view/op numbers). *)
+      own message records already do (view/op numbers).
+
+      This signature alone does not say what happens when [to_] is unreachable (never known, or
+      known but since gone): a conforming implementation MAY raise to signal this synchronously on
+      a later call (e.g. {!Tcp.send} raises [Invalid_argument] once it has confirmed a peer's
+      connection is dead -- see [tcp.mli]'s "Send failures" section for the exact cases), or it MAY
+      just keep silently dropping the message, matching the "no delivery guarantee" above. Callers
+      that want to be portable across implementations should not rely on [send] either always or
+      never raising for a gone peer -- only on the fact that it never blocks waiting for
+      delivery. *)
 
   val receive : t -> string
   (** [receive t] blocks (cooperatively) until the next message addressed to this handle's own
