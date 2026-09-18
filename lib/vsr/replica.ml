@@ -161,6 +161,15 @@ let handle_prepare_ok t ~view ~n ~i =
     () (* VSR.tla:141's own [p \in replicas] domain restriction -- a decoded [i] naming no real
           replica must never be allowed into [peer_op_number] at all (see that field's own doc
           comment above for why this is the single point where the invariant is established) *)
+  else if n > op_number t then
+    () (* A genuine [Prepare_ok] can never legitimately claim to have acked an op-number higher
+          than what THIS primary has itself assigned via a Prepare broadcast -- op-numbers are
+          minted only by this replica's own log (op_number t = Replica_log.length), so [m.n]
+          can be at most that. Left unbounded, a forged (or corrupted) [n] from an otherwise
+          real replica id permanently pre-acks every future op this primary ever proposes,
+          letting it "commit" with zero real acks once op_number catches up -- the same
+          AcknowledgedWritesExistOnMajority violation M1/M2 were fixed against, just via [n]
+          instead of [i]/[k]. *)
   else begin
     let prev = Option.value (Hashtbl.find_opt t.peer_op_number i) ~default:0 in
     if n > prev then Hashtbl.replace t.peer_op_number i n;

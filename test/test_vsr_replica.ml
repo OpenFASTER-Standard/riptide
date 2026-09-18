@@ -274,13 +274,33 @@ let test_prepare_k_exceeding_op_number_rejected_across_multiple_prepares () =
     (Replica.commit_number t)
 
 let test_prepare_k_within_bound_still_advances_normally () =
-  (* a well-formed, genuinely higher k that stays within [0, op_number] must still be applied --
-     the fix must not weaken the legitimate case *)
+  (* a genuinely WELL-FORMED, higher k must still be applied -- the fix must not weaken the
+     legitimate case. Well-formed per VSR.tla:106-109's own comment means k < n strictly (the
+     primary's commit-number from strictly BEFORE the request carried by this same message was
+     appended), not merely k <= op_number -- the implementation's own bound (k <= op_number t,
+     i.e. k <= n once this Prepare's append has advanced op_number to n) is intentionally a
+     little wider than that, as a defense-in-depth margin against off-by-one edge cases, not
+     because k = n is itself a message any correct primary would ever actually send. *)
   let send, _sent = capturing_send () in
   let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 2 }));
-  Alcotest.(check int) "a valid, in-bound k still advances commit_number" 2 (Replica.commit_number t)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "a valid, in-bound k still advances commit_number" 1 (Replica.commit_number t)
+
+(* ---- M3 fix: a forged Prepare_ok.n from a REAL replica id permanently pre-acks future ops ---- *)
+
+let test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  (* Before the fix: a single forged ack, from a REAL replica id, claiming to have acked an
+     op-number this primary has never proposed, permanently inflated that peer's recorded
+     high-water mark -- so once op_number genuinely caught up, the primary would "commit" future
+     ops with only ONE further real ack instead of the two needed for majority in a 3-replica
+     cluster (f=1). *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1_000_000; i = 2 }));
+  Replica.propose t (v "op1");
+  Alcotest.(check int) "the forged, out-of-range ack does not commit op1 by itself" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed" false (Replica.is_committed t (v "op1"))
 
 (* ---- L1 fix-round regression tests: create validates its numeric arguments ---- *)
 
@@ -385,6 +405,10 @@ let tests =
       `Quick,
       test_prepare_k_exceeding_op_number_rejected_across_multiple_prepares );
     ("M2: a valid, in-bound k still advances commit_number normally", `Quick, test_prepare_k_within_bound_still_advances_normally);
+    (* M3 fix-round regression test *)
+    ( "M3: a forged PrepareOk.n from a real replica id does not pre-ack future ops",
+      `Quick,
+      test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops );
     (* L1 fix-round regression tests *)
     ("L1: create accepts a valid, degenerate single-replica cluster", `Quick, test_create_accepts_a_valid_single_replica_cluster);
     (* L2 fix-round regression test *)

@@ -92,9 +92,14 @@ val commit_number : t -> int
     [Prepare] there is produced by [ReceiveClientRequest] itself, which guarantees [m.k < m.n]
     (VSR.tla:106-109's own comment) — a precondition that does not hold for a [Prepare] decoded
     off {!Riptide_transport.Transport_intf.S}'s own "no payload integrity" wire. {!handle_message}
-    re-establishes it explicitly by also capping the update at [op_number t] (this replica's own
-    log length, which the [Prepare] being processed has just extended to [m.n]) — see its own doc
-    comment below for the exact bound. *)
+    re-establishes it explicitly by REJECTING (not capping/clamping) a [Prepare]'s [k] once it
+    would exceed [op_number t] (this replica's own log length, which the [Prepare] being
+    processed has just extended to [m.n]) — [commit_number] is left at its prior, legitimately-
+    established value rather than substituted with a different one, on the reasoning that a [k]
+    this far outside the well-formed range is a signal the whole message is suspect, not just
+    that one field. See {!handle_message}'s own doc comment below for the exact bound, and the
+    analogous, independently-established bound on a [Prepare_ok]'s own [n] field (a genuine ack
+    can never claim to have acked an op-number this primary hasn't itself assigned). *)
 
 val entries : t -> Riptide.Value.value list
 (** [entries t] is this replica's log in append order (op-number 1 first) — a thin wrapper over
@@ -178,7 +183,14 @@ val handle_message : t -> string -> unit
       [replicas == 1..ReplicaCount]), enforced here at the point [m.i] would otherwise enter
       {!t}'s internal peer-acknowledgment table, so a decoded [Prepare_ok] naming no real replica
       (a corrupted or forged [i]) can never inflate quorum. A [m.i] that fails this check is
-      dropped exactly like a wrong-view message — no state change. Otherwise: updates this
+      dropped exactly like a wrong-view message — no state change. {b Also gated on [m.n] not
+      exceeding [op_number t]}: op-numbers are minted only by this primary's own log (this
+      replica IS the primary in this branch), so a genuine ack can never legitimately claim a
+      higher one — a [m.n] a corrupted/forged network delivery has pushed past what this replica
+      has itself ever proposed is dropped too, for the same reason (and same
+      [AcknowledgedWritesExistOnMajority] concern) as the [m.i] check just above: left unbounded,
+      it would let a single forged ack from an otherwise-real replica id permanently pre-ack every
+      future op this primary ever proposes. Otherwise: updates this
       replica's tracked high-water mark for peer [m.i] to [m.n], but ONLY if higher than what was
       already recorded (VSR.tla:131-132's own [IF m.n > @ THEN m.n ELSE @]) — cumulative, not
       per-op, per VSR.tla's own §1.5 point 2 comment (VSR.tla:125). Then internally drives VSR.tla's
