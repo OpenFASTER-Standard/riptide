@@ -109,8 +109,33 @@ let with_cluster (body : replicas:Replica.t array -> settle:(unit -> unit) -> un
         Eio.Switch.fail sw Cluster_test_done)
   with Cluster_test_done -> ()
 
-let check_entries msg expected actual =
-  Alcotest.(check bool) msg true (actual = expected)
+(* A minimal, test-only pretty-printer -- Value.value has no pp/show of its own (nothing in
+   lib/value.mli needs one outside test diagnostics), just enough structure to make an Alcotest
+   failure diff actually legible instead of a bare "Expected: true / Received: false". *)
+let rec pp_value fmt (v : Value.value) =
+  match v with
+  | Value.Scalar (Value.Bool b) -> Format.fprintf fmt "Bool %b" b
+  | Value.Scalar (Value.Int i) -> Format.fprintf fmt "Int %Ld" i
+  | Value.Scalar (Value.Float f) -> Format.fprintf fmt "Float %f" f
+  | Value.Scalar (Value.String s) -> Format.fprintf fmt "String %S" s
+  | Value.Scalar (Value.Bytes b) -> Format.fprintf fmt "Bytes %S" b
+  | Value.Record fields ->
+    Format.fprintf fmt "Record [%a]"
+      (Format.pp_print_list ~pp_sep:(fun fmt () -> Format.fprintf fmt "; ") (fun fmt (k, v) ->
+           Format.fprintf fmt "(%S, %a)" k pp_value v))
+      fields
+  | Value.Sum (tag, v) -> Format.fprintf fmt "Sum (%S, %a)" tag pp_value v
+  | Value.Sequence items ->
+    Format.fprintf fmt "Sequence [%a]" (Format.pp_print_list ~pp_sep:(fun fmt () -> Format.fprintf fmt "; ") pp_value) items
+  | Value.Map entries ->
+    Format.fprintf fmt "Map [%a]"
+      (Format.pp_print_list ~pp_sep:(fun fmt () -> Format.fprintf fmt "; ") (fun fmt (k, v) ->
+           Format.fprintf fmt "(%a, %a)" pp_value k pp_value v))
+      entries
+
+let value_testable = Alcotest.testable pp_value (fun a b -> Value.canonical_encode a = Value.canonical_encode b)
+
+let check_entries msg expected actual = Alcotest.(check (list value_testable)) msg expected actual
 
 (* ---- Step 4: single propose -- replication, primary commit, and the backup-commit-lag question
    ---- *)
@@ -197,11 +222,17 @@ let test_single_propose_replicates_then_second_propose_advances_backup_commit ()
 (* Proposes 4 values in sequence (settling fully between each, so each step's cause and effect
    stay unambiguous), and confirms two things a single-value test can't: (a) every replica's log
    converges to the SAME content, in the SAME order, not just "contains the right values"; and
-   (b) the backup-commit-lag finding from the test above generalizes exactly as its own mechanism
-   predicts -- with N values proposed and none beyond the Nth, the primary is fully committed
-   (commit_number = N, from its own PrepareOk-driven quorum checks) while both backups are
-   perpetually exactly ONE behind (commit_number = N-1), because the Nth value's own commit
-   confirmation has, by construction, never piggybacked onto any (N+1)th Prepare. *)
+   (b) the backup-commit-lag finding from the test above generalizes -- UNDER THIS TEST'S OWN
+   settle-after-every-propose PATTERN SPECIFICALLY, not as a general protocol invariant: with N
+   values proposed one at a time, each fully settled before the next is proposed, the primary is
+   fully committed (commit_number = N) while both backups are exactly ONE behind (commit_number =
+   N-1), because the Nth value's own commit confirmation has, by construction, never piggybacked
+   onto any (N+1)th Prepare. This "lag by exactly one" shape is an artifact of proposing and
+   settling one value at a time -- it is NOT a property of the protocol itself: proposing several
+   values in a row BEFORE settling produces a different, larger lag (e.g. batching 4 proposals
+   before one settle leaves both backups at commit_number = 0 while the primary reaches 4, since
+   none of the intervening Prepares had a chance to be individually observed and piggybacked on
+   in turn) -- do not read this test as proving "backups always lag by one" in general. *)
 let test_multiple_proposes_converge_with_backups_lagging_by_exactly_one () =
   with_cluster (fun ~replicas ~settle ->
       let primary = replicas.(0) and backup2 = replicas.(1) and backup3 = replicas.(2) in
@@ -214,18 +245,21 @@ let test_multiple_proposes_converge_with_backups_lagging_by_exactly_one () =
       Array.iteri
         (fun i r -> check_entries (Printf.sprintf "replica %d's log converges to all 4 values, in order" (i + 1)) values (Replica.entries r))
         replicas;
-      Alcotest.(check bool) "backup 2's log is IDENTICAL to the primary's, not just overlapping" true
-        (Replica.entries backup2 = Replica.entries primary);
-      Alcotest.(check bool) "backup 3's log is IDENTICAL to the primary's too" true (Replica.entries backup3 = Replica.entries primary);
+      check_entries "backup 2's log is IDENTICAL to the primary's, not just overlapping" (Replica.entries primary)
+        (Replica.entries backup2);
+      check_entries "backup 3's log is IDENTICAL to the primary's too" (Replica.entries primary) (Replica.entries backup3);
       Alcotest.(check int) "primary is fully committed: commit_number = 4, all 4 proposed values" 4
         (Replica.commit_number primary);
       Alcotest.(check int)
-        "backup 2 lags by exactly one, per the mechanism this file's other test isolates: \
-         commit_number = 3, not 4 (the 4th value's own commit confirmation never piggybacked onto \
-         a 5th Prepare that was never sent) and not some other value (each step only ever advances \
-         by exactly what its OWN Prepare's k field carried)"
+        "backup 2 lags by exactly one UNDER THIS TEST'S settle-after-every-propose PATTERN, per \
+         the mechanism this file's other test isolates: commit_number = 3, not 4 (the 4th value's \
+         own commit confirmation never piggybacked onto a 5th Prepare that was never sent) and not \
+         some other value (each step only ever advances by exactly what its OWN Prepare's k field \
+         carried) -- this specific '-1' lag is a consequence of settling between each propose, not \
+         a general protocol property (batching proposals before settling produces a different lag)"
         3 (Replica.commit_number backup2);
-      Alcotest.(check int) "backup 3 lags identically, by exactly one" 3 (Replica.commit_number backup3);
+      Alcotest.(check int) "backup 3 lags identically, by exactly one, under this same settle-per-propose pattern" 3
+        (Replica.commit_number backup3);
       List.iteri
         (fun i v ->
           let n = i + 1 in
