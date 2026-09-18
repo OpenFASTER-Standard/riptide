@@ -61,4 +61,5 @@ let () =
       ("vsr_replica_log", Test_vsr_replica_log.tests);
       ("vsr_replica", Test_vsr_replica.tests);
       ("vsr_replica_cluster", Test_vsr_replica_cluster.tests);
+      ("vsr_replica_view_change", Test_vsr_replica_view_change.tests);
     ]
