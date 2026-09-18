@@ -38,7 +38,22 @@
     non-blocking-until-pumped, which is real, correct behavior of the underlying simulated
     network, not an adapter-specific quirk to paper over. {!pump_one}/{!pump_all} below are
     exposed on {!t} precisely so a caller (e.g. a test) can drive delivery explicitly, the same
-    way it would have to against {!Network} directly. *)
+    way it would have to against {!Network} directly.
+
+    {2 Delivery semantics this implementation provides}
+
+    Deliberately, the bare minimum {!Riptide_transport.Transport_intf.S} allows and nothing more:
+    whatever the underlying {!Network.fault_config} dictates. Messages may be reordered (including
+    two messages from the same sender to the same destination, since {!Network.schedule} draws an
+    independent random delay for each), dropped, duplicated, or delivered with corrupted payload
+    bytes. None of {!Riptide_transport.Tcp}'s stronger properties (per-peer FIFO, at-most-once,
+    integrity) hold here -- which is the point: code that works against both implementations is
+    code that genuinely relies only on the shared contract.
+
+    Note also that {!Riptide_transport.Transport_intf.S.receive} blocks until something calls
+    {!pump_one}/{!pump_all}, so a receive loop against this implementation must share its domain
+    with whatever does the pumping -- see that operation's own documentation, and the
+    "does not drive delivery on its own" paragraph above. *)
 
 type t
 

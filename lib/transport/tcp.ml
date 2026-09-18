@@ -16,10 +16,41 @@ let dial_timeout = connect_retry_delay *. float_of_int connect_max_retries
    was going to succeed has already done so well within that window, waiting much longer for the
    *accepting* side to complete isn't buying anything -- it just turns a misconfigured/late
    cluster into an unexplained hang instead of a clear error. Note this is a SECOND, independent
-   ~20s budget stacked after the dial loop's own: [create]'s real worst-case wall-clock time is
-   [dial_timeout +. mesh_formation_timeout] (~40s total), not just this constant on its own -- see
-   the [@raise Failure] note on [create] in tcp.mli. *)
+   ~20s budget stacked after the dial loop's own, and the dial loop runs SEQUENTIALLY over every
+   higher-id peer: [create]'s real worst-case wall-clock time is
+   [dial_timeout *. (number of higher-id peers) +. mesh_formation_timeout], not just this constant
+   on its own -- see the [@raise Failure] note on [create] in tcp.mli. *)
 let mesh_formation_timeout = dial_timeout
+
+(* Bound on how long an ACCEPTED connection is given to send its 8-byte handshake preamble (see
+   tcp.mli) before it is dropped. Without a bound, any party that can reach the listening port can
+   open a connection, send nothing, and park a fiber plus an fd here for the lifetime of the
+   process -- and accumulating stuck fds is precisely what walks this process toward the [EMFILE]
+   the accept loop below has to survive. Generous relative to the real case (the dialing side
+   writes its preamble immediately after [connect] returns, before anything else), so this only
+   ever fires for a peer that is not speaking this protocol at all, or is wedged. *)
+let preamble_read_timeout = 10.0
+
+(* Error handling for the listener's accept loop. [Eio.Net.accept_fork]'s [~on_error] covers only
+   the per-connection handler fiber, NOT the [accept(2)] call itself, so a transient OS-level
+   accept failure ([EMFILE]/[ENFILE] fd exhaustion, [ECONNABORTED] from a client that resets
+   between SYN and accept, [ENOBUFS]) would otherwise escape the loop, fail the whole transport's
+   switch, and take every already-established connection -- and typically the process -- with it.
+   A single failed accept must cost at most the one connection it was for.
+
+   The loop therefore logs and retries, pausing [accept_error_backoff] first so a listener that is
+   failing continuously degrades into a slow log rather than a busy loop (a busy loop is invisible
+   to Eio's own deadlock detection and to the test suite's watchdog). But retrying forever would
+   turn a PERMANENT failure -- the listening socket itself closed, say -- into a silent,
+   unbounded log spin with no way for the caller to ever learn about it, and this module exposes
+   no error channel other than raising. So consecutive failures are counted (the count resets on
+   every successful accept, so unrelated transient blips never accumulate into a shutdown) and
+   once the budget is spent the last exception is re-raised, surfacing on [sw] the way an
+   unrecoverable listener failure should. 64 * 0.1s means roughly 6s of uninterrupted failure
+   before that happens -- far longer than any transient condition here plausibly lasts, far
+   shorter than "never". *)
+let accept_error_backoff = 0.1
+let accept_max_consecutive_errors = 64
 
 (* Backlog for the listening socket. This is a small, fixed cluster, so a generous constant is
    simpler than trying to size it from [peers]. *)
@@ -162,20 +193,21 @@ let reader_body t r =
 (* Runs one connection's whole lifetime, coupling its reader and writer fibers so that neither can
    outlive the other's knowledge that the connection is dead.
 
-   Earlier in this fix round, the writer was forked bare onto the OUTER, whole-process switch
-   while the reader ran inline inside whatever called this connection's handler (for an accepted
-   connection, that's [Eio.Net.accept_fork]'s own per-connection handler). That meant whichever
-   side noticed death first left the other unaware: on a dialed connection this "only" leaked an
-   open, unused flow forever (the flow is owned by the outer switch, never otherwise closed); on
-   an ACCEPTED connection it was worse, because [accept_fork] closes the flow itself, exactly
-   once, the moment its handler returns (`Flow.close flow` right after `handle flow addr`
-   completes) -- so a reader that returned quietly on EOF let [accept_fork] close the fd out from
-   under a writer that was still alive on the outer switch, and that writer's next write hit
-   [Invalid_argument "writev: file descriptor used after calling close!"], a shape neither this nor
-   the round-1 fix's [End_of_file]/[Eio.Io] guard caught -- a real process crash, for exactly the
-   scenario H1 was filed about, on every peer holding an ACCEPTED connection to a peer that died
-   (which, given this module's own "lower id dials, higher id accepts" topology, means every
-   surviving peer with a higher id than the one that died).
+   This coupling is load-bearing, not tidiness. The uncoupled arrangement -- writer forked bare
+   onto the OUTER, whole-process switch, reader running inline inside whatever called this
+   connection's handler (for an accepted connection, that's [Eio.Net.accept_fork]'s own
+   per-connection handler) -- leaves whichever side notices death first unable to tell the other.
+   On a dialed connection that "only" leaks an open, unused flow forever (the flow is owned by the
+   outer switch, and nothing else ever closes it). On an ACCEPTED connection it is far worse,
+   because [accept_fork] closes the flow itself, exactly once, the moment its handler returns
+   (`Flow.close flow` right after `handle flow addr` completes): a reader that returns quietly on
+   EOF lets [accept_fork] close the fd out from under a writer that is still alive on the outer
+   switch, and that writer's next write raises
+   [Invalid_argument "writev: file descriptor used after calling close!"] -- a shape the
+   [End_of_file]/[Eio.Io] guards in [writer_body] do not catch, i.e. a real process crash, on
+   every peer holding an ACCEPTED connection to a peer that just died. Given this module's own
+   "lower id dials, higher id accepts" topology, that is every surviving peer with a higher id
+   than the one that died: one peer's death would kill the rest of the cluster.
 
    [Eio.Fiber.first] is what actually couples the two fibers: it runs [writer_body flow] and
    [reader_body r] concurrently in a private cancellation sub-context, and as soon as EITHER one
@@ -209,10 +241,49 @@ let run_connection t ~is_dialer ~owns_flow peer_id flow r =
        inside an outer cancellation (e.g. the whole transport's [sw] tearing down), swallowing
        that signal here would stop it from propagating to whatever is waiting on it. *))
 
-let handle_accepted t flow =
+(* Handles one accepted connection for its whole lifetime, starting with its handshake preamble.
+   The preamble read is bounded by [preamble_read_timeout] (see above): on timeout this function
+   simply returns without ever running the connection, which is enough to release the fd, since
+   [Eio.Net.accept_fork] closes the flow itself as soon as this handler returns. *)
+let handle_accepted t ~clock flow =
   let r = Eio.Buf_read.of_flow flow ~max_size:max_message_size in
-  let peer_id = read_preamble r in
-  run_connection t ~is_dialer:false ~owns_flow:false peer_id flow r
+  match Eio.Time.with_timeout clock preamble_read_timeout (fun () -> Ok (read_preamble r)) with
+  | Ok peer_id -> run_connection t ~is_dialer:false ~owns_flow:false peer_id flow r
+  | Error `Timeout ->
+    Eio.traceln
+      "Tcp: connection error: accepted connection sent no handshake preamble within %.1fs; \
+       dropping connection"
+      preamble_read_timeout
+
+(* The listener's whole lifetime: accept connections until cancelled, surviving transient
+   accept-time errors -- see [accept_max_consecutive_errors] above for the full reasoning behind
+   this loop's error policy, including why it eventually gives up rather than retrying forever. *)
+let run_accept_loop t ~sw ~clock listener =
+  let consecutive_errors = ref 0 in
+  while true do
+    match
+      Eio.Net.accept_fork ~sw listener
+        ~on_error:(fun exn -> Eio.traceln "Tcp: connection error: %s" (Printexc.to_string exn))
+        (fun flow _addr -> handle_accepted t ~clock flow)
+    with
+    | () -> consecutive_errors := 0
+    (* [Eio.Cancel.Cancelled] is deliberately NOT caught: it is this fiber's own switch tearing
+       down, not a listener fault, and must propagate for that teardown to complete. *)
+    | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+    | exception ((Eio.Io _ | End_of_file) as exn) ->
+      incr consecutive_errors;
+      if !consecutive_errors >= accept_max_consecutive_errors then begin
+        Eio.traceln
+          "Tcp: accept failed %d times consecutively over ~%.0fs; giving up on the listener: %s"
+          !consecutive_errors
+          (float_of_int !consecutive_errors *. accept_error_backoff)
+          (Printexc.to_string exn);
+        raise exn
+      end;
+      Eio.traceln "Tcp: accept error (%d consecutive), retrying in %.1fs: %s" !consecutive_errors
+        accept_error_backoff (Printexc.to_string exn);
+      Eio.Time.sleep clock accept_error_backoff
+  done
 
 let connect_to t ~sw ~net ~clock ~host ~port peer_id =
   let addr = addr_of_host_port host port in
@@ -231,6 +302,19 @@ let connect_to t ~sw ~net ~clock ~host ~port peer_id =
       let r = Eio.Buf_read.of_flow flow ~max_size:max_message_size in
       run_connection t ~is_dialer:true ~owns_flow:true peer_id flow r)
 
+(* Which peers in [peers] this handle does not yet have an outbound path to. The empty list is
+   exactly the "mesh is formed" condition [create] waits for, and the same list names the peers in
+   [create]'s own timeout error -- deliberately one function used for both, because a readiness
+   check that is not literally the negation of the diagnostic ("are there ENOUGH connections?" vs
+   "are the RIGHT ones present?") can and did disagree with it: [t.writers] is keyed by whatever
+   peer id a handshake preamble claims (trusted, not validated -- see the [writers] field above),
+   so any accepted connection, including one claiming an id not in [peers] at all, counts toward a
+   count-based check while leaving a genuinely expected peer missing. *)
+let missing_peers t peers =
+  List.filter_map
+    (fun (id, _, _) -> if id <> t.my_id && not (Hashtbl.mem t.writers id) then Some id else None)
+    peers
+
 let create ~sw ~net ~clock ~my_id ~peers =
   let my_host, my_port =
     match List.find_opt (fun (id, _, _) -> id = my_id) peers with
@@ -248,40 +332,43 @@ let create ~sw ~net ~clock ~my_id ~peers =
     Eio.Net.listen ~reuse_addr:true ~backlog:listen_backlog ~sw net
       (addr_of_host_port my_host my_port)
   in
-  Eio.Fiber.fork ~sw (fun () ->
-      while true do
-        Eio.Net.accept_fork ~sw listener
-          ~on_error:(fun exn -> Eio.traceln "Tcp: connection error: %s" (Printexc.to_string exn))
-          (fun flow _addr -> handle_accepted t flow)
-      done);
+  Eio.Fiber.fork ~sw (fun () -> run_accept_loop t ~sw ~clock listener);
+  (* Known gap (documented, not fixed here): from this point on, if this function raises, the
+     listener and any connections already established stay attached to [sw] with no handle for
+     this function to reach them and tear them down -- see tcp.mli's "No shutdown path" section,
+     which this is one more concrete instance of. *)
   List.iter
     (fun (peer_id, host, port) ->
-      if peer_id > my_id then connect_to t ~sw ~net ~clock ~host ~port peer_id)
+      if peer_id > my_id then
+        match connect_to t ~sw ~net ~clock ~host ~port peer_id with
+        | () -> ()
+        | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+        | exception exn ->
+          (* [connect_to] re-raises whatever [Eio.Net.connect] last failed with once its retry
+             budget is spent -- most often an [Eio.Io] "connection refused" from a peer that never
+             started. Re-raise it as the same [Failure] the mesh-formation timeout below produces,
+             so that BOTH ways a peer can fail to show up (it never accepted our dial; it never
+             dialed us) reach the caller as one documented exception type carrying the peer id,
+             rather than the caller having to also know Eio's own exception vocabulary to catch
+             the more likely of the two. The original exception's text is preserved verbatim. *)
+          failwith
+            (Printf.sprintf "Tcp.create: gave up dialing peer %d at %s:%d after ~%.1fs: %s" peer_id
+               host port dial_timeout (Printexc.to_string exn)))
     peers;
-  let expected = List.length peers - 1 in
-  if expected > 0 then begin
+  if missing_peers t peers <> [] then begin
     match
       Eio.Time.with_timeout clock mesh_formation_timeout (fun () ->
           Eio.Condition.loop_no_mutex t.writer_added (fun () ->
-              if Hashtbl.length t.writers >= expected then Some () else None);
+              if missing_peers t peers = [] then Some () else None);
           Ok ())
     with
     | Ok () -> ()
     | Error `Timeout ->
-      let missing =
-        List.filter_map
-          (fun (id, _, _) -> if id <> my_id && not (Hashtbl.mem t.writers id) then Some id else None)
-          peers
-      in
-      (* Known gap (documented, not fixed this round): the listener and any connections already
-         established before this timeout fired stay attached to [sw] with no handle for this
-         function to reach them and tear them down -- see tcp.mli's "No shutdown path" section,
-         which this is one more concrete instance of. *)
       failwith
         (Printf.sprintf
            "Tcp.create: timed out after %.1fs waiting for the mesh to form; still missing connection(s) to peer(s) [%s]"
            mesh_formation_timeout
-           (String.concat "; " (List.map string_of_int missing)))
+           (String.concat "; " (List.map string_of_int (missing_peers t peers))))
   end;
   t
 

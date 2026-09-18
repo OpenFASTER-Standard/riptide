@@ -273,6 +273,11 @@ Register both suites in `test/test_riptide.ml`.
   beyond initial cluster startup; no TLS/authentication (single-operator cluster, per Decision 1's
   own fault-model framing — not a stated requirement anywhere in the design spec); no
   backpressure/flow-control beyond whatever the OS TCP stack and `Eio.Buf_write` already provide;
+no `close`/`shutdown` operation — neither on `Transport.S` nor on `Tcp`, whose background fibers
+therefore live exactly as long as the `sw` passed to `Tcp.create` (see `tcp.mli`'s "No shutdown
+path"); both test files independently work around this by failing the switch explicitly, so this
+is a real, already-costly gap and an explicit follow-up for subtask 3.2 or later, and it belongs
+on `Transport.S` (so both implementations satisfy one contract) rather than improvised on `Tcp`;
   no integration with `lib/sim/network.ml`'s own fault-injection for the TCP implementation (a
   DST harness that wants to fault-inject *real* socket behavior, e.g. via a wrapping `Eio.Flow`
   that drops/delays at the byte level, is subtask 3.4's concern, building on top of this plan's

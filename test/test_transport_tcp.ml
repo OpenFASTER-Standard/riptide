@@ -5,21 +5,41 @@
    [Eio_mock.Backend] -- there is no mock socket layer to substitute here; the whole point is to
    prove the real wire behavior).
 
-   This module does not re-derive the crash-bug hunt that produced the current, fixed
-   [tcp.ml]/[tcp.mli] (send-to-dead-peer, corrupt/oversized-frame, and accept-vs-dial connection
-   lifecycle bugs -- see task-3-brief.md and tcp.ml's own doc comments on [run_connection] for that
-   history). It locks in, permanently, the three properties that history's throwaway repro scripts
-   proved and that would otherwise have no lasting test:
+   {b What these tests do not cover, permanently.} An earlier round of work on [tcp.ml] fixed a
+   family of crash bugs -- a write to a peer that had already died, and a corrupt/oversized frame,
+   each behaving differently depending on whether the connection had been dialed or accepted --
+   whose defining symptom was that they killed the whole OS process, not just one connection (see
+   [tcp.ml]'s doc comment on [run_connection] for the mechanism and the fix). Nothing below
+   regression-tests that class of bug, and nothing in this file structurally can: observing
+   "process A survived process B's death" requires two real OS processes, and this suite runs a
+   whole mesh inside one. A failure of that kind would take the test runner itself down rather
+   than fail an assertion. So treat a green run here as evidence about the framing, routing and
+   delivery properties listed below, and {b not} as evidence that the process-crash-on-dead-peer
+   scenarios are still fixed -- those were verified with throwaway multi-process harnesses at the
+   time, and re-verifying them needs the same kind of harness again. Closing this gap properly
+   would mean a multi-process integration-test mechanism this repo does not yet have.
+
+   What this file does lock in, permanently, is the three properties that would otherwise have no
+   lasting test:
    - a real multi-peer mesh actually delivers messages correctly, in both directions, on every
      pairwise connection;
    - length-prefixed framing is byte-exact even when payload content itself contains bytes that
      look like framing metadata -- two back-to-back sends over one connection arrive as two
      distinct, unmodified messages, never merged or split;
    - each peer's [receive] only ever surfaces messages actually sent [~to_] it, with no
-     cross-peer misattribution, even under concurrent multi-connection traffic.
+     cross-peer misattribution, even under concurrent multi-connection traffic;
+   - [Tcp.create] does not return until every SPECIFIC expected peer id is connected, rather than
+     merely that many connections existing (see that test's own comment).
+
+   Two further failure paths are also not covered here, for reasons of mechanism rather than
+   oversight, and both were instead verified with throwaway harnesses: the listener surviving a
+   transient [accept(2)] error needs the process's file-descriptor budget deliberately exhausted,
+   which would break the test runner itself long before it reached an assertion; and the bounded
+   wait for an accepted connection's handshake preamble takes longer to fire (~10s) than this
+   suite's own wall-clock watchdog allows a single test to run.
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
-   19321-19323) so a re-run or a future added test in this file can't collide even if an earlier
+   19321-19323, 19331-19333) so a re-run or a future added test in this file can't collide even if an earlier
    test's sockets are still winding down -- [Tcp.create] itself passes [~reuse_addr:true] to
    [Eio.Net.listen], but distinct ports sidestep the question entirely rather than relying on
    that. [Tcp.create] does not expose its internal listening socket, so there is no way to ask it
@@ -164,11 +184,77 @@ let test_no_cross_peer_misattribution_under_concurrent_traffic () =
             (expected_for p) (Hashtbl.find received p))
         ids)
 
+(* -- Area 4: [create]'s mesh-readiness predicate -- *)
+
+exception Stray_mesh_torn_down
+
+let be8 n =
+  let b = Bytes.create 8 in
+  Bytes.set_int64_be b 0 (Int64.of_int n);
+  Bytes.to_string b
+
+(* [Tcp.create] must not return until it has an outbound path to each SPECIFIC other peer id in
+   the membership table -- not merely to that MANY peers. The distinction is observable because
+   the per-peer connection table is keyed by the id a handshake preamble claims, and that id is
+   trusted rather than checked against the membership table (see tcp.mli's preamble note): any
+   accepted connection lands in it, including one claiming an id the cluster has never heard of.
+
+   This test makes the difference decide the outcome. Two stray sockets connect to peer 3's
+   listener and claim ids 98 and 99 -- neither in [peer_specs] -- before peers 1 and 2 have even
+   started. That is exactly as many connections as peer 3 is waiting for, so a readiness check
+   that counted entries would declare the mesh formed and let [create] return with no path to
+   either real peer. Peer 3's fiber therefore sends to both real peers the instant its own
+   [create] returns, while peers 1 and 2 may still be starting: against a count-based check those
+   sends raise [Invalid_argument "no connection to peer 1"], and against a per-id check they
+   cannot, because [create] cannot have returned yet. The receives are asserted afterwards, once
+   every peer is up, so the assertion proves the messages were also really delivered. *)
+let test_create_waits_for_the_specific_expected_peers () =
+  let peer_specs = [ (1, "127.0.0.1", 19331); (2, "127.0.0.1", 19332); (3, "127.0.0.1", 19333) ] in
+  let stray_addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19333) in
+  let msg = "sent-the-instant-create-returned" in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  try
+    Eio.Switch.run (fun sw ->
+        let handles = Hashtbl.create (List.length peer_specs) in
+        Eio.Fiber.all
+          ((fun () ->
+             (* Let peer 3's listener bind first (it starts without any delay, below), then park
+                two connections on it claiming ids outside the membership table entirely. *)
+             Eio.Time.sleep clock 0.1;
+             List.iter
+               (fun claimed_id ->
+                 let flow = Eio.Net.connect ~sw net stray_addr in
+                 Eio.Flow.copy_string (be8 claimed_id) flow)
+               [ 98; 99 ])
+          :: List.map
+               (fun (my_id, _, _) () ->
+                 (* Peers 1 and 2 start late deliberately, so that the strays are the only thing
+                    in peer 3's connection table when a count-based check would have fired. *)
+                 if my_id <> 3 then Eio.Time.sleep clock 0.5;
+                 let t = Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs in
+                 Hashtbl.replace handles my_id t;
+                 if my_id = 3 then List.iter (fun to_ -> Tcp.send t ~to_ msg) [ 1; 2 ])
+               peer_specs);
+        List.iter
+          (fun id ->
+            Alcotest.(check string)
+              (Printf.sprintf
+                 "peer %d receives what peer 3 sent the instant peer 3's own create returned" id)
+              msg
+              (Tcp.receive (Hashtbl.find handles id)))
+          [ 1; 2 ];
+        Eio.Switch.fail sw Stray_mesh_torn_down)
+  with Stray_mesh_torn_down -> ()
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
     ("framing boundary: back-to-back sends stay distinct, byte-exact", `Quick,
       test_framing_boundary_back_to_back_messages_stay_distinct);
     ("no cross-peer misattribution under concurrent traffic", `Quick,
-      test_no_cross_peer_misattribution_under_concurrent_traffic)
+      test_no_cross_peer_misattribution_under_concurrent_traffic);
+    ("create waits for the specific expected peers, not merely that many connections", `Quick,
+      test_create_waits_for_the_specific_expected_peers)
   ]

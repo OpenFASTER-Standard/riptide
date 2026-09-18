@@ -18,6 +18,12 @@
       oversight: real authentication is out of scope for this module, per Decision 1's
       single-operator-cluster framing in the design this implements. It is called out here so a
       future reader doesn't have to rediscover it by reading the source.
+
+      The accepting side's wait for this preamble is bounded (~10s): a connection that is accepted
+      but sends nothing is dropped and its fd released, rather than parking a fiber and a file
+      descriptor for the lifetime of the process. This matters because the listening port is
+      reachable by anyone who can route to it (see the authentication note above), so an unbounded
+      wait here would be an unbounded resource leak.
     - {b Message framing}: every message thereafter, in both directions, is wrapped as an 8-byte
       big-endian length prefix followed by exactly that many raw payload bytes -- the same
       convention as [Value.buf_add_len_prefixed] (see [lib/value.ml]), so that concatenating two
@@ -58,6 +64,33 @@
     with {!Transport_intf.S.send}'s own "no delivery guarantee" documentation, but worth stating
     plainly here since this is the specific mechanism that can trigger it.
 
+    {2 Delivery semantics this implementation provides}
+
+    {!Transport_intf.S} deliberately promises none of the following (see its own doc comments) --
+    they are what {e this} implementation happens to provide, on top of that contract, and a
+    caller that wants to stay portable across implementations (notably the simulated-network
+    adapter, which provides none of them) must not rely on them:
+
+    - {b Per-peer FIFO ordering}: messages sent to one peer arrive in send order, because exactly
+      one TCP connection, with exactly one {!Eio.Buf_write} in front of it, carries them all.
+      Ordering {e across} different senders is not defined by anything here, and is not promised.
+    - {b At-most-once delivery}: nothing in this module ever duplicates a message. Messages can
+      still be lost (a connection that dies discards whatever it had buffered -- see above), so
+      this is at-most-once, never at-least-once or exactly-once.
+    - {b Payload integrity}: a delivered message is byte-identical to what was sent, to the extent
+      TCP's own checksums and the length-prefix framing above guarantee. This module adds no
+      integrity check of its own, and specifically no cryptographic one -- an active attacker on
+      the path is out of scope for the same reason authentication is.
+
+    {2 Listener error handling}
+
+    A transient failure of [accept(2)] itself (fd exhaustion, a client that resets between SYN and
+    accept, kernel buffer exhaustion) costs only the connection it was for: it is logged as a
+    [Tcp: accept error], retried after a short pause, and every already-established connection
+    keeps working. Only a listener that fails continuously for several seconds is treated as
+    unrecoverable, at which point the failure is raised on [sw] rather than retried silently
+    forever -- this module has no other channel to report it on.
+
     {2 Send failures}
 
     {!send} raises [Invalid_argument] (never any other exception type) in three cases:
@@ -87,6 +120,13 @@
     other side calls {!receive}. A caller that needs real backpressure today gets none from this
     module beyond whatever the OS TCP stack itself applies to the underlying socket buffers.
 
+    Also out of scope, and worth naming here rather than only in the plan this module was built
+    from: fault injection against {e real} sockets. This module has never been exercised under
+    packet loss, reordering, duplication or corruption -- the simulated network fabric
+    ([lib/sim/network.ml]) injects those faults at its own level, not at the byte level underneath
+    a real {!Eio.Flow}. Building a fault-injecting flow wrapper to change that is a later,
+    separate task.
+
     {2 No shutdown path}
 
     Neither this module nor {!Transport_intf.S} exposes a [close]/[shutdown] operation. A [t]'s
@@ -94,14 +134,15 @@
     for as long as the [sw] passed to {!create} is alive; the only way to stop them today is to
     let or force that switch to finish from the outside (e.g. [Eio.Switch.run]'s block returning,
     or an explicit {!Eio.Switch.fail}/cancellation). This is a real gap for anything that wants a
-    [Tcp.t] to shut down cleanly and independently of its own switch -- e.g. Task 4's
-    substitutability test, which needs to tear down a cluster between test cases -- but adding a
-    [close] deliberately wasn't done as part of this fix round: it belongs at the
-    {!Transport_intf.S} level (so the simulated-network adapter can satisfy the same contract),
-    not improvised per-implementation here. A concrete instance of this same gap: if {!create}
-    itself fails (see its [@raise Failure] below), the listener and any connections already
-    established before the failure stay attached to [sw] with no handle for {!create} to reach
-    them and tear them down before raising -- also not fixed this round, for the same reason. *)
+    [Tcp.t] to shut down cleanly and independently of its own switch -- e.g. the substitutability
+    test, which needs to tear down a cluster between test cases, and works around the gap by
+    failing the switch explicitly. Adding a [close] is a deliberate deferral, not an oversight: it
+    belongs at the {!Transport_intf.S} level (so the simulated-network adapter can satisfy the
+    same contract), not improvised per-implementation here, and is tracked as a follow-up in this
+    module's own implementation plan. A concrete instance of the same gap: if {!create} itself
+    fails (see its [@raise Failure] below), the listener and any connections already established
+    before the failure stay attached to [sw] with no handle for {!create} to reach them and tear
+    them down before raising -- deferred for the same reason. *)
 
 type t
 
@@ -142,8 +183,11 @@ val create :
       {!Eio.Net.accept_fork} itself creates for that connection.
 
     [peers] is the full membership table, including an entry for [my_id] itself. [create] blocks
-    until this peer has an outbound path ready to every other peer in [peers] (i.e.
-    [List.length peers - 1] of them) -- for a dialed connection, that's as soon as [connect]
+    until this peer has an outbound path ready to {e each specific} other peer id in [peers] (not
+    merely to that {e many} peers: the connection table is keyed by the id a handshake preamble
+    claims, and that id is trusted rather than validated against [peers] -- see the preamble note
+    above -- so a connection from an unexpected id must not, and does not, count toward readiness
+    for an expected one). For a dialed connection, an outbound path is ready as soon as [connect]
     succeeds and the handshake preamble has been queued to send; for an accepted connection, it's
     once that connection's own incoming preamble has been read. (This is a slightly weaker
     guarantee than "handshaken in both directions simultaneously": it says nothing about whether
@@ -155,12 +199,23 @@ val create :
     are attached to it.
 
     @raise Invalid_argument if [my_id] is not present in [peers].
-    @raise Failure if the mesh has not finished forming within a bounded timeout, once dialing
-      itself has finished -- e.g. because some other peer in [peers] never started. The error
-      message names which peer id(s) are still missing a connection. This timeout is itself ~20s,
-      stacked AFTER the ~20s dial budget above, so [create]'s real worst-case wall-clock time
-      before raising is closer to ~40s total, not the ~20s either budget alone might suggest. A
-      failed [create] does not clean up whatever it had already started (see "No shutdown path"
+    @raise Failure if some peer in [peers] never showed up. Both ways that can happen raise this
+      one exception type, each with a message naming the peer(s) involved:
+      - a higher-id peer never accepted this peer's dial (it never started, or is unreachable):
+        raised once that peer's ~20s dial budget is spent, with the underlying [Eio.Io] error's
+        own text appended;
+      - a lower-id peer never dialed this peer (so no connection from it was ever accepted and
+        handshaken): raised once the separate ~20s mesh-formation budget is spent, listing every
+        still-missing peer id.
+
+      Worst-case wall-clock time before raising is therefore
+      [~20s * (number of peers with an id greater than my_id) + ~20s], because dialing is
+      {e sequential}: each higher-id peer's full retry budget is spent before the next one is
+      dialed at all, and only then does the mesh-formation wait begin. For a two-peer cluster
+      that is the ~40s the two budgets suggest; for the lowest peer of a five-peer cluster it is
+      ~100s.
+
+      A failed [create] does not clean up whatever it had already started (see "No shutdown path"
       above) -- a known, undone gap, not a claim that it does. *)
 
 include Transport_intf.S with type t := t
