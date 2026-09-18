@@ -17,10 +17,9 @@ This session's own Phase 7 work on the OLD Riptide is the direct cautionary tale
  ~~Carried forward from Layer 0 seed (Task 2)'s final review: Envelope.content_hash reuses Value.content_hash directly (Envelope.content_hash e = Value.content_hash (Envelope.to_value e)), so there is no domain separation between an envelope's event_id and a plain payload Value's hash - a crafted payload Value can collide with a real event_id. Harmless today because verify_chain_list always recomputes from actual envelopes, but this task is where event_id first gets asked to carry real security/consensus meaning (e.g. as a vote/reference target) - decide explicitly at the start of this task whether domain separation (e.g. a leading domain tag before hashing) is needed, rather than inheriting the Layer 0 seed's reuse-one-encoding choice by default.~~
 
 **RESOLVED (2026-09-18):** implemented as the prerequisite step described in
-`docs/superpowers/plans/2026-09-18-event-id-domain-separation.md` (Task 1 of that plan, branch
-`task3-event-id-domain-separation`; see that branch's `lib/envelope.ml` history for the exact
-commit and `.superpowers/sdd/2026-09-18-event-id-domain-separation/task-1-report.md` for full
-verification). `Envelope.content_hash` now hashes `Value.Sum (Envelope.domain_tag, to_value e)`
+`docs/superpowers/plans/2026-09-18-event-id-domain-separation.md` (Task 1 of that plan, commit
+`c0da18ae9ef9731e93a1136a6c6c5d66d32eaaeb` on branch `task3-event-id-domain-separation`; see
+`.superpowers/sdd/2026-09-18-event-id-domain-separation/task-1-report.md` for full verification). `Envelope.content_hash` now hashes `Value.Sum (Envelope.domain_tag, to_value e)`
 instead of a bare `Record`, so an envelope's hash space can never collide with a plain payload
 `Value.value`'s hash space (distinct `Sum`/`Record` leading tag bytes in
 `Value.canonical_encode` make this hold by construction). `Envelope.to_value`'s shape and the
