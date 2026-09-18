@@ -1,40 +1,43 @@
-(** A single VSR replica's normal-case state and message handling — `spec/tla/VSR.tla`'s
+(** A single VSR replica's state and message handling — `spec/tla/VSR.tla`'s
     [ReceiveClientRequest], [ReceivePrepareMsg], [ReceivePrepareOkMsg], and [PrimaryExecuteOp]
-    (VSR.tla:91-155), implemented against a FIXED primary.
+    (VSR.tla:91-155), generalized to a real, mutable [status]/[view_number] rather than a fixed
+    primary.
 
-    {b Scope}: normal-case operation only. View-change ([TimerSendSVC] through [ReceiveSV],
-    VSR.tla:161-305) is out of scope for this module — [primary_id] is fixed at {!create} time
-    and never changes, matching VSR.tla's own incremental history (its normal-case actions were
-    modeled with a fixed primary before view-change was added). A [Start_view_change] /
-    [Do_view_change] / [Start_view] message reaching {!handle_message} is silently ignored, not
-    an error — a later plan adds real handling once view-change exists.
+    {b Scope}: this module implements the normal-case actions above against the GENERAL form of
+    their guards ([IsNormalPrimary(r) == status[r] = "Normal" /\ Primary(View(r)) = r] and
+    [IsNormalBackup(r) == status[r] = "Normal" /\ Primary(View(r)) # r], VSR.tla:48-49) — not the
+    fixed-primary/fixed-view=0 simplification an earlier plan built these against. View-change
+    itself ([TimerSendSVC] through [ReceiveSV], VSR.tla:161-305) is still out of scope for this
+    module's BEHAVIOR — nothing in this module ever moves [status] to [View_change] or advances
+    [view_number] — but the STATE those actions need ([status], [view_number],
+    [last_normal_view], [recv_svc], [recv_dvc], [sent_dvc], [svc_count]) already lives on [t], so
+    a later plan implementing them needs no further restructuring of [t] itself. A
+    [Start_view_change] / [Do_view_change] / [Start_view] message reaching {!handle_message} is
+    silently ignored, not an error — a later plan adds real handling once view-change exists.
 
-    {b View number}: every message this module sends or accepts carries view [0] (VSR.tla's own
-    [View(r)] is [rep_view_number[r]], which starts at [0] at [Init] and this module never
-    changes it, matching the fixed-primary scope above). {!handle_message} enforces VSR.tla's own
-    [m.view = View(r)] guard by dropping any in-scope message — a [Prepare] or a [Prepare_ok],
-    the two types that carry a [view] field — whose [view] isn't exactly [0]. (The out-of-scope
+    {b View number}: {!handle_message} enforces VSR.tla's own [m.view = View(r)] guard by
+    dropping any in-scope message — a [Prepare] or a [Prepare_ok], the two types that carry a
+    [view] field — whose [view] isn't exactly {!view_number}'s current value. (The out-of-scope
     view-change types name their own field [v], not [view]; they are dropped wholesale, without a
-    view check, per the scope note above.) A real guard, not a no-op, so this module's
-    message-level behavior stays faithful to the spec even though the value never varies within
-    this plan's scope.
+    view check, per the scope note above.)
 
     {b Replica identity}: replica ids are [1..replica_count], matching VSR.tla's own
-    [replicas == 1..ReplicaCount] (VSR.tla:15). [primary_id] is an arbitrary, explicitly-configured
-    constant supplied by {!create}'s caller: it is NOT derived from, and is NOT required to match,
-    VSR.tla's own [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18) — this module never
-    implements, calls, or depends on that formula anywhere, because the only thing that needs it
-    (view-change) is out of scope per the note above. With the primary fixed and [view] pinned to
-    [0], which id is primary is a pure relabeling: the normal-case fragment is symmetric under any
-    permutation of replica ids, so this module's own tests and callers conventionally pass [1].
+    [replicas == 1..ReplicaCount] (VSR.tla:15). There is no stored, configured "primary" field
+    any more — {!create}'s caller no longer supplies one. Which replica id is primary is now
+    ALWAYS the pure function [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18) applied to
+    {!view_number}'s current value — see {!primary} below.
 
-    {b Forward note for the view-change plan — do NOT carry "view 0 ⇒ primary 1" forward from
-    here}: TLA+'s [%] is mathematical (Euclidean) modulo, not a truncating remainder, so
-    [(0-1) % ReplicaCount] is [ReplicaCount - 1] and [Primary(0)] is [ReplicaCount], NOT [1].
-    Verified directly with TLC 2.19 against VSR.tla:18's own formula at [ReplicaCount = 3]:
-    [Primary(0) = 3], [Primary(1) = 1], [Primary(2) = 2]. A view-change implementation must
-    evaluate [Primary(v)] literally rather than inherit this module's conventional [1], or it will
-    silently disagree with the spec at exactly the view the spec starts in.
+    {b TLA+'s [%] is Euclidean (floored) modulo, not OCaml's truncating [mod]} — [(0-1) %
+    ReplicaCount] is [ReplicaCount - 1], so [Primary(0)] is [ReplicaCount], NOT [1]. Verified
+    directly with TLC 2.19 against VSR.tla:18's own formula at [ReplicaCount = 3]: [Primary(0) =
+    3], [Primary(1) = 1], [Primary(2) = 2] — re-confirmed computationally (a throwaway [ocaml]
+    script, not by mental arithmetic) against {!primary}'s own normalized-modulo implementation
+    before it was written into [replica.ml], giving the same three values. Since
+    [view_number] starts at [0] at {!create} (VSR.tla's own [Init], VSR.tla:79), a replica
+    constructed with [replica_count = 3] and left untouched starts with replica [3], NOT replica
+    [1], as its primary — do not assume replica [1] is ever the "natural" starting primary; it
+    only becomes primary once [view_number] itself reaches a value [v] with [Primary(v) = 1] (any
+    [v ≡ 1 (mod replica_count)], e.g. [v = 1]).
 
     {b [dest] and message delivery}: {!Riptide_vsr.Message.t} deliberately omits the TLA+ spec's
     own [dest] field (see [message.mli]) because the transport layer's own destination argument
@@ -44,27 +47,32 @@
     is exactly what "dest = r" meant in the TLA+ message-bag model. *)
 
 type t
-(** One replica's mutable normal-case state: its log, op-number (tracked implicitly as the log's
-    own length — see {!op_number}), commit-number, and (primary-only) per-peer acknowledgment
-    high-water marks. *)
+(** One replica's mutable state: its log, op-number (tracked implicitly as the log's own length —
+    see {!op_number}), commit-number, view-change status/view-number/last-normal-view (see the
+    top-level scope note above for what is and isn't yet wired up), and (primary-only) per-peer
+    acknowledgment high-water marks. *)
 
-val create :
-  my_id:int -> replica_count:int -> primary_id:int -> send:(to_:int -> string -> unit) -> t
-(** [create ~my_id ~replica_count ~primary_id ~send] is a fresh replica matching VSR.tla's [Init]
+val create : my_id:int -> replica_count:int -> svc_limit:int -> send:(to_:int -> string -> unit) -> t
+(** [create ~my_id ~replica_count ~svc_limit ~send] is a fresh replica matching VSR.tla's [Init]
     (VSR.tla:71-84) restricted to this replica [my_id]: empty log, [op_number = 0],
-    [commit_number = 0], no peer acknowledgments recorded yet.
+    [commit_number = 0], [status = Normal], [view_number = 0], [last_normal_view = 0],
+    [recv_svc]/[recv_dvc] empty, [sent_dvc = false], [svc_count = 0], no peer acknowledgments
+    recorded yet.
 
-    [primary_id] is FIXED for this replica's entire lifetime — see this module's own top-level
-    scope note; there is no way to change it after {!create} (a later, view-change-aware plan
-    will need to restructure this).
+    {b There is no [primary_id] parameter any more} — an earlier, normal-case-only plan's fixed
+    primary is gone; which replica id is primary is now always computed from {!view_number} via
+    {!primary} (see this module's own top-level scope note). [svc_limit] is VSR.tla's own
+    [StartViewOnTimerLimit] (VSR.tla:13) — stored on [t] now, per this plan's own Architecture, but
+    not yet read by anything in this plan's scope (a later plan's [check_timeout] is its first
+    reader).
 
     Raises [Invalid_argument] if [replica_count < 1]; if [replica_count] is even (VSR.tla:140's
     own comment assumes [2f+1 = ReplicaCount], i.e. an odd count — [spec/tla/VSR.cfg] never
-    instantiates an even one, and this module doesn't either); or if [my_id]/[primary_id] fall
-    outside [1, replica_count] (VSR.tla's own [replicas == 1..ReplicaCount], VSR.tla:15). These
-    are cheap, deliberate sanity checks on {!create}'s own arguments, not a defense against
-    adversarial network input (that's {!handle_message}'s job — see its own doc comment below);
-    a [replica_count = 1] cluster is accepted (it is odd and [>= 1]) and behaves per VSR.tla's own
+    instantiates an even one, and this module doesn't either); or if [my_id] falls outside
+    [1, replica_count] (VSR.tla's own [replicas == 1..ReplicaCount], VSR.tla:15). These are cheap,
+    deliberate sanity checks on {!create}'s own arguments, not a defense against adversarial
+    network input (that's {!handle_message}'s job — see its own doc comment below); a
+    [replica_count = 1] cluster is accepted (it is odd and [>= 1]) and behaves per VSR.tla's own
     degenerate [f = 0] case — see {!propose}'s own doc comment for what that implies.
 
     [send] is a closure over some transport handle's own [send : t -> to_:int -> string -> unit]
@@ -77,11 +85,15 @@ val create :
     deferred — so a caller supplying a closure that itself blocks will block the caller of
     {!propose}/{!handle_message} too. *)
 
+val primary : t -> int
+(** [primary t] is VSR.tla's own [Primary(View(r)) == 1 + ((View(r)-1) % ReplicaCount)]
+    (VSR.tla:18) evaluated against [t]'s current {!view_number} — a pure, computed function of
+    state, never a stored field. See this module's own top-level scope note for the Euclidean-vs-
+    truncating-modulo trap this implementation is normalized against, and for why [view_number =
+    0]'s primary is [replica_count], not [1]. *)
+
 val is_primary : t -> bool
-(** [is_primary t] is this module's stand-in for VSR.tla's own [r = Primary(View(r))] test — with
-    the primary fixed for this module's whole scope, [primary_id] stands in for [Primary(v)]
-    (which this module never evaluates; see the Replica identity note above), so this is exactly
-    [my_id = primary_id] as passed to {!create}. *)
+(** [is_primary t] is VSR.tla's own [r = Primary(View(r))] test — exactly [t.my_id = primary t]. *)
 
 val op_number : t -> int
 (** [op_number t] is VSR.tla's [rep_op_number[r]] (VSR.tla:24). Always equals the number of
@@ -122,6 +134,13 @@ val commit_number : t -> int
     analogous, independently-established bound on a [Prepare_ok]'s own [n] field (a genuine ack
     can never claim to have acked an op-number this primary hasn't itself assigned). *)
 
+val view_number : t -> int
+(** [view_number t] is VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. Starts at [0]
+    (VSR.tla's own [Init]) and, within this plan's scope, never changes — nothing in this module
+    yet implements any action that advances it (view-change is a later plan's scope; see this
+    module's own top-level note). Exposed read-only, the same way {!op_number}/{!commit_number}
+    are, since it is genuine protocol state, not a test-only concern. *)
+
 val entries : t -> Riptide.Value.value list
 (** [entries t] is this replica's log in append order (op-number 1 first) — a thin wrapper over
     {!Riptide_vsr.Replica_log.to_list}, exposed read-only for tests/callers to inspect resulting
@@ -138,15 +157,19 @@ val propose : t -> Riptide.Value.value -> unit
 (** [propose t v] is VSR.tla's [ReceiveClientRequest(v)] (VSR.tla:91-102) — the entry point an
     application/client-facing layer calls to submit a new value to this replica.
 
-    {b No-op, not an error, if [t] is not the primary} (["not (is_primary t)"]): this mirrors
-    VSR.tla's own [IsNormalPrimary(r)] guard (VSR.tla:48, conjoined into [ReceiveClientRequest]
-    at VSR.tla:93) — when a guard in the TLA+ model doesn't hold, the action simply isn't enabled
-    and nothing happens; there is no "reject with an error" step anywhere in the spec for this
-    case for {!handle_message} to mirror ([Malformed_message]/[Out_of_order_append] are a
-    different case — see {!handle_message} — genuine adversarial/network conditions the spec
-    deliberately doesn't model at all, not a guard failure within the model). Use {!is_primary}
-    first if the caller needs to distinguish "was rejected because I'm not the primary" from
-    "was accepted."
+    {b No-op, not an error, unless [IsNormalPrimary(r)] holds} — VSR.tla:48's own
+    [status[r] = "Normal" /\ Primary(View(r)) = r], conjoined into [ReceiveClientRequest] at
+    VSR.tla:93: this is now a real TWO-part guard (an earlier, normal-case-only plan's version
+    only checked the second half, since [status] didn't yet exist as real state) — when a guard in
+    the TLA+ model doesn't hold, the action simply isn't enabled and nothing happens; there is no
+    "reject with an error" step anywhere in the spec for this case for {!handle_message} to mirror
+    ([Malformed_message]/[Out_of_order_append] are a different case — see {!handle_message} —
+    genuine adversarial/network conditions the spec deliberately doesn't model at all, not a guard
+    failure within the model). Use {!is_primary} first if the caller needs to distinguish "was
+    rejected because I'm not the primary" from "was accepted" — note this does NOT by itself
+    distinguish the [status <> Normal] rejection case; a caller needing that distinction too has
+    no accessor for [status] in this plan's scope (nothing in this module can move [status] away
+    from [Normal] yet — see the top-level scope note).
 
     {b Also a no-op if [v] is already present anywhere in this replica's log} — VSR.tla's own
     dedup guard, [v \notin { rep_log[r][i] : i \in DOMAIN rep_log[r] }] (VSR.tla:94), checked here
@@ -159,10 +182,10 @@ val propose : t -> Riptide.Value.value -> unit
     second identity notion.
 
     Otherwise: appends [v] to the log at [op_number t + 1], then broadcasts
-    [Prepare{view=0; n=op_number t + 1; v; k=commit_number t}] (VSR.tla's [Broadcast], VSR.tla:64,
-    98-99) to every OTHER replica [1..replica_count] (i.e. every id in that range except this
-    replica's own [my_id] — VSR.tla's [BroadcastFunc]'s own [replicas \ {source}], VSR.tla:56),
-    via [create]'s [send] closure, once per destination.
+    [Prepare{view=view_number t; n=op_number t + 1; v; k=commit_number t}] (VSR.tla's [Broadcast],
+    VSR.tla:64, 98-99) to every OTHER replica [1..replica_count] (i.e. every id in that range
+    except this replica's own [my_id] — VSR.tla's [BroadcastFunc]'s own [replicas \ {source}],
+    VSR.tla:56), via [create]'s [send] closure, once per destination.
 
     Also drives VSR.tla's [IsCommitted]/[PrimaryExecuteOp] (VSR.tla:139-155) internally afterward,
     the same incremental check {!handle_message}'s own [Prepare_ok] handling drives (see its doc
@@ -179,32 +202,35 @@ val handle_message : t -> string -> unit
 (** [handle_message t bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and dispatches:
 
     - A [Prepare] message drives VSR.tla's [ReceivePrepareMsg] (VSR.tla:110-123): a backup-side
-      handler ([IsNormalBackup(r)], VSR.tla:49 — a no-op if [t] IS the primary), gated on
-      [m.view = 0] and, per VSR.tla's own strict-order guard [rep_op_number[r] + 1 = m.n]
-      (VSR.tla:115), on the message's [n] being exactly [op_number t + 1]. {b An out-of-order
-      [Prepare] (too high, too low, or a gap) is silently dropped} — log unchanged, no
-      [Prepare_ok] sent, no exception raised to the caller — exactly matching VSR.tla's own
-      behavior of simply not enabling this action for a mismatched [n]: there is no buffering,
-      reordering, or retry logic anywhere in this module's (or the underlying spec's) scope. {b
-      This is a real, disclosed liveness gap}, not a defect: a backup that misses one [Prepare]
-      has no way to catch up in this module's scope (no COMMIT-message resend, no state-transfer,
-      no retry — those are explicitly out of scope for `spec/tla/VSR.tla` itself, per
-      `spec/tla/README.md`). On success: appends [m.v] at [m.n], advances [commit_number] to
-      [m.k] if higher AND if [m.k <= op_number t] (i.e. [<= m.n], since [op_number t] has just
-      become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k > @ THEN m.k ELSE @]), and
-      never lets it exceed what this replica's own log actually contains, even for a [Prepare]
-      whose [k] a corrupted/forged network delivery has pushed past [n] (VSR.tla's own [m.k < m.n]
-      precondition, VSR.tla:106-109, holds for every [Prepare] the TLA+ model itself can produce,
-      but rather than trust it this module enforces its own explicit bound, [m.k <= m.n] —
-      deliberately one step wider than that precondition, which would exclude [m.k = m.n]; see
-      {!commit_number}'s own doc comment and [replica.ml]'s comment at the bound itself for why
-      the extra step is a harmless defense-in-depth margin here, and why tightening it is the
-      safer direction once view-change lands) — then unicasts [Prepare_ok{view=0; n=m.n;
-      i=my_id}] back to the primary.
+      handler ([IsNormalBackup(r)] == [status[r] = "Normal" /\ Primary(View(r)) # r], VSR.tla:49 —
+      a no-op if [status t <> Normal] OR if [t] IS the primary; an earlier, normal-case-only plan's
+      version only checked the primary half), gated on [m.view = view_number t] and, per VSR.tla's
+      own strict-order guard [rep_op_number[r] + 1 = m.n] (VSR.tla:115), on the message's [n]
+      being exactly [op_number t + 1]. {b An out-of-order [Prepare] (too high, too low, or a gap)
+      is silently dropped} — log unchanged, no [Prepare_ok] sent, no exception raised to the
+      caller — exactly matching VSR.tla's own behavior of simply not enabling this action for a
+      mismatched [n]: there is no buffering, reordering, or retry logic anywhere in this module's
+      (or the underlying spec's) scope. {b This is a real, disclosed liveness gap}, not a defect: a
+      backup that misses one [Prepare] has no way to catch up in this module's scope (no
+      COMMIT-message resend, no state-transfer, no retry — those are explicitly out of scope for
+      `spec/tla/VSR.tla` itself, per `spec/tla/README.md`). On success: appends [m.v] at [m.n],
+      advances [commit_number] to [m.k] if higher AND if [m.k <= op_number t] (i.e. [<= m.n],
+      since [op_number t] has just become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k >
+      @ THEN m.k ELSE @]), and never lets it exceed what this replica's own log actually contains,
+      even for a [Prepare] whose [k] a corrupted/forged network delivery has pushed past [n]
+      (VSR.tla's own [m.k < m.n] precondition, VSR.tla:106-109, holds for every [Prepare] the
+      TLA+ model itself can produce, but rather than trust it this module enforces its own
+      explicit bound, [m.k <= m.n] — deliberately one step wider than that precondition, which
+      would exclude [m.k = m.n]; see {!commit_number}'s own doc comment and [replica.ml]'s comment
+      at the bound itself for why the extra step is a harmless defense-in-depth margin here, and
+      why tightening it is the safer direction once view-change lands) — then unicasts
+      [Prepare_ok{view=view_number t; n=m.n; i=my_id}] back to {!primary}'s current value (NOT a
+      stored [primary_id] any more — computed fresh from [view_number t] at reply time).
     - A [Prepare_ok] message drives VSR.tla's [ReceivePrepareOkMsg] (VSR.tla:126-136): a
-      primary-side handler ([IsNormalPrimary(r)] — a no-op if [t] is not the primary), gated on
-      [m.view = 0] AND on [m.i] being a valid replica id in [1, replica_count] — VSR.tla:141's own
-      [p \in replicas] domain restriction on the set [IsCommitted] counts over (VSR.tla:15's
+      primary-side handler ([IsNormalPrimary(r)] == [status[r] = "Normal" /\ Primary(View(r)) =
+      r] — a no-op if [status t <> Normal] OR if [t] is not the primary), gated on [m.view =
+      view_number t] AND on [m.i] being a valid replica id in [1, replica_count] — VSR.tla:141's
+      own [p \in replicas] domain restriction on the set [IsCommitted] counts over (VSR.tla:15's
       [replicas == 1..ReplicaCount]), enforced here at the point [m.i] would otherwise enter
       {!t}'s internal peer-acknowledgment table, so a decoded [Prepare_ok] naming no real replica
       (a corrupted or forged [i]) can never inflate quorum. A [m.i] that fails this check is
@@ -239,10 +265,32 @@ val handle_message : t -> string -> unit
       combination that happens to also satisfy a higher [n] — a [n]-only check can miss advancing
       to [commit_number+1] even though it is, in fact, already committed.)
     - A [Start_view_change], [Do_view_change], or [Start_view] message is silently ignored (this
-      module's scope is normal-case only; see this file's own top-level comment) — NOT an error,
-      since a real message stream will carry these once a later plan adds view-change, and this
-      replica must not crash on a message type it doesn't yet handle.
+      module doesn't yet implement view-change's own actions; see this file's own top-level
+      comment) — NOT an error, since a real message stream will carry these once a later plan adds
+      view-change, and this replica must not crash on a message type it doesn't yet handle.
     - Any input that fails to decode (raises {!Riptide_vsr.Message.Malformed_message}) is treated
       the same as an out-of-order [Prepare]: silently dropped, no exception propagates to the
       caller. A real network provides no payload integrity ({!Riptide_transport.Transport_intf.S}'s
       own documented guarantee), and this replica must not crash when it is handed garbage. *)
+
+(** {2 Test-support surface}
+
+    Everything below exists purely to make [t] constructible into specific test scenarios; it is
+    NOT part of the VSR protocol and no production caller should ever need it. Kept separate and
+    clearly labeled per this plan's own Architecture note, rather than folded into the "real" API
+    above. *)
+
+val for_test_set_view_number : t -> int -> unit
+(** [for_test_set_view_number t v] directly sets [t]'s [view_number] to [v], leaving every other
+    field (including [status], which stays [Normal]) untouched. Exists because {!create} no longer
+    takes a [primary_id] parameter — which replica id is primary is now always {!primary}, a pure
+    function of [view_number] — so a test that needs a SPECIFIC replica id to play the primary
+    role (the overwhelming majority of {!propose}/{!handle_message} tests, which are normal-case
+    tests with no path to move [view_number] any other way in this plan's scope) has no way to get
+    there other than this direct setter.
+
+    {b Convention this module's own test suite uses}: [for_test_set_view_number t 1] always makes
+    replica id [1] the primary, for ANY [replica_count] — [Primary(1) = 1 + ((1-1) %
+    replica_count) = 1 + (0 % replica_count) = 1] regardless of [replica_count]'s value — matching
+    an earlier plan's own convention of conventionally using replica id [1] as "the" primary in
+    hand-constructed tests, now achieved by view rather than by a configured field. *)

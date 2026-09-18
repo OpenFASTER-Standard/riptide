@@ -3,18 +3,51 @@
 
 open Riptide
 
-(* This plan's scope is normal-case only, with a fixed primary -- every message this replica
-   sends or accepts carries view 0 (VSR.tla's [rep_view_number[r]] starts at 0 at [Init] and this
-   module never changes it). Named rather than a bare literal so every guard/construction site
-   below reads as "the view", not a magic number. *)
-let normal_view = 0
+(* VSR.tla's own [rep_status] (VSR.tla:29): {"Normal", "ViewChange"}. Renamed [View_change] here
+   only for OCaml's own constructor-casing convention -- no semantic change from the spec's own
+   string literal. [View_change] is unused within THIS plan's scope (nothing here ever transitions
+   [status] away from [Normal] -- that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]), hence
+   the warning suppression; it exists now, per Architecture, so [t]'s shape doesn't need to change
+   again once that plan lands. *)
+type status = Normal | View_change
+
+(* Nothing in THIS plan's scope ever constructs [View_change] -- no action here moves [status]
+   away from [Normal] (that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]). [Normal] is
+   constructed for real, in [create]; [View_change] exists on the type now, per Architecture, so
+   [t]'s shape doesn't need to change again once that later plan lands. This unused, never-called
+   binding exists solely so the compiler sees [View_change] actually built somewhere (warning 37,
+   unused-constructor, fires on a constructor that's never used to build a value, not one that's
+   merely unmatched) -- deliberately not blanket-disabling the warning for the whole file, so a
+   FUTURE genuinely-dead constructor would still be caught. *)
+let _view_change_witness = View_change [@warning "-32"]
 
 type t = {
   my_id : int;
   replica_count : int;
-  primary_id : int;
+  svc_limit : int; (* StartViewOnTimerLimit -- bounds check_timeout, a later plan's own concern;
+                       stored now (Architecture) but not yet read by anything in this plan's
+                       scope. *)
   log : Replica_log.t;
+  mutable status : status; (* VSR.tla's [rep_status[r]] (VSR.tla:29). *)
+  mutable view_number : int; (* VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. *)
+  mutable last_normal_view : int;
+  (* VSR.tla's [rep_last_normal_view[r]] (VSR.tla:31) -- the paper's [v'], deliberately NOT
+     derivable from [view_number]. Not yet written or read by anything in this plan's scope
+     (view-change hasn't landed yet); stored now per Architecture so later plans don't need to
+     restructure [t] again. *)
   mutable commit_number : int;
+  mutable recv_svc : int list;
+  (* VSR.tla's [rep_recv_svc[r]] (VSR.tla:33) -- STARTVIEWCHANGE senders for the current
+     view-change episode. A plain list, not a set: small (bounded by [replica_count]) and never
+     read by anything in this plan's scope; a later plan can pick a real set representation once
+     it actually needs [Cardinality]. Not yet written or read here. *)
+  mutable recv_dvc : Message.t list;
+  (* VSR.tla's [rep_recv_dvc[r]] (VSR.tla:34) -- the raw DOVIEWCHANGE messages received this
+     episode. Not yet written or read by anything in this plan's scope. *)
+  mutable sent_dvc : bool; (* VSR.tla's [rep_sent_dvc[r]] (VSR.tla:35). Not yet read/written here. *)
+  mutable svc_count : int;
+  (* VSR.tla's [aux_svc_count[r]] (VSR.tla:41) -- bounds [TimerSendSVC]. Not yet read/written
+     here. *)
   (* Primary-only bookkeeping (VSR.tla's [rep_peer_op_number[r]]) -- harmless, simply never
      populated, on a backup. Keyed by peer replica id, value is that peer's highest acknowledged
      op-number (a cumulative high-water mark, never regressed -- see handle_prepare_ok).
@@ -32,7 +65,7 @@ type t = {
   send : to_:int -> string -> unit;
 }
 
-let create ~my_id ~replica_count ~primary_id ~send =
+let create ~my_id ~replica_count ~svc_limit ~send =
   if replica_count < 1 then invalid_arg "Replica.create: replica_count must be >= 1";
   if replica_count mod 2 = 0 then
     invalid_arg
@@ -40,22 +73,49 @@ let create ~my_id ~replica_count ~primary_id ~send =
        ReplicaCount, and VSR.cfg never instantiates an even count";
   if my_id < 1 || my_id > replica_count then
     invalid_arg "Replica.create: my_id must be in [1, replica_count] (VSR.tla's replicas == 1..ReplicaCount)";
-  if primary_id < 1 || primary_id > replica_count then
-    invalid_arg "Replica.create: primary_id must be in [1, replica_count] (VSR.tla's replicas == 1..ReplicaCount)";
   {
     my_id;
     replica_count;
-    primary_id;
+    svc_limit;
     log = Replica_log.create ();
+    status = Normal;
+    view_number = 0;
+    (* VSR.tla's [Init] (VSR.tla:79): [rep_view_number = [r \in replicas |-> 0]]. *)
+    last_normal_view = 0;
     commit_number = 0;
+    recv_svc = [];
+    recv_dvc = [];
+    sent_dvc = false;
+    svc_count = 0;
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
     send;
   }
 
-let is_primary t = t.my_id = t.primary_id
+(* [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18). TLA+'s [%] is Euclidean (floored)
+   modulo, always non-negative; OCaml's [mod] follows the sign of the DIVIDEND, so [(v-1) mod
+   replica_count] can itself be negative when [v = 0] (or any [v <= 0]). Normalized to the
+   Euclidean result via [(x mod n + n) mod n] -- computationally verified against TLC's own
+   already-established values (both in the TLA+ spec plan and again for this plan) before being
+   written here: at [replica_count = 3], this formula gives [Primary(0) = 3], [Primary(1) = 1],
+   [Primary(2) = 2]. See replica.mli's own note on why [Primary(0) = 3], NOT [1], is the trap this
+   normalization exists to avoid. *)
+let primary t = 1 + (((t.view_number - 1) mod t.replica_count + t.replica_count) mod t.replica_count)
+
+let is_primary t = t.my_id = primary t
 let op_number t = Replica_log.length t.log
 let commit_number t = t.commit_number
+let view_number t = t.view_number
 let entries t = Replica_log.to_list t.log
+
+(* ---- Test-support surface: NOT part of the protocol. ----
+   [t] is abstract, and the real protocol never lets anything other than the view-change actions
+   themselves (TimerSendSVC / ReceiveHigherSVC / ReceiveMatchingSVC / SendSV / ReceiveSV -- later
+   plans) move [view_number]. Tests, though, need a way to put a chosen replica id at [primary t]
+   without either hand-deriving [Primary(v)] at every call site or waiting for view-change to
+   exist. See replica.mli's own doc comment on this function for the exact convention it
+   establishes (view_number = 1 always makes replica id 1 the primary, regardless of
+   replica_count, since Primary(1) = 1 + ((1-1) mod replica_count) = 1 for any replica_count). *)
+let for_test_set_view_number t v = t.view_number <- v
 
 (* [Value.value] identity for dedup/is_committed purposes: canonical-encoding equality, not
    OCaml's structural [=] -- see replica.mli's own doc comment on [propose] for why (lib/value.mli's
@@ -121,12 +181,13 @@ let primary_execute_op t =
 (* ---- ReceiveClientRequest (VSR.tla:91-102) ---- *)
 
 let propose t (v : Value.value) =
-  if not (is_primary t) then ()
+  if t.status <> Normal then () (* IsNormalPrimary(r) guard: not enabled outside status="Normal" *)
+  else if not (is_primary t) then () (* IsNormalPrimary(r) guard's other conjunct: r = Primary(View(r)) *)
   else if List.exists (fun existing -> value_equal existing v) (entries t) then ()
   else begin
     let n = op_number t + 1 in
     Replica_log.append t.log ~op_number:n v;
-    let bytes = Message.encode (Message.Prepare { view = normal_view; n; v; k = t.commit_number }) in
+    let bytes = Message.encode (Message.Prepare { view = t.view_number; n; v; k = t.commit_number }) in
     for peer = 1 to t.replica_count do
       if peer <> t.my_id then t.send ~to_:peer bytes
     done;
@@ -136,8 +197,9 @@ let propose t (v : Value.value) =
 (* ---- ReceivePrepareMsg (VSR.tla:104-123) ---- *)
 
 let handle_prepare t ~view ~n ~(v : Value.value) ~k =
-  if is_primary t then () (* IsNormalBackup(r) guard: not enabled for the primary itself *)
-  else if view <> normal_view then ()
+  if t.status <> Normal then () (* IsNormalBackup(r) guard: not enabled outside status="Normal" *)
+  else if is_primary t then () (* IsNormalBackup(r) guard's other conjunct: not enabled for the primary itself *)
+  else if view <> t.view_number then ()
   else
     match Replica_log.append t.log ~op_number:n v with
     | exception Replica_log.Out_of_order_append _ ->
@@ -167,14 +229,15 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
          [DoViewChange.k] and feeds [HighestCommitNumber] (VSR.tla:257-260), so a
          falsely-inflated-by-one backup commit_number becomes load-bearing rather than benign. *)
       if k > t.commit_number && k <= op_number t then t.commit_number <- k;
-      let reply = Message.encode (Message.Prepare_ok { view = normal_view; n; i = t.my_id }) in
-      t.send ~to_:t.primary_id reply
+      let reply = Message.encode (Message.Prepare_ok { view = t.view_number; n; i = t.my_id }) in
+      t.send ~to_:(primary t) reply
 
 (* ---- ReceivePrepareOkMsg (VSR.tla:125-136) ---- *)
 
 let handle_prepare_ok t ~view ~n ~i =
-  if not (is_primary t) then ()
-  else if view <> normal_view then ()
+  if t.status <> Normal then () (* IsNormalPrimary(r) guard: not enabled outside status="Normal" *)
+  else if not (is_primary t) then ()
+  else if view <> t.view_number then ()
   else if i < 1 || i > t.replica_count then
     () (* VSR.tla:141's own [p \in replicas] domain restriction -- a decoded [i] naming no real
           replica must never be allowed into [peer_op_number] at all (see that field's own doc
