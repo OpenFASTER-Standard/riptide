@@ -5,22 +5,21 @@ open Riptide
 
 (* VSR.tla's own [rep_status] (VSR.tla:29): {"Normal", "ViewChange"}. Renamed [View_change] here
    only for OCaml's own constructor-casing convention -- no semantic change from the spec's own
-   string literal. [View_change] is unused within THIS plan's scope (nothing here ever transitions
-   [status] away from [Normal] -- that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]); it
-   exists now, per Architecture, so [t]'s shape doesn't need to change again once that plan lands. *)
+   string literal. THIS task ([check_timeout]/[handle_message]'s new [Start_view_change] dispatch)
+   is the first to actually construct [View_change] for real -- via [TimerSendSVC] and
+   [ReceiveHigherSVC] below -- so the earlier plan's placeholder "unused constructor" witness
+   binding that used to live here is gone: the compiler now sees [View_change] built for real, at
+   multiple call sites, with no need for a dummy binding to justify its existence. *)
 type status = Normal | View_change
 
-(* Nothing in THIS plan's scope ever constructs [View_change] -- no action here moves [status]
-   away from [Normal] (that's a later plan's [TimerSendSVC]/[ReceiveHigherSVC]). [Normal] is
-   constructed for real, in [create]; [View_change] exists on the type now, per Architecture, so
-   [t]'s shape doesn't need to change again once that later plan lands. This unused, never-called
-   binding (the underscore prefix already suppresses warning 32, unused-value, on its own -- no
-   attribute needed for that) exists solely so the compiler sees [View_change] actually built
-   somewhere: warning 37 (unused-constructor) fires on a constructor that's never used to build a
-   value, not one that's merely unmatched, and removing this binding reproduces that error
-   directly. Deliberately not blanket-disabled for the whole file, so a FUTURE genuinely-dead
-   constructor would still be caught. *)
-let _view_change_witness = View_change
+(* A real replica id set -- VSR.tla's own [rep_recv_svc[r]] (VSR.tla:33) is typed [SUBSET
+   replicas], a genuine set with [\cup]/[Cardinality] semantics (ReceiveMatchingSVC's own [@ \cup
+   {m.i}], VSR.tla:201; SendDVC's own [Cardinality(rep_recv_svc[r]) >= f], VSR.tla:221) -- so the
+   earlier plan's placeholder [int list] representation (justified there only by "never read by
+   anything in this plan's scope") is replaced here, now that this task's own [try_send_dvc]
+   genuinely needs both dedup (the same sender's StartViewChange arriving twice must not inflate
+   the count) and [Cardinality]. *)
+module Int_set = Set.Make (Int)
 
 type t = {
   my_id : int;
@@ -37,18 +36,43 @@ type t = {
      (view-change hasn't landed yet); stored now per Architecture so later plans don't need to
      restructure [t] again. *)
   mutable commit_number : int;
-  mutable recv_svc : int list;
+  mutable recv_svc : Int_set.t;
   (* VSR.tla's [rep_recv_svc[r]] (VSR.tla:33) -- STARTVIEWCHANGE senders for the current
-     view-change episode. A plain list, not a set: small (bounded by [replica_count]) and never
-     read by anything in this plan's scope; a later plan can pick a real set representation once
-     it actually needs [Cardinality]. Not yet written or read here. *)
+     view-change episode. Written by [check_timeout] (reset to empty, TimerSendSVC, VSR.tla:168),
+     [handle_start_view_change]'s two branches (seeded to a singleton, ReceiveHigherSVC,
+     VSR.tla:189; unioned, ReceiveMatchingSVC, VSR.tla:201), and read by [try_send_dvc]
+     (Cardinality, SendDVC, VSR.tla:221). *)
   mutable recv_dvc : Message.t list;
   (* VSR.tla's [rep_recv_dvc[r]] (VSR.tla:34) -- the raw DOVIEWCHANGE messages received this
-     episode. Not yet written or read by anything in this plan's scope. *)
-  mutable sent_dvc : bool; (* VSR.tla's [rep_sent_dvc[r]] (VSR.tla:35). Not yet read/written here. *)
+     episode. Reset to empty by [check_timeout]/[handle_start_view_change]'s ReceiveHigherSVC
+     branch (both begin a new view-change episode, VSR.tla:169, 190) whenever this task's scope
+     touches it; still not POPULATED by anything in this task's scope -- [ReceiveDVC], the action
+     that adds to it, is Task 3's own territory. *)
+  mutable sent_dvc : bool;
+  (* VSR.tla's [rep_sent_dvc[r]] (VSR.tla:35) -- the one-shot "already sent my DOVIEWCHANGE for
+     this episode" flag [SendDVC] (VSR.tla:216-228) is gated on. Reset to [false] by
+     [check_timeout]/[handle_start_view_change]'s ReceiveHigherSVC branch (both begin a new
+     episode) and set [true] by [try_send_dvc] once it actually fires. *)
   mutable svc_count : int;
-  (* VSR.tla's [aux_svc_count[r]] (VSR.tla:41) -- bounds [TimerSendSVC]. Not yet read/written
-     here. *)
+  (* VSR.tla's [aux_svc_count[r]] (VSR.tla:41) -- bounds [check_timeout] (TimerSendSVC,
+     VSR.tla:161-174), incremented every time it fires. VSR.tla's own [aux_svc_count] is a pure
+     state-space-bounding device for TLC (research §6.3 point 4) and is NEVER reset anywhere in the
+     abstract spec -- transcribed literally, a real replica would permanently stop trying to
+     trigger a view change after [svc_limit] timeouts, forever, which is clearly wrong for a real
+     long-running deployment that needs to recover from repeated primary failures.
+
+     DELIBERATE, DISCLOSED DIVERGENCE from the literal TLA+ transcription (this task's own review
+     ruling, not an oversight): [svc_count] must reset to [0] whenever this replica successfully
+     returns to [Normal] status by actually COMPLETING a view change -- either by calling [SendSV]
+     itself (becoming the new primary) or via [ReceiveSV] (accepting a new primary's [StartView])
+     -- since at that point the replica has proven it can reach a working view, and any FUTURE
+     timeout represents a genuinely new failure deserving its own fresh budget. Neither [SendSV]
+     nor [ReceiveSV] exists yet (both are Task 3's own scope), so nothing in THIS task's scope ever
+     resets [svc_count] -- this comment, and the identical one on [check_timeout] below, are the
+     hook Task 3 needs: at the exact point each of those two actions sets [status' = "Normal"]
+     (VSR.tla:275, 301), it must also add [t.svc_count <- 0] (a direct mutation of this private
+     field from within THIS module -- no separate exposed reset function is needed, the same way
+     no separate setter exists for any other field only ever written from inside [replica.ml]). *)
   (* Primary-only bookkeeping (VSR.tla's [rep_peer_op_number[r]]) -- harmless, simply never
      populated, on a backup. Keyed by peer replica id, value is that peer's highest acknowledged
      op-number (a cumulative high-water mark, never regressed -- see handle_prepare_ok).
@@ -90,7 +114,7 @@ let create ~my_id ~replica_count ~svc_limit ~send =
     (* VSR.tla's [Init] (VSR.tla:79): [rep_view_number = [r \in replicas |-> 0]]. *)
     last_normal_view = 0;
     commit_number = 0;
-    recv_svc = [];
+    recv_svc = Int_set.empty;
     recv_dvc = [];
     sent_dvc = false;
     svc_count = 0;
@@ -113,6 +137,7 @@ let op_number t = Replica_log.length t.log
 let commit_number t = t.commit_number
 let view_number t = t.view_number
 let last_normal_view t = t.last_normal_view
+let status t = t.status
 let entries t = Replica_log.to_list t.log
 
 (* ---- Test-support surface: NOT part of the protocol. ----
@@ -143,6 +168,24 @@ let entries t = Replica_log.to_list t.log
 let for_test_set_view_number t v =
   t.view_number <- v;
   t.last_normal_view <- v
+
+(* Prescribed by replica.mli's own note on [for_test_set_view_number] (task-1-review.md's M3
+   fix-round finding): [for_test_set_view_number] is correct ONLY for [status = Normal] (it forces
+   [last_normal_view = view_number] in lockstep, matching the spec's confirmed
+   [status = "Normal" => last_normal_view = view_number] invariant) -- reusing it to build a
+   [View_change]-status test state would silently construct the exact mirror-image bug that
+   fix-round finding fixed for the Normal case: a [View_change]-status replica's [last_normal_view]
+   is very often DIFFERENT from its [view_number] (that is the whole point of the field -- see
+   VSR.tla:31's own comment, "the paper's v', NOT derivable from rep_view_number"), so a setter that
+   force-synced the two would make it impossible to construct the realistic test states
+   [WinningDVC] (VSR.tla:248-255) itself depends on selecting between. This setter therefore sets
+   all three fields directly and independently, with no synchronization -- the caller is
+   responsible for choosing a combination that is actually reachable if that matters for what it's
+   testing. *)
+let for_test_set_view t ~status:s ~view_number ~last_normal_view =
+  t.status <- s;
+  t.view_number <- view_number;
+  t.last_normal_view <- last_normal_view
 
 (* [Value.value] identity for dedup/is_committed purposes: canonical-encoding equality, not
    OCaml's structural [=] -- see replica.mli's own doc comment on [propose] for why (lib/value.mli's
@@ -284,10 +327,116 @@ let handle_prepare_ok t ~view ~n ~i =
     primary_execute_op t
   end
 
+(* ---- SendDVC (VSR.tla:216-228) ----
+   Driven from every point [recv_svc] actually changes -- [check_timeout]'s own reset to empty,
+   and [handle_start_view_change]'s two branches (seed / union) below -- mirroring the normal-case
+   plan's [PrimaryExecuteOp]-driven-from-both-[propose]-and-[handle_prepare_ok] pattern exactly: a
+   guard with several conjuncts (here [status = View_change], [not sent_dvc], and
+   [Cardinality(recv_svc) >= f]) needs a check after EVERY action that can change any one of them,
+   not just some of them -- polling from a single call site would miss the others. [check_timeout]'s
+   own call is a genuine no-op in every cluster with [f >= 1] (a fresh, empty [recv_svc] can never
+   satisfy [Cardinality(recv_svc) >= f] for a positive [f]) -- it only has a real effect in the
+   degenerate [f = 0] (replica_count = 1) cluster, where [Cardinality({}) = 0 >= f = 0] is already
+   true the instant [check_timeout] itself flips [status] to [View_change]. Included anyway, for
+   the same reason [propose]'s own call to [primary_execute_op] is: leaving out the point that only
+   matters in the degenerate case is exactly the kind of asymmetry a future refactor could silently
+   depend on being "always a no-op" and get wrong. *)
+let try_send_dvc t =
+  let f = (t.replica_count - 1) / 2 in
+  if t.status = View_change && (not t.sent_dvc) && Int_set.cardinal t.recv_svc >= f then begin
+    let bytes =
+      Message.encode
+        (Message.Do_view_change
+           {
+             v = t.view_number;
+             log = entries t;
+             last_normal_view = t.last_normal_view;
+             n = op_number t;
+             k = t.commit_number;
+             i = t.my_id;
+           })
+    in
+    t.send ~to_:(primary t) bytes;
+    t.sent_dvc <- true
+  end
+
+(* ---- TimerSendSVC (VSR.tla:161-174) ----
+   research §2.1: VSR.tla deliberately does not model real timeouts -- this is an unconditional,
+   always-enabled (once its guard holds) action, not something driven by a clock; a caller decides
+   when to invoke [check_timeout] (e.g. on an actual timer firing with no Prepare/heartbeat seen
+   recently), matching the spec's own framing of it as "bounded by a state-space-limiting counter"
+   rather than real wall-clock logic. *)
+let check_timeout t =
+  if t.svc_count >= t.svc_limit then
+    () (* [aux_svc_count[r] < StartViewOnTimerLimit] guard (VSR.tla:163) -- see [svc_count]'s own
+          doc comment on [t] for why this bound is NOT permanent in this implementation despite
+          [aux_svc_count] never resetting in the literal TLA+ transcription: Task 3's [SendSV]/
+          [ReceiveSV] reset it back to 0 on every successful return to [Normal], giving each new
+          failure its own fresh budget. *)
+  else if t.status <> Normal then () (* [rep_status[r] = "Normal"] guard (VSR.tla:164) *)
+  else begin
+    let v = t.view_number + 1 in
+    t.view_number <- v;
+    t.status <- View_change;
+    t.recv_svc <- Int_set.empty;
+    t.recv_dvc <- [];
+    t.sent_dvc <- false;
+    t.svc_count <- t.svc_count + 1;
+    let bytes = Message.encode (Message.Start_view_change { v; i = t.my_id }) in
+    for peer = 1 to t.replica_count do
+      if peer <> t.my_id then t.send ~to_:peer bytes
+    done;
+    try_send_dvc t (* see try_send_dvc's own doc comment for why this call is included *)
+  end
+
+(* ---- ReceiveHigherSVC (VSR.tla:183-194) / ReceiveMatchingSVC (VSR.tla:196-205) ----
+   [handle_message]'s own [Start_view_change] dispatch below decides which of these two (if
+   either) is enabled for a given decoded message. *)
+let handle_start_view_change t ~(v : int) ~(i : int) =
+  if i < 1 || i > t.replica_count then
+    () (* Defense-in-depth, not itself a VSR.tla guard -- mirrors [handle_prepare_ok]'s own [m.i]
+          check (see [peer_op_number]'s doc comment above for the general rationale): VSR.tla:15's
+          own [replicas == 1..ReplicaCount] domain restriction means [rep_recv_svc[r]] can never
+          legitimately contain an out-of-range id in the abstract model (every [StartViewChange]
+          there is broadcast with [i] set to the sending replica's own, always-valid id), but a
+          decoded message off {!Riptide_transport.Transport_intf.S}'s own "no payload integrity"
+          wire has no such guarantee. Left unchecked, a single forged [StartViewChange] naming a
+          non-existent replica id would inflate [Cardinality(recv_svc)] -- the exact same quorum-
+          inflation bug class M1 (task-1-review.md) fixed for [Prepare_ok]'s own [i] field, just
+          feeding [SendDVC]'s threshold instead of [is_committed_quorum]'s. Dropped WHOLESALE (no
+          state change at all -- view_number/status untouched even if [v > view_number] would
+          otherwise adopt it), exactly like a wrong-[i] [Prepare_ok]: simpler to reason about than
+          applying every effect except the [recv_svc] write, and consistent with this module's
+          established "guard failure => total no-op" convention. *)
+  else if v > t.view_number then begin
+    (* ReceiveHigherSVC (VSR.tla:183-194): a higher view than our own -- assume-mode, adopt it
+       unconditionally (no majority needed to START a view change this way; see VSR.tla's own
+       comment at ReceiveHigherSVC for the "assume-mode, not increment-mode" citation). *)
+    t.view_number <- v;
+    t.status <- View_change;
+    t.recv_svc <- Int_set.singleton i;
+    t.recv_dvc <- [];
+    t.sent_dvc <- false;
+    try_send_dvc t
+  end
+  else if v = t.view_number && t.status = View_change then begin
+    (* ReceiveMatchingSVC (VSR.tla:196-205): another StartViewChange for the SAME episode we are
+       already running -- accumulate. *)
+    t.recv_svc <- Int_set.add i t.recv_svc;
+    try_send_dvc t
+  end
+  else
+    () (* Matches neither action's guard -- e.g. [v < view_number] (stale), or [v = view_number]
+          while [status = Normal] (no view-change episode is running here to join) -- not enabled
+          by anything, dropped, the same "no buffering/retry" discipline already established for
+          an out-of-order Prepare. *)
+
 let handle_message t (bytes : string) =
   match Message.decode bytes with
   | exception Message.Malformed_message _ -> ()
   | Message.Prepare { view; n; v; k } -> handle_prepare t ~view ~n ~v ~k
   | Message.Prepare_ok { view; n; i } -> handle_prepare_ok t ~view ~n ~i
-  | Message.Start_view_change _ | Message.Do_view_change _ | Message.Start_view _ ->
-    () (* out of this plan's scope -- silently ignored, not raised *)
+  | Message.Start_view_change { v; i } -> handle_start_view_change t ~v ~i
+  | Message.Do_view_change _ | Message.Start_view _ ->
+    () (* out of THIS task's scope -- Task 3's own [SendSV]/[ReceiveSV] -- silently ignored, not
+          raised *)

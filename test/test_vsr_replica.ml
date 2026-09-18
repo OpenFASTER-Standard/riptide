@@ -15,7 +15,17 @@
    deliberately want a VIEW MISMATCH (test_prepare_wrong_view_dropped) or that only need
    [is_primary] to be unconditionally false (test_prepare_ok_is_noop_on_non_primary, which is
    already true at the default view_number = 0 for any my_id <> replica_count) skip that call, with
-   a comment explaining why. *)
+   a comment explaining why.
+
+   NOTE on Task 2's own additions (check_timeout / handle_message's Start_view_change dispatch /
+   the internal SendDVC drive): see the "---- check_timeout ----" and "---- Start_view_change
+   dispatch ----" sections near the end of this file. Tests there that need a replica ALREADY in
+   [View_change] status use [Replica.for_test_set_view] (NOT [Replica.for_test_set_view_number],
+   which is correct only for [status = Normal] -- see that function's own doc comment in
+   replica.mli) only where doing so is strictly simpler than driving the transition via a real
+   [check_timeout]/[handle_message] call; several of the tests below deliberately drive real
+   transitions instead, specifically to double as coverage of check_timeout/ReceiveHigherSVC/
+   ReceiveMatchingSVC themselves rather than assuming them. *)
 open Riptide
 open Riptide_vsr
 
@@ -611,19 +621,225 @@ let test_handle_message_malformed_bytes_dropped () =
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
 
+(* [Start_view_change] is deliberately NOT in this list any more -- Task 2 of the view-change plan
+   made it a genuinely in-scope message type (see handle_start_view_change's own tests below,
+   "---- Start_view_change dispatch ----"); only [Do_view_change]/[Start_view] (Task 3's own
+   [ReceiveDVC]/[SendSV]/[ReceiveSV]) remain out of scope here. *)
 let test_handle_message_out_of_scope_types_ignored () =
   let send, sent = capturing_send () in
   let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
   List.iter
     (fun m -> Replica.handle_message t (Message.encode m))
     [
-      Message.Start_view_change { v = 1; i = 3 };
       Message.Do_view_change { v = 1; log = []; last_normal_view = 0; n = 0; k = 0; i = 3 };
       Message.Start_view { v = 1; log = []; n = 0; k = 0 };
     ];
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "status unchanged (still Normal)" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number unchanged" 0 (Replica.view_number t);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
+
+(* ---- check_timeout (TimerSendSVC, VSR.tla:161-174) ---- *)
+
+let test_check_timeout_transitions_and_broadcasts_start_view_change () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  Alcotest.(check bool) "starts Normal" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "starts at view_number 0" 0 (Replica.view_number t);
+  Replica.check_timeout t;
+  Alcotest.(check bool) "transitions to View_change" true (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number advances by exactly one" 1 (Replica.view_number t);
+  Alcotest.(check int) "op_number is untouched (UNCHANGED in VSR.tla:173)" 0 (Replica.op_number t);
+  Alcotest.(check int) "commit_number is untouched" 0 (Replica.commit_number t);
+  (* Broadcast StartViewChange{v=1; i=1} to every OTHER replica (2, 3), never to self *)
+  Alcotest.(check bool) "broadcasts StartViewChange to both other replicas, not itself" true
+    (decoded_sent sent
+    = [ (2, Message.Start_view_change { v = 1; i = 1 }); (3, Message.Start_view_change { v = 1; i = 1 }) ])
+
+let test_check_timeout_noop_when_already_view_change () =
+  (* Isolates the [status = "Normal"] guard specifically, independent of the svc_limit bound
+     (svc_limit is generous here) -- a naive implementation that dropped this guard would let a
+     second, back-to-back check_timeout call bump view_number again and re-broadcast. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:5 ~send in
+  Replica.check_timeout t;
+  Alcotest.(check int) "1st timeout advances view_number to 1" 1 (Replica.view_number t);
+  let sent_after_first = sent () in
+  Replica.check_timeout t;
+  Alcotest.(check bool) "2nd back-to-back call is a no-op: status stays View_change (not bumped further)"
+    true
+    (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number NOT advanced a second time" 1 (Replica.view_number t);
+  Alcotest.(check bool) "no additional StartViewChange broadcast for the blocked 2nd call" true
+    (sent () = sent_after_first)
+
+let test_check_timeout_bounded_by_svc_limit () =
+  (* Isolates the [svc_count < svc_limit] guard. Since nothing in THIS task's own scope can bring
+     [status] back to Normal for real (that's Task 3's SendSV/ReceiveSV), [for_test_set_view] is
+     used here ONLY to simulate "the replica somehow returned to Normal" between real
+     check_timeout calls -- svc_count itself is never touched directly (it has no setter at all;
+     only check_timeout's own real firings increment it), so this genuinely exercises svc_count's
+     accumulation and bound, not a shortcut around it. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:2 ~send in
+  Replica.check_timeout t;
+  Alcotest.(check bool) "1st timeout (svc_count 0 < 2) fires" true (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number advances to 1" 1 (Replica.view_number t);
+  Replica.for_test_set_view t ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
+  Replica.check_timeout t;
+  Alcotest.(check bool) "2nd timeout (svc_count 1 < 2) fires" true (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number advances to 2" 2 (Replica.view_number t);
+  Replica.for_test_set_view t ~status:Replica.Normal ~view_number:2 ~last_normal_view:2;
+  let sent_before_third = List.length (sent ()) in
+  Replica.check_timeout t;
+  Alcotest.(check bool) "3rd timeout (svc_count 2 >= svc_limit 2) is blocked: status stays Normal" true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number NOT advanced by the blocked 3rd timeout" 2 (Replica.view_number t);
+  Alcotest.(check int) "no additional StartViewChange broadcast for the blocked timeout" sent_before_third
+    (List.length (sent ()))
+
+(* ---- Start_view_change dispatch: ReceiveHigherSVC (VSR.tla:183-194) / ReceiveMatchingSVC
+   (VSR.tla:196-205) / SendDVC (VSR.tla:216-228) ---- *)
+
+let test_receive_higher_svc_adopts_view_seeds_recv_svc_and_resets_episode () =
+  (* replica_count=3, f=1: a single seed already meets SendDVC's own threshold, so this test
+     doubles as proof that ReceiveHigherSVC really does seed recv_svc with the SENDER (not leave
+     it empty) -- if seeding were broken, SendDVC could never fire from a single message here. It
+     also proves recv_dvc/sent_dvc are genuinely reset on each new higher-view episode: after the
+     first DoViewChange fires (sent_dvc -> true), a SECOND, even-higher StartViewChange only
+     re-enables SendDVC if sent_dvc was really reset back to false. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  Alcotest.(check bool) "starts Normal at view 0" true (Replica.status t = Replica.Normal && Replica.view_number t = 0);
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 5; i = 2 }));
+  Alcotest.(check bool) "adopts the higher view: status -> View_change" true (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number adopts the message's v (5), not view+1" 5 (Replica.view_number t);
+  (* f=1 and recv_svc was just seeded with {2} -- SendDVC's threshold is already met, so exactly
+     one DoViewChange should already be in flight, to Primary(5) = 1 + ((5-1) mod 3) = 1 + 1 = 2. *)
+  Alcotest.(check bool) "seeding recv_svc with the sender alone already meets f=1's threshold: one DoViewChange sent"
+    true
+    (decoded_sent sent
+    = [ (2, Message.Do_view_change { v = 5; log = []; last_normal_view = 0; n = 0; k = 0; i = 1 }) ]);
+  (* A second, EVEN HIGHER StartViewChange starts a fresh episode -- if sent_dvc/recv_svc weren't
+     really reset, this could never produce a second DoViewChange. *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 9; i = 3 }));
+  Alcotest.(check int) "view_number adopts the newer, even higher view" 9 (Replica.view_number t);
+  Alcotest.(check bool) "the new episode's own seed (f=1) fires a SECOND DoViewChange -- proves sent_dvc was reset"
+    true
+    (decoded_sent sent
+    = [
+        (2, Message.Do_view_change { v = 5; log = []; last_normal_view = 0; n = 0; k = 0; i = 1 });
+        (3, Message.Do_view_change { v = 9; log = []; last_normal_view = 0; n = 0; k = 0; i = 1 });
+      ])
+
+let test_receive_matching_svc_unions_and_dedups_send_dvc_fires_once () =
+  (* replica_count=5, f=2: a single seed/union is NOT enough on its own, so this discriminates
+     real set-union accumulation from a single-message trigger, AND from a naive list-append that
+     would double-count a duplicate sender. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  Replica.check_timeout t;
+  Alcotest.(check int) "view_number advances to 1" 1 (Replica.view_number t);
+  let sent_after_timeout = List.length (sent ()) in
+  (* one matching StartViewChange: cardinality 1 < f=2 -- SendDVC must NOT fire yet *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
+  Alcotest.(check int) "below quorum: no DoViewChange sent yet" sent_after_timeout (List.length (sent ()));
+  (* the SAME sender again -- a true set must not let this inflate the count *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
+  Alcotest.(check int) "duplicate sender does not inflate recv_svc's cardinality: still below quorum"
+    sent_after_timeout (List.length (sent ()));
+  (* a genuinely different sender -- cardinality now 2 >= f=2 -- SendDVC fires exactly once *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
+  Alcotest.(check int) "a second, distinct sender reaches quorum: exactly one DoViewChange sent"
+    (sent_after_timeout + 1) (List.length (sent ()));
+  (* a THIRD matching sender -- cardinality now 3 >= f=2 (still true), but sent_dvc is already
+     true for this episode -- SendDVC must not fire a second time *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 4 }));
+  Alcotest.(check int) "SendDVC never fires twice for the same episode, even though the guard's \
+                        cardinality conjunct is still satisfied"
+    (sent_after_timeout + 1) (List.length (sent ()))
+
+let test_send_dvc_message_content_matches_replica_state () =
+  (* Builds up genuinely non-trivial log/commit_number/last_normal_view state via the well-tested
+     normal-case path (real Prepares), THEN drives it into a view change, to pin that SendDVC's
+     own DoViewChange really does carry THIS replica's real state, not placeholder/zero values. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.for_test_set_view t ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
+  (* my_id=3 is a backup at view 1 (Primary(1) = 1) -- feed it two in-order Prepares *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "op_number is 2 after the two Prepares" 2 (Replica.op_number t);
+  Alcotest.(check int) "commit_number advanced to 1 (the second Prepare's own k)" 1 (Replica.commit_number t);
+  let sent_before_timeout = List.length (sent ()) in
+  Replica.check_timeout t;
+  Alcotest.(check int) "check_timeout does not touch op_number/commit_number/last_normal_view" 2
+    (Replica.op_number t);
+  Alcotest.(check int) "check_timeout does not touch commit_number" 1 (Replica.commit_number t);
+  Alcotest.(check int) "check_timeout does not touch last_normal_view" 1 (Replica.last_normal_view t);
+  Alcotest.(check int) "view_number advances to 2" 2 (Replica.view_number t);
+  (* f=1: a single matching StartViewChange from replica 1 meets quorum and fires SendDVC *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 1 }));
+  (* Primary(2) = 1 + ((2-1) mod 3) = 1 + 1 = 2 *)
+  let sent_after = decoded_sent sent in
+  Alcotest.(check int) "exactly one new message sent (the DoViewChange)" (sent_before_timeout + 3)
+    (List.length sent_after)
+  (* (sent_before_timeout messages) + 2 StartViewChange broadcasts from check_timeout + 1 DoViewChange *);
+  Alcotest.(check bool) "the DoViewChange carries this replica's real log/n/k/last_normal_view/i, \
+                         addressed to Primary(2) = 2"
+    true
+    (List.nth sent_after (List.length sent_after - 1)
+    = (2, Message.Do_view_change { v = 2; log = [ v "a"; v "b" ]; last_normal_view = 1; n = 2; k = 1; i = 3 }))
+
+let test_start_view_change_lower_or_equal_while_normal_dropped () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.for_test_set_view t ~status:Replica.Normal ~view_number:3 ~last_normal_view:3;
+  (* LOWER: v=1 < view_number=3 -- matches neither ReceiveHigherSVC nor ReceiveMatchingSVC *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
+  Alcotest.(check bool) "a lower-view StartViewChange is dropped: status stays Normal" true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number unchanged by the lower-view message" 3 (Replica.view_number t);
+  (* EQUAL while Normal: v=3=view_number, but status=Normal, so ReceiveMatchingSVC's own
+     [status = "ViewChange"] conjunct fails -- no episode is running here to join *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 3; i = 2 }));
+  Alcotest.(check bool) "an equal-view StartViewChange while Normal is dropped too" true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number unchanged by the equal-view-while-Normal message" 3 (Replica.view_number t);
+  Alcotest.(check bool) "neither dropped message produced any outgoing message" true (sent () = [])
+
+let test_start_view_change_forged_out_of_range_i_dropped () =
+  (* Defense-in-depth boundary pin, mirroring the I2-style boundary tests above for Prepare_ok's
+     own [i] guard: i = replica_count + 1 = 4 is the first out-of-range id and must still be
+     rejected wholesale (no state change at all, not even adopting the higher view); i = 2 (a
+     genuinely valid id) must still work normally right after. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 5; i = 4 }));
+  Alcotest.(check bool) "forged out-of-range i (4, first invalid id for replica_count=3) is dropped wholesale: \
+                         status stays Normal"
+    true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number NOT adopted from a message with a forged i" 0 (Replica.view_number t);
+  Alcotest.(check bool) "no message sent for the forged-i StartViewChange" true (sent () = []);
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 5; i = 2 }));
+  Alcotest.(check bool) "a genuinely valid i (2, the last legal id below the forged boundary) is accepted normally"
+    true
+    (Replica.status t = Replica.View_change && Replica.view_number t = 5)
+
+(* ---- for_test_set_view (test-support surface) ---- *)
+
+let test_for_test_set_view_round_trips_independently () =
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  (* Deliberately mismatched view_number/last_normal_view, at status=View_change -- exactly the
+     combination for_test_set_view_number cannot produce (it force-syncs the two), and exactly
+     the combination a real mid-view-change replica is routinely in. *)
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:7 ~last_normal_view:2;
+  Alcotest.(check bool) "status round-trips" true (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number round-trips" 7 (Replica.view_number t);
+  Alcotest.(check int) "last_normal_view round-trips independently, NOT forced to match view_number" 2
+    (Replica.last_normal_view t)
 
 let tests =
   [
@@ -691,5 +907,33 @@ let tests =
     ("handle_message: out-of-scope message types are silently ignored", `Quick, test_handle_message_out_of_scope_types_ignored);
     (* Fix-round L2 (task-1-review.md): svc_limit boundary *)
     ("Fix-round L2: svc_limit = 1 (the smallest legal value) is accepted", `Quick, test_svc_limit_boundary_one_is_accepted);
+    (* Task 2: check_timeout (TimerSendSVC) *)
+    ( "Task 2: check_timeout transitions to View_change and broadcasts StartViewChange",
+      `Quick,
+      test_check_timeout_transitions_and_broadcasts_start_view_change );
+    ( "Task 2: check_timeout is a no-op when already View_change (status guard)",
+      `Quick,
+      test_check_timeout_noop_when_already_view_change );
+    ("Task 2: check_timeout is bounded by svc_limit", `Quick, test_check_timeout_bounded_by_svc_limit);
+    (* Task 2: Start_view_change dispatch (ReceiveHigherSVC / ReceiveMatchingSVC / SendDVC) *)
+    ( "Task 2: ReceiveHigherSVC adopts the higher view, seeds recv_svc, and resets the episode",
+      `Quick,
+      test_receive_higher_svc_adopts_view_seeds_recv_svc_and_resets_episode );
+    ( "Task 2: ReceiveMatchingSVC unions and dedups recv_svc; SendDVC fires exactly once",
+      `Quick,
+      test_receive_matching_svc_unions_and_dedups_send_dvc_fires_once );
+    ( "Task 2: SendDVC's DoViewChange carries this replica's real log/n/k/last_normal_view/i",
+      `Quick,
+      test_send_dvc_message_content_matches_replica_state );
+    ( "Task 2: a lower or equal-while-Normal StartViewChange is dropped",
+      `Quick,
+      test_start_view_change_lower_or_equal_while_normal_dropped );
+    ( "Task 2: a StartViewChange with a forged out-of-range i is dropped wholesale",
+      `Quick,
+      test_start_view_change_forged_out_of_range_i_dropped );
+    (* Task 2: for_test_set_view (test-support surface) *)
+    ( "Task 2: for_test_set_view round-trips status/view_number/last_normal_view independently",
+      `Quick,
+      test_for_test_set_view_round_trips_independently );
   ]
   @ create_invalid_arg_tests
