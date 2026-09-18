@@ -1,0 +1,513 @@
+(* test/test_vsr_replica.ml -- single-replica-in-isolation tests: handle_message/propose called
+   directly with hand-constructed encoded messages, no real transport, no second replica. Real
+   multi-replica message exchange over Sim_transport is Task 2's own test file
+   (test_vsr_replica_cluster.ml), not this one. *)
+open Riptide
+open Riptide_vsr
+
+let v s = Value.Scalar (Value.String s)
+
+(* Captures every [~to_, bytes] pair a replica's [send] closure is given, in call order. *)
+let capturing_send () =
+  let sent = ref [] in
+  let send ~to_ bytes = sent := (to_, bytes) :: !sent in
+  (send, fun () -> List.rev !sent)
+
+let decoded_sent sent_fn = List.map (fun (to_, bytes) -> (to_, Message.decode bytes)) (sent_fn ())
+
+(* ---- propose (ReceiveClientRequest, VSR.tla:91-102) ---- *)
+
+let test_primary_propose_broadcasts_prepare () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "hello");
+  Alcotest.(check int) "op_number advances to 1" 1 (Replica.op_number t);
+  Alcotest.(check int) "commit_number unchanged by propose alone" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "entries now contains the proposed value" true (Replica.entries t = [ v "hello" ]);
+  (* every OTHER replica (2, 3) gets a Prepare{view=0; n=1; v; k=0}, primary (1) does not *)
+  Alcotest.(check bool) "broadcasts Prepare to both other replicas, not itself" true
+    (decoded_sent sent
+    = [ (2, Message.Prepare { view = 0; n = 1; v = v "hello"; k = 0 });
+        (3, Message.Prepare { view = 0; n = 1; v = v "hello"; k = 0 }) ])
+
+let test_propose_is_noop_on_non_primary () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Alcotest.(check bool) "is_primary is false for a backup" false (Replica.is_primary t);
+  Replica.propose t (v "should-not-be-accepted");
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "entries unchanged" true (Replica.entries t = []);
+  Alcotest.(check bool) "no message sent" true (sent () = [])
+
+let test_propose_duplicate_value_rejected_second_time () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "dup");
+  Alcotest.(check int) "op_number after first propose" 1 (Replica.op_number t);
+  Alcotest.(check int) "two Prepares sent after first propose" 2 (List.length (sent ()));
+  (* same value again -- VSR.tla's own dedup guard (v \notin log) makes this a no-op *)
+  Replica.propose t (v "dup");
+  Alcotest.(check int) "op_number NOT advanced by the duplicate propose" 1 (Replica.op_number t);
+  Alcotest.(check bool) "entries still just the one value" true (Replica.entries t = [ v "dup" ]);
+  Alcotest.(check int) "no additional messages sent for the rejected duplicate" 2 (List.length (sent ()));
+  (* a genuinely different value is still accepted *)
+  Replica.propose t (v "not-a-dup");
+  Alcotest.(check int) "op_number advances for a distinct value" 2 (Replica.op_number t);
+  Alcotest.(check int) "four Prepares sent in total now" 4 (List.length (sent ()))
+
+(* ---- ReceivePrepareMsg (VSR.tla:104-123) ---- *)
+
+let test_backup_in_order_prepare_appends_and_replies () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  let prepare = Message.encode (Message.Prepare { view = 0; n = 1; v = v "x"; k = 0 }) in
+  Replica.handle_message t prepare;
+  Alcotest.(check int) "op_number advances to 1" 1 (Replica.op_number t);
+  Alcotest.(check bool) "entries contains the prepared value" true (Replica.entries t = [ v "x" ]);
+  Alcotest.(check int) "commit_number stays 0 (k=0 in this Prepare)" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "replies with the right PrepareOk, to the primary" true
+    (decoded_sent sent = [ (1, Message.Prepare_ok { view = 0; n = 1; i = 2 }) ])
+
+let test_backup_prepare_advances_commit_number_from_k () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  (* op 1 in-order, k=0 *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  (* op 2 in-order, carrying k=1 (the primary's own commit_number from before op 2 was appended) *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "commit_number advances to the Prepare's own k" 1 (Replica.commit_number t);
+  (* a later Prepare carrying a LOWER k must never regress commit_number *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0 }));
+  Alcotest.(check int) "commit_number never regresses" 1 (Replica.commit_number t)
+
+let test_backup_out_of_order_prepare_dropped () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  (* op_number is 0; a Prepare for n=2 (a gap) must not be matched by ReceivePrepareMsg at all *)
+  let prepare = Message.encode (Message.Prepare { view = 0; n = 2; v = v "skip"; k = 0 }) in
+  Replica.handle_message t prepare;
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "log unchanged" true (Replica.entries t = []);
+  Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "no PrepareOk sent" true (sent () = [])
+
+let test_backup_duplicate_prepare_dropped () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  let sent_after_first = sent () in
+  (* the same op_number 1 arriving again (e.g. a duplicated network delivery) is "too low", not
+     in-order -- must be dropped just like any other out-of-order arrival *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a-again"; k = 0 }));
+  Alcotest.(check int) "op_number unchanged by the duplicate" 1 (Replica.op_number t);
+  Alcotest.(check bool) "log still holds only the first delivery's value" true (Replica.entries t = [ v "a" ]);
+  Alcotest.(check bool) "no second PrepareOk sent" true (sent () = sent_after_first)
+
+let test_prepare_wrong_view_dropped () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "wrong-view"; k = 0 }) in
+  Replica.handle_message t prepare;
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "log unchanged" true (Replica.entries t = []);
+  Alcotest.(check bool) "no reply sent" true (sent () = [])
+
+let test_prepare_addressed_to_primary_itself_dropped () =
+  (* IsNormalBackup(r) requires Primary(view) <> r -- a Prepare somehow handed to the primary's
+     own handle_message must not be treated as a backup receiving it *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  let prepare = Message.encode (Message.Prepare { view = 0; n = 1; v = v "x"; k = 0 }) in
+  Replica.handle_message t prepare;
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "no reply sent" true (sent () = [])
+
+(* ---- ReceivePrepareOkMsg + IsCommitted/PrimaryExecuteOp (VSR.tla:125-155) ---- *)
+
+let test_primary_prepare_ok_below_quorum_does_not_commit () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "only-op");
+  Alcotest.(check int) "commit_number is 0 before any ack" 0 (Replica.commit_number t);
+  (* 3 replicas, f = 1: a single ack from one other replica is already enough -- confirm the
+     boundary the other way: with 0 acks, nothing commits *)
+  Alcotest.(check bool) "not yet committed" false (Replica.is_committed t (v "only-op"))
+
+let test_primary_prepare_ok_reaches_quorum_and_commits () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "only-op");
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "commit_number advances to 1 once f=1 other replica acks" 1 (Replica.commit_number t);
+  Alcotest.(check bool) "is_committed now true" true (Replica.is_committed t (v "only-op"))
+
+let test_primary_prepare_ok_is_cumulative_high_water_mark () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~primary_id:1 ~send in
+  Replica.propose t (v "a");
+  Replica.propose t (v "b");
+  (* peer 2 acks n=2 directly (its own high-water mark), never having separately reported n=1 to
+     this primary -- PrepareOk is cumulative, so this must still count as an ack for op 1 too *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 2; i = 2 }));
+  (* only 1 of the required f=2 other replicas so far -- nothing committed yet *)
+  Alcotest.(check int) "commit_number still 0 with only 1 of 2 required acks" 0 (Replica.commit_number t);
+  (* a LOWER, stale-looking ack from the same peer must not regress its recorded high-water mark *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "commit_number unaffected by the stale lower ack" 0 (Replica.commit_number t)
+
+(* The single highest-risk scenario per this plan's own self-review: with a cluster large enough
+   that a single Prepare_ok isn't already enough to satisfy quorum by itself (replica_count=5,
+   f=2), construct a delivery order where the message that completes op 1's OWN quorum happens to
+   carry n=2 (a different, higher op-number than the one it makes newly committed) and confirm
+   commit_number advances to exactly 1 -- not straight to 2 -- until op 2's own, independent
+   quorum is separately satisfied.
+
+   What this actually discriminates (corrected after independent review, see task-1-review.md
+   section 1c): because IsCommitted(n) provably implies IsCommitted(n-1) for ANY threshold
+   (rep_peer_op_number is a single cumulative high-water mark per peer, so the set of peers
+   satisfying ">= n" is always a subset of those satisfying ">= n-1"), an implementation that
+   jumped straight to the HIGHEST quorum-satisfied op-number would be extensionally IDENTICAL to
+   the incremental loop -- that specific "skip ahead" shape is not a real, distinguishable bug,
+   and no test can catch it because it isn't wrong. What this test genuinely catches is the
+   family of bugs that check ONLY the arriving message's own n instead of walking from
+   commit_number+1: e.g. "if IsCommitted(m.n) then commit_number := m.n" would incorrectly stay
+   at 0 after the second message below (m.n=2 doesn't itself have quorum yet, so it never notices
+   op 1 became committed); "commit_number := m.n unconditionally" would incorrectly jump to 2.
+   Only replica_count=5 (f>=2) can discriminate any of this -- at f=1 (3 replicas) a single ack
+   already satisfies every op-number's quorum simultaneously, so every variant agrees. *)
+let test_primary_advances_commit_number_by_exactly_one_never_skips () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  Replica.propose t (v "op2");
+  Alcotest.(check int) "op_number is 2 after two proposes" 2 (Replica.op_number t);
+  Alcotest.(check int) "commit_number starts at 0" 0 (Replica.commit_number t);
+  (* replica 2 acks only op 1 *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "still 0: only 1 of 2 required acks for op 1" 0 (Replica.commit_number t);
+  (* replica 3 acks up to op 2 (cumulative) -- this SAME message's contribution is what completes
+     op 1's own quorum (replicas 2 and 3 both now >= 1), while op 2's quorum (needs 2 replicas
+     with ack >= 2, only replica 3 qualifies) is NOT yet satisfied *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 2; i = 3 }));
+  Alcotest.(check int)
+    "commit_number advances to EXACTLY 1, not straight to 2, even though this message's own n=2" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is committed" true (Replica.is_committed t (v "op1"));
+  Alcotest.(check bool) "op2 is NOT yet committed" false (Replica.is_committed t (v "op2"));
+  (* replica 2 now also acks up to op 2 -- op 2's quorum (replicas 2 and 3, both >= 2) is now met *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 2; i = 2 }));
+  Alcotest.(check int) "commit_number now advances to 2" 2 (Replica.commit_number t);
+  Alcotest.(check bool) "op2 is now committed too" true (Replica.is_committed t (v "op2"))
+
+let test_prepare_ok_is_noop_on_non_primary () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 3 }));
+  Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "no messages sent" true (sent () = [])
+
+let test_prepare_ok_wrong_view_dropped () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 2 }));
+  Alcotest.(check int) "commit_number unchanged by a wrong-view PrepareOk" 0 (Replica.commit_number t)
+
+(* ---- M1 fix-round regression tests: a PrepareOk's [i] must name a real replica
+   (VSR.tla:141's own [p \in replicas] domain restriction on the set IsCommitted counts over) --
+   reproduces the reviewer's own live repro from task-1-review.md's M1 finding. ---- *)
+
+let test_prepare_ok_forged_nonexistent_replica_id_does_not_commit () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  (* replica id 42 does not exist in a 3-replica cluster (valid ids are 1..3) -- before the fix,
+     a single such forged ack committed op 1 with ZERO real backup acknowledgements *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 42 }));
+  Alcotest.(check int) "a forged ack from a non-existent replica id does not commit" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed" false (Replica.is_committed t (v "op1"))
+
+let test_prepare_ok_out_of_range_id_zero_does_not_commit () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  (* 0 is out of VSR.tla's 1..replica_count range too (ids are 1-indexed) *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 0 }));
+  Alcotest.(check int) "id 0 (out of the valid 1..replica_count range) does not commit" 0 (Replica.commit_number t)
+
+let test_prepare_ok_forged_ids_do_not_commit_in_larger_cluster () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  (* reviewer's own 5-replica repro: two forged acks (i=0, i=99), neither a real replica id *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 99 }));
+  Alcotest.(check int) "two forged acks from non-existent replicas still do not commit" 0 (Replica.commit_number t);
+  (* a REAL replica's ack, combined with one forged one, must still need the full quorum of
+     genuine acks (f=2 for a 5-replica cluster) -- one real + one forged is not enough *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "one real ack plus forged ones is still below the required quorum of 2" 0
+    (Replica.commit_number t);
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 3 }));
+  Alcotest.(check int) "a second REAL ack reaches genuine quorum and commits" 1 (Replica.commit_number t)
+
+(* ---- M2 fix-round regression tests: a Prepare's [k] must never push commit_number past
+   op_number -- reproduces the reviewer's own live repro from task-1-review.md's M2 finding. ---- *)
+
+let test_prepare_k_exceeding_op_number_is_rejected () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  (* before the fix: Prepare{n=1; k=9999} yielded op_number=1, commit_number=9999 -- the fix
+     rejects the update outright when k > op_number (rather than silently substituting op_number
+     for it), so commit_number stays at its last legitimately-established value, here still 0 *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 9999 }));
+  Alcotest.(check int) "op_number advances normally" 1 (Replica.op_number t);
+  Alcotest.(check int) "commit_number is NOT advanced by the out-of-bound forged k" 0 (Replica.commit_number t)
+
+let test_prepare_k_exceeding_op_number_rejected_across_multiple_prepares () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 9999 }));
+  Alcotest.(check int) "op_number is 2" 2 (Replica.op_number t);
+  Alcotest.(check int) "commit_number is NOT advanced by the out-of-bound forged k (9999 > op_number 2)" 0
+    (Replica.commit_number t)
+
+let test_prepare_k_within_bound_still_advances_normally () =
+  (* a genuinely WELL-FORMED, higher k must still be applied -- the fix must not weaken the
+     legitimate case. Well-formed per VSR.tla:106-109's own comment means k < n strictly (the
+     primary's commit-number from strictly BEFORE the request carried by this same message was
+     appended), not merely k <= op_number -- the implementation's own bound (k <= op_number t,
+     i.e. k <= n once this Prepare's append has advanced op_number to n) is intentionally a
+     little wider than that, as a defense-in-depth margin against off-by-one edge cases, not
+     because k = n is itself a message any correct primary would ever actually send. *)
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "a valid, in-bound k still advances commit_number" 1 (Replica.commit_number t)
+
+(* ---- M3 fix: a forged Prepare_ok.n from a REAL replica id permanently pre-acks future ops ---- *)
+
+let test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  (* Before the fix: a single forged ack, from a REAL replica id, claiming to have acked an
+     op-number this primary has never proposed, permanently inflated that peer's recorded
+     high-water mark -- so once op_number genuinely caught up, the primary would "commit" future
+     ops with only ONE further real ack instead of the two needed for majority in a 3-replica
+     cluster (f=1). *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1_000_000; i = 2 }));
+  Replica.propose t (v "op1");
+  Alcotest.(check int) "the forged, out-of-range ack does not commit op1 by itself" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed" false (Replica.is_committed t (v "op1"))
+
+(* ---- I2 boundary pins: the exact first-REJECTED and last-ACCEPTED value of each of the three
+   safety guards (replica.ml's [i < 1 || i > t.replica_count], [k <= op_number t], and
+   [n > op_number t]).
+
+   Why these are separate from the M1/M2/M3 regression tests above: every one of those uses an
+   obviously-forged value (i = 42, i = 99, k = 9999, n = 1_000_000), and a guard loosened by
+   exactly one token still rejects all of them. They therefore pin that each guard EXISTS, not
+   WHERE it sits. The final whole-branch review demonstrated this concretely: loosening any single
+   guard by one ([i > replica_count + 1], [k <= op_number t + 1], [n > op_number t + 1]) left the
+   entire 137-test suite green while fully reopening the original vulnerability it was added for.
+   Each test below therefore asserts BOTH directions -- the first illegal value is still rejected
+   (so the guard cannot be silently widened) AND the last legal value is still accepted (so it
+   cannot be over-tightened into rejecting legitimate traffic either). ---- *)
+
+let test_prepare_ok_i_boundary_is_exactly_replica_count () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.propose t (v "op1");
+  (* i = replica_count + 1 = 4 is the FIRST id past VSR.tla:15's own [replicas == 1..ReplicaCount]
+     range -- the exact value [i > t.replica_count] must still reject. Loosened to
+     [i > t.replica_count + 1], this single forged ack commits op 1 in a 3-replica cluster
+     (f = 1) with zero real backup acknowledgements. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 4 }));
+  Alcotest.(check int) "i = replica_count + 1 (the first out-of-range id) does not commit" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed by a boundary-adjacent forged id" false (Replica.is_committed t (v "op1"));
+  (* The last IN-range id, i = replica_count = 3, must still be accepted: the guard must not be
+     over-tightened to [i >= t.replica_count] either. This is a real backup in this cluster, so
+     its ack alone reaches the f = 1 quorum. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 3 }));
+  Alcotest.(check int) "i = replica_count (the last legal id) is accepted and reaches quorum" 1 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is committed by the genuine boundary-valued ack" true (Replica.is_committed t (v "op1"))
+
+let test_prepare_k_boundary_is_exactly_op_number () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  (* k = 2 on a Prepare with n = 1: after the append, op_number = 1, so this is exactly
+     [op_number t + 1] -- the FIRST value [k <= op_number t] must reject. Loosened to
+     [k <= op_number t + 1] it is applied, yielding commit_number = 2 > op_number = 1: a direct
+     violation of CommitNumberNeverHigherThanOpNumber (VSR.tla:330-331), which replica.mli's own
+     [commit_number] doc comment claims holds for EVERY reachable state, adversarial input
+     included. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 2 }));
+  Alcotest.(check int) "the Prepare itself is still accepted -- only the k field's effect is dropped" 1
+    (Replica.op_number t);
+  Alcotest.(check int) "k = op_number + 1 (the first out-of-bound k) is rejected" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number <= op_number still holds" true (Replica.commit_number t <= Replica.op_number t);
+  (* The last ACCEPTED value is k = n (== op_number t after this Prepare's own append), NOT
+     k = n - 1: the implemented bound is deliberately ONE STEP WIDER than VSR.tla:106-109's own
+     [m.k < m.n] precondition (see replica.ml's comment at the bound, and
+     test_prepare_k_within_bound_still_advances_normally above for the genuinely well-formed
+     k = n - 1 case). k = n is accepted here even though no correct primary ever sends it --
+     pinned so the widening stays a visible, deliberate choice rather than drift.
+     NOTE for a future plan: if the bound is tightened to [k < op_number t] (the review's
+     recommended direction, once view-change makes a backup's commit_number load-bearing via
+     DoViewChange.k / HighestCommitNumber, VSR.tla:257-260), THIS expectation is the one to
+     update -- it pins a deliberate margin, not a safety property. The k = n + 1 assertion above
+     is the safety one and must never be loosened. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 2 }));
+  Alcotest.(check int) "k = op_number (the deliberately widened, still-accepted boundary) advances commit_number" 2
+    (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number <= op_number still holds at the widened boundary too" true
+    (Replica.commit_number t <= Replica.op_number t)
+
+let test_prepare_ok_n_boundary_is_exactly_op_number () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~primary_id:1 ~send in
+  Alcotest.(check int) "op_number is 0 before anything is proposed" 0 (Replica.op_number t);
+  (* With op_number = 0, n = 1 is exactly [op_number t + 1] -- the FIRST value [n > op_number t]
+     must reject. Loosened to [n > op_number t + 1] it is recorded, pre-acking an op that does not
+     exist yet; the very next propose then commits with zero genuine acks. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Replica.propose t (v "op1");
+  Alcotest.(check int) "n = op_number + 1 (pre-acking the next op) does not commit it" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is NOT committed by the boundary-adjacent forged ack" false (Replica.is_committed t (v "op1"));
+  (* The last ACCEPTED value, n = op_number t exactly, must still count -- a genuine ack for the
+     op this primary really has assigned is the single most common message in the protocol and
+     must not be rejected by the same guard. *)
+  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 2 }));
+  Alcotest.(check int) "n = op_number (a genuine ack for the current op) is accepted and commits" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "op1 is committed by the genuine boundary-valued ack" true (Replica.is_committed t (v "op1"))
+
+(* ---- L1 fix-round regression tests: create validates its numeric arguments ---- *)
+
+let expect_invalid_arg name (f : unit -> Replica.t) =
+  ( name,
+    `Quick,
+    fun () ->
+      match f () with
+      | (_ : Replica.t) -> Alcotest.failf "%s: expected Invalid_argument, but create succeeded" name
+      | exception Invalid_argument _ -> ()
+      | exception exn -> Alcotest.failf "%s: expected Invalid_argument, got %s" name (Printexc.to_string exn) )
+
+let create_invalid_arg_tests =
+  [
+    expect_invalid_arg "replica_count = 0 is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:0 ~primary_id:1 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "negative replica_count is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:(-3) ~primary_id:1 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "even replica_count is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:4 ~primary_id:1 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "my_id below 1 is rejected" (fun () ->
+        Replica.create ~my_id:0 ~replica_count:3 ~primary_id:1 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "my_id above replica_count is rejected" (fun () ->
+        Replica.create ~my_id:4 ~replica_count:3 ~primary_id:1 ~send:(fun ~to_:_ _ -> ()));
+    expect_invalid_arg "primary_id out of range is rejected" (fun () ->
+        Replica.create ~my_id:1 ~replica_count:3 ~primary_id:9 ~send:(fun ~to_:_ _ -> ()));
+  ]
+
+let test_create_accepts_a_valid_single_replica_cluster () =
+  (* replica_count = 1 is odd and >= 1 -- a legitimate (if degenerate) configuration, not to be
+     rejected by the same validation that rejects even counts (see L2's own test below) *)
+  let t = Replica.create ~my_id:1 ~replica_count:1 ~primary_id:1 ~send:(fun ~to_:_ _ -> ()) in
+  Alcotest.(check bool) "is_primary" true (Replica.is_primary t)
+
+(* ---- L2 fix-round regression test: propose must also drive PrimaryExecuteOp (the f=0 case) ---- *)
+
+let test_propose_commits_immediately_in_single_replica_cluster () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:1 ~primary_id:1 ~send in
+  Replica.propose t (v "solo");
+  (* f = (1-1)/2 = 0, so IsCommitted is vacuously true for every op-number -- before the fix,
+     nothing but a (nonexistent, since there are no other replicas) Prepare_ok could ever drive
+     primary_execute_op, so commit_number stayed 0 forever even though VSR.tla's own Next would
+     let PrimaryExecuteOp fire immediately after ReceiveClientRequest here *)
+  Alcotest.(check int) "commit_number advances to 1 immediately, with zero other replicas to ack" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "the proposed value is committed" true (Replica.is_committed t (v "solo"))
+
+(* ---- handle_message robustness: malformed bytes and out-of-scope message types ---- *)
+
+let test_handle_message_malformed_bytes_dropped () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  Replica.handle_message t "\xff\xff\xff not a valid encoding";
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "no messages sent" true (sent () = [])
+
+let test_handle_message_out_of_scope_types_ignored () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~primary_id:1 ~send in
+  List.iter
+    (fun m -> Replica.handle_message t (Message.encode m))
+    [
+      Message.Start_view_change { v = 1; i = 3 };
+      Message.Do_view_change { v = 1; log = []; last_normal_view = 0; n = 0; k = 0; i = 3 };
+      Message.Start_view { v = 1; log = []; n = 0; k = 0 };
+    ];
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "no messages sent" true (sent () = [])
+
+let tests =
+  [
+    ("primary propose broadcasts Prepare to every other replica", `Quick, test_primary_propose_broadcasts_prepare);
+    ("propose is a no-op on a non-primary replica", `Quick, test_propose_is_noop_on_non_primary);
+    ("a duplicate client value is rejected the second time", `Quick, test_propose_duplicate_value_rejected_second_time);
+    ("backup: in-order Prepare appends and replies with PrepareOk", `Quick, test_backup_in_order_prepare_appends_and_replies);
+    ("backup: Prepare's k field advances commit_number, monotonically", `Quick, test_backup_prepare_advances_commit_number_from_k);
+    ("backup: out-of-order Prepare is silently dropped", `Quick, test_backup_out_of_order_prepare_dropped);
+    ("backup: duplicate (too-low) Prepare is silently dropped", `Quick, test_backup_duplicate_prepare_dropped);
+    ("backup: Prepare with a mismatched view is silently dropped", `Quick, test_prepare_wrong_view_dropped);
+    ("Prepare addressed to the primary's own handle_message is dropped", `Quick, test_prepare_addressed_to_primary_itself_dropped);
+    ("primary: PrepareOk below quorum does not commit", `Quick, test_primary_prepare_ok_below_quorum_does_not_commit);
+    ("primary: PrepareOk reaching quorum commits", `Quick, test_primary_prepare_ok_reaches_quorum_and_commits);
+    ("primary: PrepareOk high-water mark is cumulative and never regresses", `Quick, test_primary_prepare_ok_is_cumulative_high_water_mark);
+    ( "primary: commit_number advances by exactly one, never skips ahead (op 2 quorum-acked before op 1)",
+      `Quick,
+      test_primary_advances_commit_number_by_exactly_one_never_skips );
+    ("PrepareOk is a no-op on a non-primary replica", `Quick, test_prepare_ok_is_noop_on_non_primary);
+    ("primary: PrepareOk with a mismatched view is silently dropped", `Quick, test_prepare_ok_wrong_view_dropped);
+    (* M1 fix-round regression tests *)
+    ( "M1: a forged PrepareOk from a non-existent replica id does not commit",
+      `Quick,
+      test_prepare_ok_forged_nonexistent_replica_id_does_not_commit );
+    ("M1: PrepareOk with id 0 (out of range) does not commit", `Quick, test_prepare_ok_out_of_range_id_zero_does_not_commit);
+    ( "M1: forged ids do not count toward quorum in a larger cluster (reviewer's own repro)",
+      `Quick,
+      test_prepare_ok_forged_ids_do_not_commit_in_larger_cluster );
+    (* M2 fix-round regression tests *)
+    ("M2: Prepare with k exceeding op_number is rejected, not applied verbatim", `Quick, test_prepare_k_exceeding_op_number_is_rejected);
+    ( "M2: an out-of-bound k is rejected across multiple Prepares too",
+      `Quick,
+      test_prepare_k_exceeding_op_number_rejected_across_multiple_prepares );
+    ("M2: a valid, in-bound k still advances commit_number normally", `Quick, test_prepare_k_within_bound_still_advances_normally);
+    (* M3 fix-round regression test *)
+    ( "M3: a forged PrepareOk.n from a real replica id does not pre-ack future ops",
+      `Quick,
+      test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops );
+    (* I2 boundary pins: the exact first-rejected/last-accepted value of each safety guard *)
+    ( "I2 boundary: PrepareOk's i guard sits exactly at replica_count (i+1 rejected, i accepted)",
+      `Quick,
+      test_prepare_ok_i_boundary_is_exactly_replica_count );
+    ( "I2 boundary: Prepare's k guard sits exactly at op_number (k+1 rejected, k accepted)",
+      `Quick,
+      test_prepare_k_boundary_is_exactly_op_number );
+    ( "I2 boundary: PrepareOk's n guard sits exactly at op_number (n+1 rejected, n accepted)",
+      `Quick,
+      test_prepare_ok_n_boundary_is_exactly_op_number );
+    (* L1 fix-round regression tests *)
+    ("L1: create accepts a valid, degenerate single-replica cluster", `Quick, test_create_accepts_a_valid_single_replica_cluster);
+    (* L2 fix-round regression test *)
+    ( "L2: propose alone commits immediately in a single-replica (f=0) cluster",
+      `Quick,
+      test_propose_commits_immediately_in_single_replica_cluster );
+    ("handle_message: malformed bytes are silently dropped, never raise", `Quick, test_handle_message_malformed_bytes_dropped);
+    ("handle_message: out-of-scope message types are silently ignored", `Quick, test_handle_message_out_of_scope_types_ignored);
+  ]
+  @ create_invalid_arg_tests
