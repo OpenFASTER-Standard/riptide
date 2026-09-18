@@ -491,22 +491,26 @@ let test_prepare_k_boundary_is_exactly_op_number () =
     (Replica.op_number t);
   Alcotest.(check int) "k = op_number + 1 (the first out-of-bound k) is rejected" 0 (Replica.commit_number t);
   Alcotest.(check bool) "commit_number <= op_number still holds" true (Replica.commit_number t <= Replica.op_number t);
-  (* The last ACCEPTED value is k = n (== op_number t after this Prepare's own append), NOT
-     k = n - 1: the implemented bound is deliberately ONE STEP WIDER than VSR.tla:106-109's own
-     [m.k < m.n] precondition (see replica.ml's comment at the bound, and
-     test_prepare_k_within_bound_still_advances_normally above for the genuinely well-formed
-     k = n - 1 case). k = n is accepted here even though no correct primary ever sends it --
-     pinned so the widening stays a visible, deliberate choice rather than drift.
-     NOTE for a future plan: if the bound is tightened to [k < op_number t] (the review's
-     recommended direction, once view-change makes a backup's commit_number load-bearing via
-     DoViewChange.k / HighestCommitNumber, VSR.tla:257-260), THIS expectation is the one to
-     update -- it pins a deliberate margin, not a safety property. The k = n + 1 assertion above
-     is the safety one and must never be loosened. *)
+  (* TIGHTENED BY TASK 3, exactly as the note this test used to carry predicted: the bound is now
+     [k < op_number t], VSR.tla:106-109's own [m.k < m.n] precondition verbatim, so k = n is
+     REJECTED too and the last ACCEPTED value is k = n - 1. The old, one-step-wider margin was
+     justified only by a backup's commit_number being purely local state; Task 3 makes it leave the
+     replica as [DoViewChange.k] and feed [HighestCommitNumber] (VSR.tla:257-260) -- an independent
+     maximum that becomes the NEW primary's commit_number and is then broadcast cluster-wide as
+     [StartView.k] -- so an inflated-by-one backup commit_number is no longer benign. *)
   Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 2 }));
-  Alcotest.(check int) "k = op_number (the deliberately widened, still-accepted boundary) advances commit_number" 2
+  Alcotest.(check int) "the second Prepare is still accepted -- again, only the k field's effect is dropped" 2
+    (Replica.op_number t);
+  Alcotest.(check int) "k = op_number (== m.n) is now REJECTED too: the margin that used to accept it is gone" 0
     (Replica.commit_number t);
-  Alcotest.(check bool) "commit_number <= op_number still holds at the widened boundary too" true
-    (Replica.commit_number t <= Replica.op_number t)
+  (* The last ACCEPTED value, k = n - 1, is the genuinely well-formed one every correct primary
+     actually sends (its commit-number from strictly BEFORE this request was appended) -- the
+     tightening must not overshoot into rejecting that. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 3; v = v "c"; k = 2 }));
+  Alcotest.(check int) "k = n - 1 (the last legal, genuinely well-formed value) still advances commit_number" 2
+    (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number < op_number holds at the tightened boundary" true
+    (Replica.commit_number t < Replica.op_number t)
 
 let test_prepare_ok_n_boundary_is_exactly_op_number () =
   let send, _sent = capturing_send () in
@@ -621,23 +625,31 @@ let test_handle_message_malformed_bytes_dropped () =
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
 
-(* [Start_view_change] is deliberately NOT in this list any more -- Task 2 of the view-change plan
-   made it a genuinely in-scope message type (see handle_start_view_change's own tests below,
-   "---- Start_view_change dispatch ----"); only [Do_view_change]/[Start_view] (Task 3's own
-   [ReceiveDVC]/[SendSV]/[ReceiveSV]) remain out of scope here. *)
-let test_handle_message_out_of_scope_types_ignored () =
+(* NO message type is out of scope any more. Task 2 brought [Start_view_change] in (its own tests
+   are below, "---- Start_view_change dispatch ----"); Task 3 brings in the last two,
+   [Do_view_change] ([ReceiveDVC]/[SendSV]) and [Start_view] ([ReceiveSV]) -- all five of
+   {!Message.t}'s constructors now reach a real action.
+
+   What survives here, unweakened, is the half of the old "out-of-scope types are ignored" test
+   that is still true and still worth pinning: a [Do_view_change] whose own guard does not hold
+   changes NOTHING at all. The message below is exactly the one the old test used (v = 1 against a
+   replica at its Init view_number of 0), which now fails [ValidDvc(r, m) == m.v = View(r)]
+   (VSR.tla:230) rather than being ignored for lack of an implementation -- so this test keeps its
+   original assertions AND gains a direct check that nothing entered [recv_dvc]. The [Start_view]
+   half of the old test has NOT been dropped: at v = 1 against a replica at view 0 it is now a
+   genuinely ACCEPTED message ([ReceiveSV]'s guard is [m.v >= View(r)]), so it moved into the
+   ReceiveSV section below, where its real acceptance is asserted instead. *)
+let test_do_view_change_wrong_view_dropped () =
   let send, sent = capturing_send () in
   let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
-  List.iter
-    (fun m -> Replica.handle_message t (Message.encode m))
-    [
-      Message.Do_view_change { v = 1; log = []; last_normal_view = 0; n = 0; k = 0; i = 3 };
-      Message.Start_view { v = 1; log = []; n = 0; k = 0 };
-    ];
+  Replica.handle_message t
+    (Message.encode (Message.Do_view_change { v = 1; log = []; last_normal_view = 0; n = 0; k = 0; i = 3 }));
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
   Alcotest.(check bool) "status unchanged (still Normal)" true (Replica.status t = Replica.Normal);
   Alcotest.(check int) "view_number unchanged" 0 (Replica.view_number t);
+  Alcotest.(check bool) "nothing accumulated into recv_dvc: ValidDvc rejected it" true
+    (Replica.for_test_recv_dvc_senders t = []);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
 
 (* ---- check_timeout (TimerSendSVC, VSR.tla:161-174) ---- *)
@@ -884,6 +896,569 @@ let test_for_test_set_view_round_trips_independently () =
   Alcotest.(check int) "last_normal_view round-trips independently, NOT forced to match view_number" 2
     (Replica.last_normal_view t)
 
+(* ============================================================================================
+   Task 3: ReceiveDVC (VSR.tla:232-240) / WinningDVC (:248-255) / HighestCommitNumber (:257-260) /
+   SendSV (:264-280) / ReceiveSV (:292-305).
+
+   This is the logic class of the original published VSR formalization's own real, documented
+   114-step safety counterexample, so the tests below deliberately go past happy-path coverage:
+   every quorum count is exercised at its exact threshold, both selection scans are exercised in
+   scenarios where a plausible-but-wrong implementation gives a DIFFERENT answer (not merely a
+   scenario where it happens to agree), and every integer field of the two new message types is
+   pinned at its first-rejected and last-accepted value.
+
+   Conventions used throughout this section:
+   - [Primary(v)] is a real, TLC-verified function of the view (see this file's own header): at
+     [replica_count = 5], [Primary(6) = 1 + ((6-1) mod 5) = 1]; at [replica_count = 3],
+     [Primary(5) = 1 + ((5-1) mod 3) = 2] and [Primary(2) = 2]. Tests that need this replica to BE
+     the new primary pick [my_id]/[view_number] from that table, never by assuming replica 1.
+   - A [DoViewChange]'s [last_normal_view] is always STRICTLY below its own [v] in every message a
+     correct replica can produce (TLC-confirmed: [status = "ViewChange" => last_normal_view <
+     view_number] holds across all 264,376 distinct reachable states of spec/tla/VSR.tla), and
+     [handle_message] enforces that -- so every well-formed DVC built below satisfies it. *)
+
+let dvc_msg ~v ~log ~last_normal_view ~n ~k ~i =
+  Message.encode (Message.Do_view_change { v; log; last_normal_view; n; k; i })
+
+let sv_msg ~v ~log ~n ~k = Message.encode (Message.Start_view { v; log; n; k })
+
+(* A replica already mid-view-change at [view_number], with a [last_normal_view] genuinely below it
+   -- the combination [for_test_set_view] exists for (see its doc comment in replica.mli). *)
+let create_in_view_change ~my_id ~replica_count ~view_number ~last_normal_view ~send =
+  let t = Replica.create ~my_id ~replica_count ~svc_limit:3 ~send in
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number ~last_normal_view;
+  t
+
+(* ---- ReceiveDVC / ValidDvc ---- *)
+
+let test_receive_dvc_accumulates_only_current_view () =
+  let send, sent = capturing_send () in
+  (* replica_count=5 (f=2) so SendSV's own f+1=3 threshold is never reached here -- this test is
+     about accumulation and the ValidDvc filter alone. *)
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:2 ~send in
+  Alcotest.(check bool) "this replica is Primary(6) at replica_count=5" true (Replica.is_primary t);
+  Alcotest.(check (list int)) "recv_dvc starts empty" [] (Replica.for_test_recv_dvc_senders t);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:2 ~n:0 ~k:0 ~i:3);
+  Alcotest.(check (list int)) "a DVC for the CURRENT view is accumulated" [ 3 ]
+    (Replica.for_test_recv_dvc_senders t);
+  (* ValidDvc(r, m) == m.v = View(r) (VSR.tla:230): a STALE (lower-view) DVC is matched by no
+     action at all -- this is the view filter that fixes the historical 114-step counterexample. *)
+  Replica.handle_message t (dvc_msg ~v:5 ~log:[] ~last_normal_view:2 ~n:0 ~k:0 ~i:4);
+  (* A HIGHER-view DVC is dropped too (not adopted, unlike a higher-view StartViewChange) -- the
+     disclosed, liveness-only simplification spec/tla/README.md analyses: a DoViewChange is unicast,
+     so any view it could announce was broadcast as a StartViewChange first. *)
+  Replica.handle_message t (dvc_msg ~v:7 ~log:[] ~last_normal_view:2 ~n:0 ~k:0 ~i:5);
+  Alcotest.(check (list int)) "neither the lower- nor the higher-view DVC was accumulated" [ 3 ]
+    (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check bool) "nothing sent: 1 valid DVC is below the f+1 = 3 threshold" true (sent () = []);
+  Alcotest.(check bool) "status still View_change" true (Replica.status t = Replica.View_change)
+
+(* THE sender-keying test (task-3-brief.md's resolved design decision 1). VSR.tla:34 types
+   rep_recv_dvc as a SET OF RECORDS, which in the abstract model is safe only because a correct
+   replica sends exactly one DVC per episode and TLA+'s bag cannot corrupt anything. This codebase's
+   simulated transport has real duplicate AND corrupt fault injection, so the same sender's DVC can
+   arrive twice with DIFFERENT bytes -- two distinct elements under a literal set-of-records, both
+   counting toward SendSV's own quorum, while VSR.tla:262-263 requires "f+1 DOVIEWCHANGE from
+   DIFFERENT replicas". This test pins BOTH halves of the fix: the count is per SENDER, and the
+   FIRST arrival per sender wins (a later, possibly-corrupted copy never overwrites it). *)
+let test_receive_dvc_is_sender_keyed_and_first_wins () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  (* Sender 3's genuine DVC: the most recently normal replica in this set (last_normal_view = 5),
+     so whatever copy of IT survives is what WinningDVC will select. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:5 ~n:1 ~k:0 ~i:3);
+  (* The same sender again: an exact duplicate (a plain network duplicate or a retransmission) ... *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:5 ~n:1 ~k:0 ~i:3);
+  (* ... and a duplicate whose payload has been independently corrupted -- byte-different, so a
+     literal set-of-records would hold it as a THIRD distinct element. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "x"; v "y"; v "z" ] ~last_normal_view:5 ~n:3 ~k:3 ~i:3);
+  Alcotest.(check (list int)) "three arrivals from one sender leave exactly ONE entry" [ 3 ]
+    (Replica.for_test_recv_dvc_senders t);
+  (* One genuinely different sender. Real distinct-sender count is now 2, below f+1 = 3. Under
+     message-counting semantics the count would be 4 and SendSV would already have fired. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check (list int)) "two distinct senders recorded" [ 3; 4 ] (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check bool)
+    "NO StartView yet: one sender's duplicated/corrupted copies must not inflate the quorum count" true
+    (sent () = []);
+  Alcotest.(check bool) "still View_change" true (Replica.status t = Replica.View_change);
+  (* A third distinct sender completes the real f+1 = 3 quorum. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:5);
+  Alcotest.(check bool) "status returns to Normal once the REAL quorum of 3 senders is met" true
+    (Replica.status t = Replica.Normal);
+  (* FIRST-WINS, not last-wins: sender 3's winning entry must still be its first, pristine copy
+     (log [a], n = 1, k = 0), NOT the corrupted later one (log [x;y;z], n = 3, k = 3). *)
+  Alcotest.(check bool) "the FIRST copy of sender 3's DVC is what won, not the corrupted duplicate" true
+    (Replica.entries t = [ v "a" ]);
+  Alcotest.(check int) "op_number is the first copy's n" 1 (Replica.op_number t);
+  Alcotest.(check int) "commit_number is the first copy's k, not the corrupted k=3" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "the broadcast StartView carries the same, uncorrupted state" true
+    (decoded_sent sent
+    = [
+        (2, Message.Start_view { v = 6; log = [ v "a" ]; n = 1; k = 0 });
+        (3, Message.Start_view { v = 6; log = [ v "a" ]; n = 1; k = 0 });
+        (4, Message.Start_view { v = 6; log = [ v "a" ]; n = 1; k = 0 });
+        (5, Message.Start_view { v = 6; log = [ v "a" ]; n = 1; k = 0 });
+      ])
+
+(* The deliberate CONTRAST with handle_start_view_change's own [i = my_id] exclusion
+   (task-2-review.md's M1): a self-addressed DoViewChange is not a forgery and not an accident --
+   VSR.tla:224 addresses it to Primary(View(r)), which IS this replica whenever it is the new
+   primary, and VSR.tla:262-263's quorum is "f+1 ... from different replicas, INCLUDING ITSELF".
+   Excluding it (by copying the StartViewChange rule) would require f+1 OTHER replicas, a strictly
+   larger quorum than the protocol specifies, stalling every view change in a cluster with exactly
+   f+1 survivors. *)
+let test_receive_dvc_from_self_counts_toward_quorum () =
+  let send, sent = capturing_send () in
+  (* replica_count=3 (f=1): SendSV needs f+1 = 2 DVCs, and only 2 replicas will send one here. *)
+  let t = create_in_view_change ~my_id:2 ~replica_count:3 ~view_number:5 ~last_normal_view:4 ~send in
+  Alcotest.(check bool) "this replica is Primary(5) at replica_count=3" true (Replica.is_primary t);
+  Replica.handle_message t (dvc_msg ~v:5 ~log:[ v "a" ] ~last_normal_view:4 ~n:1 ~k:1 ~i:2);
+  Alcotest.(check (list int)) "this replica's OWN DoViewChange is accepted into recv_dvc" [ 2 ]
+    (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check bool) "one DVC is still below the f+1 = 2 threshold" true (sent () = []);
+  Replica.handle_message t (dvc_msg ~v:5 ~log:[] ~last_normal_view:3 ~n:0 ~k:0 ~i:1);
+  Alcotest.(check bool) "self + one other reaches quorum: view change completes" true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check bool) "the self-sent DVC won selection (last_normal_view 4 > 3)" true
+    (Replica.entries t = [ v "a" ]);
+  Alcotest.(check int) "commit_number from HighestCommitNumber" 1 (Replica.commit_number t);
+  Alcotest.(check bool) "StartView broadcast to the other two replicas only" true
+    (decoded_sent sent
+    = [
+        (1, Message.Start_view { v = 5; log = [ v "a" ]; n = 1; k = 1 });
+        (3, Message.Start_view { v = 5; log = [ v "a" ]; n = 1; k = 1 });
+      ])
+
+(* Every integer field of a DoViewChange, pinned at its first-REJECTED value and (below) at its
+   last-ACCEPTED value -- the M1/M2/M3 + I2 pattern already established for Prepare/Prepare_ok.
+   Message.decode validates SHAPE only, never protocol-level legality. *)
+let test_receive_dvc_forged_fields_rejected () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  let rejected =
+    [
+      ("i = 0 (below VSR.tla:15's own 1..ReplicaCount)", dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:0);
+      ( "i = replica_count + 1 (the first id past the range)",
+        dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:6 );
+      ( "n higher than the log the SAME message carries (LogLengthMatchesOpNumber)",
+        dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:0 ~n:2 ~k:0 ~i:2 );
+      ( "n lower than the log the same message carries",
+        dvc_msg ~v:6 ~log:[ v "a"; v "b" ] ~last_normal_view:0 ~n:1 ~k:0 ~i:2 );
+      ("negative n", dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:(-1) ~k:0 ~i:2);
+      ( "k = n + 1 (first value past CommitNumberNeverHigherThanOpNumber for the sender)",
+        dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:0 ~n:1 ~k:2 ~i:2 );
+      ("k far past n -- the field HighestCommitNumber maximises over", dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:9999 ~i:2);
+      ("negative k", dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:(-1) ~i:2);
+      ( "last_normal_view = v (must be STRICTLY below the view it announces)",
+        dvc_msg ~v:6 ~log:[] ~last_normal_view:6 ~n:0 ~k:0 ~i:2 );
+      ( "last_normal_view above v -- would let one forged DVC dictate the cluster's whole log",
+        dvc_msg ~v:6 ~log:[] ~last_normal_view:99 ~n:0 ~k:0 ~i:2 );
+      ("negative last_normal_view", dvc_msg ~v:6 ~log:[] ~last_normal_view:(-1) ~n:0 ~k:0 ~i:2);
+    ]
+  in
+  List.iter
+    (fun (name, msg) ->
+      Replica.handle_message t msg;
+      Alcotest.(check (list int)) (Printf.sprintf "rejected wholesale: %s" name) []
+        (Replica.for_test_recv_dvc_senders t))
+    rejected;
+  Alcotest.(check bool) "no forged DVC produced any outgoing message" true (sent () = []);
+  Alcotest.(check bool) "status untouched by every forged DVC" true (Replica.status t = Replica.View_change);
+  (* The last ACCEPTED value of each bounded field, so the guards cannot be over-tightened either:
+     i = replica_count (5), last_normal_view = v - 1 (5), k = n (1) -- a replica whose whole log is
+     committed legitimately reports k = n, unlike a Prepare's own strict k < n. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:5 ~n:1 ~k:1 ~i:5);
+  Alcotest.(check (list int)) "the boundary-valid DVC (i = replica_count, last_normal_view = v-1, k = n) IS accepted"
+    [ 5 ] (Replica.for_test_recv_dvc_senders t)
+
+(* ---- WinningDVC (VSR.tla:248-255) ---- *)
+
+(* The single most important selection test in this file: a scenario where selecting by [n] alone
+   -- the plausible wrong implementation -- gives a DIFFERENT, unsafe answer. The winner has a
+   FIVE-times-shorter log but was normal in a LATER view, and research §2.4 step 3 is explicit that
+   the largest v' wins first ("selects as the new log the one contained in the message with the
+   largest v'"). Adopting the longer, older log instead would discard the newer view's entries. *)
+let test_send_sv_winner_is_last_normal_view_first_not_n () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:2 ~replica_count:3 ~view_number:5 ~last_normal_view:0 ~send in
+  Alcotest.(check bool) "this replica is Primary(5) at replica_count=3" true (Replica.is_primary t);
+  (* Delivered FIRST, and by far the longest log -- an n-only implementation picks this one. *)
+  Replica.handle_message t
+    (dvc_msg ~v:5 ~log:[ v "b"; v "c"; v "d"; v "e"; v "f" ] ~last_normal_view:2 ~n:5 ~k:0 ~i:3);
+  Alcotest.(check bool) "one DVC is below the f+1 = 2 threshold" true (sent () = []);
+  (* Delivered second: shorter log, but last_normal_view 4 > 2 -- this must win. *)
+  Replica.handle_message t (dvc_msg ~v:5 ~log:[ v "a" ] ~last_normal_view:4 ~n:1 ~k:0 ~i:1);
+  Alcotest.(check bool) "the HIGHER last_normal_view wins, despite a 5x shorter log" true
+    (Replica.entries t = [ v "a" ]);
+  Alcotest.(check int) "op_number follows the winning DVC's own n, not the longest log's" 1 (Replica.op_number t);
+  Alcotest.(check bool) "the StartView broadcast carries the winning log, not the longest one" true
+    (decoded_sent sent
+    = [
+        (1, Message.Start_view { v = 5; log = [ v "a" ]; n = 1; k = 0 });
+        (3, Message.Start_view { v = 5; log = [ v "a" ]; n = 1; k = 0 });
+      ])
+
+(* The second half of the lexicographic rule: "if several messages have the same v' it selects the
+   one among them with the largest n". All three DVCs here share a last_normal_view, so ONLY the n
+   tie-break can separate them -- and the fold is exercised in both directions (a strictly larger n
+   must replace the incumbent; a strictly smaller one must not). *)
+let test_send_sv_tie_on_last_normal_view_breaks_by_largest_n () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:3 ~n:1 ~k:0 ~i:2);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "b"; v "c" ] ~last_normal_view:3 ~n:2 ~k:0 ~i:3);
+  Alcotest.(check bool) "two DVCs are below the f+1 = 3 threshold" true (sent () = []);
+  (* A THIRD DVC with the same last_normal_view but the SMALLEST n completes quorum -- it must not
+     displace the incumbent winner just by arriving last. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:3 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "the largest n among the tied last_normal_views wins" true
+    (Replica.entries t = [ v "b"; v "c" ]);
+  Alcotest.(check int) "op_number is that DVC's own n" 2 (Replica.op_number t);
+  Alcotest.(check bool) "every StartView carries the tie-broken winner" true
+    (List.for_all
+       (fun (_, m) -> m = Message.Start_view { v = 6; log = [ v "b"; v "c" ]; n = 2; k = 0 })
+       (decoded_sent sent))
+
+(* ---- HighestCommitNumber (VSR.tla:257-260) ---- *)
+
+(* VSR.tla:244-245's own explicit warning, and this plan's Global Constraints, both require
+   HighestCommitNumber to be a SEPARATE maximum rather than the winning DVC's own k. This scenario
+   makes the two answers differ: the winning DVC (highest last_normal_view) carries k = 0, while a
+   DIFFERENT, losing DVC carries k = 2. An implementation that took [winner.k] would commit 0 here. *)
+let test_highest_commit_number_is_a_separate_maximum_not_the_winner_s_k () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  (* Winner by last_normal_view (5), but its own k is 0. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a"; v "b" ] ~last_normal_view:5 ~n:2 ~k:0 ~i:2);
+  (* Loses selection (last_normal_view 4 < 5), yet carries the HIGHEST commit-number in the set. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a"; v "b" ] ~last_normal_view:4 ~n:2 ~k:2 ~i:3);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "the view change completed" true (Replica.status t = Replica.Normal);
+  Alcotest.(check bool) "the log comes from the WINNING DVC" true (Replica.entries t = [ v "a"; v "b" ]);
+  Alcotest.(check int)
+    "commit_number is the maximum k across ALL valid DVCs (2), NOT the winning DVC's own k (0)" 2
+    (Replica.commit_number t);
+  Alcotest.(check bool) "and the same independent maximum is what gets broadcast as StartView.k" true
+    (List.for_all
+       (fun (_, m) -> m = Message.Start_view { v = 6; log = [ v "a"; v "b" ]; n = 2; k = 2 })
+       (decoded_sent sent))
+
+(* ---- SendSV's guard (VSR.tla:264-269) ---- *)
+
+let test_send_sv_threshold_is_f_plus_one_not_f () =
+  let send, sent = capturing_send () in
+  (* replica_count=5: f = 2, so SendDVC's own threshold is 2 and SendSV's is 3. A test at
+     replica_count=3 (f=1, f+1=2) could not tell a [>= f] confusion apart as sharply. *)
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:2);
+  Alcotest.(check bool) "1 valid DVC: below threshold" true (sent () = []);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:3);
+  Alcotest.(check bool)
+    "2 valid DVCs == f: still below SendSV's own f+1 threshold (this is exactly SendDVC's \
+     threshold, and confusing the two is the bug this assertion catches)"
+    true
+    (sent () = []);
+  Alcotest.(check bool) "still View_change at f DVCs" true (Replica.status t = Replica.View_change);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check int) "f+1 = 3 valid DVCs fires SendSV: one StartView per OTHER replica, none to self" 4
+    (List.length (sent ()));
+  Alcotest.(check bool) "status returns to Normal" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number is UNCHANGED by SendSV (it starts the view it is already in)" 6
+    (Replica.view_number t);
+  Alcotest.(check int) "last_normal_view advances to the view just started (VSR.tla:276)" 6
+    (Replica.last_normal_view t);
+  Alcotest.(check bool) "the StartView went to every other replica, never to self" true
+    (List.map fst (sent ()) = [ 2; 3; 4; 5 ]);
+  (* A fourth DVC arriving after the fact must not fire a second StartView: status is Normal now,
+     and SendSV's own guard (VSR.tla:267) requires View_change. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:5);
+  Alcotest.(check int) "SendSV never fires twice for the same episode" 4 (List.length (sent ()))
+
+let test_send_sv_noop_when_not_the_primary_of_this_view () =
+  let send, sent = capturing_send () in
+  (* Primary(6) = 1 at replica_count=5; my_id = 2 is therefore NOT the new primary, even though it
+     is mid-view-change at view 6 and (implausibly, but the point is the guard) receives a full
+     quorum of DVCs -- VSR.tla:268's own [r = Primary(View(r))] conjunct. *)
+  let t = create_in_view_change ~my_id:2 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  Alcotest.(check bool) "not the primary of view 6" false (Replica.is_primary t);
+  List.iter
+    (fun i -> Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "a" ] ~last_normal_view:1 ~n:1 ~k:1 ~i))
+    [ 1; 3; 4 ];
+  Alcotest.(check (list int)) "the DVCs are still accumulated (ReceiveDVC has no primary conjunct)" [ 1; 3; 4 ]
+    (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check bool) "but no StartView is sent" true (sent () = []);
+  Alcotest.(check bool) "and the replica stays in View_change" true (Replica.status t = Replica.View_change);
+  Alcotest.(check bool) "its log is untouched" true (Replica.entries t = []);
+  Alcotest.(check int) "its commit_number is untouched" 0 (Replica.commit_number t)
+
+(* The one guard in SendSV with no counterpart in VSR.tla (see replica.ml's own comment): the two
+   independent maxima can only disagree this way if some DVC in the set is corrupt/forged, since
+   TLC confirms HighestCommitNumber(r) <= WinningDVC(r).n across the spec's entire reachable state
+   graph. Applying it would set commit_number > op_number on the new primary AND broadcast that same
+   k cluster-wide, violating CommitNumberNeverHigherThanOpNumber everywhere it was accepted. *)
+let test_send_sv_refuses_when_highest_commit_exceeds_the_winning_log () =
+  let send, sent = capturing_send () in
+  let t = create_in_view_change ~my_id:1 ~replica_count:5 ~view_number:6 ~last_normal_view:0 ~send in
+  (* Winner by last_normal_view (5) -- but it carries an EMPTY log. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:5 ~n:0 ~k:0 ~i:2);
+  (* Individually well-formed (k = n, log length = n, last_normal_view < v) and therefore accepted
+     into recv_dvc -- only CROSS-message comparison exposes it: its k is far beyond the winner's
+     log. *)
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[ v "x"; v "y"; v "z" ] ~last_normal_view:0 ~n:3 ~k:3 ~i:3);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "SendSV refuses outright: no StartView broadcast" true (sent () = []);
+  Alcotest.(check bool) "no state change at all -- status stays View_change" true
+    (Replica.status t = Replica.View_change);
+  Alcotest.(check bool) "the log is NOT replaced" true (Replica.entries t = []);
+  Alcotest.(check int) "commit_number is NOT advanced (a clamp to winner.n would have set it to 0 \
+                        here, but a clamp in general declares the whole adopted log committed)" 0
+    (Replica.commit_number t);
+  Alcotest.(check int) "last_normal_view untouched" 0 (Replica.last_normal_view t);
+  (* The cost is liveness for THIS episode only, and it is bounded: the next episode wipes
+     recv_dvc, so a later, clean quorum completes normally. *)
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 7; i = 2 }));
+  Alcotest.(check (list int)) "a new episode wipes the poisoned DVC set" []
+    (Replica.for_test_recv_dvc_senders t)
+
+let test_send_sv_resets_svc_count () =
+  let send, _sent = capturing_send () in
+  (* svc_limit = 1: without the reset, the single timeout budget is spent for good. *)
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:1 ~send in
+  Replica.for_test_set_view_number t 1;
+  Replica.check_timeout t;
+  Alcotest.(check int) "the one permitted timeout moves this replica to view 2" 2 (Replica.view_number t);
+  Alcotest.(check bool) "Primary(2) = 2 = my_id, so this replica is the new primary" true (Replica.is_primary t);
+  (* f+1 = 2 DVCs complete the view change via SendSV (not ReceiveSV -- this test is about SendSV's
+     own reset specifically). *)
+  Replica.handle_message t (dvc_msg ~v:2 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:1);
+  Replica.handle_message t (dvc_msg ~v:2 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:3);
+  Alcotest.(check bool) "the view change completed via SendSV" true (Replica.status t = Replica.Normal);
+  (* The disclosed divergence from VSR.tla's never-resetting aux_svc_count: having reached a working
+     view, this replica gets a fresh budget, so a LATER failure can still trigger a view change. *)
+  Replica.check_timeout t;
+  Alcotest.(check int) "svc_count was reset by SendSV, so a later timeout still fires" 3 (Replica.view_number t);
+  Alcotest.(check bool) "and it really did start a new view-change episode" true
+    (Replica.status t = Replica.View_change)
+
+(* ---- ReceiveSV (VSR.tla:292-305) ---- *)
+
+let test_receive_sv_adopts_log_view_and_returns_to_normal () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.for_test_set_view_number t 1;
+  (* Build real, non-trivial state first, through the well-tested normal-case path. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "commit_number is 1 before the view change" 1 (Replica.commit_number t);
+  Replica.check_timeout t;
+  Alcotest.(check bool) "mid-view-change at view 2" true
+    (Replica.status t = Replica.View_change && Replica.view_number t = 2);
+  (* The new primary's StartView carries a DIFFERENT log tail (c instead of b) -- adoption is
+     WHOLESALE (VSR.tla:296), not a merge or an append. *)
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+  Alcotest.(check bool) "the log is replaced wholesale by the StartView's own log" true
+    (Replica.entries t = [ v "a"; v "c" ]);
+  Alcotest.(check int) "op_number follows the adopted log's length (= m.n)" 2 (Replica.op_number t);
+  Alcotest.(check int) "commit_number advances to m.k (higher than the previous 1)" 2 (Replica.commit_number t);
+  Alcotest.(check int) "view_number is m.v" 2 (Replica.view_number t);
+  Alcotest.(check int) "last_normal_view is m.v too (VSR.tla:302)" 2 (Replica.last_normal_view t);
+  Alcotest.(check bool) "status returns to Normal" true (Replica.status t = Replica.Normal)
+
+(* VSR.tla:295's guard is [m.v >= View(r)] -- [>=], NOT [>], and with no status conjunct. Both
+   halves matter: the equal-view case is what makes the svc_count reset conditional (below), and a
+   strictly lower view must still be dropped. *)
+let test_receive_sv_accepts_equal_view_and_rejects_lower () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  (* A fresh replica at its Init view 0 accepts a HIGHER view -- this is the Start_view case that
+     used to live in this file's "out-of-scope message types" test. *)
+  Replica.handle_message t (sv_msg ~v:1 ~log:[ v "p" ] ~n:1 ~k:0);
+  Alcotest.(check int) "a higher-view StartView is adopted" 1 (Replica.view_number t);
+  Alcotest.(check bool) "with its log" true (Replica.entries t = [ v "p" ]);
+  Replica.for_test_set_view_number t 3;
+  (* EQUAL view, while already Normal: accepted (no status conjunct, and [>=] includes equality). *)
+  Replica.handle_message t (sv_msg ~v:3 ~log:[ v "x" ] ~n:1 ~k:0);
+  Alcotest.(check bool) "an EQUAL-view StartView is accepted and re-applied" true (Replica.entries t = [ v "x" ]);
+  Alcotest.(check int) "view_number stays at the same view" 3 (Replica.view_number t);
+  (* Strictly LOWER view: not enabled, dropped wholesale. *)
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "stale" ] ~n:1 ~k:0);
+  Alcotest.(check bool) "a lower-view StartView changes nothing" true (Replica.entries t = [ v "x" ]);
+  Alcotest.(check int) "view_number unchanged by the stale StartView" 3 (Replica.view_number t)
+
+(* Adversarial M2-style regression test (mirroring the normal-case plan's own Prepare-k tests):
+   VSR.tla:298-299's [IF m.k > @ THEN m.k ELSE @] is research §5.7 Part 4's documented fix for a
+   REAL published double-application defect. An unconditional assignment here would silently
+   REGRESS a replica's commit_number, un-committing entries it has already reported committed. *)
+let test_receive_sv_commit_number_is_monotonic_only () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.for_test_set_view_number t 1;
+  List.iter
+    (fun (n, value, k) ->
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n; v = v value; k })))
+    [ (1, "a", 0); (2, "b", 1); (3, "c", 2) ];
+  Alcotest.(check int) "commit_number is 2, legitimately established via real Prepares" 2 (Replica.commit_number t);
+  (* A StartView carrying a LOWER k (k = 0 -- e.g. corrupted, or simply a new primary that knows
+     less than this replica does). Everything else is applied; commit_number must NOT regress. *)
+  Replica.handle_message t (sv_msg ~v:1 ~log:[ v "a"; v "b"; v "c" ] ~n:3 ~k:0);
+  Alcotest.(check int) "commit_number does NOT regress to the StartView's lower k" 2 (Replica.commit_number t);
+  Alcotest.(check bool) "the rest of the message was still applied (log adopted)" true
+    (Replica.entries t = [ v "a"; v "b"; v "c" ]);
+  (* A genuinely HIGHER k is still applied -- the monotonic guard must not block legitimate
+     progress. *)
+  Replica.handle_message t (sv_msg ~v:1 ~log:[ v "a"; v "b"; v "c" ] ~n:3 ~k:3);
+  Alcotest.(check int) "a higher k still advances commit_number" 3 (Replica.commit_number t);
+  (* And a replayed older StartView after that must not undo it either. *)
+  Replica.handle_message t (sv_msg ~v:1 ~log:[ v "a"; v "b"; v "c" ] ~n:3 ~k:1);
+  Alcotest.(check int) "a replayed lower-k StartView never regresses it" 3 (Replica.commit_number t);
+  Alcotest.(check bool) "commit_number <= op_number throughout" true (Replica.commit_number t <= Replica.op_number t)
+
+let test_receive_sv_refuses_to_truncate_below_commit_number () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  Replica.for_test_set_view_number t 1;
+  List.iter
+    (fun (n, value, k) ->
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n; v = v value; k })))
+    [ (1, "a", 0); (2, "b", 1); (3, "c", 2) ];
+  Alcotest.(check int) "commit_number 2, op_number 3" 2 (Replica.commit_number t);
+  (* A StartView whose whole log is SHORTER than this replica's committed prefix. Adopting it would
+     discard committed entries outright, and (with the monotonic rule above keeping commit_number at
+     2) would leave commit_number > op_number. Dropped wholesale instead. *)
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "z" ] ~n:1 ~k:1);
+  Alcotest.(check bool) "the committed log is NOT truncated" true (Replica.entries t = [ v "a"; v "b"; v "c" ]);
+  Alcotest.(check int) "view_number untouched (dropped wholesale, not partially applied)" 1 (Replica.view_number t);
+  Alcotest.(check int) "commit_number untouched" 2 (Replica.commit_number t);
+  Alcotest.(check bool) "status untouched" true (Replica.status t = Replica.Normal);
+  (* Boundary: a log exactly AS LONG as the committed prefix is still legal and still accepted. *)
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "a"; v "b" ] ~n:2 ~k:2);
+  Alcotest.(check bool) "n = commit_number (the shortest legal log) is accepted" true
+    (Replica.entries t = [ v "a"; v "b" ]);
+  Alcotest.(check int) "and the view is adopted" 2 (Replica.view_number t)
+
+let test_receive_sv_forged_fields_rejected () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  List.iter
+    (fun (name, msg) ->
+      Replica.handle_message t msg;
+      Alcotest.(check int) (Printf.sprintf "view_number untouched: %s" name) 0 (Replica.view_number t);
+      Alcotest.(check bool) (Printf.sprintf "log untouched: %s" name) true (Replica.entries t = []);
+      Alcotest.(check int) (Printf.sprintf "commit_number untouched: %s" name) 0 (Replica.commit_number t))
+    [
+      ("n higher than the carried log's length", sv_msg ~v:1 ~log:[ v "a" ] ~n:2 ~k:0);
+      ("n lower than the carried log's length", sv_msg ~v:1 ~log:[ v "a"; v "b" ] ~n:1 ~k:0);
+      ("negative n", sv_msg ~v:1 ~log:[] ~n:(-1) ~k:0);
+      ("k = n + 1 (first value violating CommitNumberNeverHigherThanOpNumber)", sv_msg ~v:1 ~log:[ v "a" ] ~n:1 ~k:2);
+      ("k far past n", sv_msg ~v:1 ~log:[] ~n:0 ~k:9999);
+      ("negative k", sv_msg ~v:1 ~log:[ v "a" ] ~n:1 ~k:(-1));
+      ("negative v", sv_msg ~v:(-1) ~log:[] ~n:0 ~k:0);
+    ];
+  (* The last ACCEPTED values: k = n exactly (a fully-committed view is legitimate here, unlike a
+     Prepare's strict k < n) at the lowest legal v. *)
+  Replica.handle_message t (sv_msg ~v:0 ~log:[ v "a" ] ~n:1 ~k:1);
+  Alcotest.(check bool) "the boundary-valid StartView (k = n, v = View(r)) IS accepted" true
+    (Replica.entries t = [ v "a" ]);
+  Alcotest.(check int) "commit_number = k = n" 1 (Replica.commit_number t)
+
+(* A DIRECT test of the deliberate NON-reset (VSR.tla:304 lists rep_recv_dvc and rep_recv_svc as
+   UNCHANGED), not merely the absence of a crash -- and of the other half of the safety argument
+   spec/tla/README.md makes for why that non-reset is sound: the stale entries genuinely survive,
+   and the actions that re-enter View_change are what clear them. This is also the implementation
+   counterpart of VSR.tla's own RecvDvcValidWhenViewChange invariant (VSR.tla:347-349), whose
+   comment asks for exactly this re-check whenever the view-transition actions change. *)
+let test_receive_sv_does_not_reset_recv_dvc_or_recv_svc () =
+  let send, _sent = capturing_send () in
+  (* Primary(2) = 2 at replica_count=5, so this replica is the primary of the episode it starts --
+     but only ONE DVC arrives (f+1 = 3 is needed), so SendSV never fires and ReceiveSV is genuinely
+     what returns it to Normal. *)
+  let t = Replica.create ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send in
+  Replica.for_test_set_view_number t 1;
+  Replica.check_timeout t;
+  Alcotest.(check int) "mid-view-change at view 2" 2 (Replica.view_number t);
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 4 }));
+  Replica.handle_message t (dvc_msg ~v:2 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:5);
+  Alcotest.(check (list int)) "recv_svc populated before the StartView" [ 3; 4 ]
+    (Replica.for_test_recv_svc_senders t);
+  Alcotest.(check (list int)) "recv_dvc populated before the StartView" [ 5 ]
+    (Replica.for_test_recv_dvc_senders t);
+  Replica.handle_message t (sv_msg ~v:2 ~log:[] ~n:0 ~k:0);
+  Alcotest.(check bool) "ReceiveSV returned this replica to Normal" true (Replica.status t = Replica.Normal);
+  Alcotest.(check (list int))
+    "recv_svc is deliberately NOT reset by ReceiveSV -- VSR.tla:304's own UNCHANGED" [ 3; 4 ]
+    (Replica.for_test_recv_svc_senders t);
+  Alcotest.(check (list int))
+    "recv_dvc is deliberately NOT reset by ReceiveSV either -- do not 'fix' this into a reset" [ 5 ]
+    (Replica.for_test_recv_dvc_senders t)
+
+(* The companion to the test above, and the direct implementation counterpart of the argument that
+   makes the non-reset safe: whatever ReceiveSV leaves behind is wiped by BOTH actions that re-enter
+   View_change, before SendSV (the only reader) can ever see it. task-2-review.md's M-H asked for
+   exactly this test once ReceiveDVC could populate recv_dvc for real. *)
+let test_new_view_change_episode_resets_recv_dvc_and_recv_svc () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send in
+  Replica.for_test_set_view_number t 1;
+  Replica.check_timeout t;
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
+  Replica.handle_message t (dvc_msg ~v:2 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:5);
+  Replica.handle_message t (sv_msg ~v:2 ~log:[] ~n:0 ~k:0);
+  Alcotest.(check (list int)) "carried over past ReceiveSV" [ 5 ] (Replica.for_test_recv_dvc_senders t);
+  (* Path 1: TimerSendSVC (VSR.tla:168-169). *)
+  Replica.check_timeout t;
+  Alcotest.(check (list int)) "check_timeout empties recv_dvc for the new episode" []
+    (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check (list int)) "and recv_svc" [] (Replica.for_test_recv_svc_senders t);
+  (* Repopulate, then exercise path 2: ReceiveHigherSVC (VSR.tla:189-190), which seeds recv_svc with
+     just the sender and empties recv_dvc. *)
+  Replica.handle_message t (dvc_msg ~v:3 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check (list int)) "repopulated in the new episode" [ 4 ] (Replica.for_test_recv_dvc_senders t);
+  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 9; i = 5 }));
+  Alcotest.(check (list int)) "ReceiveHigherSVC empties recv_dvc too" [] (Replica.for_test_recv_dvc_senders t);
+  Alcotest.(check (list int)) "and seeds recv_svc with just the sender" [ 5 ] (Replica.for_test_recv_svc_senders t)
+
+(* task-3-brief.md's resolved design decision 3, both directions. ReceiveSV's guard is
+   [m.v >= View(r)] with NO status conjunct, so it genuinely re-fires on a duplicated or replayed
+   StartView for a view this replica is ALREADY Normal in -- and lib/sim/network.ml injects real
+   duplicates. An unconditional [svc_count <- 0] there would let such duplicates refresh the timeout
+   budget indefinitely, quietly nullifying the svc_limit bound the whole mechanism exists for. *)
+let test_receive_sv_resets_svc_count_only_on_a_real_transition () =
+  let send, _sent = capturing_send () in
+  (* Direction 1: a REAL View_change -> Normal transition DOES reset the budget. *)
+  let t = Replica.create ~my_id:3 ~replica_count:3 ~svc_limit:1 ~send in
+  Replica.check_timeout t;
+  Alcotest.(check bool) "the one permitted timeout fired" true (Replica.status t = Replica.View_change);
+  Replica.handle_message t (sv_msg ~v:1 ~log:[] ~n:0 ~k:0);
+  Alcotest.(check bool) "ReceiveSV completed the view change" true (Replica.status t = Replica.Normal);
+  Replica.check_timeout t;
+  Alcotest.(check int) "svc_count was reset, so a LATER timeout still fires" 2 (Replica.view_number t);
+
+  (* Direction 2: duplicate/replayed StartViews arriving while ALREADY Normal must NOT refresh it.
+     [for_test_set_view] is used purely to return this replica to Normal WITHOUT going through
+     ReceiveSV (the existing check_timeout tests use the same device), so that svc_count genuinely
+     accumulates to its limit. *)
+  let send2, _sent2 = capturing_send () in
+  let u = Replica.create ~my_id:3 ~replica_count:3 ~svc_limit:2 ~send:send2 in
+  Replica.check_timeout u;
+  Replica.for_test_set_view u ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
+  Replica.check_timeout u;
+  Replica.for_test_set_view u ~status:Replica.Normal ~view_number:2 ~last_normal_view:2;
+  Alcotest.(check int) "both permitted timeouts have been spent (view 2)" 2 (Replica.view_number u);
+  (* Three duplicate StartViews for the view this replica is already Normal in. Each is genuinely
+     ACCEPTED (m.v >= View(r), no status conjunct) and re-applies its log/view/status -- what it
+     must NOT do is reset svc_count. *)
+  List.iter (fun () -> Replica.handle_message u (sv_msg ~v:2 ~log:[] ~n:0 ~k:0)) [ (); (); () ];
+  Alcotest.(check bool) "the duplicates were accepted (status Normal at the same view)" true
+    (Replica.status u = Replica.Normal && Replica.view_number u = 2);
+  Replica.check_timeout u;
+  Alcotest.(check int)
+    "svc_count was NOT refreshed by the duplicates: the timeout budget is still spent, so this \
+     check_timeout is blocked and view_number stays at 2"
+    2 (Replica.view_number u);
+  Alcotest.(check bool) "and the replica stays Normal" true (Replica.status u = Replica.Normal)
+
 let tests =
   [
     (* Fix-round M2/M3 (task-1-review.md): Primary(v)/view_number/last_normal_view coverage *)
@@ -947,7 +1522,7 @@ let tests =
       `Quick,
       test_propose_commits_immediately_in_single_replica_cluster );
     ("handle_message: malformed bytes are silently dropped, never raise", `Quick, test_handle_message_malformed_bytes_dropped);
-    ("handle_message: out-of-scope message types are silently ignored", `Quick, test_handle_message_out_of_scope_types_ignored);
+    ("handle_message: a DoViewChange failing ValidDvc changes nothing at all", `Quick, test_do_view_change_wrong_view_dropped);
     (* Fix-round L2 (task-1-review.md): svc_limit boundary *)
     ("Fix-round L2: svc_limit = 1 (the smallest legal value) is accepted", `Quick, test_svc_limit_boundary_one_is_accepted);
     (* Task 2: check_timeout (TimerSendSVC) *)
@@ -984,5 +1559,73 @@ let tests =
     ( "Task 2: for_test_set_view round-trips status/view_number/last_normal_view independently",
       `Quick,
       test_for_test_set_view_round_trips_independently );
+    (* Task 3: ReceiveDVC / ValidDvc *)
+    ( "Task 3: ReceiveDVC accumulates only current-view DVCs (ValidDvc's own filter)",
+      `Quick,
+      test_receive_dvc_accumulates_only_current_view );
+    ( "Task 3: recv_dvc is keyed by SENDER and first-wins -- one sender's duplicated/corrupted \
+       copies never inflate SendSV's quorum",
+      `Quick,
+      test_receive_dvc_is_sender_keyed_and_first_wins );
+    ( "Task 3: a self-addressed DoViewChange DOES count toward quorum (VSR.tla:262-263's \
+       'including itself'), unlike a self-addressed StartViewChange",
+      `Quick,
+      test_receive_dvc_from_self_counts_toward_quorum );
+    ( "Task 3: every forged/out-of-range DoViewChange field is rejected; the boundary-valid one is \
+       accepted",
+      `Quick,
+      test_receive_dvc_forged_fields_rejected );
+    (* Task 3: WinningDVC *)
+    ( "Task 3: WinningDVC selects by last_normal_view FIRST -- a 5x shorter but more recently \
+       normal log wins",
+      `Quick,
+      test_send_sv_winner_is_last_normal_view_first_not_n );
+    ( "Task 3: WinningDVC breaks a last_normal_view tie by the largest n",
+      `Quick,
+      test_send_sv_tie_on_last_normal_view_breaks_by_largest_n );
+    (* Task 3: HighestCommitNumber *)
+    ( "Task 3: HighestCommitNumber is a SEPARATE maximum, not the winning DVC's own k \
+       (VSR.tla:244-245)",
+      `Quick,
+      test_highest_commit_number_is_a_separate_maximum_not_the_winner_s_k );
+    (* Task 3: SendSV *)
+    ("Task 3: SendSV's threshold is f+1, not SendDVC's f", `Quick, test_send_sv_threshold_is_f_plus_one_not_f);
+    ( "Task 3: SendSV is a no-op on a replica that is not Primary(View(r))",
+      `Quick,
+      test_send_sv_noop_when_not_the_primary_of_this_view );
+    ( "Task 3: SendSV refuses outright (never clamps) when HighestCommitNumber exceeds the winning \
+       log's length",
+      `Quick,
+      test_send_sv_refuses_when_highest_commit_exceeds_the_winning_log );
+    ("Task 3: SendSV resets svc_count on completing a view change", `Quick, test_send_sv_resets_svc_count);
+    (* Task 3: ReceiveSV *)
+    ( "Task 3: ReceiveSV adopts log/op_number/view wholesale and returns to Normal",
+      `Quick,
+      test_receive_sv_adopts_log_view_and_returns_to_normal );
+    ( "Task 3: ReceiveSV's guard is m.v >= View(r) -- an equal view is accepted, a lower one dropped",
+      `Quick,
+      test_receive_sv_accepts_equal_view_and_rejects_lower );
+    ( "Task 3: ReceiveSV's commit_number update is monotonic-only under an adversarial m.k",
+      `Quick,
+      test_receive_sv_commit_number_is_monotonic_only );
+    ( "Task 3: ReceiveSV refuses a StartView whose log is shorter than this replica's committed \
+       prefix",
+      `Quick,
+      test_receive_sv_refuses_to_truncate_below_commit_number );
+    ( "Task 3: every forged/out-of-range StartView field is rejected; the boundary-valid one is \
+       accepted",
+      `Quick,
+      test_receive_sv_forged_fields_rejected );
+    ( "Task 3: ReceiveSV deliberately does NOT reset recv_dvc/recv_svc (VSR.tla:304's UNCHANGED)",
+      `Quick,
+      test_receive_sv_does_not_reset_recv_dvc_or_recv_svc );
+    ( "Task 3: both actions that re-enter View_change DO reset recv_dvc/recv_svc (the other half of \
+       the non-reset safety argument)",
+      `Quick,
+      test_new_view_change_episode_resets_recv_dvc_and_recv_svc );
+    ( "Task 3: ReceiveSV resets svc_count ONLY on a real View_change -> Normal transition, never on \
+       a duplicate StartView",
+      `Quick,
+      test_receive_sv_resets_svc_count_only_on_a_real_transition );
   ]
   @ create_invalid_arg_tests

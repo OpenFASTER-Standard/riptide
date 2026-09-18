@@ -21,6 +21,28 @@ type status = Normal | View_change
    the count) and [Cardinality]. *)
 module Int_set = Set.Make (Int)
 
+(* One received DOVIEWCHANGE, as an element of VSR.tla's own [rep_recv_dvc[r]] (VSR.tla:34, typed
+   [SUBSET [message]] -- a set of message RECORDS). Exactly the six fields [SendDVC]'s own record
+   literal carries (VSR.tla:222-224), minus [type]/[dest] (constant/implied here -- see
+   message.mli's own note on why [dest] is not on the wire at all in this implementation).
+
+   Why a dedicated record rather than storing the decoded [Message.t] variant itself (the shape
+   task-3-brief.md sketches as "e.g. [(int, Message.t) Hashtbl.t]"): the two are equivalent in
+   content, but every reader below ([winning_dvc], [highest_commit_number], [valid_dvc]) wants the
+   six fields directly, and a [Message.t] would force each of them to re-match the variant and
+   handle four constructor cases that [receive_dvc] structurally never inserts -- an unreachable
+   catch-all arm in the single highest-risk function in this module. Keying and first-wins
+   semantics (the actual substance of that brief decision) are unchanged; see
+   [handle_do_view_change] below. *)
+type dvc = {
+  dvc_v : int;
+  dvc_log : Value.value list;
+  dvc_last_normal_view : int;
+  dvc_n : int;
+  dvc_k : int;
+  dvc_i : int;
+}
+
 type t = {
   my_id : int;
   replica_count : int;
@@ -41,12 +63,39 @@ type t = {
      [handle_start_view_change]'s two branches (seeded to a singleton, ReceiveHigherSVC,
      VSR.tla:189; unioned, ReceiveMatchingSVC, VSR.tla:201), and read by [try_send_dvc]
      (Cardinality, SendDVC, VSR.tla:221). *)
-  mutable recv_dvc : Message.t list;
-  (* VSR.tla's [rep_recv_dvc[r]] (VSR.tla:34) -- the raw DOVIEWCHANGE messages received this
-     episode. Reset to empty by [check_timeout]/[handle_start_view_change]'s ReceiveHigherSVC
-     branch (both begin a new view-change episode, VSR.tla:169, 190) whenever this task's scope
-     touches it; still not POPULATED by anything in this task's scope -- [ReceiveDVC], the action
-     that adds to it, is Task 3's own territory. *)
+  recv_dvc : (int, dvc) Hashtbl.t;
+  (* VSR.tla's [rep_recv_dvc[r]] (VSR.tla:34) -- the DOVIEWCHANGE messages received this episode.
+     Reset to empty by [check_timeout]/[handle_start_view_change]'s ReceiveHigherSVC branch (both
+     begin a new view-change episode, VSR.tla:169, 190) and populated by [handle_do_view_change]
+     ([ReceiveDVC], VSR.tla:232-240). Read only by [try_send_sv] ([SendSV], VSR.tla:264-280).
+
+     DELIBERATE, DISCLOSED DIVERGENCE from a literal transcription of VSR.tla:34's own
+     [SUBSET [message]] type, resolved by task-3-brief.md and reproduced here so the reasoning
+     lives next to the code: this is a table KEYED BY SENDER ([m.i]), not a set of message records.
+     In the abstract model a set-of-records is safe, because a correct replica sends exactly one
+     DOVIEWCHANGE per view-change episode ([rep_sent_dvc]'s own one-shot semantics on the sending
+     side) and TLA+'s message bag cannot corrupt anything -- so "one element per sender" and "one
+     element per distinct record" coincide. Neither premise survives contact with this codebase's
+     real simulated transport: [lib/sim/network.ml] injects both [duplicate_probability] AND
+     [corrupt_probability], so the same sender's DOVIEWCHANGE can arrive twice with DIFFERENT bytes
+     (one pristine copy, one independently corrupted copy). Under a literal set-of-records those
+     are two distinct elements, and [SendSV]'s own [Cardinality(...) >= f + 1] threshold
+     (VSR.tla:269) would count ONE sender twice -- while VSR.tla:262-263's own citation requires
+     "f+1 DOVIEWCHANGE from DIFFERENT replicas, including itself". Counting messages instead of
+     senders is a literal reading of the TLA+ text and the WRONG semantics for a real adversarial
+     network: it is the historical 114-step-counterexample bug class (quorum inflation during view
+     change) reached by a different route.
+
+     FIRST-WINS, NOT LAST-WINS: once a sender has an entry for the CURRENT episode, every later
+     arrival from that same sender is ignored -- a genuine retransmission, a duplicate-injected
+     copy, and a corrupted duplicate are indistinguishable at this layer, so the rule that keeps
+     the most trustworthy state is "keep the first, never let a later arrival overwrite an earlier
+     one". Last-wins would let a single corrupted duplicate replace an already-accepted, valid DVC
+     (its [log]/[n]/[k] are what [WinningDVC]/[HighestCommitNumber] then select over). See
+     [handle_do_view_change] below for the one nuance: an entry left over from an OLDER view (only
+     reachable via [ReceiveSV], the sole action that raises [view_number] without clearing this
+     table) is NOT protected by first-wins, since it does not belong to the current episode at
+     all. *)
   mutable sent_dvc : bool;
   (* VSR.tla's [rep_sent_dvc[r]] (VSR.tla:35) -- the one-shot "already sent my DOVIEWCHANGE for
      this episode" flag [SendDVC] (VSR.tla:216-228) is gated on. Reset to [false] by
@@ -60,18 +109,25 @@ type t = {
      trigger a view change after [svc_limit] timeouts, forever, which is clearly wrong for a real
      long-running deployment that needs to recover from repeated primary failures.
 
-     DELIBERATE, DISCLOSED DIVERGENCE from the literal TLA+ transcription (this task's own review
-     ruling, not an oversight): [svc_count] must reset to [0] whenever this replica successfully
-     returns to [Normal] status by actually COMPLETING a view change -- either by calling [SendSV]
-     itself (becoming the new primary) or via [ReceiveSV] (accepting a new primary's [StartView])
-     -- since at that point the replica has proven it can reach a working view, and any FUTURE
-     timeout represents a genuinely new failure deserving its own fresh budget. Neither [SendSV]
-     nor [ReceiveSV] exists yet (both are Task 3's own scope), so nothing in THIS task's scope ever
-     resets [svc_count] -- this comment, and the identical one on [check_timeout] below, are the
-     hook Task 3 needs: at the exact point each of those two actions sets [status' = "Normal"]
-     (VSR.tla:275, 301), it must also add [t.svc_count <- 0] (a direct mutation of this private
-     field from within THIS module -- no separate exposed reset function is needed, the same way
-     no separate setter exists for any other field only ever written from inside [replica.ml]). *)
+     DELIBERATE, DISCLOSED DIVERGENCE from the literal TLA+ transcription (an earlier task's own
+     review ruling, not an oversight): [svc_count] must reset to [0] whenever this replica
+     successfully returns to [Normal] status by actually COMPLETING a view change -- either by
+     calling [SendSV] itself (becoming the new primary) or via [ReceiveSV] (accepting a new
+     primary's [StartView]) -- since at that point the replica has proven it can reach a working
+     view, and any FUTURE timeout represents a genuinely new failure deserving its own fresh
+     budget. BOTH resets are now implemented, in [try_send_sv] and [handle_start_view] below, at
+     the exact point each action sets [status' = "Normal"] (VSR.tla:275, 301).
+
+     The two are NOT symmetric, and the asymmetry is deliberate (task-3-brief.md's own resolved
+     design decision 3): [SendSV]'s guard already requires [rep_status[r] = "ViewChange"]
+     (VSR.tla:267), so its reset is unconditional and can only ever fire on a real
+     View_change -> Normal transition. [ReceiveSV]'s guard is [m.v >= View(r)] (VSR.tla:295 --
+     [>=], not [>]) with NO status conjunct at all, so it genuinely fires on a duplicate or
+     replayed [StartView] for the view this replica is ALREADY Normal in. Resetting [svc_count]
+     unconditionally there would let a stream of duplicate [StartView]s (not hypothetical --
+     [lib/sim/network.ml] has a real [duplicate_probability]) refresh this replica's timeout budget
+     indefinitely, silently nullifying the [svc_limit] bound the whole mechanism exists to enforce.
+     [handle_start_view] therefore resets only on an actual [View_change -> Normal] transition. *)
   (* Primary-only bookkeeping (VSR.tla's [rep_peer_op_number[r]]) -- harmless, simply never
      populated, on a backup. Keyed by peer replica id, value is that peer's highest acknowledged
      op-number (a cumulative high-water mark, never regressed -- see handle_prepare_ok).
@@ -114,7 +170,7 @@ let create ~my_id ~replica_count ~svc_limit ~send =
     last_normal_view = 0;
     commit_number = 0;
     recv_svc = Int_set.empty;
-    recv_dvc = [];
+    recv_dvc = Hashtbl.create (max 1 replica_count);
     sent_dvc = false;
     svc_count = 0;
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
@@ -285,20 +341,25 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
          just well-formed ones. A genuinely higher, in-range [k] from a well-formed message is
          still applied exactly as before.
 
-         This bound is deliberately ONE STEP WIDER than the spec's own precondition, and does NOT
-         re-establish it exactly: it admits [k = n], which VSR.tla:106-109's [m.k < m.n] excludes
-         and no correct primary ever sends ([m.k] is its commit-number from strictly BEFORE this
-         request was appended). The extra step is a defense-in-depth margin against off-by-one
-         edge cases, and is harmless in this plan's scope -- at [k = n] the entry at [n] exists
-         and [commit_number = op_number], so [CommitNumberNeverHigherThanOpNumber] and
-         [NoLogDivergence] both still hold. test_vsr_replica.ml's own k-boundary tests pin all
-         three of [k = n-1] (well-formed, accepted), [k = n] (the widened margin, accepted) and
-         [k = n+1] (rejected), so the exact bound is pinned by tests, not just by this comment.
-         FORWARD NOTE: tightening to [k < op_number t] is the safer direction once view-change
-         lands -- a backup's commit_number stops being purely local there, since it is sent as
-         [DoViewChange.k] and feeds [HighestCommitNumber] (VSR.tla:257-260), so a
-         falsely-inflated-by-one backup commit_number becomes load-bearing rather than benign. *)
-      if k > t.commit_number && k <= op_number t then t.commit_number <- k;
+         SETTLED (this was the FORWARD NOTE an earlier task left here, and this task is the moment
+         it predicted): the bound is now [k < op_number t], exactly VSR.tla:106-109's own
+         [m.k < m.n] precondition, no longer one step wider. It used to admit [k = n] as a
+         deliberate defense-in-depth margin, justified solely by [k = n] being harmless while a
+         backup's commit_number was purely local state -- at [k = n] the entry at [n] exists and
+         [commit_number = op_number], so [CommitNumberNeverHigherThanOpNumber] and
+         [NoLogDivergence] both still held. That justification is now GONE: this task wires
+         [try_send_dvc] (already merged) into [ReceiveDVC]/[HighestCommitNumber]/[SendSV] below, so
+         a backup's commit_number leaves the replica as [DoViewChange.k] and feeds
+         [HighestCommitNumber] (VSR.tla:257-260) -- an INDEPENDENT maximum over all valid DVCs' [k]
+         fields, NOT derived from the winning DVC. A backup whose commit_number was inflated by one
+         by a corrupted [Prepare] therefore becomes the new primary's own commit_number and is
+         broadcast cluster-wide as [StartView.k], where it can exceed the winning log's own length.
+         The margin is no longer benign, so it is gone: [k = n] is now REJECTED (only the [k]
+         field's effect is dropped -- the Prepare itself is still appended and still acked, exactly
+         as for the out-of-bound case this bound has always rejected). test_vsr_replica.ml's own
+         k-boundary tests pin all three of [k = n-1] (well-formed, accepted), [k = n] (now
+         rejected) and [k = n+1] (rejected). *)
+      if k > t.commit_number && k < op_number t then t.commit_number <- k;
       let reply = Message.encode (Message.Prepare_ok { view = t.view_number; n; i = t.my_id }) in
       t.send ~to_:(primary t) reply
 
@@ -379,7 +440,7 @@ let check_timeout t =
     t.view_number <- v;
     t.status <- View_change;
     t.recv_svc <- Int_set.empty;
-    t.recv_dvc <- [];
+    Hashtbl.reset t.recv_dvc;
     t.sent_dvc <- false;
     t.svc_count <- t.svc_count + 1;
     let bytes = Message.encode (Message.Start_view_change { v; i = t.my_id }) in
@@ -424,7 +485,7 @@ let handle_start_view_change t ~(v : int) ~(i : int) =
     t.view_number <- v;
     t.status <- View_change;
     t.recv_svc <- Int_set.singleton i;
-    t.recv_dvc <- [];
+    Hashtbl.reset t.recv_dvc;
     t.sent_dvc <- false;
     try_send_dvc t
   end
@@ -440,12 +501,307 @@ let handle_start_view_change t ~(v : int) ~(i : int) =
           by anything, dropped, the same "no buffering/retry" discipline already established for
           an out-of-order Prepare. *)
 
+(* ---- ValidDvc (VSR.tla:230) ----
+   [ValidDvc(r, m) == m.v = View(r)] -- verbatim. This is the view-filtered DVC quorum-counting fix
+   for the original formalization's own published 114-step safety counterexample (spec/tla/README.md,
+   "What the ValidDvc filter is actually doing here"). It is applied in BOTH places VSR.tla applies
+   it: as [ReceiveDVC]'s own guard (VSR.tla:235, in [handle_do_view_change] below) and AGAIN as a
+   filter at every read (VSR.tla:258, 269 -- [valid_dvcs] below). The second application is
+   currently inert in the abstract model, exhaustively (TLC: [RecvDvcValidWhenViewChange] holds on
+   all 264,376 reachable states, because both actions that enter [View_change] reset [recv_dvc]
+   first) -- spec/tla/README.md's own conclusion is that it stays anyway, since its redundancy is a
+   property of the current reset discipline rather than of the protocol. Same conclusion here: the
+   filter is kept, not optimized away. *)
+let valid_dvc t (d : dvc) = d.dvc_v = t.view_number
+
+(* The set VSR.tla writes as [{ m \in rep_recv_dvc[r] : ValidDvc(r, m) }] (VSR.tla:258, 269),
+   materialized once per read. Sorted by sender id purely for DETERMINISM: [Hashtbl.fold]'s order
+   is unspecified, and [winning_dvc] below resolves an exact [(last_normal_view, n)] tie by keeping
+   whichever candidate it saw first -- VSR.tla's own [CHOOSE] is likewise free to return any
+   maximal element, so sorting does not narrow the spec, it just makes THIS implementation's choice
+   reproducible across runs (and therefore testable). *)
+let valid_dvcs t =
+  Hashtbl.fold (fun _ d acc -> if valid_dvc t d then d :: acc else acc) t.recv_dvc []
+  |> List.sort (fun a b -> compare a.dvc_i b.dvc_i)
+
+(* ---- WinningDVC (VSR.tla:248-255) ----
+   [CHOOSE] the valid DVC for which no other valid DVC has either a strictly greater
+   [last_normal_view], or an equal [last_normal_view] and a strictly greater [n] -- i.e. the
+   lexicographic maximum by [(last_normal_view, n)], [last_normal_view] FIRST (research §2.4 step 3:
+   "selects as the new log the one contained in the message with the largest v'; if several messages
+   have the same v' it selects the one among them with the largest n"). Selecting by [n] alone is a
+   real safety bug, not a simplification: a replica that stayed in an OLDER view can have a longer
+   log than the replica that was most recently normal in the NEWEST view, and adopting the longer
+   log would discard the newer view's committed entries.
+
+   The fold keeps the incumbent on ties (STRICT [>] in both comparisons), so with [valid_dvcs]'s
+   sort above, an exact [(last_normal_view, n)] tie resolves to the lowest sender id. *)
+let winning_dvc (dvcs : dvc list) =
+  match dvcs with
+  | [] -> None (* unreachable from [try_send_sv]: its own [>= f + 1] guard implies a non-empty list *)
+  | first :: rest ->
+    Some
+      (List.fold_left
+         (fun best d ->
+           if
+             d.dvc_last_normal_view > best.dvc_last_normal_view
+             || (d.dvc_last_normal_view = best.dvc_last_normal_view && d.dvc_n > best.dvc_n)
+           then d
+           else best)
+         first rest)
+
+(* ---- HighestCommitNumber (VSR.tla:257-260) ----
+   A SEPARATE, INDEPENDENT maximum of [m.k] over the valid DVCs -- deliberately NOT derived from
+   [winning_dvc]'s own result. VSR.tla:244-245 warns about exactly this in its own comment ("§5.7's
+   explicit warning that HighestCommitNumber is a SEPARATE maximum, not derived from the winning
+   DVC"), and this plan's Global Constraints repeat it: a future reader diffing this code against
+   the spec must find two clearly separate scans. The winning DVC (chosen by [(last_normal_view, n)])
+   routinely is NOT the DVC with the highest [k].
+
+   [0] is a correct identity for the fold rather than a floor that could mask a negative: every
+   entry in [recv_dvc] has passed [handle_do_view_change]'s own [k < 0] rejection below, and
+   VSR.tla's [rep_commit_number] is typed [Nat] (VSR.tla:25, 325). *)
+let highest_commit_number (dvcs : dvc list) =
+  List.fold_left (fun acc d -> if d.dvc_k > acc then d.dvc_k else acc) 0 dvcs
+
+(* ---- SendSV (VSR.tla:264-280) ----
+   Driven from [handle_do_view_change] ([ReceiveDVC]) below, mirroring [try_send_dvc]'s own
+   established "drive the derived action from every point its enabling condition can change"
+   pattern. Unlike [try_send_dvc], NO call is needed from [check_timeout] or
+   [handle_start_view_change]: those two are the only other actions that touch anything this guard
+   reads, and both set [recv_dvc] to EMPTY in the same step, so the threshold conjunct
+   [Cardinality(valid recv_dvc) >= f + 1] is provably false immediately after either of them --
+   [f + 1 >= 1 > 0] for EVERY [replica_count], including the degenerate [f = 0] cluster that made
+   [try_send_dvc]'s own extra call worth including. That is a proof for all cluster sizes, not an
+   "always a no-op in practice" assumption.
+
+   Note the threshold is [>= f + 1] (VSR.tla:269), NOT [SendDVC]'s [>= f] (VSR.tla:221): "f+1
+   DOVIEWCHANGE from different replicas, INCLUDING ITSELF" (VSR.tla:262-263) vs. "f STARTVIEWCHANGE
+   from OTHER replicas" (VSR.tla:207). The two are kept as two textually separate expressions, each
+   citing its own spec line, per this plan's Global Constraints -- deliberately not factored into
+   one shared constant that a later edit could drift. *)
+let try_send_sv t =
+  let f = (t.replica_count - 1) / 2 in
+  let dvcs = valid_dvcs t in
+  if t.status = View_change (* VSR.tla:267 *) && is_primary t (* VSR.tla:268: r = Primary(View(r)) *)
+     && List.length dvcs >= f + 1 (* VSR.tla:269 *)
+  then
+    match winning_dvc dvcs with
+    | None -> () (* unreachable, see [winning_dvc] *)
+    | Some winner ->
+      let new_k = highest_commit_number dvcs in
+      if new_k > winner.dvc_n then
+        () (* DEFENSIVE, NOT IN VSR.tla -- and inert for every correct execution the model can
+              reach. The two independent maxima above disagree here in a way no well-formed DVC set
+              can produce: some valid DVC claims a commit_number beyond the END of the log this
+              view is about to adopt. Applying it would set [commit_number > op_number] on the new
+              primary and then broadcast that same [k] cluster-wide in [StartView], violating
+              [CommitNumberNeverHigherThanOpNumber] (VSR.tla:330-331) on every replica that accepts
+              it. Since each individual DVC is already field-validated on arrival (see
+              [handle_do_view_change]), reaching this branch means at least one DVC in the set is
+              corrupt/forged in a way only CROSS-message comparison can expose, and there is no way
+              to tell which -- so the whole action is refused, no state changes at all (this
+              module's established "guard failure => total no-op" convention), rather than
+              inventing a bounded substitute. Deliberately NOT a clamp to [winner.dvc_n]: that
+              targets the maximum legal value, i.e. it would declare the entire adopted log
+              committed off the back of one corrupted integer -- exactly the reasoning
+              [handle_prepare]'s own [k] bound already rejects clamping for. Cost of refusing is
+              liveness only, and bounded: [recv_dvc] is wiped at the start of the next view-change
+              episode. EVIDENCE this never fires for well-formed traffic: a scratch copy of
+              spec/tla/VSR.tla with the invariant [T3_SendSvCommitWithinWinnerLog] (SendSV enabled
+              => HighestCommitNumber(r) <= WinningDVC(r).n) was TLC-checked over the shipped
+              VSR.cfg bound -- no violation, 553,084 states generated / 264,376 distinct / 0 left
+              on queue, the same exhaustive state graph spec/tla/README.md quotes; a companion
+              vacuity check ([SendSV] is never enabled) IS violated, confirming the invariant was
+              exercised against real states rather than passing vacuously. *)
+      else begin
+        (* VSR.tla:272-273: [rep_log' = winner.log] and [rep_op_number' = winner.n]. This module
+           tracks op_number AS the log's own length (see [op_number] above), so the second
+           assignment is not separate code -- it is implied by the first, and is correct ONLY
+           because [handle_do_view_change] rejects any DVC whose [n] disagrees with its own log's
+           length. That check is what keeps VSR.tla's [LogLengthMatchesOpNumber] (VSR.tla:337-338)
+           true by construction here for adversarial input too, not just well-formed input. *)
+        Replica_log.replace_with t.log winner.dvc_log;
+        t.commit_number <- new_k;
+        (* VSR.tla:274 -- unconditional, NOT monotonic-guarded: unlike [ReceiveSV]'s own update,
+           this replica is the one STARTING the new view, and [new_k] is the maximum over a
+           quorum's worth of DVCs including (normally) its own. *)
+        t.last_normal_view <- t.view_number (* VSR.tla:276 *);
+        t.svc_count <- 0
+        (* Disclosed divergence -- see [svc_count]'s own doc comment on [t]. Unconditional here
+           because VSR.tla:267's own guard already restricts this action to [status = View_change],
+           so reaching this point IS a real View_change -> Normal transition. *);
+        t.status <- Normal (* VSR.tla:275 *);
+        let bytes =
+          Message.encode (Message.Start_view { v = t.view_number; log = winner.dvc_log; n = winner.dvc_n; k = new_k })
+        in
+        (* VSR.tla:277-278's own [Broadcast(..., r)] -- every OTHER replica, never self (VSR.tla:56's
+           [replicas \ {source}]), exactly like [propose]'s and [check_timeout]'s broadcasts. *)
+        for peer = 1 to t.replica_count do
+          if peer <> t.my_id then t.send ~to_:peer bytes
+        done
+      end
+
+(* ---- ReceiveDVC (VSR.tla:232-240) ----
+   Guard: [ValidDvc(r, m)] and nothing else -- in particular NO status conjunct (a DVC matching this
+   replica's current view is accumulated even while [status = Normal], exactly as in the spec; the
+   sole reader, [try_send_sv], carries the [status = View_change] check instead) and no
+   [r = Primary(View(r))] conjunct (VSR.tla relies on [m.dest] for that; a misrouted DVC simply
+   accumulates on a non-primary, where nothing ever reads it).
+
+   Every integer field is validated before being trusted, matching the precedent already
+   established twice in this module ([handle_prepare_ok]'s [i]/[n], [handle_prepare]'s [k]):
+   [Message.decode] confirms a message's SHAPE, never its protocol-level legality, and
+   {!Riptide_transport.Transport_intf.S} promises no payload integrity. Each check below is
+   accompanied by the property of the sending replica it re-establishes, and each was confirmed
+   INERT for correct traffic by TLC on a scratch copy of spec/tla/VSR.tla (invariant
+   [T3_DvcFieldsWellFormed]: every DoViewChange record in the message bag satisfies
+   [Len(m.log) = m.n /\ m.k <= m.n /\ m.last_normal_view < m.v /\ m.i \in replicas]) -- no
+   violation over the full 264,376-distinct-state graph, with a companion vacuity check confirming
+   DoViewChange messages really do occur there. *)
+let handle_do_view_change t ~(v : int) ~(log : Value.value list) ~(last_normal_view : int) ~(n : int) ~(k : int)
+    ~(i : int) =
+  if i < 1 || i > t.replica_count then
+    () (* VSR.tla:15's own [replicas == 1..ReplicaCount]. Note this check does NOT exclude
+          [i = t.my_id], unlike [handle_start_view_change]'s otherwise-identical-looking check: a
+          DOVIEWCHANGE from this replica to itself is entirely legitimate and REQUIRED -- VSR.tla:224
+          addresses it to [Primary(View(r))], which is this replica whenever it is the new primary,
+          and VSR.tla:262-263's quorum is "f+1 ... from different replicas, INCLUDING ITSELF".
+          Excluding self here would make [SendSV] need f+1 OTHER replicas, i.e. a strictly larger
+          quorum than the protocol specifies, and would stall every view change in a cluster with
+          exactly f+1 survivors. *)
+  else if v <> t.view_number then
+    () (* ValidDvc(r, m) == m.v = View(r) (VSR.tla:230, 235) -- a DVC for any other view, higher or
+          lower, is matched by no action and dropped. For a HIGHER view this is a deliberate,
+          already-analyzed liveness simplification, not an oversight (spec/tla/README.md's own
+          known-simplifications list, and VSR.tla:176-182's own scope note): a DOVIEWCHANGE is
+          unicast, so any view it could announce was already broadcast to everyone as a
+          STARTVIEWCHANGE first. *)
+  else if n < 0 || n <> List.length log then
+    () (* [n] must be exactly the length of the log the same message carries -- VSR.tla's own
+          [LogLengthMatchesOpNumber] (VSR.tla:337-338) applied to the sender's state, since
+          [SendDVC] builds [log] and [n] from [rep_log[r]] and [rep_op_number[r]] in one step
+          (VSR.tla:222-223). Load-bearing rather than cosmetic: [try_send_sv] adopts [winner.log]
+          and relies on the resulting log length BEING [winner.n] (this module has no separate
+          op_number field to assign), and [StartView.n] is then broadcast cluster-wide. *)
+  else if k < 0 || k > n then
+    () (* [CommitNumberNeverHigherThanOpNumber] (VSR.tla:330-331) applied to the sender's own state.
+          Note [<=], not [<], is the right bound HERE, unlike [handle_prepare]'s [k < n]: a DVC's
+          [k] and [n] are the sender's own commit_number and op_number, which legitimately coincide
+          on a fully-committed replica, whereas a Prepare's [k] is the primary's commit_number from
+          strictly before the entry that same message carries. This is the single field
+          [HighestCommitNumber] maximizes over, so an unbounded [k] here is the most direct route to
+          a cluster-wide [CommitNumberNeverHigherThanOpNumber] violation via [StartView.k]. *)
+  else if last_normal_view < 0 || last_normal_view >= v then
+    () (* [last_normal_view] is the PRIMARY sort key [WinningDVC] selects the surviving log by, so an
+          unbounded value here lets one forged DVC dictate the entire cluster's log -- the most
+          safety-critical field on this message type. A correct sender's [last_normal_view] is
+          always STRICTLY below the view its DOVIEWCHANGE announces: [SendDVC] requires
+          [status = "ViewChange"] (VSR.tla:219), [last_normal_view] is only ever written by
+          [SendSV]/[ReceiveSV] (which set [status = "Normal"] in the same step, VSR.tla:275-276,
+          301-302), and both actions that ENTER "ViewChange" raise [view_number] strictly above the
+          replica's current view without touching [last_normal_view] (VSR.tla:166-167, 187-188).
+          Confirmed exhaustively rather than argued: TLC on a scratch copy of VSR.tla with
+          [T3_ViewChangeImpliesLastNormalViewBelowView] ([status = "ViewChange" =>
+          last_normal_view < view_number]) found no violation across all 264,376 distinct reachable
+          states, and the matching [T3_DvcFieldsWellFormed] conjunct checks the property on the
+          DOVIEWCHANGE records themselves. *)
+  else begin
+    let d =
+      { dvc_v = v; dvc_log = log; dvc_last_normal_view = last_normal_view; dvc_n = n; dvc_k = k; dvc_i = i }
+    in
+    (* FIRST-WINS, per sender, per EPISODE -- see [recv_dvc]'s own doc comment on [t] for the full
+       reasoning. [already_this_episode] deliberately checks the stored entry's own [dvc_v] rather
+       than mere key presence: an entry left over from an older view (only reachable via
+       [handle_start_view], the one action that raises [view_number] without clearing this table)
+       belongs to no current episode and must not shadow a genuinely current DVC from the same
+       sender. That shadowing would in fact be harmless today -- any entry present while
+       [status = Normal] is wiped by whichever action next enters [View_change], before
+       [try_send_sv] can read it -- but the check costs one comparison and removes the need for a
+       future reader to re-derive that argument. *)
+    let already_this_episode =
+      match Hashtbl.find_opt t.recv_dvc i with Some existing -> existing.dvc_v = t.view_number | None -> false
+    in
+    if not already_this_episode then begin
+      Hashtbl.replace t.recv_dvc i d (* VSR.tla:236's own [@ \cup {m}], keyed by sender *);
+      try_send_sv t
+      (* [ReceiveDVC] is the ONLY action that raises [Cardinality({valid DVCs})], so this is the
+         only point [SendSV]'s threshold can newly become satisfied -- see [try_send_sv]'s own
+         comment for why no other call site is needed. Deliberately inside this branch: an ignored
+         duplicate changes nothing the guard reads. *)
+    end
+  end
+
+(* ---- ReceiveSV (VSR.tla:292-305) ---- *)
+let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : int) =
+  if v < 0 then () (* [rep_view_number] is typed [Nat] (VSR.tla:30, 326) *)
+  else if v < t.view_number then
+    () (* VSR.tla:295's own guard is [m.v >= View(r)] -- [>=], NOT [>]: a StartView for the view
+          this replica is ALREADY in is accepted and re-applied (that is what makes the conditional
+          [svc_count] reset below necessary, per task-3-brief.md's resolved decision 3). Only a
+          strictly LOWER view is dropped. There is deliberately no status conjunct either. *)
+  else if n < 0 || n <> List.length log then
+    () (* Same [LogLengthMatchesOpNumber] check, same reason, as [handle_do_view_change]'s: this
+          log is adopted wholesale and its length BECOMES this replica's op_number. TLC-confirmed
+          inert for correct traffic ([T3_SvFieldsWellFormed]). *)
+  else if k < 0 || k > n then
+    () (* [CommitNumberNeverHigherThanOpNumber] for the state this message is asking us to adopt:
+          [k] is the new primary's [HighestCommitNumber] and [n] the winning log's length. *)
+  else if n < t.commit_number then
+    () (* DEFENSIVE, NOT IN VSR.tla, and inert for every correct execution the model can reach:
+          refuse a StartView whose log is SHORTER than what this replica has already committed.
+          Adopting it would discard committed entries outright (real data loss, and it would leave
+          [commit_number > op_number] here the moment the monotonic update below keeps our own
+          higher value). EVIDENCE: TLC on a scratch copy of VSR.tla with
+          [T3_ReceiveSvNeverTruncatesBelowCommit] (ReceiveSV enabled => [m.n >= rep_commit_number[r]])
+          found no violation across the full 264,376-distinct-state graph, with a companion vacuity
+          check confirming receivable StartViews with [m.v >= View(r)] really do occur. So this
+          rejects nothing a correct primary ever sends -- it is purely a bound on forged/corrupted
+          input. Dropped WHOLESALE (view_number/status untouched), per this module's "guard failure
+          => total no-op" convention. *)
+  else begin
+    Replica_log.replace_with t.log log (* VSR.tla:296-297: log and op_number adopted wholesale *);
+    if k > t.commit_number then t.commit_number <- k;
+    (* VSR.tla:298-299's own [IF m.k > @ THEN m.k ELSE @] -- MONOTONIC ONLY. research §5.7 Part 4:
+       applying [m.k] unconditionally is a REAL, documented defect (it caused a
+       double-application-of-an-operation bug in the original published spec). Do not simplify this
+       back to an unconditional assignment. The [k <= n] bound checked above is what keeps the
+       result [<= op_number] in the OTHER direction, for a forged [k]. *)
+    t.view_number <- v (* VSR.tla:300 *);
+    t.last_normal_view <- v (* VSR.tla:302 *);
+    if t.status = View_change then t.svc_count <- 0;
+    (* Disclosed divergence (see [svc_count]'s doc comment on [t]), and CONDITIONAL here on a real
+       View_change -> Normal transition -- task-3-brief.md's resolved decision 3. VSR.tla:295's
+       guard has no status conjunct, so this action genuinely fires on a duplicated/replayed
+       StartView for a view this replica is already Normal in; an unconditional reset would let such
+       duplicates refresh the timeout budget indefinitely and quietly nullify [svc_limit]. Must be
+       read BEFORE the [status <- Normal] write below. *)
+    t.status <- Normal (* VSR.tla:301 *)
+    (* [recv_dvc] and [recv_svc] are deliberately NOT reset -- VSR.tla:304 lists both as UNCHANGED,
+       and spec/tla/README.md ("What the ValidDvc filter is actually doing here") has the detailed,
+       TLC-backed argument for why the stale entries this genuinely leaves behind can never be READ:
+       every reader is gated on [status = View_change], and both actions that reach that status
+       ([check_timeout], [handle_start_view_change]'s higher-view branch) reset both structures
+       first. Adding a reset here would deviate from the model this code is required to match, in a
+       direction the model was never checked against. Do not "fix" it. *)
+  end
+
 let handle_message t (bytes : string) =
   match Message.decode bytes with
   | exception Message.Malformed_message _ -> ()
   | Message.Prepare { view; n; v; k } -> handle_prepare t ~view ~n ~v ~k
   | Message.Prepare_ok { view; n; i } -> handle_prepare_ok t ~view ~n ~i
   | Message.Start_view_change { v; i } -> handle_start_view_change t ~v ~i
-  | Message.Do_view_change _ | Message.Start_view _ ->
-    () (* out of THIS task's scope -- Task 3's own [SendSV]/[ReceiveSV] -- silently ignored, not
-          raised *)
+  | Message.Do_view_change { v; log; last_normal_view; n; k; i } ->
+    handle_do_view_change t ~v ~log ~last_normal_view ~n ~k ~i
+  | Message.Start_view { v; log; n; k } -> handle_start_view t ~v ~log ~n ~k
+
+(* ---- Test-support surface (continued): read-only views of the two view-change accumulators ----
+   [recv_dvc]/[recv_svc] are private, and the protocol itself never needs to expose them -- but
+   several properties this module is REQUIRED to hold are stated directly about them and are
+   otherwise only observable indirectly, through whether a message eventually gets sent:
+   [ReceiveSV]'s deliberate NON-reset of both (VSR.tla:304), the per-episode reset performed by
+   [check_timeout]/[ReceiveHigherSVC] (VSR.tla:169, 190), and [recv_dvc]'s sender-keyed first-wins
+   dedup. Both return sorted sender ids so a test can assert on an exact list. *)
+let for_test_recv_dvc_senders t = Hashtbl.fold (fun i _ acc -> i :: acc) t.recv_dvc [] |> List.sort compare
+let for_test_recv_svc_senders t = Int_set.elements t.recv_svc

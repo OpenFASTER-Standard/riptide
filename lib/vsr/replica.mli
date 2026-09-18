@@ -1,22 +1,28 @@
-(** A single VSR replica's state and message handling — `spec/tla/VSR.tla`'s
+(** A single VSR replica's state and message handling — ALL ELEVEN of `spec/tla/VSR.tla`'s actions:
     [ReceiveClientRequest], [ReceivePrepareMsg], [ReceivePrepareOkMsg], [PrimaryExecuteOp]
-    (VSR.tla:91-155), [TimerSendSVC], [ReceiveHigherSVC], [ReceiveMatchingSVC], and [SendDVC]
-    (VSR.tla:161-228), generalized to a real, mutable [status]/[view_number] rather than a fixed
-    primary.
+    (VSR.tla:91-155), [TimerSendSVC], [ReceiveHigherSVC], [ReceiveMatchingSVC], [SendDVC],
+    [ReceiveDVC], [SendSV], and [ReceiveSV] (VSR.tla:161-305), against a real, mutable
+    [status]/[view_number] rather than a fixed primary.
 
-    {b Scope}: this module implements the normal-case actions above against the GENERAL form of
-    their guards ([IsNormalPrimary(r) == status[r] = "Normal" /\ Primary(View(r)) = r] and
-    [IsNormalBackup(r) == status[r] = "Normal" /\ Primary(View(r)) # r], VSR.tla:48-49), plus the
-    FIRST HALF of view-change: a replica can now move itself into [View_change] (on its own
-    timeout, or on hearing of a higher view) and, once it collects enough corroborating
-    [StartViewChange]s, send its own [DoViewChange] to the new primary. {!check_timeout} implements
-    [TimerSendSVC]; {!handle_message}'s [Start_view_change] dispatch implements both
-    [ReceiveHigherSVC] and [ReceiveMatchingSVC]; [SendDVC] itself has no separate entry point (see
-    {!handle_message}'s own doc comment for why). {b Still out of scope}: [ReceiveDVC], [SendSV],
-    and [ReceiveSV] (VSR.tla:230-305) — nothing in this module ever moves [status] back to
-    [Normal], populates [recv_dvc], or lets a replica actually BECOME the new primary; that's
-    Task 3's own scope. A [Do_view_change] / [Start_view] message reaching {!handle_message} is
-    silently ignored, not an error, until then.
+    {b Scope}: the normal-case actions are implemented against the GENERAL form of their guards
+    ([IsNormalPrimary(r) == status[r] = "Normal" /\ Primary(View(r)) = r] and
+    [IsNormalBackup(r) == status[r] = "Normal" /\ Primary(View(r)) # r], VSR.tla:48-49), and the
+    view-change half is now complete end to end: a replica moves itself into [View_change] (on its
+    own timeout, or on hearing of a higher view), collects corroborating [StartViewChange]s, sends
+    its own [DoViewChange] to the new primary, accumulates other replicas' [DoViewChange]s, and —
+    if it is the new primary — selects the surviving log, starts the new view, and broadcasts
+    [StartView]; a replica receiving that [StartView] adopts the new view and returns to [Normal].
+    {!check_timeout} implements [TimerSendSVC]; {!handle_message}'s [Start_view_change] dispatch
+    implements [ReceiveHigherSVC]/[ReceiveMatchingSVC], its [Do_view_change] dispatch implements
+    [ReceiveDVC], and its [Start_view] dispatch implements [ReceiveSV]. [SendDVC] and [SendSV] have
+    no separate entry points of their own — both are derived actions driven from whichever handler
+    changes what their guards read (see {!handle_message}'s own doc comment).
+
+    {b Still out of scope}, as for `spec/tla/VSR.tla` itself (see `spec/tla/README.md`):
+    state-transfer, storage-fault-aware recovery, crash modeling, reconfiguration, the client
+    table, and COMMIT messages. Two disclosed, liveness-only simplifications are inherited
+    directly from the spec: no [PrepareOk] re-send on [StartView], and only a higher-view
+    [StartViewChange] (never a higher-view [DoViewChange]) makes a replica adopt a higher view.
 
     {b View number}: {!handle_message} enforces VSR.tla's own [m.view = View(r)] guard by
     dropping any [Prepare]/[Prepare_ok] (the two normal-case types that carry a [view] field)
@@ -128,17 +134,25 @@ val commit_number : t -> int
     actions).
 
     {b [commit_number t <= op_number t] holds for every reachable state, including against a
-    network-corrupted/adversarial [Prepare]}, not merely for well-formed input: VSR.tla:118's own
+    network-corrupted/adversarial [Prepare], [DoViewChange] or [StartView]}, not merely for
+    well-formed input: VSR.tla:118's own
     [rep_commit_number' = IF m.k > @ THEN m.k ELSE @] is safe in the TLA+ model only because every
     [Prepare] there is produced by [ReceiveClientRequest] itself, which guarantees [m.k < m.n]
     (VSR.tla:106-109's own comment) — a precondition that does not hold for a [Prepare] decoded
     off {!Riptide_transport.Transport_intf.S}'s own "no payload integrity" wire. {!handle_message}
     bounds it explicitly by REJECTING (not capping/clamping) a [Prepare]'s [k] once it
-    would exceed [op_number t] (this replica's own log length, which the [Prepare] being
+    reaches [op_number t] (this replica's own log length, which the [Prepare] being
     processed has just extended to [m.n]) — [commit_number] is left at its prior, legitimately-
-    established value rather than substituted with a different one.
+    established value rather than substituted with a different one. The same discipline is applied
+    to every other field that can move [commit_number] off the wire: a [DoViewChange] is rejected
+    unless [0 <= k <= n] and [n] equals its own log's length, a [StartView] likewise plus a refusal
+    to adopt a log shorter than this replica's own committed prefix, and [SendSV] refuses outright
+    (rather than clamping) if the [HighestCommitNumber] maximum exceeds the winning log's length.
+    See {!handle_message}'s own doc comment for each guard's exact bound and the TLC evidence that
+    each is inert for correct traffic.
 
-    {b Only that one field's effect is discarded — the message itself is NOT treated as suspect}:
+    {b For a [Prepare] specifically, only that one field's effect is discarded — the message itself
+    is NOT treated as suspect}:
     [m.v] is still appended at [m.n] and a [Prepare_ok{n = m.n}] is still unicast back to the
     primary, exactly as for any in-order [Prepare]. Dropping the whole message instead would open
     a gap in this replica's log that nothing in this plan's scope (no state transfer, no retry)
@@ -147,38 +161,60 @@ val commit_number : t -> int
     corrupted integer would let a backup declare its entire log committed — invariant-preserving
     and still completely wrong. See {!handle_message}'s own doc comment below for the exact bound, and the
     analogous, independently-established bound on a [Prepare_ok]'s own [n] field (a genuine ack
-    can never claim to have acked an op-number this primary hasn't itself assigned). *)
+    can never claim to have acked an op-number this primary hasn't itself assigned).
+
+    {b Monotonic over this replica's lifetime with exactly one exception, [SendSV]}: every
+    normal-case path only ever raises [commit_number], and {!handle_message}'s [Start_view]
+    dispatch ([ReceiveSV]) is explicitly monotonic too (VSR.tla:298-299's [IF m.k > @ THEN m.k ELSE
+    @] — research §5.7 Part 4's documented fix for a real published double-application defect, not
+    an incidental choice). [SendSV] is the one action that assigns [commit_number] unconditionally
+    (VSR.tla:274): the new primary starts the view fresh from a quorum's worth of [DoViewChange]s,
+    so its new value is [HighestCommitNumber] over that quorum, not a maximum with its own prior
+    value. *)
 
 val view_number : t -> int
 (** [view_number t] is VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. Starts at [0]
-    (VSR.tla's own [Init]) and now also advances via two REAL actions this task adds —
-    {!check_timeout} ([TimerSendSVC]) and {!handle_message}'s [Start_view_change] dispatch
-    ([ReceiveHigherSVC]) — in addition to the test-only {!for_test_set_view_number}/
+    (VSR.tla's own [Init]) and advances via three REAL actions —
+    {!check_timeout} ([TimerSendSVC]), {!handle_message}'s [Start_view_change] dispatch
+    ([ReceiveHigherSVC]), and its [Start_view] dispatch ([ReceiveSV], which ADOPTS [m.v] rather
+    than incrementing) — in addition to the test-only {!for_test_set_view_number}/
     {!for_test_set_view}. Exposed read-only, the same way {!op_number}/{!commit_number} are, since
     it is genuine protocol state, not a test-only concern. *)
 
 val last_normal_view : t -> int
 (** [last_normal_view t] is VSR.tla's [rep_last_normal_view[r]] (VSR.tla:31) — the paper's own
     [v'], deliberately NOT derivable from {!view_number} in general (see [replica.ml]'s own doc
-    comment on the field). Nothing in THIS task's scope writes it for real — [TimerSendSVC]/
-    [ReceiveHigherSVC]/[ReceiveMatchingSVC]/[SendDVC] (VSR.tla:161-228) all leave it UNCHANGED; only
-    [SendSV]/[ReceiveSV] (Task 3's scope, VSR.tla:276, 302) ever assign it a new value for real. It
-    only changes here via {!for_test_set_view_number} (which force-syncs it to {!view_number}, valid
-    only while [status = Normal] — see that function's own doc comment) or {!for_test_set_view}
-    (which sets it independently, valid for any [status], including [View_change] — see its own doc
-    comment for why {!for_test_set_view_number} must NOT be reused for that case). Exposed
-    read-only for the same reason {!view_number} is: genuine protocol state a caller (in particular,
-    this task's own [SendDVC] logic, which reads it to populate a [Do_view_change]'s own
-    [last_normal_view] field, or a future Task 3 test asserting the spec's confirmed
-    [status = "Normal" => last_normal_view = view_number] invariant, or [WinningDVC]'s own eventual
-    consumer) may need to inspect. *)
+    comment on the field). [TimerSendSVC]/[ReceiveHigherSVC]/[ReceiveMatchingSVC]/[SendDVC]
+    (VSR.tla:161-228) all leave it UNCHANGED; the two actions that assign it for real are
+    [SendSV] (to [View(r)], VSR.tla:276 — i.e. the view this replica is starting as its new
+    primary) and [ReceiveSV] (to [m.v], VSR.tla:302), both of which set [status = Normal] in the
+    same step. It also changes via {!for_test_set_view_number} (which force-syncs it to
+    {!view_number}, valid only while [status = Normal] — see that function's own doc comment) or
+    {!for_test_set_view} (which sets it independently, valid for any [status], including
+    [View_change] — see its own doc comment for why {!for_test_set_view_number} must NOT be reused
+    for that case).
+
+    {b [status = View_change] implies [last_normal_view < view_number], strictly} — exhaustively
+    TLC-confirmed against `spec/tla/VSR.tla` (invariant
+    [status = "ViewChange" => last_normal_view < view_number], no violation across all 264,376
+    distinct reachable states), and load-bearing here rather than incidental: {!handle_message}'s
+    [Do_view_change] dispatch REJECTS a [DoViewChange] whose [last_normal_view] is not strictly
+    below its own [v], because that field is the primary sort key [WinningDVC] selects the
+    surviving log by. Exposed read-only for the same reason {!view_number} is: genuine protocol
+    state a caller (this module's own [SendDVC] logic, or a test asserting either of the two
+    invariants above) may need to inspect. *)
 
 val status : t -> status
 (** [status t] is VSR.tla's own [rep_status[r]] (VSR.tla:29). Starts [Normal] ({!create}, VSR.tla's
     own [Init]); {!check_timeout} ([TimerSendSVC]) and {!handle_message}'s [Start_view_change]
-    dispatch ([ReceiveHigherSVC]) are the first REAL actions that move it to [View_change] — nothing
-    in this task's scope ever moves it back to [Normal] (that needs [SendSV]/[ReceiveSV], Task 3's
-    own scope). Also settable directly, for tests, via {!for_test_set_view} (and, restricted to
+    dispatch ([ReceiveHigherSVC]) are the ONLY two actions that move it to [View_change], and both
+    reset [recv_svc]/[recv_dvc]/[sent_dvc] in the same step (VSR.tla:168-170, 189-191). The two
+    that move it BACK to [Normal] are [SendSV] (driven internally from {!handle_message}'s
+    [Do_view_change] dispatch) and [ReceiveSV] ({!handle_message}'s [Start_view] dispatch) —
+    neither of which can ever move it INTO [View_change], per VSR.tla:275 and :301. That asymmetry
+    is what makes the stale entries [ReceiveSV] deliberately leaves in [recv_dvc]/[recv_svc]
+    unreadable; see {!handle_message}'s own doc comment. Also settable directly, for tests, via
+    {!for_test_set_view} (and, restricted to
     [Normal], implicitly by {!for_test_set_view_number}, which never touches [status] at all since
     it is already [Normal] on every replica {!for_test_set_view_number} is meant to be used
     against). *)
@@ -268,11 +304,16 @@ val check_timeout : t -> unit
     to [0] whenever this replica successfully returns to [Normal] status by actually COMPLETING a
     view change — via [SendSV] (becoming the new primary itself) or [ReceiveSV] (accepting a new
     primary's [StartView]) — since reaching a working view again proves the replica can recover,
-    making any FUTURE timeout a genuinely new failure that deserves its own fresh budget. Neither
-    [SendSV] nor [ReceiveSV] exists yet in this module (both are Task 3's own scope) — see
-    [replica.ml]'s own comment on the [svc_count] field for exactly where Task 3 needs to add the
-    reset (a direct mutation of the private field, at the point each of those two actions sets
-    [status' = "Normal"], VSR.tla:275, 301 — no separately exposed reset function is needed).
+    making any FUTURE timeout a genuinely new failure that deserves its own fresh budget. Both
+    resets are implemented, at the exact point each action sets [status' = "Normal"] (VSR.tla:275,
+    301), and they are deliberately NOT symmetric: [SendSV]'s is unconditional (its own guard
+    already requires [status = View_change], VSR.tla:267, so it can only fire on a real transition),
+    while [ReceiveSV]'s fires ONLY on an actual [View_change → Normal] transition. [ReceiveSV]'s
+    guard is [m.v >= View(r)] with no status conjunct (VSR.tla:295), so it genuinely re-fires on a
+    duplicated or replayed [StartView] for a view this replica is already [Normal] in — and
+    [lib/sim/network.ml] injects real duplicates. An unconditional reset there would let such
+    duplicates refresh this budget indefinitely, silently nullifying the [svc_limit] bound the whole
+    mechanism exists to enforce.
 
     Also internally drives VSR.tla's [SendDVC] (VSR.tla:216-228) the same way {!handle_message}'s
     [Start_view_change] dispatch does — see {!handle_message}'s own doc comment for the general
@@ -394,10 +435,88 @@ val handle_message : t -> string -> unit
       sending to other replicas), and sets [sent_dvc] to [true] so it cannot fire again for the
       same episode (VSR.tla:225's own comment on why this one-shot flag exists at all — without
       it, every firing would leave every guard conjunct unchanged, re-enabling itself forever).
-    - A [Do_view_change] or [Start_view] message is silently ignored (this module doesn't yet
-      implement [ReceiveDVC]/[SendSV]/[ReceiveSV] — Task 3's own scope; see this file's own
-      top-level comment) — NOT an error, since a real message stream will carry these once that
-      task lands, and this replica must not crash on a message type it doesn't yet handle.
+    - A [Do_view_change] message drives VSR.tla's [ReceiveDVC] (VSR.tla:232-240), whose only guard
+      is [ValidDvc(r, m) == m.v = View(r)] (VSR.tla:230) — the view-filtered DVC quorum-counting fix
+      for the original formalization's own published 114-step safety counterexample. There is
+      deliberately NO status conjunct (a DVC for this replica's current view accumulates even while
+      [status = Normal]; the sole reader, [SendSV], carries the status check instead) and no
+      "am I the primary" conjunct (VSR.tla relies on [m.dest]; a misrouted DVC simply accumulates
+      where nothing reads it). A DVC for any OTHER view — higher or lower — is dropped; for a
+      higher view that is a disclosed, liveness-only simplification inherited from the spec (a
+      [DoViewChange] is unicast, so any view it could announce was broadcast to everyone as a
+      [StartViewChange] first).
+
+      {b The accumulator is keyed by SENDER ([m.i]), and the first arrival per sender per episode
+      wins} — a deliberate, disclosed divergence from VSR.tla:34's literal [SUBSET [message]]
+      (set-of-records) type, resolved in this task's brief and argued at length on [replica.ml]'s
+      own [recv_dvc] field. In the abstract model the two coincide: a correct replica sends exactly
+      one [DoViewChange] per episode and TLA+'s bag cannot corrupt anything. On a real wire they do
+      not: [lib/sim/network.ml] injects both duplicates and corruption, so the same sender's DVC can
+      arrive twice with different bytes, which a literal set-of-records would count as TWO elements
+      toward [SendSV]'s [>= f + 1] threshold — while VSR.tla:262-263 requires "f+1 DOVIEWCHANGE from
+      DIFFERENT replicas". First-wins (never last-wins) is likewise deliberate: a retransmission, a
+      duplicate and a corrupted duplicate are indistinguishable here, so a later arrival must never
+      overwrite an already-accepted earlier one.
+
+      {b Every integer field is validated before being trusted}, the same discipline the [Prepare]/
+      [Prepare_ok] arms above apply, since [Message.decode] confirms SHAPE only, never protocol-level
+      legality: [i] must name a real replica in [1, replica_count] (VSR.tla:15) — but, unlike the
+      [Start_view_change] arm, [i = my_id] is explicitly ALLOWED, because VSR.tla:224 addresses a
+      [DoViewChange] to [Primary(View(r))] (this replica, whenever it is the new primary) and
+      VSR.tla:262-263's quorum is "from different replicas, INCLUDING ITSELF"; [n] must be exactly
+      the length of the [log] the same message carries (VSR.tla's [LogLengthMatchesOpNumber] applied
+      to the sender — load-bearing, since [SendSV] adopts [winner.log] and relies on the resulting
+      length BEING [winner.n]); [k] must satisfy [0 <= k <= n] (the sender's own
+      [CommitNumberNeverHigherThanOpNumber]; note [<=] is correct here, unlike the [Prepare] arm's
+      strict [k < n], because a DVC's [k]/[n] are one replica's commit- and op-number, which
+      legitimately coincide); and [last_normal_view] must satisfy [0 <= last_normal_view < v] (see
+      {!last_normal_view} — this is the field [WinningDVC] sorts by FIRST, so an unbounded value
+      would let one forged DVC dictate the whole cluster's log). A message failing any of these is
+      dropped wholesale.
+
+      {b [SendSV] (VSR.tla:264-280) has no separate entry point of its own}, exactly like
+      [PrepareOk]'s [PrimaryExecuteOp] and [Start_view_change]'s [SendDVC]: its guard
+      ([status t = View_change /\ is_primary t /\ Cardinality(valid recv_dvc) >= f + 1]) is checked
+      internally after every successful accumulation above — the only point that count can rise.
+      No check is needed at the episode-reset points ({!check_timeout}, [ReceiveHigherSVC]) because
+      both set [recv_dvc] to empty, and [f + 1 >= 1 > 0] for EVERY [replica_count], including the
+      degenerate [f = 0] cluster. {b The threshold is [>= f + 1] (VSR.tla:269), not [SendDVC]'s
+      [>= f] (VSR.tla:221)}, and the two are kept as separate expressions on purpose. When it
+      fires, it performs two INDEPENDENT scans over the valid DVCs — never one derived from the
+      other, per VSR.tla:244-245's own explicit warning: [WinningDVC] (VSR.tla:248-255) picks the
+      lexicographic maximum by [(last_normal_view, n)] — largest [last_normal_view] first, ties
+      broken by largest [n] — and [HighestCommitNumber] (VSR.tla:257-260) takes the maximum [k] over
+      the same set, which routinely is NOT the winning DVC's own [k]. It then adopts [winner.log]
+      (and therefore [winner.n]) wholesale, sets [commit_number] to that separate maximum, moves to
+      [Normal] with [last_normal_view = view_number], resets [svc_count], and broadcasts
+      [StartView{v = view_number t; log = winner.log; n = winner.n; k}] to every OTHER replica. One
+      defensive guard has no counterpart in VSR.tla: if the two maxima disagree so badly that
+      [k > winner.n] — impossible for any well-formed DVC set, TLC-confirmed inert over the spec's
+      full 264,376-state graph — the whole action is refused with no state change, rather than
+      clamping [k] down (a clamp targets the maximum legal value, i.e. it would declare the entire
+      adopted log committed off one corrupted integer).
+    - A [Start_view] message drives VSR.tla's [ReceiveSV] (VSR.tla:292-305). Guard: [m.v >= View(r)]
+      — {b [>=], not [>]}, and with no status conjunct, so a [StartView] for the view this replica is
+      already in is accepted and re-applied; only a strictly lower [m.v] is dropped. Effect: adopts
+      [m.log] (and hence [m.n]) wholesale, sets [view_number] and [last_normal_view] to [m.v],
+      returns [status] to [Normal], resets [svc_count] {b only on a real [View_change → Normal]
+      transition} (see {!check_timeout}), and advances [commit_number] to [m.k]
+      {b if and only if [m.k] is higher} (VSR.tla:298-299 — research §5.7 Part 4's documented fix for
+      a real published double-application defect; never simplify this to an unconditional
+      assignment). Field validation mirrors the [Do_view_change] arm: [v >= 0], [n] exactly the
+      carried log's length, [0 <= k <= n], plus one guard with no counterpart in VSR.tla — a
+      [StartView] whose log is SHORTER than this replica's own [commit_number] is refused outright,
+      since adopting it would discard already-committed entries (TLC-confirmed inert for correct
+      traffic: no reachable state of `spec/tla/VSR.tla` has a receivable, view-eligible [StartView]
+      with [m.n < rep_commit_number[r]]). Note [Start_view] carries no [i] field at all (neither does
+      the spec's own record literal), so there is no sender to range-check.
+
+      {b [recv_dvc] and [recv_svc] are deliberately NOT reset here} — VSR.tla:304 lists both as
+      UNCHANGED, and `spec/tla/README.md` has the detailed, TLC-backed argument for why the stale
+      entries this genuinely leaves behind can never be read (every reader is gated on
+      [status = View_change]; both actions that reach that status reset both structures first).
+      Adding a reset would deviate from the model this code must match, in a direction that model
+      was never checked against. Do not "fix" it.
     - Any input that fails to decode (raises {!Riptide_vsr.Message.Malformed_message}) is treated
       the same as an out-of-order [Prepare]: silently dropped, no exception propagates to the
       caller. A real network provides no payload integrity ({!Riptide_transport.Transport_intf.S}'s
@@ -457,8 +576,31 @@ val for_test_set_view : t -> status:status -> view_number:int -> last_normal_vie
     (`task-1-review.md`) fixed {!for_test_set_view_number} itself against for the [Normal] case.
 
     {b Does not touch [recv_svc]/[recv_dvc]/[sent_dvc]/[svc_count]} — {!create}'s own [Init] values
+    (see also {!for_test_recv_dvc_senders}/{!for_test_recv_svc_senders}, which let a test observe
+    the first two of those directly rather than inferring them from what gets sent)
     for those ([recv_svc]/[recv_dvc] empty, [sent_dvc = false], [svc_count = 0]) are what a replica
-    freshly constructed and then moved via this setter still has; this task adds no separate setter
-    for any of them, since every test this task itself needs can reach the states it needs by
-    calling {!check_timeout}/{!handle_message} for real (see test_vsr_replica.ml) rather than by
-    forcing those four fields directly. *)
+    freshly constructed and then moved via this setter still has; no separate SETTER exists for any
+    of them, since every test reaches the states it needs by calling
+    {!check_timeout}/{!handle_message} for real (see test_vsr_replica.ml) rather than by forcing
+    those four fields directly. *)
+
+val for_test_recv_dvc_senders : t -> int list
+(** [for_test_recv_dvc_senders t] is the sorted list of replica ids currently holding an entry in
+    [t]'s private [recv_dvc] accumulator (VSR.tla's [rep_recv_dvc[r]], VSR.tla:34) — i.e. the
+    senders whose [DoViewChange] this replica has accepted, at most one per sender (see
+    {!handle_message}'s [Do_view_change] arm for the sender-keying and first-wins rule).
+
+    {b Read-only, and NOT filtered by [ValidDvc]} — it reports what the structure actually holds,
+    including entries carried over from an earlier view, precisely so a test can assert on the two
+    properties that are otherwise invisible from outside: that [ReceiveSV] deliberately leaves this
+    accumulator populated (VSR.tla:304's own UNCHANGED), and that [TimerSendSVC]/[ReceiveHigherSVC]
+    genuinely empty it (VSR.tla:169, 190). Without it, both are only observable second-hand,
+    through whether some later message does or doesn't get sent — which is exactly the kind of
+    indirect coverage an earlier task's review found had left a reset untested. *)
+
+val for_test_recv_svc_senders : t -> int list
+(** [for_test_recv_svc_senders t] is the sorted list of replica ids in [t]'s private [recv_svc] set
+    (VSR.tla's [rep_recv_svc[r]], VSR.tla:33) — the [StartViewChange] senders accumulated for the
+    current view-change episode, the set [SendDVC]'s own [Cardinality(...) >= f] threshold counts.
+    Same rationale as {!for_test_recv_dvc_senders} above: it exists so a test can pin [ReceiveSV]'s
+    deliberate non-reset (VSR.tla:304) and the episode resets directly. *)
