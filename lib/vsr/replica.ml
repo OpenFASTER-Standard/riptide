@@ -606,8 +606,19 @@ let try_send_sv t =
               targets the maximum legal value, i.e. it would declare the entire adopted log
               committed off the back of one corrupted integer -- exactly the reasoning
               [handle_prepare]'s own [k] bound already rejects clamping for. Cost of refusing is
-              liveness only, and bounded: [recv_dvc] is wiped at the start of the next view-change
-              episode. EVIDENCE this never fires for well-formed traffic: a scratch copy of
+              liveness only, but NOT bounded to one episode (task-3-review.md's F1, correcting an
+              earlier draft of this comment): [recv_dvc] is wiped at the start of the next
+              view-change episode, but a single corrupted [Prepare] that already inflated a
+              BACKUP's own [commit_number] (see [handle_prepare]'s own bound) rides into every
+              subsequent episode's [DoViewChange.k] that backup ever sends, since a backup's
+              [commit_number] only ever advances, never regresses -- so this refusal can re-fire
+              on every future view-change attempt for as long as that corrupted replica keeps
+              participating, which in a cluster where the survivors are exactly the [f+1] quorum
+              is an unbounded, cluster-wide liveness loss from a single corrupted message, not a
+              one-episode wedge. Refusing is still the right choice over clamping or accepting
+              (both would trade a liveness cost for a SAFETY one), but the true cost is disclosed
+              here accurately rather than understated. EVIDENCE this never fires for well-formed
+              traffic: a scratch copy of
               spec/tla/VSR.tla with the invariant [T3_SendSvCommitWithinWinnerLog] (SendSV enabled
               => HighestCommitNumber(r) <= WinningDVC(r).n) was TLC-checked over the shipped
               VSR.cfg bound -- no violation, 553,084 states generated / 264,376 distinct / 0 left

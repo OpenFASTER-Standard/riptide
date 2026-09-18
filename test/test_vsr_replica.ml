@@ -1144,6 +1144,41 @@ let test_highest_commit_number_is_a_separate_maximum_not_the_winner_s_k () =
        (fun (_, m) -> m = Message.Start_view { v = 6; log = [ v "a"; v "b" ]; n = 2; k = 2 })
        (decoded_sent sent))
 
+let test_send_sv_commit_number_assignment_is_unconditional_not_monotonic () =
+  (* task-3-review.md's F2: every prior test's new_k happened to be >= the primary's own
+     pre-existing commit_number, so a mutation that made this assignment monotonic (matching
+     handle_prepare's/handle_start_view's OWN monotonic-only updates -- the change a reader would
+     naturally make, since it is the pattern used everywhere else in this file) survived all
+     existing tests. VSR.tla:274's rep_commit_number' = HighestCommitNumber(r) is UNCONDITIONAL:
+     the new primary starts the view fresh from the winning DVC set, not from its own prior
+     value. Establish a real pre-existing commit_number of 1 via genuine Prepare traffic, THEN
+     force a view-change episode whose own HighestCommitNumber is 0 (lower), and confirm
+     commit_number actually DROPS to 0, not stays at 1. *)
+  let send, sent = capturing_send () in
+  let t = Replica.create ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "a real Prepare exchange establishes commit_number = 1 before view-change" 1
+    (Replica.commit_number t);
+  (* [t] is a backup at view 0 (Primary(0) = replica_count = 5), so the two Prepares above each
+     produced a Prepare_ok reply -- capture the count here so the final assertion only inspects
+     what SendSV itself sends, not this setup traffic. *)
+  let sent_before_view_change = List.length (sent ()) in
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:6 ~last_normal_view:0;
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:2);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:3);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "the view change completed" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int)
+    "commit_number is UNCONDITIONALLY set to HighestCommitNumber (0), not kept at the higher \
+     pre-existing value (1) -- a monotonic-only assignment here would be a real deviation from \
+     VSR.tla:274"
+    0 (Replica.commit_number t);
+  let sv_sent = List.filteri (fun i _ -> i >= sent_before_view_change) (decoded_sent sent) in
+  Alcotest.(check bool) "and the dropped value is what gets broadcast as StartView.k too" true
+    (sv_sent <> []
+    && List.for_all (fun (_, m) -> m = Message.Start_view { v = 6; log = []; n = 0; k = 0 }) sv_sent)
+
 (* ---- SendSV's guard (VSR.tla:264-269) ---- *)
 
 let test_send_sv_threshold_is_f_plus_one_not_f () =
@@ -1215,8 +1250,13 @@ let test_send_sv_refuses_when_highest_commit_exceeds_the_winning_log () =
                         here, but a clamp in general declares the whole adopted log committed)" 0
     (Replica.commit_number t);
   Alcotest.(check int) "last_normal_view untouched" 0 (Replica.last_normal_view t);
-  (* The cost is liveness for THIS episode only, and it is bounded: the next episode wipes
-     recv_dvc, so a later, clean quorum completes normally. *)
+  (* This episode's own recv_dvc set IS wiped by the next episode (asserted below) -- but that
+     does not bound the overall cost to one episode: if the poisoned DVC's own sender's inflated
+     commit_number came from a corrupted Prepare (see handle_prepare's own k bound), that
+     sender's commit_number never regresses and will poison every FUTURE episode's DVC set too
+     (task-3-review.md's F1). This test only demonstrates the local wipe, not the full,
+     unbounded-until-that-replica-is-fixed cost -- see replica.ml's own comment on this refusal
+     for the complete picture. *)
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 7; i = 2 }));
   Alcotest.(check (list int)) "a new episode wipes the poisoned DVC set" []
     (Replica.for_test_recv_dvc_senders t)
@@ -1588,6 +1628,9 @@ let tests =
        (VSR.tla:244-245)",
       `Quick,
       test_highest_commit_number_is_a_separate_maximum_not_the_winner_s_k );
+    ( "Task 3: SendSV's commit_number assignment is unconditional, not monotonic (task-3-review.md's F2)",
+      `Quick,
+      test_send_sv_commit_number_assignment_is_unconditional_not_monotonic );
     (* Task 3: SendSV *)
     ("Task 3: SendSV's threshold is f+1, not SendDVC's f", `Quick, test_send_sv_threshold_is_f_plus_one_not_f);
     ( "Task 3: SendSV is a no-op on a replica that is not Primary(View(r))",
