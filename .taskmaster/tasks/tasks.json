@@ -107,9 +107,9 @@
             "id": 1,
             "title": "Choose and TLA+-specify the consensus/replication protocol",
             "description": "VSR-derived (TigerBeetle's choice, storage-fault-aware) vs Raft (simpler, larger ecosystem) - make the call explicitly, with the tradeoff reasoning documented, and get it model-checked before implementation, the way AWS's TLA+ practice found 35-step bugs that survived design review, code review, and testing.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
-            "details": "Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the checked state space.",
+            "details": "Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the checked state space. DONE, with honest scope caveats (see spec/tla/README.md for the full account): spec/tla/VSR.tla models VSR core safety only (normal-case + view change; storage-fault-aware recovery, state-transfer, and reconfiguration are explicitly out of scope, deferred to a follow-up plan). Exhaustively model-checked at ReplicaCount=3, Values={v1}, StartViewOnTimerLimit=1: 264,376 distinct states, 0 states left on queue, zero invariant violations. Pre-fixes two real published VSR defects (ValidDvc view-filtered DVC quorum counting; commit-number monotonicity on STARTVIEW). A final-review fix wave caught and fixed a real bug (SendDVC was an unguarded self-loop making the state space genuinely infinite, previously misattributed to inherent spec-class size) and settled with real TLC evidence whether the ValidDvc filter is reachable-relevant at this bound (it is not, but is kept as correct defense-in-depth, with a new regression invariant wired in). Known limitation disclosed, not hidden: NoLogDivergence is structurally vacuous at Values={v1}; the real safety evidence at this bound comes from CommitNumberNeverHigherThanOpNumber and AcknowledgedWritesExistOnMajority. Merged to main via PR #138 (commit dd8b236), 2026-09-18.",
             "testStrategy": "",
             "parentId": "undefined"
           },
