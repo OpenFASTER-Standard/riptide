@@ -58,4 +58,5 @@ let () =
       ("transport_shared_sim", Test_transport_shared.sim_tests);
       ("transport_shared_tcp", Test_transport_shared.tcp_tests);
       ("vsr_message", Test_vsr_message.tests);
+      ("vsr_replica_log", Test_vsr_replica_log.tests);
     ]
