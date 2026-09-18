@@ -46,6 +46,15 @@ val create :
     scope note; there is no way to change it after {!create} (a later, view-change-aware plan
     will need to restructure this).
 
+    Raises [Invalid_argument] if [replica_count < 1]; if [replica_count] is even (VSR.tla:140's
+    own comment assumes [2f+1 = ReplicaCount], i.e. an odd count — [spec/tla/VSR.cfg] never
+    instantiates an even one, and this module doesn't either); or if [my_id]/[primary_id] fall
+    outside [1, replica_count] (VSR.tla's own [replicas == 1..ReplicaCount], VSR.tla:15). These
+    are cheap, deliberate sanity checks on {!create}'s own arguments, not a defense against
+    adversarial network input (that's {!handle_message}'s job — see its own doc comment below);
+    a [replica_count = 1] cluster is accepted (it is odd and [>= 1]) and behaves per VSR.tla's own
+    degenerate [f = 0] case — see {!propose}'s own doc comment for what that implies.
+
     [send] is a closure over some transport handle's own [send : t -> to_:int -> string -> unit]
     (see {!Riptide_transport.Transport_intf.S.send}) with the handle itself and [~to_]'s type
     already applied down to just [to_:int -> string -> unit] — deliberately NOT a direct
@@ -75,7 +84,17 @@ val commit_number : t -> int
     [PrimaryExecuteOp]-driving logic only ever raise it, matching VSR.tla's own
     [CommitNumberNeverHigherThanOpNumber] invariant, VSR.tla:330-331, together with the fact
     that [rep_commit_number] is never assigned a lower value anywhere in the spec's normal-case
-    actions). *)
+    actions).
+
+    {b [commit_number t <= op_number t] holds for every reachable state, including against a
+    network-corrupted/adversarial [Prepare]}, not merely for well-formed input: VSR.tla:118's own
+    [rep_commit_number' = IF m.k > @ THEN m.k ELSE @] is safe in the TLA+ model only because every
+    [Prepare] there is produced by [ReceiveClientRequest] itself, which guarantees [m.k < m.n]
+    (VSR.tla:106-109's own comment) — a precondition that does not hold for a [Prepare] decoded
+    off {!Riptide_transport.Transport_intf.S}'s own "no payload integrity" wire. {!handle_message}
+    re-establishes it explicitly by also capping the update at [op_number t] (this replica's own
+    log length, which the [Prepare] being processed has just extended to [m.n]) — see its own doc
+    comment below for the exact bound. *)
 
 val entries : t -> Riptide.Value.value list
 (** [entries t] is this replica's log in append order (op-number 1 first) — a thin wrapper over
@@ -117,7 +136,18 @@ val propose : t -> Riptide.Value.value -> unit
     [Prepare{view=0; n=op_number t + 1; v; k=commit_number t}] (VSR.tla's [Broadcast], VSR.tla:64,
     98-99) to every OTHER replica [1..replica_count] (i.e. every id in that range except this
     replica's own [my_id] — VSR.tla's [BroadcastFunc]'s own [replicas \ {source}], VSR.tla:56),
-    via [create]'s [send] closure, once per destination. *)
+    via [create]'s [send] closure, once per destination.
+
+    Also drives VSR.tla's [IsCommitted]/[PrimaryExecuteOp] (VSR.tla:139-155) internally afterward,
+    the same incremental check {!handle_message}'s own [Prepare_ok] handling drives (see its doc
+    comment for the exact algorithm) — needed because [PrimaryExecuteOp]'s guard has two
+    conjuncts, and [propose] is the action that changes the FIRST one
+    ([rep_commit_number[r] < rep_op_number[r]], VSR.tla:148), not [ReceivePrepareOkMsg]. For
+    [replica_count >= 3] (so [f >= 1]) this call is a provable no-op — a freshly-appended op has
+    zero acks and can never immediately satisfy [IsCommitted] — with one exception: the degenerate
+    [replica_count = 1] cluster ([f = 0]), where [IsCommitted] is vacuously true for every
+    op-number and this replica commits its own proposal immediately, with no acks needed at all,
+    matching what VSR.tla's own [Next] would allow. *)
 
 val handle_message : t -> string -> unit
 (** [handle_message t bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and dispatches:
@@ -134,19 +164,28 @@ val handle_message : t -> string -> unit
       has no way to catch up in this module's scope (no COMMIT-message resend, no state-transfer,
       no retry — those are explicitly out of scope for `spec/tla/VSR.tla` itself, per
       `spec/tla/README.md`). On success: appends [m.v] at [m.n], advances [commit_number] to
-      [m.k] if higher (never regresses it — VSR.tla:118's own [IF m.k > @ THEN m.k ELSE @]), and
-      unicasts [Prepare_ok{view=0; n=m.n; i=my_id}] back to the primary.
+      [m.k] if higher AND if [m.k <= op_number t] (i.e. [<= m.n], since [op_number t] has just
+      become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k > @ THEN m.k ELSE @]), and
+      never lets it exceed what this replica's own log actually contains, even for a [Prepare]
+      whose [k] a corrupted/forged network delivery has pushed past [n] (VSR.tla's own [m.k < m.n]
+      precondition, VSR.tla:106-109, holds for every [Prepare] the TLA+ model itself can produce
+      but is re-checked explicitly here rather than trusted — see {!commit_number}'s own doc
+      comment) — then unicasts [Prepare_ok{view=0; n=m.n; i=my_id}] back to the primary.
     - A [Prepare_ok] message drives VSR.tla's [ReceivePrepareOkMsg] (VSR.tla:126-136): a
       primary-side handler ([IsNormalPrimary(r)] — a no-op if [t] is not the primary), gated on
-      [m.view = 0]. Updates this replica's tracked high-water mark for peer [m.i] to [m.n], but
-      ONLY if higher than what was already recorded (VSR.tla:131-132's own [IF m.n > @ THEN m.n
-      ELSE @]) — cumulative, not per-op, per VSR.tla's own §1.5 point 2 comment (VSR.tla:125).
-      Then internally drives VSR.tla's [IsCommitted]/[PrimaryExecuteOp] (VSR.tla:139-155): this is
-      NOT a separate externally-triggered action in the TLA+ model (nothing but time passing
-      enables it) — it becomes newly enabled only when [rep_peer_op_number] changes, which only
-      [ReceivePrepareOkMsg] does, so it is driven directly from here, exactly once per
-      [Prepare_ok] processed, per this module's own design (matching the containing plan's
-      Architecture notes). The advance is applied INCREMENTALLY: starting from
+      [m.view = 0] AND on [m.i] being a valid replica id in [1, replica_count] — VSR.tla:141's own
+      [p \in replicas] domain restriction on the set [IsCommitted] counts over (VSR.tla:15's
+      [replicas == 1..ReplicaCount]), enforced here at the point [m.i] would otherwise enter
+      {!t}'s internal peer-acknowledgment table, so a decoded [Prepare_ok] naming no real replica
+      (a corrupted or forged [i]) can never inflate quorum. A [m.i] that fails this check is
+      dropped exactly like a wrong-view message — no state change. Otherwise: updates this
+      replica's tracked high-water mark for peer [m.i] to [m.n], but ONLY if higher than what was
+      already recorded (VSR.tla:131-132's own [IF m.n > @ THEN m.n ELSE @]) — cumulative, not
+      per-op, per VSR.tla's own §1.5 point 2 comment (VSR.tla:125). Then internally drives VSR.tla's
+      [IsCommitted]/[PrimaryExecuteOp] (VSR.tla:139-155) — the same check {!propose} also drives
+      (see its own doc comment for why both must: [PrimaryExecuteOp]'s guard has two conjuncts,
+      and this action is the one that changes the SECOND, [IsCommitted(r, next)], by changing
+      [rep_peer_op_number]). The advance is applied INCREMENTALLY: starting from
       [commit_number t + 1], repeatedly check [IsCommitted(r, next)] — [f] OTHER replicas (VSR.tla
       [f = (ReplicaCount-1) \div 2], VSR.tla:140) with a recorded high-water mark [>= next] — and
       if true, advance [commit_number] to [next] and continue to [next+1]; stop at the first
