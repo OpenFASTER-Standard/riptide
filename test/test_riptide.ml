@@ -54,4 +54,5 @@ let () =
       ("sim_network", Test_sim_network.tests);
       ("sim_faults", Test_sim_faults.tests);
       ("sim_workload", Test_sim_workload.tests);
+      ("transport_tcp", Test_transport_tcp.tests);
     ]
