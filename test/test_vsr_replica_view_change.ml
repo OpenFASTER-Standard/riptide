@@ -138,7 +138,15 @@ exception Replica_stopped
    drops any message addressed to an isolated [to_] at the point of send. Dropped, not buffered:
    [reconnect i] does not replay whatever [i] missed while isolated -- there is nothing queued to
    replay, so whatever divergence [isolate] built (a shorter log, a stale [last_normal_view], or
-   both) stays exactly as built until later real traffic changes it. This is what lets a test build
+   both) stays exactly as built until later real traffic changes it.
+
+   ONE PRECONDITION this drops-not-buffers property relies on, worth stating explicitly: it only
+   holds for messages sent AFTER [isolate i] is called, not for anything already sitting in [net]'s
+   own pending-delivery queue at that moment (those were already scheduled before the drop check
+   could apply, and will still be delivered). Every call site in this file calls [isolate] only
+   right after a [settle ()] has fully drained the network, so this never bites here -- but it is a
+   real precondition of the mechanism, not an incidental fact about how this file happens to use
+   it. This is what lets a test build
    a survivor whose [(last_normal_view, n)] genuinely differs from its peers' by literally excluding
    it from some real, running traffic for a while -- not by poking its fields directly (contrast
    [for_test_set_view], which is for hand-built unit-level DVC records, not this file's own
@@ -685,28 +693,37 @@ let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
    (last_normal_view, n) is built to mirror Y's/G's (an also-ran, never a contender to win) rather
    than duplicate any single one of them.
 
-   - Round 1 (before crash 1): replicas 4, 5, 6, 7 (W, Y, G, H) are isolated while replica 1 (the
-     original primary) proposes 2 more values that only replicas 2 (P2) and 3 (X) receive --
-     growing P2's and X's logs to n = 4 while W/Y/G/H stay frozen at n = 2. Then replica 2 (P2) is
-     ALSO isolated and replica 1 proposes 8 MORE values that only replica 3 (X) receives -- growing
-     X alone to n = 12 while P2 stays frozen at n = 4. This is the key move: X's log is now
-     STRICTLY LONGER than anything else in the cluster will ever reach again, but X is about to be
-     excluded from the view change that would normally let it prove that log "won" anything.
+   - Round 1a (before crash 1): only replica 7 (H) is isolated while replica 1 (the original
+     primary) proposes 2 more values that reach P2 (2), X (3), AND W/Y/G (4, 5, 6) -- everyone
+     except H. P2, X, W, Y, G all grow to n = 4; H alone stays frozen at n = 2. (Deliberately NOT
+     "only P2 and X reach n = 4, W/Y/G isolated too" -- see this test's own body for why a MAJORITY
+     holding the winning value, not just one replica, is what makes crash 1's own outcome robust to
+     arrival-order sensitivity.)
+
+   - Round 1b (still before crash 1): P2, W, Y, G (2, 4, 5, 6) are ALSO isolated, and replica 1
+     proposes 8 MORE values that reach ONLY replica 3 (X) -- growing X alone to n = 12 while
+     P2/W/Y/G stay frozen at n = 4 (H stays at n = 2, isolated since round 1a, untouched here). This
+     is the key move: X's log is now STRICTLY LONGER than anything else in the cluster will ever
+     reach again, but X is about to be excluded from the view change that would normally let it
+     prove that log "won" anything.
 
    - Crash 1: replica 3 (X) is isolated (so it hears NONE of this episode's StartViewChange /
      DoViewChange / StartView traffic and stays parked at view 1, last_normal_view = 1, forever,
      with its n = 12 log frozen exactly as built above), replica 2 (P2) and replicas 4/5/6/7 (W, Y,
      G, H) are reconnected, and replica 1 is stopped. Among {P2, W, Y, G, H} -- all still at
-     last_normal_view = 1, since none of them has been through a view change yet -- P2's n = 4 log
-     is the unique highest, so P2 (Primary(2) = 2) wins episode 1 and becomes the new primary; W, Y,
-     G, H all adopt P2's n = 4 log via ReceiveSV, reaching last_normal_view = 2. THIS is exactly why
-     X can never catch up to the others' view_number again on its own: X missed the one event
-     ([ReceiveSV]) that would have advanced it, and nothing in this module lets a replica already
-     stuck at a stale view skip ahead except by living through (or passively adopting) a real
-     episode -- which is precisely what X is deliberately excluded from here.
+     last_normal_view = 1, since none of them has been through a view change yet -- FOUR of the
+     five (P2, W, Y, G; only H differs, at n = 2) hold the identical n = 4 log, so P2
+     (Primary(2) = 2) wins episode 1 and becomes the new primary regardless of exactly which 4-of-5
+     DVCs [try_send_sv] happens to read first; W, Y, G, H all adopt that n = 4 log via ReceiveSV,
+     reaching last_normal_view = 2. THIS is exactly why X can never catch up to the others'
+     view_number again on its own: X missed the one event ([ReceiveSV]) that would have advanced
+     it, and nothing in this module lets a replica already stuck at a stale view skip ahead except
+     by living through (or passively adopting) a real episode -- which is precisely what X is
+     deliberately excluded from here.
 
-   - Crash 2 (the view change under test): replicas 3, 5, 6, 7 (X, Y, G, H) are reconnected and
-     replica 2 (P2) is stopped, WITHOUT ever calling check_timeout on X (see this function's own
+   - Crash 2 (the view change under test): replica 3 (X) is reconnected (Y, G, H are already live,
+     reconnected at crash 1 and never re-isolated since) and replica 2 (P2) is stopped, WITHOUT
+     ever calling check_timeout on X (see this function's own
      body for why: X's view_number is still 1, so an ACTIVE check_timeout call on X would target
      the WRONG, stale view -- X reaches the real target view purely by PASSIVE adoption instead).
      The five survivors -- X, W, Y, G, H -- now have genuinely different, REAL, verified
@@ -745,7 +762,22 @@ let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
      test needs), this version keeps W/Y/G/H's logs identical after crash 1: the last_normal_view
      comparison alone is sufficient to catch both target mutations (verified above), and a
      dedicated within-group n tie-break is already covered at the unit level by
-     test_vsr_replica.ml's own Task 3 tests (e.g. "WinningDVC breaks ties..."). *)
+     test_vsr_replica.ml's own Task 3 tests (e.g. "WinningDVC breaks ties...").
+
+     DURABILITY NOTE, not a defect in what's committed: this test's own mutation-discriminating
+     power rests on an unasserted delivery-order property. By this construction there are always
+     f + 2 DVC candidates (f + 1 actively-broadcasting replicas are structurally required, plus X)
+     against [try_send_sv]'s own [>= f + 1] threshold, so exactly one candidate is excluded from
+     the set [winning_dvc] evaluates -- today, empirically, one of W/Y/G/H (never X; see this
+     test's own crash-2 assertions, which pin exactly this). If a future change to this file or to
+     [replica.ml]'s own delivery-order-sensitive internals ever shifted that exclusion onto X's own
+     self-addressed DVC instead, this test would keep PASSING (the remaining four all hold the
+     identical (last_normal_view = 2, n = 4) log regardless of who's excluded) while silently no
+     longer exercising either target mutation at all -- the exact silent-degradation shape this
+     comment's own "dead end 2" paragraph above already ran into once, just relocated to X's vote
+     instead of W's. Nothing here currently exposes the evaluated DVC set for a test to assert on
+     directly (see replica.mli's own accessor list), so this is left as a known, disclosed
+     limitation of this regression test rather than fixed. *)
 let test_winning_dvc_selects_by_last_normal_view_then_n_over_a_real_cluster () =
   with_cluster ~replica_count:7 ~svc_limit:3 (fun ~replicas ~stop ~settle ~isolate ~reconnect ->
       let original_primary = replicas.(0) (* my_id = 1 *) in
@@ -821,8 +853,12 @@ let test_winning_dvc_selects_by_last_normal_view_then_n_over_a_real_cluster () =
       settle ();
 
       (* Episode 1 genuinely completed -- verified, not assumed. Primary(2) = 1 + ((2-1) mod 7) =
-         2 = P2, and among {P2, W, Y, G, H} (all still last_normal_view = 1 at this point) P2's
-         n = 4 log is the unique highest, so P2 wins and becomes the new primary. *)
+         2 = P2, and among {P2, W, Y, G, H} (all still last_normal_view = 1 at this point) FOUR of
+         the five (P2, W, Y, G) hold the identical, majority n = 4 log (only H differs, at n = 2),
+         so P2 wins and becomes the new primary regardless of exactly which 4-of-5 DVCs
+         [try_send_sv] happens to read first -- see this test's own top-of-file comment for why
+         that majority construction, not "P2 alone holds the unique highest n", is what makes this
+         outcome robust. *)
       let view_2 = 2 in
       Alcotest.(check int) "Primary(2) = 2 (P2) under a 7-replica cluster" 2
         (primary_of_view ~view:view_2 ~replica_count:7);
@@ -852,7 +888,9 @@ let test_winning_dvc_selects_by_last_normal_view_then_n_over_a_real_cluster () =
           check_entries (name ^ "'s log matches episode 1's winning log exactly") expected_group_log (Replica.entries r))
         [ ("W", w); ("Y", y); ("G", g); ("H", h) ];
 
-      (* Crash 2, the view change under test: reconnect X, Y, G, H; stop P2.
+      (* Crash 2, the view change under test: reconnect X (Y, G, H are already live -- reconnected
+         at crash 1 above and never re-isolated since, so there is nothing left to reconnect for
+         them here); stop P2.
 
          Deliberately NO [fire_check_timeout_repeatedly x]: X's own view_number is still 1 (it
          never went through episode 1, by design), so an ACTIVE check_timeout call on X here would
@@ -867,9 +905,6 @@ let test_winning_dvc_selects_by_last_normal_view_then_n_over_a_real_cluster () =
          confirmed live: the "select by n alone" mutation went completely undetected with that
          version, because [winning_dvc] never even got to see X's (1, 12) vote before firing. *)
       reconnect 3;
-      reconnect 5;
-      reconnect 6;
-      reconnect 7;
       stop 2;
       fire_check_timeout_repeatedly w ~times:3;
       fire_check_timeout_repeatedly y ~times:3;
