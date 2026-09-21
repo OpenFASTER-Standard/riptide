@@ -360,20 +360,35 @@ let test_single_view_change_survives_primary_failure () =
 
    svc_limit = 1 is the deliberately tight choice this test's whole point depends on: it means each
    replica gets exactly ONE real check_timeout firing before it would be permanently blocked from
-   ever trying again -- UNLESS completing a view change (SendSV or ReceiveSV) resets its own
-   svc_count back to 0, per replica.mli's own disclosed, deliberate divergence from VSR.tla's
-   literal (never-reset) aux_svc_count. Neither of those two accessors is exposed on Replica.t (see
-   replica.mli's own read-only accessor list -- svc_count itself is deliberately test-support-only
-   in a way that isn't even exposed to for_test_* readers), so this test cannot assert the counter's
-   own numeric value directly; instead it proves the reset happened the only way observable from
-   outside the module at all: EVERY replica that already fired its one check_timeout in episode 1
-   successfully fires check_timeout AGAIN in episode 2 and a second, genuinely new view change
-   completes. If the reset were missing (i.e. if this were a regression back to literally
-   transcribing VSR.tla's own aux_svc_count), every one of those second calls would silently no-op
-   (svc_count stuck at 1 >= svc_limit 1 forever), no second StartViewChange would ever be
-   broadcast, and this test's own view_number/is_primary assertions for episode 2 would fail
-   outright -- a real, falsifiable regression test, not merely a demonstration that runs either
-   way. *)
+   ever trying again -- UNLESS completing a view change (SendSV or ReceiveSV -- replica.ml has two
+   separate reset sites, one per action, see each one's own doc comment) resets its own svc_count
+   back to 0, per replica.mli's own disclosed, deliberate divergence from VSR.tla's literal
+   (never-reset) aux_svc_count.
+
+   WHICH OF THE TWO RESET SITES THIS TEST ACTUALLY EXERCISES (corrected per task-4-review.md's own
+   F1, which mutation-proved this precisely: deleting the SendSV-path reset at replica.ml:641 left
+   BOTH of this file's tests passing, while deleting the ReceiveSV-path reset at replica.ml:783 made
+   THIS test fail at the exact assertion below): only ReceiveSV's. The one replica whose episode-1
+   reset came via SendSV is episode 1's own new primary (it is the one that actually RUNS SendSV,
+   becoming primary) -- and that is exactly the replica this test kills at the top of episode 2
+   (`stop primary_2_id` below), so its own reset is never re-exercised by a second check_timeout
+   call here. Every replica this test DOES call check_timeout on again in episode 2 is one whose
+   episode-1 reset came via ReceiveSV (it adopted episode 1's StartView as a backup). The SendSV
+   reset is a real, covered path -- just not by this file: it is exercised directly by
+   test_vsr_replica.ml's own unit test ("Task 3: SendSV resets sv...", vsr_replica #56), which hand-
+   constructs a DoViewChange quorum and asserts the reset via a second check_timeout on the same
+   replica without any intervening ReceiveSV. Neither svc_count nor svc_limit is exposed on
+   Replica.t (see replica.mli's own read-only accessor list -- svc_count itself is deliberately
+   test-support-only in a way that isn't even exposed to for_test_* readers), so this test cannot
+   assert the counter's own numeric value directly; instead it proves the ReceiveSV reset happened
+   the only way observable from outside the module at all: EVERY replica that already fired its one
+   check_timeout in episode 1 (and reset via ReceiveSV, not SendSV) successfully fires check_timeout
+   AGAIN in episode 2 and a second, genuinely new view change completes. If that reset were missing
+   (i.e. if this were a regression back to literally transcribing VSR.tla's own aux_svc_count), every
+   one of those second calls would silently no-op (svc_count stuck at 1 >= svc_limit 1 forever), no
+   second StartViewChange would ever be broadcast, and this test's own view_number/is_primary
+   assertions for episode 2 would fail outright -- a real, falsifiable regression test, not merely a
+   demonstration that runs either way. *)
 let test_two_sequential_view_changes () =
   with_cluster ~replica_count:5 ~svc_limit:1 (fun ~replicas ~stop ~settle ->
       let replica_count = 5 in
@@ -452,7 +467,10 @@ let test_two_sequential_view_changes () =
       Alcotest.(check int)
         "episode 2's new primary reached view 3 -- only possible if its earlier check_timeout \
          firing in episode 1 did NOT permanently exhaust its svc_limit=1 budget, i.e. the \
-         SendSV/ReceiveSV reset genuinely fired at the end of episode 1"
+         ReceiveSV reset genuinely fired at the end of episode 1 (this replica was a BACKUP in \
+         episode 1, per survivors_2's own construction above -- it never ran SendSV itself; see \
+         this test's own top-of-file doc comment for why the SendSV-path reset is proven \
+         elsewhere, not here)"
         view_3 (Replica.view_number primary_3);
       Alcotest.(check bool) "episode 2's new primary considers itself primary" true (Replica.is_primary primary_3);
       Alcotest.(check bool) "episode 2's new primary is genuinely Normal" true (Replica.status primary_3 = Replica.Normal);
@@ -496,6 +514,101 @@ let test_two_sequential_view_changes () =
       Alcotest.(check bool) "episode-2 primary commits vd (its own quorum acks, real traffic)" true
         (Replica.is_committed primary_3 vd))
 
+(* ---- Test 3 (F3, task-4-review.md): the permanent liveness wedge when two CONSECUTIVE
+   Primary-designates are both dead -- disclosed in spec/tla/README.md's "Known simplifications,
+   not omissions" list (point 3) and replica.mli's own check_timeout doc comment; this is that
+   disclosure's regression test, reproducing the reviewer's own PROBE-W scenario exactly rather
+   than merely asserting the prose is true.
+
+   5 replicas (f = 2, replica_count = 5). Kill BACKUP 2 first -- deliberately, not incidentally: a
+   backup dying triggers nothing observable anywhere else in the cluster (no message, no state
+   change on any other replica), so at the moment it happens this looks like a complete no-op.
+   Then kill the PRIMARY (replica 1). Survivors {3,4,5} are exactly f + 1 = 3, a live quorum, and
+   (per test 1/2's own established mechanism) they correctly time out and complete a view change
+   into view 2 -- but Primary(2) = 1 + ((2-1) mod 5) = 2, which is EXACTLY the backup killed first.
+   The cluster is now permanently wedged: every survivor reaches [status = View_change] and NOTHING
+   in this module can move any of them past it, because check_timeout's own guard requires
+   [status = Normal] (VSR.tla:164, faithfully transcribed) -- a replica already in [View_change] has
+   no mechanism to try yet another, newer view on its own. Real VSR/VRR re-arms the view-change
+   timer while already in [View_change] specifically to handle this; this implementation (and the
+   spec it transcribes) does not.
+
+   This test proves BOTH halves of the disclosure: (a) the wedge is real and permanent (repeated
+   check_timeout calls, across several further rounds with real settling in between, change
+   NOTHING), and (b) safety is completely unaffected throughout (the value committed before either
+   crash remains committed and present on every survivor the whole time) -- exactly the "liveness-
+   only, never a safety violation" framing spec/tla/README.md's disclosure makes, now backed by a
+   real, running reproduction rather than prose alone. *)
+let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
+  with_cluster ~replica_count:5 ~svc_limit:10 (fun ~replicas ~stop ~settle ->
+      let replica_count = 5 in
+      let original_primary = replicas.(0) (* my_id = 1, Primary(1) = 1 *) in
+      let x = record_value "committed-before-either-crash-f3" in
+      let y = record_value "second-propose-to-fully-commit-x-f3" in
+      Replica.propose original_primary x;
+      settle ();
+      Replica.propose original_primary y;
+      settle ();
+      Array.iter
+        (fun r -> Alcotest.(check bool) "x is committed everywhere before either crash" true (Replica.is_committed r x))
+        replicas;
+
+      (* Kill the BACKUP first -- deliberately, per this test's own doc comment: nothing anywhere
+         else in the cluster reacts to this at all. No settle() needed to "observe" the effect
+         because there is none to observe yet. *)
+      stop 2;
+
+      (* Now kill the primary. Survivors: {3,4,5}, exactly f + 1 = 3. *)
+      stop 1;
+      let survivors = [ replicas.(2); replicas.(3); replicas.(4) ] in
+      List.iter (fun r -> fire_check_timeout_repeatedly r ~times:2) survivors;
+      settle ();
+
+      let view_2 = 2 in
+      let dead_primary_2_id = primary_of_view ~view:view_2 ~replica_count in
+      Alcotest.(check int) "Primary(2) = 2 -- exactly the backup killed FIRST, the crux of the wedge" 2
+        dead_primary_2_id;
+
+      (* The view change genuinely started (view_number advanced), but cannot possibly complete:
+         the one replica everyone's DoViewChange is addressed to never processes anything again. *)
+      List.iter
+        (fun r ->
+          Alcotest.(check int) "every survivor's view_number advanced to 2 (the attempt is real)" view_2
+            (Replica.view_number r);
+          Alcotest.(check bool) "every survivor is stuck in View_change, never Normal" true
+            (Replica.status r = Replica.View_change);
+          Alcotest.(check bool) "no survivor considers itself primary (Primary(2) is the dead backup)" false
+            (Replica.is_primary r))
+        survivors;
+
+      (* THE WEDGE ITSELF: repeated check_timeout calls, across several further rounds with real
+         settling in between (so any latent message flow gets a genuine chance to run), change
+         NOTHING. This is what makes it a real regression test of the disclosed gap rather than a
+         single-snapshot assertion that could vacuously pass for an unrelated reason. *)
+      for round = 1 to 4 do
+        List.iter (fun r -> fire_check_timeout_repeatedly r ~times:3) survivors;
+        settle ();
+        List.iter
+          (fun r ->
+            Alcotest.(check int)
+              (Printf.sprintf "round %d: still wedged at view 2, not advancing to view 3 (or beyond) on its own" round)
+              view_2 (Replica.view_number r);
+            Alcotest.(check bool)
+              (Printf.sprintf "round %d: still stuck in View_change, never recovers to Normal on its own" round)
+              true
+              (Replica.status r = Replica.View_change))
+          survivors
+      done;
+
+      (* Safety is completely unaffected throughout the wedge -- the whole point of this being a
+         disclosed LIVENESS gap, not a safety one. *)
+      List.iter
+        (fun r ->
+          Alcotest.(check bool) "x is STILL committed on every wedged survivor -- nothing lost, nothing corrupted" true
+            (Replica.is_committed r x);
+          check_entries "every wedged survivor's log is unchanged and intact" [ x; y ] (Replica.entries r))
+        survivors)
+
 let tests =
   [ ( "single primary failure: real view change over Sim_transport, committed data survives, a \
        new primary (verified against Primary(v), not assumed) resumes normal operation",
@@ -504,5 +617,11 @@ let tests =
     ( "two sequential primary failures: two real view changes complete in turn, proving \
        svc_count's own reset discipline holds across repeated episodes, not just one",
       `Quick,
-      test_two_sequential_view_changes )
+      test_two_sequential_view_changes );
+    ( "F3 regression: two consecutive dead Primary-designates (a backup, then the primary) \
+       permanently wedge a live-quorum cluster in View_change -- disclosed in \
+       spec/tla/README.md's known-simplifications list; safety (committed data) unaffected \
+       throughout",
+      `Quick,
+      test_two_dead_primary_designates_wedge_the_cluster_permanently )
   ]

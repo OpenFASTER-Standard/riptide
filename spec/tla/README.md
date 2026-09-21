@@ -40,9 +40,12 @@ is pre-fixed, not left for TLC to (re)discover: the `ValidDvc` view-filtered DVC
 is actually doing here" below for exactly how much verification evidence backs the first of those
 against *this* spec, as opposed to against the original research.
 
-**Known simplifications, not omissions.** Both are liveness-only: neither can lose a committed
+**Known simplifications, not omissions.** All three are liveness-only: none can lose a committed
 entry, and neither `NoLogDivergence` nor `AcknowledgedWritesExistOnMajority` — this scope's two
-headline safety invariants — depends on either.
+headline safety invariants — depends on any of them. The third (below) was found later than the
+first two — during Task 4's adversarial cluster-level testing, not during this spec's own design —
+and is disclosed here for the same reason the first two are: an incomplete disclosed-gaps list
+would undermine the credibility every other claim in this file depends on.
 
 1. **No `PREPAREOK` re-send on `STARTVIEW`.** `ReceiveSV` does not re-send `PREPAREOK` for
    uncommitted entries carried into the new view (the paper's own §4.2 step 5 final clause). A
@@ -72,6 +75,38 @@ headline safety invariants — depends on either.
    have rejected, only make it slower to join a view it would have joined anyway. Nothing here is
    a proof, and TLC checks no liveness properties at this scope; a follow-up plan that adds
    liveness checking should model this path properly rather than inherit the simplification.
+
+3. **A replica already in `View_change` has no mechanism to try a NEWER view on its own — so two
+   consecutive dead `Primary`-designates can wedge the whole cluster permanently, even with a live
+   quorum and a live, eligible next primary.** `TimerSendSVC` (`check_timeout` in the OCaml
+   implementation) is gated on `rep_status[r] = "Normal"` (`VSR.tla:164`), faithfully transcribed —
+   a replica that has already moved to `"ViewChange"` cannot re-fire it to escalate to `v+1` if the
+   view it is currently trying to reach also turns out to have a dead primary. Concretely (found by
+   adversarial cluster-level testing during Task 4's review, not by TLC — see
+   `test/test_vsr_replica_view_change.ml`'s own regression test for the reproduction): in a
+   5-replica cluster, kill a BACKUP first (this alone triggers nothing — a backup dying is
+   invisible to the rest of the cluster), then kill the PRIMARY. The 3 survivors are exactly
+   `f + 1`, a live quorum, and they correctly time out and complete a view change into the next
+   view — but if `Primary` of THAT next view also happens to be the replica that was killed first
+   (the backup), the cluster is now permanently stuck: all 3 survivors sit at
+   `status = "ViewChange"` forever, `check_timeout`'s own guard blocks every further call as a
+   no-op, and there is no other mechanism anywhere in this module's scope that re-arms the timer or
+   escalates the view while already mid-view-change. Real VSR/Viewstamped Replication Revisited
+   re-arms the view-change timer while already in `ViewChange` status specifically to handle this;
+   neither the original paper's formalization here nor this implementation does.
+
+   Safety is completely unaffected — nothing is lost, nothing is corrupted, no committed entry
+   becomes uncommitted or divergent; every replica's own log and `commit_number` simply stop
+   advancing. This is therefore a THIRD liveness-only simplification, more consequential than the
+   two above (those cost extra round-trips; this one is an unrecoverable wedge with a live quorum
+   and a live, legitimate next primary sitting right there, unreachable), and — unlike the two
+   above — was not identified during this spec's own design or its TLC run; it surfaced only once
+   real, running, multi-replica code was driven through an adversarial two-failure scenario Task 4
+   itself did not originally construct. Not modeled or checked by `VSR.tla`/TLC at all (TLC checks
+   no liveness properties at this scope, per point 2's own note); fixing it for real (e.g.
+   re-triggering `TimerSendSVC` from within `View_change` status, or bounding how long a replica
+   waits there before trying a newer view) is real, separate design work, out of scope for this
+   plan.
 
 **Known limitation of the shipped bound, disclosed rather than silently accepted:**
 `NoLogDivergence` is one of this scope's two headline safety invariants (the other is

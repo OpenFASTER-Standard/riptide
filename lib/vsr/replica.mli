@@ -288,6 +288,18 @@ val check_timeout : t -> unit
     guard in this module, a failing guard means the action simply isn't enabled: no exception, no
     state change, nothing sent.
 
+    {b The [status t = Normal] conjunct is a real, disclosed liveness gap, not just a guard}: a
+    replica that has already moved to [View_change] has NO mechanism anywhere in this module to
+    re-arm and try a NEWER view on its own, even if the view it's currently attempting also turns
+    out to have a dead primary. Two consecutive dead [Primary]-designates (e.g. a backup dies, then
+    the primary dies, and the next view's own [Primary] happens to be that already-dead backup) can
+    therefore wedge an entire live-quorum cluster in [View_change] PERMANENTLY — every further
+    {!check_timeout} call is a no-op, safety is completely unaffected (nothing committed is ever
+    lost or diverges), but no replica ever becomes primary again. See [spec/tla/README.md]'s "Known
+    simplifications, not omissions" list, point 3, for the full explanation, why this is
+    liveness-only, and why fixing it is real, separate design work out of scope here; see
+    [test/test_vsr_replica_view_change.ml]'s own regression test for a real, running reproduction.
+
     Otherwise: advances [view_number] to [view_number t + 1], moves [status] to [View_change],
     resets [recv_svc] to empty, [recv_dvc] to empty, and [sent_dvc] to [false] (VSR.tla:166-170 —
     all four together mark the start of a fresh view-change episode), increments the replica's own
