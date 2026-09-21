@@ -308,19 +308,21 @@ val check_timeout : t -> unit
     liveness-only, and why fixing it is real, separate design work out of scope here; see
     [test/test_vsr_replica_view_change.ml]'s own regression test for a real, running reproduction.
 
-    {b A related, MORE reachable gap, driven by the same root cause}: [ReceiveHigherSVC] (see
-    {!handle_message}'s own doc comment, its [Start_view_change] dispatch section) adopts a higher
-    view it hears about from someone else's [Start_view_change] but never re-broadcasts one of its
-    own — so completing a
-    view change needs at least [f + 1] replicas whose OWN [check_timeout] fires independently, not
-    just one replica noticing and the rest merely overhearing it. A caller driving this function
-    from a real per-replica wall-clock timer (this module's own intended shape) MUST NOT assume
-    that one replica detecting a dead primary is enough to recover the cluster — survivors' timers
-    firing at different times is the ordinary case, not an edge case, and if fewer than [f + 1] of
-    them fire before the first one's own view-change episode is under way, the cluster can wedge
-    permanently on a SINGLE primary failure, with no second failure required. See
-    [spec/tla/README.md]'s same "Known simplifications, not omissions" list, point 4, for the full
-    mechanism and a live reproduction.
+    {b A related, MORE reachable gap, sharing this same broad root cause} (no replica in this
+    module ever sends a [Start_view_change] once it has left [Normal] status, by any path):
+    [ReceiveHigherSVC] (see {!handle_message}'s own doc comment, its [Start_view_change] dispatch
+    section) adopts a higher view it hears about from someone else's [Start_view_change] but never
+    re-broadcasts one of its own. A caller driving this function from a real per-replica wall-clock
+    timer (this module's own intended shape) MUST NOT assume that one replica detecting a dead
+    primary is always enough to recover the cluster on its own: with the survivors split between
+    active timer-firers and passive adopters, completing a view change can require as many as
+    [f + 1] of them to have fired [check_timeout] independently — worst case, exactly the dead-
+    primary scenario point 3 already covers — even though a fully-live cluster with no crash at
+    all needs only [f]. Survivors' timers firing at different times is the ordinary case for
+    independent real timers, not an edge case, and a timer policy that assumes "the first replica
+    to notice is enough" can wedge the cluster permanently on a SINGLE primary failure, with no
+    second failure required. See [spec/tla/README.md]'s same "Known simplifications, not
+    omissions" list, point 4, for the full mechanism and a live reproduction.
 
     Otherwise: advances [view_number] to [view_number t + 1], moves [status] to [View_change],
     resets [recv_svc] to empty, [recv_dvc] to empty, and [sent_dvc] to [false] (VSR.tla:166-170 —

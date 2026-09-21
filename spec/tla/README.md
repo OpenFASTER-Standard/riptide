@@ -43,9 +43,10 @@ against *this* spec, as opposed to against the original research.
 **Known simplifications, not omissions.** All four are liveness-only: none can lose a committed
 entry, and neither `NoLogDivergence` nor `AcknowledgedWritesExistOnMajority` — this scope's two
 headline safety invariants — depends on any of them. The third and fourth (below) were found later
-than the first two — during Task 4's adversarial cluster-level testing, not during this spec's own
-design — and are disclosed here for the same reason the first two are: an incomplete disclosed-gaps
-list would undermine the credibility every other claim in this file depends on.
+than the first two — the third during Task 4's own adversarial cluster-level testing, the fourth
+during this plan's final whole-branch review, neither during this spec's own design — and are
+disclosed here for the same reason the first two are: an incomplete disclosed-gaps list would
+undermine the credibility every other claim in this file depends on.
 
 1. **No `PREPAREOK` re-send on `STARTVIEW`.** `ReceiveSV` does not re-send `PREPAREOK` for
    uncommitted entries carried into the new view (the paper's own §4.2 step 5 final clause). A
@@ -111,8 +112,12 @@ list would undermine the credibility every other claim in this file depends on.
 4. **`ReceiveHigherSVC` adopts a higher view but never re-broadcasts its own `STARTVIEWCHANGE` —
    so a single primary failure can wedge the cluster permanently if survivors' timers don't fire
    near-simultaneously, which is the ordinary case for independent real timers, not an edge case.**
-   The root cause is the same missing `Broadcast` as point 3 above, but this gap is reachable with
-   only ONE dead replica, not two, which makes it strictly more consequential: `ReceiveHigherSVC`
+   The shared root cause with point 3 above is broader than either gap's own specific missing
+   emission site (point 3's is `TimerSendSVC`'s own `rep_status[r] = "Normal"` gate blocking
+   re-arming; this point's is `ReceiveHigherSVC` never emitting anything at all): no replica in
+   this module EVER sends a `STARTVIEWCHANGE` once it has left `"Normal"` status, by any path. This
+   gap is reachable with only ONE dead replica, not two, which makes it strictly more consequential
+   on its own terms: `ReceiveHigherSVC`
    (`VSR.tla:183-194`) seeds `rep_recv_svc[r]` with a singleton (just the sender it heard from) and
    never sends a `STARTVIEWCHANGE` of its own — a real divergence from the original paper's own
    §4.2 step 1, where a replica that notices the need for a view change *because it heard a higher
@@ -141,8 +146,12 @@ list would undermine the credibility every other claim in this file depends on.
    `check_timeout`'s own doc comment in `replica.mli`) will routinely have survivors' timers fire
    at slightly different times, and whichever one fires first is, by this mechanism, not
    guaranteed to be enough on its own — a correct driver must expect that completing a view
-   change needs at least `f + 1` replicas' own timers to fire independently (not just one, with
-   the rest merely overhearing), and design its timer policy accordingly. Not modeled or checked
+   change can require as many as `f + 1` replicas' own timers to fire independently (worst case,
+   the dead-primary scenario this point demonstrates; a fully-live cluster with no crash needs
+   only `f`, since each of the `f + 1` non-firing replicas still independently accumulates enough
+   adopted `STARTVIEWCHANGE`s to send its own `DOVIEWCHANGE`) — not just one replica noticing,
+   with the rest merely overhearing — and design its timer policy accordingly. Not modeled or
+   checked
    by `VSR.tla`/TLC at all, for the same reason as point 3; fixing it for real (adding the missing
    re-broadcast to `ReceiveHigherSVC`, matching the original paper) is real, separate protocol
    work, out of scope for this plan.

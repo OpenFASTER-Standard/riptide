@@ -648,16 +648,20 @@ let try_send_sv t =
            adopting it would discard already-committed entries outright. This primary-side
            assignment has no counterpart. It is inert for every correct execution the model can
            reach -- quorum intersection plus [winning_dvc]'s own (last_normal_view, n) selection
-           together guarantee [winner.dvc_n] dominates any already-committed prefix -- which is
-           exactly why TLC (VSR.cfg's full state space) never exercises it, the same way
-           [test_vsr_replica.ml] (task-3-review.md's own F2) had to hand-build an otherwise-
-           protocol-unreachable DVC set to pin that this assignment really is unconditional. The
-           new primary IS NOT GUARANTEED to be part of its own DVC quorum (its own [try_send_dvc]
-           needs [Cardinality(recv_svc) >= f], which can fail to fire before it still collects
-           [f + 1] DVCs from others), so [winner.dvc_n] need not dominate THIS replica's own
-           [commit_number] by construction alone -- only by the protocol-level guarantee above,
-           which nothing here checks locally. Adding the guard is real design work (it would need
-           [test_vsr_replica.ml:1147]'s own hand-built, protocol-unreachable regression scenario
+           together guarantee [winner.dvc_n] dominates any already-committed prefix -- consistent
+           with (though not itself confirmed by a dedicated TLC invariant against this specific
+           comparison; the two invariants that DO exist here, [T3_ReceiveSvNeverTruncatesBelowCommit]
+           and [T3_SendSvCommitWithinWinnerLog], cover the BACKUP-side guard and the [new_k >
+           winner.dvc_n] refusal above, respectively, not this one) the fact that
+           [test_vsr_replica.ml]'s own [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic]
+           (task-3-review.md's own F2) had to hand-build an otherwise-protocol-unreachable DVC set
+           to pin that this assignment really is unconditional. The new primary IS NOT GUARANTEED
+           to be part of its own DVC quorum (its own [try_send_dvc] needs [Cardinality(recv_svc) >=
+           f], which can fail to fire before it still collects [f + 1] DVCs from others), so
+           [winner.dvc_n] need not dominate THIS replica's own [commit_number] by construction
+           alone -- only by the protocol-level guarantee above, which nothing here checks locally.
+           Adding the guard is real design work (it would need that same hand-built, protocol-
+           unreachable regression scenario
            re-derived into one that IS reachable, so the "unconditional, not monotonic" property
            and a would-be truncation refusal don't end up fighting each other) -- disclosed here,
            not fixed, deliberately out of scope for this plan. *)

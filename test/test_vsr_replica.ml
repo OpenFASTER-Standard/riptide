@@ -452,12 +452,19 @@ let test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops () =
    Why these are separate from the M1/M2/M3 regression tests above: every one of those uses an
    obviously-forged value (i = 42, i = 99, k = 9999, n = 1_000_000), and a guard loosened by
    exactly one token still rejects all of them. They therefore pin that each guard EXISTS, not
-   WHERE it sits. The final whole-branch review demonstrated this concretely: loosening any single
-   guard by one ([i > replica_count + 1], [k < op_number t + 1], [n > op_number t + 1]) left the
-   entire 137-test suite green while fully reopening the original vulnerability it was added for.
-   Each test below therefore asserts BOTH directions -- the first illegal value is still rejected
-   (so the guard cannot be silently widened) AND the last legal value is still accepted (so it
-   cannot be over-tightened into rejecting legitimate traffic either). ---- *)
+   WHERE it sits. The final whole-branch review demonstrated this concretely for the [i] and [n]
+   guards: loosening either by one ([i > replica_count + 1], [n > op_number t + 1]) left the rest
+   of the suite green while fully reopening the original vulnerability each was added for. (The
+   analogous [k] mutation, [k < op_number t + 1], is NOT one of these silent-widening cases today
+   -- this file's own [test_prepare_k_boundary_is_exactly_op_number], directly below, already
+   catches it via its own [k = op_number] assertion, independently of the boundary-pin test this
+   comment introduces; verified live by applying that exact mutation to replica.ml and confirming
+   the existing suite fails, not just reasoned about.) Regardless of which guards happen to have
+   independent coverage already, every guard gets its own dedicated boundary pin below, so this
+   file does not rely on that coverage being incidental. Each test below therefore asserts BOTH
+   directions -- the first illegal value is still rejected (so the guard cannot be silently
+   widened) AND the last legal value is still accepted (so it cannot be over-tightened into
+   rejecting legitimate traffic either). ---- *)
 
 let test_prepare_ok_i_boundary_is_exactly_replica_count () =
   let send, _sent = capturing_send () in
@@ -481,11 +488,12 @@ let test_prepare_k_boundary_is_exactly_op_number () =
   let send, _sent = capturing_send () in
   let t = create_at_view_1 ~my_id:2 ~replica_count:3 ~send in
   (* k = 2 on a Prepare with n = 1: after the append, op_number = 1, so this is exactly
-     [op_number t + 1] -- the FIRST value [k < op_number t] must reject. Loosened to
-     [k < op_number t + 1] it is applied, yielding commit_number = 2 > op_number = 1: a direct
-     violation of CommitNumberNeverHigherThanOpNumber (VSR.tla:330-331), which replica.mli's own
-     [commit_number] doc comment claims holds for EVERY reachable state, adversarial input
-     included. *)
+     [op_number t + 1] -- an obviously out-of-bound value [k < op_number t] must reject (the
+     EXACT first-rejected boundary, k = op_number t = 1, is pinned by the second Prepare below).
+     Loosened by two, to [k <= op_number t + 1], it is applied, yielding commit_number = 2 >
+     op_number = 1: a direct violation of CommitNumberNeverHigherThanOpNumber (VSR.tla:330-331),
+     which replica.mli's own [commit_number] doc comment claims holds for EVERY reachable state,
+     adversarial input included. *)
   Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 2 }));
   Alcotest.(check int) "the Prepare itself is still accepted -- only the k field's effect is dropped" 1
     (Replica.op_number t);

@@ -409,8 +409,8 @@ let test_single_view_change_survives_primary_failure () =
    (never-reset) aux_svc_count.
 
    WHICH OF THE TWO RESET SITES THIS TEST ACTUALLY EXERCISES (corrected per task-4-review.md's own
-   F1, which mutation-proved this precisely: deleting the SendSV-path reset at replica.ml:641 left
-   BOTH of this file's tests passing, while deleting the ReceiveSV-path reset at replica.ml:783 made
+   F1, which mutation-proved this precisely: deleting the SendSV-path reset at replica.ml:665 left
+   BOTH of this file's tests passing, while deleting the ReceiveSV-path reset at replica.ml:807 made
    THIS test fail at the exact assertion below): only ReceiveSV's. The one replica whose episode-1
    reset came via SendSV is episode 1's own new primary (it is the one that actually RUNS SendSV,
    becoming primary) -- and that is exactly the replica this test kills at the top of episode 2
