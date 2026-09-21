@@ -37,3 +37,17 @@ val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope lis
     the write side, is what makes a retried batch commit safe to apply at most once.
 
     The result satisfies {!Riptide.Log.verify_chain_list}. *)
+
+val propose : Riptide_vsr.Replica.t -> idempotency_key:string -> write list -> unit
+(** [propose t ~idempotency_key writes] proposes [writes] as one atomic batch through
+    {!Riptide_vsr.Replica.propose} -- matching that function's own fire-and-forget convention: no
+    return value, no client acknowledgment. Telling a caller whether/when their batch committed is
+    explicitly out of scope here (task-master Task 9's job).
+
+    Checks first whether [idempotency_key] already appears among [t]'s own currently-committed
+    batches ({!committed_envelopes}'s own decode, reused) and is a no-op if so -- purely to avoid
+    unboundedly bloating the replicated log with duplicate no-op entries from a client that
+    retries many times. This check is NOT what makes a duplicate safe to retry: that guarantee
+    comes entirely from {!committed_envelopes}'s own first-wins-per-key dedup on the READ side,
+    and holds regardless of how many times [propose] is called with the same key -- this check is
+    an optimization on top of an already-safe operation, not a precondition for safety. *)

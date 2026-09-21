@@ -242,6 +242,48 @@ let test_uncommitted_tail_is_excluded () =
     (List.length (Batch_commit.committed_envelopes primary));
   Alcotest.(check int) "but the entry IS present in the raw, uncommitted log" 1 (List.length (Replica.entries primary))
 
+let test_propose_produces_correct_envelopes () =
+  let t = create_solo () in
+  let actor = "actor-1" in
+  Batch_commit.propose t ~idempotency_key:"k1"
+    [
+      w ~actor ~causation:(fake_event_id "c1") ~correlation:(fake_event_id "r1") (record_value "first");
+      w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "r2") (record_value "second");
+    ];
+  let envelopes = Batch_commit.committed_envelopes t in
+  Alcotest.(check int) "propose commits both writes" 2 (List.length envelopes);
+  Alcotest.(check bool) "the resulting chain verifies" true (Log.verify_chain_list envelopes)
+
+let test_propose_skips_a_key_already_committed () =
+  let t = create_solo () in
+  let actor = "actor-1" in
+  Batch_commit.propose t ~idempotency_key:"dup"
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "first-call") ];
+  Alcotest.(check int) "one write committed after the first call" 1
+    (List.length (Batch_commit.committed_envelopes t));
+  (* A second call with the SAME key -- must be a genuine no-op on the underlying replicated log,
+     not just "produces the same decoded result by coincidence": assert op_number (the raw log
+     length) does NOT grow, proving propose itself skipped calling Replica.propose at all, rather
+     than proposing again and relying on decode-side dedup to hide it. *)
+  let op_number_before = List.length (Replica.entries t) in
+  Batch_commit.propose t ~idempotency_key:"dup"
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "second-call") ];
+  Alcotest.(check int) "propose did not grow the underlying replicated log for a duplicate key"
+    op_number_before (List.length (Replica.entries t));
+  Alcotest.(check int) "still exactly one committed envelope, from the first call" 1
+    (List.length (Batch_commit.committed_envelopes t))
+
+let test_propose_with_different_keys_both_land () =
+  let t = create_solo () in
+  let actor = "actor-1" in
+  Batch_commit.propose t ~idempotency_key:"key-a"
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "a") ];
+  Batch_commit.propose t ~idempotency_key:"key-b"
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "b") ];
+  let envelopes = Batch_commit.committed_envelopes t in
+  Alcotest.(check int) "two distinct keys both commit" 2 (List.length envelopes);
+  Alcotest.(check bool) "the resulting chain verifies" true (Log.verify_chain_list envelopes)
+
 let tests =
   [
     ("empty batch commits as zero envelopes", `Quick, test_empty_batch_commits_as_zero_envelopes);
@@ -254,4 +296,7 @@ let tests =
       test_repeated_idempotency_key_with_different_writes_keeps_only_the_first);
     ("two separate batches chain across the boundary", `Quick, test_two_separate_batches_chain_across_the_boundary);
     ("an uncommitted tail entry is excluded", `Quick, test_uncommitted_tail_is_excluded);
+    ("propose produces correct, chained envelopes", `Quick, test_propose_produces_correct_envelopes);
+    ("propose skips re-proposing an already-committed key", `Quick, test_propose_skips_a_key_already_committed);
+    ("propose with two distinct keys: both land", `Quick, test_propose_with_different_keys_both_land);
   ]

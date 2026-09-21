@@ -45,13 +45,7 @@ let write_of_value (v : Value.value) : write option =
 
 (* ---- batch <-> Value.value ---- *)
 
-(* [@warning "-32"]: unused-value-declaration -- batch_to_value has no caller yet in this task
-   (Task 1's own tests construct a batch's wire Value.value by hand, deliberately, to avoid
-   depending on Task 2's not-yet-written propose). Task 2 adds propose as a real caller and
-   removes this attribute in the same edit. Confirmed live: dune build fails with
-   "Error (warning 32 [unused-value-declaration])" without it, since batch_commit.mli (Step 2)
-   does not export this name, making it a genuinely private, genuinely unused binding until then. *)
-let[@warning "-32"] batch_to_value ~(idempotency_key : string) (writes : write list) : Value.value =
+let batch_to_value ~(idempotency_key : string) (writes : write list) : Value.value =
   Value.Record
     [
       ("idempotency_key", Value.Scalar (Value.String idempotency_key));
@@ -77,6 +71,15 @@ let committed_batch_values (t : Riptide_vsr.Replica.t) : Value.value list =
   let all = Riptide_vsr.Replica.entries t in
   let committed_count = Riptide_vsr.Replica.commit_number t in
   List.filteri (fun i _ -> i < committed_count) all
+
+let already_committed (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : bool =
+  List.exists
+    (fun v -> match batch_of_value v with Some (key, _) -> String.equal key idempotency_key | None -> false)
+    (committed_batch_values t)
+
+let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) (writes : write list) : unit =
+  if already_committed t ~idempotency_key then ()
+  else Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes)
 
 let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
   let seen_keys = Hashtbl.create 16 in
