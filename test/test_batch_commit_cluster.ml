@@ -11,6 +11,7 @@
 open Riptide
 open Riptide_vsr
 open Riptide_sim
+open Riptide_batch_commit
 
 let record_value name = Value.Record [ ("name", Value.Scalar (Value.String name)) ]
 let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
@@ -66,6 +67,13 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
     in
     loop 20
   in
+  (* Populated by each replica's own forked fiber, the first thing it does inside its own inner
+     switch -- before that assignment runs, [stop i] has nothing to call. Every test in this file
+     calls [settle] (or at minimum proposes something, which yields no fibers a turn on its own --
+     [settle] is what actually gives forked fibers a chance to run) at least once before ever
+     calling [stop], so by the time [stop] is used the assignment below has always already run; the
+     [None] branch exists purely as a loud, diagnosable failure instead of a silent no-op if that
+     assumption is ever violated by a future test. *)
   let stop_fns = Array.make replica_count None in
   try
     Eio.Switch.run (fun sw ->
@@ -198,7 +206,7 @@ let test_batch_commits_fully_despite_primary_crash_before_next_propose () =
       Array.iteri
         (fun i r ->
           if i <> 0 then begin
-            let envelopes = Riptide_batch_commit.Batch_commit.committed_envelopes r in
+            let envelopes = Batch_commit.committed_envelopes r in
             Alcotest.(check int)
               (Printf.sprintf "survivor %d: both writes from the surviving batch are present" (i + 1))
               2 (List.length envelopes);
@@ -245,7 +253,7 @@ let test_batch_that_never_reached_quorum_is_absent_everywhere () =
       stop 3;
       Replica.propose primary (batch_value ~idempotency_key:"never-commits" [ "z" ]);
       settle ();
-      let envelopes = Riptide_batch_commit.Batch_commit.committed_envelopes primary in
+      let envelopes = Batch_commit.committed_envelopes primary in
       Alcotest.(check int) "the primary itself never sees this batch commit either -- no quorum, no commit"
         0 (List.length envelopes);
       Alcotest.(check int) "but the primary's own raw, uncommitted log does have the entry" 1

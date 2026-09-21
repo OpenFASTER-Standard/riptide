@@ -28,6 +28,13 @@ let write_to_value (w : write) : Value.value =
 
 let field_opt fields name = List.assoc_opt name fields
 
+(* causation/correlation are Envelope.event_id = Value.hash, documented in lib/value.mli as "Raw
+   32-byte SHA-256 digest" -- Value.hash_to_hex raises Invalid_argument on anything else. A
+   committed entry is arbitrary VSR-replicated bytes with no payload-integrity guarantee (this
+   codebase's own established threat model), so a wrong-length causation/correlation must make
+   the WHOLE write fail to decode here, exactly like every other malformed-write case, rather than
+   producing a well-typed write/envelope whose fields silently violate their own documented
+   contract. *)
 let write_of_value (v : Value.value) : write option =
   match v with
   | Value.Record fields -> (
@@ -38,7 +45,8 @@ let write_of_value (v : Value.value) : write option =
         field_opt fields "payload" )
     with
     | Some (Value.Scalar (Value.String actor)), Some (Value.Scalar (Value.Bytes causation)),
-      Some (Value.Scalar (Value.Bytes correlation)), Some payload ->
+      Some (Value.Scalar (Value.Bytes correlation)), Some payload
+      when String.length causation = 32 && String.length correlation = 32 ->
       Some { actor; causation; correlation; payload }
     | _ -> None)
   | _ -> None

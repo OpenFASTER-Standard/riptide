@@ -948,3 +948,39 @@ Expected: all tests pass, including both new cluster-level ones. Full suite gree
 git add test/test_batch_commit_cluster.ml test/test_riptide.ml
 git commit -m "batch_commit: cluster-level proof of atomicity under primary crash"
 ```
+
+## Deviations as implemented
+
+This plan was written before implementation. As merged, a few of its code snippets don't exactly
+match what was actually built — noted here rather than rewritten in place, so the Task 1/2/3
+sections above stay an honest record of what was planned, while a future reader isn't misled by
+snippets that no longer compile or pass as written.
+
+- **Task 1 Step 6's `test_uncommitted_tail_is_excluded` snippet is missing a
+  `Replica.for_test_set_view_number r 1` call.** A freshly created replica starts at
+  `view_number = 0`, where `Primary(0) = replica_count` (Euclidean modulo, not 1) — so without
+  pinning every replica to view 1 first, replica 1 (`my_id = 1`) is not actually the primary and
+  the test's own `Replica.propose primary batch_value` call silently no-ops, making the test's
+  final assertion (zero committed envelopes) pass for the wrong reason. The shipped test adds this
+  call for all three replicas before proposing; see `test/test_batch_commit.ml`'s actual
+  `test_uncommitted_tail_is_excluded`.
+
+- **Every test snippet's `Riptide_batch_commit.write`/`.propose`/`.committed_envelopes`
+  references don't compile under dune's default module wrapping.** The library wraps its own
+  module, so the real path is `Riptide_batch_commit.Batch_commit.write`/`.propose`/
+  `.committed_envelopes` (or bare `Batch_commit.*` under `open Riptide_batch_commit`, the style
+  the shipped test files use) — not `Riptide_batch_commit.write` etc. directly.
+
+- **Task 3's filler-batch propose and the I1/I2/I3 fix-round assertions are absent from this
+  plan's own Task 3 text entirely.** The shipped
+  `test_batch_commits_fully_despite_primary_crash_before_next_propose` needed a second, throwaway
+  `Replica.propose` (idempotency key `"filler-to-piggyback-commit"`) between the batch under test
+  and the primary crash — real VSR mechanics, not a timing issue: a backup's own `commit_number`
+  only ever advances via a LATER `Prepare`'s own `k` field piggybacking on it, never from the
+  replication of the entry itself, so without this filler the primary's sole knowledge that the
+  first batch committed would be entirely lost once it crashes and never participates in the view
+  change. A later re-review round (I1/I2/I3, see `test/test_batch_commit_cluster.ml`'s own
+  comments at those markers) also added assertions that the view change itself genuinely
+  completed, that the crashed primary genuinely stopped participating, and that the surviving
+  envelopes' actual payload content/order (not just their count) matches the batch under test —
+  none of which this plan's own Task 3 text mentions.

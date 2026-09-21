@@ -18,10 +18,9 @@ let w ~actor ~causation ~correlation payload : Batch_commit.write =
 
 let test_empty_batch_commits_as_zero_envelopes () =
   let t = create_solo () in
-  (* This module's own public propose (Task 2) doesn't exist yet -- Task 1 tests the decode side
-     directly against a hand-built batch Value.value, using the SAME wire shape
-     Riptide_batch_commit.propose will build in Task 2, proposed straight through the underlying
-     Replica.propose. *)
+  (* Exercises the decode side directly against a hand-built batch Value.value, proposed straight
+     through the underlying Replica.propose -- the SAME wire shape Batch_commit.propose (see the
+     propose-focused tests further down this file) builds internally. *)
   let batch_value =
     Value.Record
       [ ("idempotency_key", Value.Scalar (Value.String "k-empty")); ("writes", Value.Sequence []) ]
@@ -135,6 +134,65 @@ let test_malformed_write_makes_the_whole_batch_malformed () =
   Alcotest.(check int) "one malformed write voids the whole batch, not just that write" 0
     (List.length (Batch_commit.committed_envelopes t))
 
+let test_wrong_length_causation_makes_the_whole_batch_malformed () =
+  let t = create_solo () in
+  (* Envelope.event_id = Value.hash, documented in lib/value.mli as "Raw 32-byte SHA-256 digest" --
+     Value.hash_to_hex raises Invalid_argument on anything else. A committed entry is arbitrary
+     VSR-replicated bytes with no payload-integrity guarantee, so a wrong-length causation/
+     correlation must void the whole batch, exactly like any other malformed-write shape, rather
+     than producing a well-typed envelope whose fields silently violate their own contract. *)
+  let batch_value =
+    Value.Record
+      [
+        ("idempotency_key", Value.Scalar (Value.String "k-bad-hash-length"));
+        ("writes",
+          Value.Sequence
+            [
+              Value.Record
+                [
+                  ("actor", Value.Scalar (Value.String "actor-1"));
+                  ("causation", Value.Scalar (Value.Bytes "abc"));
+                  (* 3 bytes, not the required 32 *)
+                  ("correlation", Value.Scalar (Value.Bytes (fake_event_id "r")));
+                  ("payload", record_value "bad-causation-length");
+                ];
+            ]);
+      ]
+  in
+  Replica.propose t batch_value;
+  Alcotest.(check int) "a wrong-length causation voids the whole batch, not just that write" 0
+    (List.length (Batch_commit.committed_envelopes t))
+
+let test_malformed_batch_does_not_burn_its_idempotency_key () =
+  let t = create_solo () in
+  let key = "k-malformed-then-retry" in
+  (* A malformed batch under [key]: batch_of_value returns None for it, so its key is never added
+     to committed_envelopes's dedup set -- it contributed nothing, so a later, well-formed batch
+     under the same key is a genuine first attempt from the read side's perspective, not a
+     duplicate. *)
+  let malformed_batch =
+    Value.Record
+      [
+        ("idempotency_key", Value.Scalar (Value.String key));
+        ("writes", Value.Sequence [ Value.Scalar (Value.Int 0L) (* not even a Record *) ]);
+      ]
+  in
+  Replica.propose t malformed_batch;
+  Alcotest.(check int) "the malformed attempt itself contributes zero envelopes" 0
+    (List.length (Batch_commit.committed_envelopes t));
+  let actor = "actor-1" in
+  Batch_commit.propose t ~idempotency_key:key
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "real-retry") ];
+  let envelopes = Batch_commit.committed_envelopes t in
+  Alcotest.(check int)
+    "a later well-formed batch under the SAME key DOES materialize -- the malformed attempt never \
+     burned the key"
+    1 (List.length envelopes);
+  match (List.hd envelopes).payload with
+  | Value.Record [ ("name", Value.Scalar (Value.String name)) ] ->
+    Alcotest.(check string) "the well-formed retry's own payload lands" "real-retry" name
+  | _ -> Alcotest.fail "unexpected payload shape"
+
 let test_repeated_idempotency_key_with_different_writes_keeps_only_the_first () =
   let t = create_solo () in
   let make_batch ~key payload_name =
@@ -199,7 +257,7 @@ let test_two_separate_batches_chain_across_the_boundary () =
 
 (* A replica_count = 1 replica can never have an uncommitted entry (everything commits
    synchronously, per create_solo's own doc comment above) -- this test needs a real 3-replica
-   cluster (f = 1) instead, where a genuine quorum is needed. No network/Eio required: two
+   cluster (f = 1) instead, where a genuine quorum is needed. No network/Eio required: three
    Replica.t values wired directly to each other's handle_message, matching test_vsr_replica.ml's
    own precedent of driving handle_message directly with real, encoded messages rather than
    requiring a full transport.
@@ -273,6 +331,29 @@ let test_propose_skips_a_key_already_committed () =
   Alcotest.(check int) "still exactly one committed envelope, from the first call" 1
     (List.length (Batch_commit.committed_envelopes t))
 
+let test_empty_batch_permanently_burns_its_key_via_propose () =
+  let t = create_solo () in
+  let key = "k-empty-burns-key" in
+  (* Unlike a malformed batch, an EMPTY batch (zero writes) is well-formed -- batch_of_value
+     decodes it fine, so committed_envelopes's own dedup set DOES gain this key. Worse: propose's
+     own already_committed guard runs BEFORE calling the underlying Replica.propose at all, so a
+     second propose call under the same key never even reaches the replicated log -- not merely
+     deduped on the read side, genuinely never sent. *)
+  Batch_commit.propose t ~idempotency_key:key [];
+  Alcotest.(check int) "the empty batch itself commits as zero envelopes" 0
+    (List.length (Batch_commit.committed_envelopes t));
+  let actor = "actor-1" in
+  Batch_commit.propose t ~idempotency_key:key
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "should-never-land") ];
+  Alcotest.(check int)
+    "a real, non-empty batch under the same key never materializes -- the empty batch already won \
+     this key"
+    0 (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int)
+    "the second propose call was genuinely skipped -- the underlying replicated log never grew \
+     past the first (empty) batch's own single entry"
+    1 (List.length (Replica.entries t))
+
 let test_propose_with_different_keys_both_land () =
   let t = create_solo () in
   let actor = "actor-1" in
@@ -292,11 +373,17 @@ let tests =
     ("a foreign/malformed committed entry contributes zero envelopes", `Quick,
       test_malformed_committed_entry_is_zero_envelopes);
     ("one malformed write voids the whole batch", `Quick, test_malformed_write_makes_the_whole_batch_malformed);
+    ("a wrong-length causation voids the whole batch", `Quick,
+      test_wrong_length_causation_makes_the_whole_batch_malformed);
+    ("a malformed batch does not burn its idempotency key -- a later well-formed retry lands", `Quick,
+      test_malformed_batch_does_not_burn_its_idempotency_key);
     ("a repeated idempotency key with different writes keeps only the first", `Quick,
       test_repeated_idempotency_key_with_different_writes_keeps_only_the_first);
     ("two separate batches chain across the boundary", `Quick, test_two_separate_batches_chain_across_the_boundary);
     ("an uncommitted tail entry is excluded", `Quick, test_uncommitted_tail_is_excluded);
     ("propose produces correct, chained envelopes", `Quick, test_propose_produces_correct_envelopes);
     ("propose skips re-proposing an already-committed key", `Quick, test_propose_skips_a_key_already_committed);
+    ("an empty batch permanently burns its key via propose's own duplicate check", `Quick,
+      test_empty_batch_permanently_burns_its_key_via_propose);
     ("propose with two distinct keys: both land", `Quick, test_propose_with_different_keys_both_land);
   ]
