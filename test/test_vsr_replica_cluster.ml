@@ -42,14 +42,18 @@ open Riptide_sim
 (* The default cluster size matches spec/tla/VSR.cfg's own ReplicaCount = 3; the f >= 2 test
    below overrides it to 5 (see its own comment).
 
-   The primary is fixed at replica 1: an arbitrary, explicitly-configured constant, NOT derived
-   from VSR.tla's own Primary(v) formula -- Replica never implements or calls that formula at all
-   (see replica.mli's own "Replica identity" note). In particular, do NOT read this 1 as
-   "Primary(0)": TLA+'s % is mathematical modulo, so VSR.tla:18's Primary(0) is actually
-   ReplicaCount (= 3 here), not 1. With a fixed primary and view pinned to 0, which id is primary
-   is a pure relabeling, so 1 is just the convention this suite uses. *)
+   The primary is replica 1, for every replica_count this suite uses: since Task 1 (the VSR
+   view-change plan) removed the fixed [primary_id] field entirely, which replica id is primary is
+   now always [Primary(view_number)] (VSR.tla:18), computed fresh, never stored. Every replica in
+   this cluster is pinned to [view_number = 1] via [Replica.for_test_set_view_number] right after
+   [create] (below) specifically because [Primary(1) = 1 + ((1-1) % replica_count) = 1] regardless
+   of [replica_count]'s value -- matching this suite's own pre-existing convention of using replica
+   id 1 as "the" primary, now achieved by view rather than by a configured field. All replicas
+   must be pinned to the SAME view_number, not just replica 1 -- handle_prepare/handle_prepare_ok
+   both reject a message whose [view] doesn't match the recipient's own [view_number], so a
+   mismatched replica would silently drop every message it received. *)
 let default_replica_count = 3
-let primary_id = 1
+let primary_view_number = 1
 
 exception Cluster_test_done
 (* Purely a control-flow signal to unwind Eio.Switch.run once a test body is done and its
@@ -106,8 +110,12 @@ let with_cluster ?(replica_count = default_replica_count)
   let replicas =
     Array.init replica_count (fun i ->
         let my_id = i + 1 in
-        Replica.create ~my_id ~replica_count ~primary_id ~send:(fun ~to_ bytes ->
-            Sim_transport.send handles.(i) ~to_ bytes))
+        let r =
+          Replica.create ~my_id ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
+              Sim_transport.send handles.(i) ~to_ bytes)
+        in
+        Replica.for_test_set_view_number r primary_view_number;
+        r)
   in
   let settle () =
     let rec loop rounds_left =
