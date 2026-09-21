@@ -15,6 +15,13 @@ open Riptide_sim
 let record_value name = Value.Record [ ("name", Value.Scalar (Value.String name)) ]
 let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
 
+(* [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18), transcribed INDEPENDENTLY here rather
+   than calling {!Replica.primary} -- matching test_vsr_replica_view_change.ml's own
+   primary_of_view (and its own doc comment's reasoning): confirming the real cluster's emergent
+   new primary against the formula itself, not against the very function under test. Euclidean
+   modulo, exactly like replica.ml's own [primary]. *)
+let primary_of_view ~view ~replica_count = 1 + (((view - 1) mod replica_count + replica_count) mod replica_count)
+
 exception Cluster_test_done
 exception Replica_stopped
 
@@ -142,6 +149,52 @@ let test_batch_commits_fully_despite_primary_crash_before_next_propose () =
           end)
         replicas;
       settle ();
+
+      (* I1 fix (task-3 re-review): without these assertions, this test's own name is a lie --
+         everything above (both the batch's commit AND the filler's piggyback) was already true
+         BEFORE stop 1 / check_timeout / this settle () ever ran, so a silently no-op view change
+         would leave every envelope/chain assertion below passing regardless. Assert the view
+         change genuinely completed, matching test_vsr_replica_view_change.ml's own
+         test_single_view_change_survives_primary_failure (its lines 336-354) exactly: the new
+         primary is verified against Primary(v) recomputed independently, not assumed. *)
+      let new_view = 2 in
+      let expected_new_primary_id = primary_of_view ~view:new_view ~replica_count:3 in
+      Alcotest.(check int)
+        "Primary(2) = 2 -- computed independently, matching VSR.tla:18's own formula at v=2, \
+         replica_count=3"
+        2 expected_new_primary_id;
+      let new_primary = replicas.(expected_new_primary_id - 1) in
+      let other_survivor_id = List.find (fun id -> id <> 1 && id <> expected_new_primary_id) [ 2; 3 ] in
+      let other_survivor = replicas.(other_survivor_id - 1) in
+      Alcotest.(check int) "the new primary's own view_number genuinely advanced to 2" new_view
+        (Replica.view_number new_primary);
+      Alcotest.(check bool) "the replica Primary(2) names actually considers itself primary" true
+        (Replica.is_primary new_primary);
+      Alcotest.(check bool) "the new primary genuinely returned to Normal, not stuck mid-view-change"
+        true (Replica.status new_primary = Replica.Normal);
+      Alcotest.(check int) "the OTHER survivor's own view_number advanced to 2 as well" new_view
+        (Replica.view_number other_survivor);
+      Alcotest.(check bool) "the other survivor does not consider itself primary" false
+        (Replica.is_primary other_survivor);
+      Alcotest.(check bool) "the other survivor also genuinely returned to Normal" true
+        (Replica.status other_survivor = Replica.Normal);
+
+      (* I2 fix (task-3 re-review): a positive check that the crashed primary (replicas.(0))
+         genuinely stopped participating -- without this, nothing in this test would fail if
+         [stop 1] were a no-op (test 2's own stop 2/stop 3 already gets this strength for free,
+         from its own zero-envelope assertion; test 1 needs it asserted explicitly). A replica
+         whose dispatch fiber is truly dead cannot have received or reacted to any
+         StartViewChange/DoViewChange/StartView traffic, so it must still be exactly where it was
+         left: view 1, status Normal (it never even entered View_change itself -- only the
+         SURVIVORS' own check_timeout calls did that, and this replica's dispatch fiber never ran
+         to see them). *)
+      Alcotest.(check int) "the crashed (stopped) old primary's own view_number is frozen at 1 -- \
+                             it never processed any view-change traffic"
+        1 (Replica.view_number replicas.(0));
+      Alcotest.(check bool) "the crashed old primary's own status is still Normal -- it never even \
+                              entered View_change, because its dispatch fiber is genuinely dead"
+        true (Replica.status replicas.(0) = Replica.Normal);
+
       Array.iteri
         (fun i r ->
           if i <> 0 then begin
@@ -151,7 +204,23 @@ let test_batch_commits_fully_despite_primary_crash_before_next_propose () =
               2 (List.length envelopes);
             Alcotest.(check bool)
               (Printf.sprintf "survivor %d: the chain verifies" (i + 1))
-              true (Log.verify_chain_list envelopes)
+              true (Log.verify_chain_list envelopes);
+            (* I3 fix (task-3 re-review): verify_chain_list alone is self-consistent with whatever
+               envelopes exist and says nothing about WHICH batch they came from -- combined with
+               just a length-2 check, the filler batch's own envelope could in principle masquerade
+               as part of the batch under test without this test noticing. Check the actual payload
+               content and order, matching this file's own established
+               `Value.Record [ ("name", Value.Scalar (Value.String name)) ]` unwrapping convention
+               (test/test_batch_commit.ml:66-73/:164-167). *)
+            let payload_name (e : Envelope.envelope) =
+              match e.payload with
+              | Value.Record [ ("name", Value.Scalar (Value.String name)) ] -> name
+              | _ -> Alcotest.fail (Printf.sprintf "survivor %d: unexpected payload shape" (i + 1))
+            in
+            Alcotest.(check (list string))
+              (Printf.sprintf "survivor %d: the envelopes are genuinely x then y from the survives \
+                                batch, not the filler batch's own write" (i + 1))
+              [ "x"; "y" ] (List.map payload_name envelopes)
           end)
         replicas)
 
