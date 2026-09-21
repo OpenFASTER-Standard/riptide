@@ -420,10 +420,10 @@ let test_prepare_k_within_bound_still_advances_normally () =
   (* a genuinely WELL-FORMED, higher k must still be applied -- the fix must not weaken the
      legitimate case. Well-formed per VSR.tla:106-109's own comment means k < n strictly (the
      primary's commit-number from strictly BEFORE the request carried by this same message was
-     appended), not merely k <= op_number -- the implementation's own bound (k <= op_number t,
-     i.e. k <= n once this Prepare's append has advanced op_number to n) is intentionally a
-     little wider than that, as a defense-in-depth margin against off-by-one edge cases, not
-     because k = n is itself a message any correct primary would ever actually send. *)
+     appended) -- exactly the implementation's own bound (k < op_number t, i.e. k < n once this
+     Prepare's append has advanced op_number to n; see replica.mli's own doc comment on the
+     [handle_message] Prepare dispatch for why an earlier, wider [k <= n] margin was tightened
+     once view-change wired a backup's commit_number into DoViewChange.k). *)
   let send, _sent = capturing_send () in
   let t = create_at_view_1 ~my_id:2 ~replica_count:3 ~send in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
@@ -446,14 +446,14 @@ let test_prepare_ok_forged_n_from_real_replica_does_not_preack_future_ops () =
   Alcotest.(check bool) "op1 is NOT committed" false (Replica.is_committed t (v "op1"))
 
 (* ---- I2 boundary pins: the exact first-REJECTED and last-ACCEPTED value of each of the three
-   safety guards (replica.ml's [i < 1 || i > t.replica_count], [k <= op_number t], and
+   safety guards (replica.ml's [i < 1 || i > t.replica_count], [k < op_number t], and
    [n > op_number t]).
 
    Why these are separate from the M1/M2/M3 regression tests above: every one of those uses an
    obviously-forged value (i = 42, i = 99, k = 9999, n = 1_000_000), and a guard loosened by
    exactly one token still rejects all of them. They therefore pin that each guard EXISTS, not
    WHERE it sits. The final whole-branch review demonstrated this concretely: loosening any single
-   guard by one ([i > replica_count + 1], [k <= op_number t + 1], [n > op_number t + 1]) left the
+   guard by one ([i > replica_count + 1], [k < op_number t + 1], [n > op_number t + 1]) left the
    entire 137-test suite green while fully reopening the original vulnerability it was added for.
    Each test below therefore asserts BOTH directions -- the first illegal value is still rejected
    (so the guard cannot be silently widened) AND the last legal value is still accepted (so it
@@ -481,8 +481,8 @@ let test_prepare_k_boundary_is_exactly_op_number () =
   let send, _sent = capturing_send () in
   let t = create_at_view_1 ~my_id:2 ~replica_count:3 ~send in
   (* k = 2 on a Prepare with n = 1: after the append, op_number = 1, so this is exactly
-     [op_number t + 1] -- the FIRST value [k <= op_number t] must reject. Loosened to
-     [k <= op_number t + 1] it is applied, yielding commit_number = 2 > op_number = 1: a direct
+     [op_number t + 1] -- the FIRST value [k < op_number t] must reject. Loosened to
+     [k < op_number t + 1] it is applied, yielding commit_number = 2 > op_number = 1: a direct
      violation of CommitNumberNeverHigherThanOpNumber (VSR.tla:330-331), which replica.mli's own
      [commit_number] doc comment claims holds for EVERY reachable state, adversarial input
      included. *)

@@ -418,9 +418,10 @@ let test_single_view_change_survives_primary_failure () =
    call here. Every replica this test DOES call check_timeout on again in episode 2 is one whose
    episode-1 reset came via ReceiveSV (it adopted episode 1's StartView as a backup). The SendSV
    reset is a real, covered path -- just not by this file: it is exercised directly by
-   test_vsr_replica.ml's own unit test ("Task 3: SendSV resets sv...", vsr_replica #56), which hand-
-   constructs a DoViewChange quorum and asserts the reset via a second check_timeout on the same
-   replica without any intervening ReceiveSV. Neither svc_count nor svc_limit is exposed on
+   test_vsr_replica.ml's own unit test (test_send_sv_resets_svc_count, "Task 3: SendSV resets
+   svc_count on completing a view change"), which hand-constructs a DoViewChange quorum and
+   asserts the reset via a second check_timeout on the same replica without any intervening
+   ReceiveSV. Neither svc_count nor svc_limit is exposed on
    Replica.t (see replica.mli's own read-only accessor list -- svc_count itself is deliberately
    test-support-only in a way that isn't even exposed to for_test_* readers), so this test cannot
    assert the counter's own numeric value directly; instead it proves the ReceiveSV reset happened
@@ -783,13 +784,17 @@ let test_winning_dvc_selects_by_last_normal_view_then_n_over_a_real_cluster () =
       let original_primary = replicas.(0) (* my_id = 1 *) in
       let p2 = replicas.(1) (* my_id = 2, episode 1's new primary *) in
       let x = replicas.(2) (* my_id = 3, the trap: excluded from episode 1 entirely *) in
-      let w = replicas.(3) (* my_id = 4, the true winner *) in
+      let w = replicas.(3) (* my_id = 4, one of the four active broadcasters -- NOT specially "the
+                               winner": W/Y/G/H end up holding an identical log after episode 1
+                               (see this function's own top-of-file comment for why an earlier
+                               version tried to diverge W's log further, and why that was dropped)
+                             *) in
       let y = replicas.(4) (* my_id = 5 *) in
-      let g = replicas.(5) (* my_id = 6, third active broadcaster, mirrors Y's fate *) in
-      let h = replicas.(6) (* my_id = 7, fourth active broadcaster, also mirrors Y's fate -- see
-                               this function's own top-of-file comment for why FOUR (not three)
-                               actively-broadcasting survivors are structurally required in crash
-                               2, now that X can only ever adopt passively *) in
+      let g = replicas.(5) (* my_id = 6, third active broadcaster, mirrors W's/Y's fate *) in
+      let h = replicas.(6) (* my_id = 7, fourth active broadcaster, also mirrors W's/Y's fate --
+                               see this function's own top-of-file comment for why FOUR (not
+                               three) actively-broadcasting survivors are structurally required in
+                               crash 2, now that X can only ever adopt passively *) in
 
       let base1 = record_value "f2-base-1" and base2 = record_value "f2-base-2" in
       let a1 = record_value "f2-a-1" and a2 = record_value "f2-a-2" in

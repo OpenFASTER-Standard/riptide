@@ -170,7 +170,15 @@ val commit_number : t -> int
     an incidental choice). [SendSV] is the one action that assigns [commit_number] unconditionally
     (VSR.tla:274): the new primary starts the view fresh from a quorum's worth of [DoViewChange]s,
     so its new value is [HighestCommitNumber] over that quorum, not a maximum with its own prior
-    value. *)
+    value.
+
+    {b This unconditional assignment is a disclosed, knowingly unguarded hazard, not merely a
+    non-monotonicity note}: unlike {!handle_message}'s [Start_view] dispatch (a BACKUP adopting a
+    [StartView] it did not send, which refuses one whose [n] is below its own [commit_number] —
+    see that dispatch's own doc comment), [SendSV]'s primary-side assignment has no such guard, and
+    the new primary is not guaranteed to be part of its own DVC quorum. See [replica.ml]'s own
+    comment at the [try_send_sv] assignment site for the full reasoning and why it is disclosed
+    rather than fixed in this plan. *)
 
 val view_number : t -> int
 (** [view_number t] is VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. Starts at [0]
@@ -300,6 +308,20 @@ val check_timeout : t -> unit
     liveness-only, and why fixing it is real, separate design work out of scope here; see
     [test/test_vsr_replica_view_change.ml]'s own regression test for a real, running reproduction.
 
+    {b A related, MORE reachable gap, driven by the same root cause}: [ReceiveHigherSVC] (see
+    {!handle_message}'s own doc comment, its [Start_view_change] dispatch section) adopts a higher
+    view it hears about from someone else's [Start_view_change] but never re-broadcasts one of its
+    own — so completing a
+    view change needs at least [f + 1] replicas whose OWN [check_timeout] fires independently, not
+    just one replica noticing and the rest merely overhearing it. A caller driving this function
+    from a real per-replica wall-clock timer (this module's own intended shape) MUST NOT assume
+    that one replica detecting a dead primary is enough to recover the cluster — survivors' timers
+    firing at different times is the ordinary case, not an edge case, and if fewer than [f + 1] of
+    them fire before the first one's own view-change episode is under way, the cluster can wedge
+    permanently on a SINGLE primary failure, with no second failure required. See
+    [spec/tla/README.md]'s same "Known simplifications, not omissions" list, point 4, for the full
+    mechanism and a live reproduction.
+
     Otherwise: advances [view_number] to [view_number t + 1], moves [status] to [View_change],
     resets [recv_svc] to empty, [recv_dvc] to empty, and [sent_dvc] to [false] (VSR.tla:166-170 —
     all four together mark the start of a fresh view-change episode), increments the replica's own
@@ -348,17 +370,24 @@ val handle_message : t -> string -> unit
       backup that misses one [Prepare] has no way to catch up in this module's scope (no
       COMMIT-message resend, no state-transfer, no retry — those are explicitly out of scope for
       `spec/tla/VSR.tla` itself, per `spec/tla/README.md`). On success: appends [m.v] at [m.n],
-      advances [commit_number] to [m.k] if higher AND if [m.k <= op_number t] (i.e. [<= m.n],
-      since [op_number t] has just become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k >
-      @ THEN m.k ELSE @]), and never lets it exceed what this replica's own log actually contains,
-      even for a [Prepare] whose [k] a corrupted/forged network delivery has pushed past [n]
-      (VSR.tla's own [m.k < m.n] precondition, VSR.tla:106-109, holds for every [Prepare] the
-      TLA+ model itself can produce, but rather than trust it this module enforces its own
-      explicit bound, [m.k <= m.n] — deliberately one step wider than that precondition, which
-      would exclude [m.k = m.n]; see {!commit_number}'s own doc comment and [replica.ml]'s comment
-      at the bound itself for why the extra step is a harmless defense-in-depth margin here, and
-      why tightening it is the safer direction once view-change lands) — then unicasts
-      [Prepare_ok{view=view_number t; n=m.n; i=my_id}] back to {!primary}'s current value (NOT a
+      advances [commit_number] to [m.k] if higher AND if [m.k < op_number t] (i.e. [< m.n], since
+      [op_number t] has just become [m.n]) — never regresses it (VSR.tla:118's own [IF m.k >
+      @ THEN m.k ELSE @]), and never lets it reach or exceed what this replica's own log actually
+      contains, even for a [Prepare] whose [k] a corrupted/forged network delivery has pushed to or
+      past [n] (VSR.tla's own [m.k < m.n] precondition, VSR.tla:106-109, holds for every [Prepare]
+      the TLA+ model itself can produce, but rather than trust it this module enforces its own
+      explicit bound, [m.k < m.n], matching that precondition exactly — see {!commit_number}'s own
+      doc comment and [replica.ml]'s comment at the bound itself for the full reasoning). An
+      earlier version of this bound admitted [m.k = m.n] as a defense-in-depth margin, justified
+      solely by [k = n] being harmless while a backup's [commit_number] was purely local state —
+      once view-change wired a backup's [commit_number] into [DoViewChange.k] and
+      [HighestCommitNumber] (a SEPARATE maximum over all valid DVCs, feeding the new primary's own
+      [commit_number] and then [StartView.k] cluster-wide), that margin stopped being benign, so
+      the bound was tightened to reject [m.k = m.n] too — see [test/test_vsr_replica.ml]'s own
+      k-boundary tests, which pin all three of [m.k = m.n - 1] (accepted), [m.k = m.n] (rejected),
+      and [m.k = m.n + 1] (rejected).
+
+      Then unicasts [Prepare_ok{view=view_number t; n=m.n; i=my_id}] back to {!primary}'s current value (NOT a
       stored [primary_id] any more — computed fresh from [view_number t] at reply time).
     - A [Prepare_ok] message drives VSR.tla's [ReceivePrepareOkMsg] (VSR.tla:126-136): a
       primary-side handler ([IsNormalPrimary(r)] == [status[r] = "Normal" /\ Primary(View(r)) =
