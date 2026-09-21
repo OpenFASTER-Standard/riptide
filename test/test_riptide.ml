@@ -50,6 +50,7 @@ let () =
       ("envelope", Test_envelope.tests);
       ("log", Test_log.tests);
       ("golden", Test_golden.tests);
+      ("batch_commit", Test_batch_commit.tests);
       ("sim_prng", Test_sim_prng.tests);
       ("sim_network", Test_sim_network.tests);
       ("sim_faults", Test_sim_faults.tests);

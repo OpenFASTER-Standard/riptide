@@ -1,0 +1,3 @@
+(library
+ (name riptide_batch_commit)
+ (libraries riptide riptide_vsr))
