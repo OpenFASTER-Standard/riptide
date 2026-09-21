@@ -753,8 +753,18 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
   let handles = Array.init replica_count (fun i -> Sim_transport.create net (i + 1)) in
   let replicas =
     Array.init replica_count (fun i ->
-        Replica.create ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
-            Sim_transport.send handles.(i) ~to_ bytes))
+        let r =
+          Replica.create ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
+              Sim_transport.send handles.(i) ~to_ bytes)
+        in
+        (* A freshly created replica starts at view_number = 0, where Primary(0) = replica_count
+           (Euclidean modulo, not 1) -- so without this, replica 1 (my_id = 1) is NOT the primary
+           and every test below's `let primary = replicas.(0)` assumption is false, silently
+           no-op-ing every propose call. Matches test_vsr_replica_view_change.ml's own established
+           convention (this harness is a trimmed copy of that file's with_cluster) of pinning every
+           replica to view 1 so Primary(1) = 1 for any replica_count. *)
+        Replica.for_test_set_view_number r 1;
+        r)
   in
   let settle () =
     let rec loop rounds_left =
