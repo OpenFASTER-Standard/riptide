@@ -45,7 +45,31 @@
    file, so [delete] removes the directory entry outright via [Eio.Path.unlink] -- confirmed
    present in the installed Eio 0.12 ([path.mli:133]). A deleted key's [get] afterwards hits a
    real [Eio.Io] (ENOENT) on open, which [durable_read] treats identically to "never put" --
-   there is no on-disk trace left for a reopen to resurrect. *)
+   there is no on-disk trace left for a reopen to resurrect. [delete]'s own catch is narrowed to
+   specifically [Eio.Fs.E (Eio.Fs.Not_found _)] (confirmed the real shape [eio_linux]'s
+   [wrap_fs] wraps [ENOENT] as, in [lib_eio_linux/err.ml]) -- not a blanket [Eio.Io _] -- so a
+   genuine failure (permission denied, I/O error) propagates instead of being silently treated
+   as "already deleted"; a caller must be able to trust that [delete] returning means the key is
+   actually gone.
+
+   {b [put]'s overwrite is crash-atomic via write-temp-then-rename.} A prior version of
+   [durable_write] wrote the new header at offset 0 and the new data after it directly in
+   place over the target file -- safe for [File_storage]'s own ring/superblock slots (protected
+   there by a separate 3-copy quorum anyway) but not for this module's [put], whose documented
+   contract is "durably overwrite any previous value", for a value that must stay readable
+   indefinitely. A crash between the header and data writes of a second [put] to an
+   already-committed key would leave a header with the new checksum pointing at old data --
+   failing the checksum check on read and losing a value an earlier, successful [put] had
+   already durably confirmed. Fixed the same way [File_storage]'s own superblock protects a
+   similarly-shaped hazard, but with the simpler primitive available here since each key has
+   its own file (no need for a multi-copy quorum): [durable_write] stages the full new record
+   (header then data, same ordering as before) into a per-key temporary file
+   ([path ^ tmp_suffix]), then publishes it with a single [Eio.Path.rename] onto the real key
+   path -- confirmed real in the installed Eio 0.12 ([path.mli:145], "atomically unlinks old_t
+   and links it as new_t"). POSIX [rename(2)] within one directory is atomic, so [get] (which
+   only ever opens the real key path, never the temp one) can only ever observe the fully-old
+   record or the fully-new one, never a torn mix -- a crash at any point before the [rename]
+   leaves the real path, and therefore the previous value, completely untouched. *)
 
 type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_capable : bool }
 
@@ -164,17 +188,27 @@ let path_for t ~key =
     (Riptide.Value.hash_to_hex
        (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key))))
 
-(* Durably writes [data] to [path]: header (length + checksum) first, then data -- the same
-   "header always written first" ordering [File_storage.wal_append] uses, so a crash between
-   the two writes leaves a header pointing at stale (previous-write's, or zero-length-file's)
-   data rather than data with no covering header. Opens with [creat] so a first [put] for a
-   key with no file yet succeeds. *)
+(* Suffix for the per-key temporary file [durable_write] stages a new record into before
+   atomically publishing it via [Eio.Path.rename] -- see this file's top comment ("[put]'s
+   overwrite is crash-atomic...") for the full rationale. Fixed, not randomized: two callers
+   concurrently [put]ting the *same* key is not a case [Kv_store_intf.S] promises to handle
+   (nothing in its contract mentions concurrent writers) -- this only needs to survive a crash
+   during a single writer's own interrupted write, not race a second writer for the name. *)
+let tmp_suffix = ".put.tmp"
+
+(* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
+   first, then data, into [path ^ tmp_suffix] -- the same "header always written first"
+   ordering [File_storage.wal_append] uses, so a crash between the two *temp*-file writes
+   leaves (at worst) a garbage temp file that the real [path] never points at -- then a single
+   [Eio.Path.rename] of the temp file onto [path] publishes the whole record atomically. Opens
+   the temp file with [creat] so a first [put] for a key with no file yet succeeds. *)
 let durable_write t path data =
   if String.length data > max_value_size then
     invalid_arg
       (Printf.sprintf "put: value of %d bytes exceeds this store's max value size of %d bytes"
          (String.length data) max_value_size);
-  let h = open_file_handle_write ~sw:t.sw path in
+  let tmp_path = path ^ tmp_suffix in
+  let h = open_file_handle_write ~sw:t.sw tmp_path in
   Fun.protect
     ~finally:(fun () -> ignore (Eio_unix.Fd.close h.fd))
     (fun () ->
@@ -186,7 +220,8 @@ let durable_write t path data =
       perform_write ~sw:t.sw h ~offset:0 header_buf;
       let data_buf = alloc_aligned_buffer data_slot_size in
       Cstruct.blit_from_string data 0 data_buf 0 (String.length data);
-      perform_write ~sw:t.sw h ~offset:header_slot_size data_buf)
+      perform_write ~sw:t.sw h ~offset:header_slot_size data_buf);
+  Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path)
 
 (* [None] for every way this can fail to verify: the file doesn't exist (never put, or
    deleted -- caught as [Eio.Io] from the open itself), a short/missing header or data read, a
@@ -223,4 +258,6 @@ let put t ~key data = durable_write t (path_for t ~key) data
 
 let delete t ~key =
   try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key)
-  with Eio.Io _ -> () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *)
+  with
+  | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+    () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *)

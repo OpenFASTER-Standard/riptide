@@ -10,7 +10,10 @@ module type S = sig
       from corrupted" ambiguity {!Storage_intf.S.wal_read} already documents. *)
 
   val put : t -> key:string -> string -> unit
-  (** Durably writes [key]'s value, overwriting any previous value. *)
+  (** Durably writes [key]'s value, overwriting any previous value. The overwrite itself is
+      atomic: a crash during a [put] can never leave [key] readable as a torn mix of the old
+      and new values -- a subsequent [get] sees either the value from the last successful
+      [put], in full, or (if this [put] itself completed) the new one, in full. *)
 
   val delete : t -> key:string -> unit
   (** Durably removes [key]. Durable across a reopen — a deleted key must
