@@ -398,8 +398,21 @@ let connect_to t ~sw ~net ~clock ~host ~port peer_id =
      settled disagreement about certificates that retrying 200 times cannot resolve, and burning
      20s on it before reporting would only delay the truth.
 
-     As in [handle_accepted], [raw_flow] is never touched again once wrapped. *)
-  match Tls_eio.client_of_flow (Tls_identity.client_config t.tls) raw_flow with
+     As in [handle_accepted], [raw_flow] is never touched again once wrapped.
+
+     This wait is bounded by [tls_handshake_timeout], the same constant and for the same reason
+     [handle_accepted] bounds its own [Tls_eio.server_of_flow] call: the peer we just dialed is,
+     from this point on, an unauthenticated party that has only proven it can accept a TCP
+     connection, not that it will ever speak TLS back to us. Without this, a peer whose process is
+     wedged, mid-restart, or behind a path that silently drops packets after [connect] succeeds
+     would park this fiber inside [Tls_eio.client_of_flow]'s [drain_handshake] forever -- and
+     because that wait happens before [mesh_formation_timeout] even starts (see below), no
+     existing timeout would ever catch it; [create] would simply hang at startup with no
+     diagnostic. *)
+  match
+    Eio.Time.with_timeout clock tls_handshake_timeout (fun () ->
+        Ok (Tls_eio.client_of_flow (Tls_identity.client_config t.tls) raw_flow))
+  with
   | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
   | exception exn ->
     (* [Eio.Net.connect ~sw] attached [raw_flow] to the long-lived outer switch, and nothing else
@@ -407,7 +420,14 @@ let connect_to t ~sw ~net ~clock ~host ~port peer_id =
        shuts down. *)
     (try Eio.Flow.close raw_flow with End_of_file | Eio.Io _ -> ());
     raise (Tls_handshake_failed exn)
-  | tls_flow ->
+  | Error `Timeout ->
+    (try Eio.Flow.close raw_flow with End_of_file | Eio.Io _ -> ());
+    raise
+      (Tls_handshake_failed
+         (Failure
+            (Printf.sprintf "TLS handshake with dialed peer did not complete within %.1fs"
+               tls_handshake_timeout)))
+  | Ok tls_flow ->
     Eio.Fiber.fork ~sw (fun () ->
         let r = Eio.Buf_read.of_flow tls_flow ~max_size:max_message_size in
         run_connection t ~is_dialer:true ~owns_flow:true peer_id tls_flow r)

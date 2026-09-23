@@ -29,18 +29,26 @@
    - each peer's [receive] only ever surfaces messages actually sent [~to_] it, with no
      cross-peer misattribution, even under concurrent multi-connection traffic;
    - [Tcp.create] does not return until every SPECIFIC expected peer id is connected, rather than
-     merely that many connections existing (see that test's own comment).
+     merely that many connections existing (see that test's own comment);
+   - the dial side's own TLS handshake (inside [connect_to]) is bounded by
+     [tls_handshake_timeout], the same as the accept side's, rather than able to hang [Tcp.create]
+     forever against a peer that accepts the TCP connection and then never speaks TLS back (see
+     [test_dial_side_tls_handshake_has_a_bounded_timeout] below for how this is timed without
+     actually waiting out the real ~10s).
 
-   Two further failure paths are also not covered here, for reasons of mechanism rather than
-   oversight, and both were instead verified with throwaway harnesses: the listener surviving a
-   transient [accept(2)] error needs the process's file-descriptor budget deliberately exhausted,
-   which would break the test runner itself long before it reached an assertion; and the bounded
-   wait for an accepted connection's handshake preamble takes longer to fire (~10s) than this
-   suite's own wall-clock watchdog allows a single test to run.
+   One further failure path is not covered here, for reasons of mechanism rather than oversight,
+   and was instead verified with a throwaway harness: the listener surviving a transient
+   [accept(2)] error needs the process's file-descriptor budget deliberately exhausted, which
+   would break the test runner itself long before it reached an assertion. The {e accept} side's
+   own bounded waits (the TLS handshake and the handshake-preamble read, both ~10s) are similarly
+   not exercised here on a real clock, for the reason above -- ~10s eats most of this suite's own
+   15s-per-test watchdog budget. The {e dial} side's equivalent new timeout, added in this file
+   alongside the fix, sidesteps that by racing the real handshake against a virtual
+   [Eio_mock.Clock] instead of the real one, so it does not have this problem and is covered.
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
-   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362) so a re-run or a
-   future added test in this file can't collide even if an earlier
+   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372) so a
+   re-run or a future added test in this file can't collide even if an earlier
    test's sockets are still winding down -- [Tcp.create] itself passes [~reuse_addr:true] to
    [Eio.Net.listen], but distinct ports sidestep the question entirely rather than relying on
    that. [Tcp.create] does not expose its internal listening socket, so there is no way to ask it
@@ -562,6 +570,98 @@ let test_first_bytes_on_the_wire_are_a_tls_handshake () =
     "...and specifically not this module's own 8-byte plaintext handshake preamble" false
     (observed = be8 1)
 
+(* -- Area 6: dial-side TLS handshake timeout -----------------------------------------------
+
+   Regression test for the finding fixed in this round: [connect_to]'s call to
+   [Tls_eio.client_of_flow] used to have no timeout at all, unlike [handle_accepted]'s equivalent
+   [server_of_flow] call. A peer that accepts the TCP connection and then never speaks TLS back --
+   wedged, mid-restart, or behind a path that silently drops packets after [connect] -- used to
+   park [Tcp.create] inside the handshake forever, with no diagnostic, *before*
+   [mesh_formation_timeout] ever got a chance to apply. The fix wraps the dial-side handshake in
+   the same [Eio.Time.with_timeout clock tls_handshake_timeout] the accept side already used.
+
+   A raw TCP listener again stands in for peer 2 (as in
+   [test_first_bytes_on_the_wire_are_a_tls_handshake] above), except this one accepts the
+   connection and then holds it open without ever writing a byte, instead of being torn down
+   immediately -- exactly the hang scenario the finding describes.
+
+   Waiting out the real [tls_handshake_timeout] (~10s) here, on the suite's real wall clock, would
+   eat most of this suite's own 15s-per-test watchdog budget (see this file's header comment) --
+   uncomfortably close for a suite that otherwise runs in a couple of seconds. [Tcp.create]'s
+   [~clock] argument is a plain [_ Eio.Time.clock], though, so this test hands it an
+   [Eio_mock.Clock] instead of the real one -- the same virtual-time mechanism
+   [lib/sim/network.ml] already uses to drive [Riptide_sim]'s simulated network deterministically.
+   The raw TCP connect and the handshake's own blocked read are still real OS I/O via
+   [Eio_main.run]; only the timeout race's notion of elapsed time is virtual, which is what lets
+   this test fire the timeout near-instantly and deterministically instead of either sleeping for
+   real or racing the assertion against wall-clock flakiness. *)
+exception Handshake_timeout_probe_done
+
+let test_dial_side_tls_handshake_has_a_bounded_timeout () =
+  let peer_specs = [ (1, "127.0.0.1", 19371); (2, "127.0.0.1", 19372) ] in
+  let result = ref None in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let real_clock = Eio.Stdenv.clock env in
+  let mock_clock = Eio_mock.Clock.make () in
+  let clock_for_tcp : float Eio.Time.clock_ty Eio.Std.r =
+    (mock_clock :> float Eio.Time.clock_ty Eio.Std.r)
+  in
+  (try
+     Eio.Switch.run (fun sw ->
+         let listener =
+           Eio.Net.listen ~reuse_addr:true ~backlog:1 ~sw net
+             (`Tcp (Eio.Net.Ipaddr.V4.loopback, 19372))
+         in
+         Eio.Fiber.both
+           (fun () ->
+             (* Accept the raw connection -- proving the finding's premise, that the raw TCP
+                connect succeeds -- then hold [flow] open and silent. [sw] keeps the fd alive after
+                this fiber moves on, so peer 1's dialer genuinely blocks inside
+                [Tls_eio.client_of_flow] waiting for a ServerHello that is never coming. Once that
+                wait has registered its timeout job on the mock clock, push virtual time past it to
+                fire the timeout deterministically rather than waiting out the real ~10s. *)
+             let flow, _addr = Eio.Net.accept ~sw listener in
+             ignore flow;
+             let rec wait_for_timeout_job () =
+               match Eio_mock.Clock.advance mock_clock with
+               | () -> ()
+               | exception Invalid_argument _ ->
+                 Eio.Time.sleep real_clock 0.02;
+                 wait_for_timeout_job ()
+             in
+             wait_for_timeout_job ())
+           (fun () ->
+             (match
+                Tcp.create ~sw ~net ~clock:clock_for_tcp ~my_id:1 ~peers:peer_specs
+                  ~tls:(peer_identity 1)
+              with
+             | (_ : Tcp.t) ->
+               Alcotest.fail
+                 "Tcp.create succeeded despite peer 2 never completing its TLS handshake"
+             | exception Failure msg -> result := Some msg);
+             Eio.Switch.fail sw Handshake_timeout_probe_done))
+   with Handshake_timeout_probe_done -> ());
+  let msg =
+    match !result with
+    | Some msg -> msg
+    | None ->
+      Alcotest.fail
+        "Tcp.create never raised -- the dial-side TLS handshake timeout did not fire"
+  in
+  let contains needle haystack =
+    let nl = String.length needle and hl = String.length haystack in
+    let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+    go 0
+  in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "the failure names the TLS handshake and peer 2 specifically, not a generic dial timeout \
+        (got: %s)"
+       msg)
+    true
+    (contains "TLS handshake" msg && contains "peer 2" msg)
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
@@ -584,5 +684,7 @@ let tests =
     ("mTLS identity: a private key not matching its certificate is rejected at construction",
       `Quick, test_identity_rejects_a_key_that_does_not_match_its_certificate);
     ("mTLS identity: a certificate the trust anchor did not issue is rejected at construction",
-      `Quick, test_identity_rejects_a_certificate_its_trust_anchor_did_not_issue)
+      `Quick, test_identity_rejects_a_certificate_its_trust_anchor_did_not_issue);
+    ("mTLS: the dial-side TLS handshake has a bounded timeout, not an unbounded hang", `Quick,
+      test_dial_side_tls_handshake_has_a_bounded_timeout)
   ]

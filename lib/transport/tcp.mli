@@ -269,11 +269,16 @@ val create :
       - a higher-id peer never accepted this peer's dial (it never started, or is unreachable):
         raised once that peer's ~20s dial budget is spent, with the underlying [Eio.Io] error's
         own text appended;
-      - a higher-id peer accepted the TCP connection but the mutual TLS handshake with it failed
-        (its certificate did not chain to this peer's trust anchor, or it rejected this peer's):
-        raised {e immediately}, not after any retry budget, with a message naming the TLS
-        handshake specifically so it is not mistaken for unreachability, and carrying the
-        underlying [tls] failure or alert;
+      - a higher-id peer accepted the TCP connection but the mutual TLS handshake with it did not
+        succeed: raised without waiting on the dial retry budget above, with a message naming the
+        TLS handshake specifically so it is not mistaken for unreachability. Two distinct causes
+        share this path: a refused handshake (its certificate did not chain to this peer's trust
+        anchor, or it rejected this peer's) is raised {e immediately}, carrying the underlying
+        [tls] failure or alert; a handshake that is accepted but never completes at all -- the
+        peer took the TCP connection and then never spoke TLS back, whether wedged, mid-restart,
+        or behind a path that silently drops packets after [connect] -- is raised once
+        [tls_handshake_timeout] (~10s) is spent, carrying a message naming that timeout, rather
+        than leaving [create] hanging with no diagnostic;
       - a lower-id peer never dialed this peer, or dialed and failed the handshake (so no
         connection from it was ever accepted and handshaken): raised once the separate ~20s
         mesh-formation budget is spent, listing every still-missing peer id. A handshake this peer
@@ -283,9 +288,12 @@ val create :
       Dialing is {e sequential}, one higher-id peer at a time -- but a peer's exhausted dial
       budget now raises {e immediately} for that peer, it does not wait for any remaining
       higher-id peers to also be dialed first. So the worst-case time before a dial-side failure
-      is raised is bounded by (successful-connect time for whichever higher-id peers were dialed
-      before the one that never showed up, typically fast) plus that one peer's own ~20s budget --
-      not the peer count. [~20s * (number of higher-id peers) + ~20s] is only a real bound on the
+      is raised is bounded by (successful-connect-and-handshake time for whichever higher-id peers
+      were dialed before the one that failed, typically fast) plus that one peer's own budget --
+      ~20s if it never showed up at the TCP layer at all, or the shorter [tls_handshake_timeout]
+      (~10s) if it accepted the TCP connection but then stalled inside the TLS handshake, since in
+      that case the (already-spent) connect time isn't part of the remaining wait -- not the peer
+      count. [~20s * (number of higher-id peers) + ~20s] is only a real bound on the
       OTHER raise case (a lower-id peer that never dials in): that one waits out the full
       mesh-formation budget regardless of how the (already-successful) dial phase went, so ~20s
       dial time per successfully-dialed higher-id peer plus the ~20s mesh-formation wait is the
