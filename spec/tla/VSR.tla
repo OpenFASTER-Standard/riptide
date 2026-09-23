@@ -127,10 +127,21 @@ IsNormalBackup(r)   == /\ rep_status[r] = "Normal" /\ Primary(View(r)) # r
    never held. Reproduce it (the derived module is deliberately not committed, so it cannot
    rot out of sync with this one) from spec/tla:
      sed -e 's/^---- MODULE VSR ----/---- MODULE VSR_AbsentFault ----/' \
-         -e 's/IF o \in corrupted THEN "corrupt"/IF o \in corrupted THEN "absent"/' \
+         -e 's/|-> IF o \\in corrupted THEN "corrupt"/|-> IF o \\in corrupted THEN "absent"/' \
          VSR.tla > VSR_AbsentFault.tla
      grep -v 'INVARIANT StorageWellFormed' VSR.cfg > VSR_AbsentFault.cfg
      cd ../.. && scripts/tlc VSR_AbsentFault
+   The DOUBLE backslash in '\\in' is load-bearing and is the one thing to get right if you retype
+   this: the spec text being matched contains a literal backslash (TLA+'s '\in'), so a
+   single-backslash sed pattern matches NOTHING. An earlier version of this comment had exactly
+   that bug, and it fails in the worst possible way -- sed silently emits an unmutated copy, TLC
+   reports the usual clean result, and the recipe appears to prove the OPPOSITE of what it is for.
+   So check the OUTCOME, not just that the command ran: it must say
+     Error: Invariant NoCommittedOpProvablyAbsent is violated.
+   with 595 states generated / 328 distinct / depth 6 (single-worker). If it instead says "Model
+   checking completed. No error has been found", the substitution missed -- confirm with
+   'diff VSR.tla VSR_AbsentFault.tla', which must show the CrashRestart line changed, not just
+   the module header.
    StorageWellFormed is dropped from the derived config on purpose: it is the direct restatement
    of the contract being mutated, so leaving it in would report the mutation itself rather than
    the SAFETY CONSEQUENCE of the mutation, which is the whole point of the exercise.
@@ -596,7 +607,14 @@ ReceiveSV ==
    ================ the enablement narrowing, and what actually makes it sound ================
    Enablement is narrowed to restarts that can MATTER: a restart that corrupts nothing AND
    happens while the replica is not mid-view-change (rep_view_number[r] = rep_last_normal_view[r])
-   is not modelled, which is where roughly a factor of two in the state graph comes from.
+   is not modelled.
+
+   The saving is real but much smaller than the shape of the change suggests, and it is MEASURED,
+   not estimated. Derive a guard-deleted module (replace the "\/ corrupted # {}" disjunct below
+   with "\/ TRUE", rename the module, copy VSR.cfg unchanged) and run the shipped bound: 10473900
+   states generated / 3926093 distinct, depth 45, 0 states left on queue, in 02min 07s -- against
+   the narrowed spec's 9226786 / 3678650 / depth 45. That is 1.067x the distinct states: the guard
+   buys about 6.7%, NOT the factor of two an earlier version of this comment claimed.
 
    This is a state-space REDUCTION, so the bar it has to clear is not "the excluded transitions
    look uninteresting" -- an earlier version of this comment said only that they are "a pure
@@ -637,12 +655,19 @@ ReceiveSV ==
        (TimerSendSVC, ReceiveHigherSVC, ForfeitViewChange, CrashRestart) already sets this flag
        FALSE itself, so the reset is not what makes a later SendDVC possible in any case.
 
-   This is an argument, not a machine-checked reduction: TLC never sees the excluded
-   transitions, so nothing here would FAIL if the argument stopped holding. A future edit that
-   adds a reader of any of those four variables -- especially a non-monotone one, or a guard
-   that fires on a variable being EMPTY -- can silently invalidate it with no failing run to
-   say so. If you add such a reader, either redo this walk or delete the narrowing (the cost is
-   roughly 2x the state graph, which is affordable at the shipped bound). *)
+   This is an argument, not a machine-checked reduction, and that stays true in general: the
+   SHIPPED run never sees the excluded transitions, so a future edit that adds a reader of any of
+   those four variables -- especially a non-monotone one, or a guard that fires on a variable
+   being EMPTY -- can invalidate this walk with no failing run to say so.
+
+   At the CURRENT bound, though, there is one cheap corroboration worth naming, because it is a
+   real machine check rather than more prose: the guard-deleted run measured just above -- in
+   which TLC DOES explore every excluded transition -- passes all fifteen invariants. So at this
+   bound the reduction is directly confirmed to exclude nothing that falsifies anything; what is
+   unchecked is only whether that survives a future edit. Which makes the maintenance rule
+   concrete: if you add such a reader, either redo this walk AND re-run the guard-deleted variant,
+   or just delete the narrowing outright -- at ~6.7% it is easily affordable at the shipped
+   bound. *)
 CrashRestart ==
     \E r \in replicas : \E corrupted \in SUBSET (1..Len(rep_log[r])) :
         /\ aux_restart_count < RestartLimit

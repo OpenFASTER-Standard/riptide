@@ -850,8 +850,17 @@ for fault configurations on behaviours that never reach a view change at all. `V
 folds fault discovery into `CrashRestart` (they are the same event in reality — a replica discovers
 a slot no longer verifies when it re-reads its WAL after a restart) and then *narrows enablement to
 restarts that can matter*: a restart that corrupts nothing **and** happens while the replica is not
-mid-view-change is a pure volatile-state reset with no bearing on any property here, and is not
-modelled. That guard is where the factor of two-and-a-bit comes from.
+mid-view-change is not modelled. (What licenses that exclusion is not "those transitions look
+uninteresting" but a per-variable walk showing they enable no action and falsify no invariant that
+was not already enabled/false — the walk lives in `VSR.tla`'s `CrashRestart` comment.)
+
+The saving from that particular guard is genuine but modest, and worth stating as the measured
+number rather than an impression: deleting it gives `10473900` states generated / `3926093`
+distinct at the shipped bound, against the narrowed spec's `9226786` / `3678650` — **1.067x, about
+6.7%**, not the factor of two the shape of the change suggests. (An earlier version of this
+paragraph claimed "a factor of two-and-a-bit"; that was never measured.) The order-of-magnitude win
+described above is from folding fault discovery into `CrashRestart` instead of paying a 7x
+configuration multiplier — not from this guard.
 
 The generalisable form of finding 2 is therefore stronger than the draft's version of it. It is not
 "model faults as configuration rather than as events" — configuration has its own multiplier. It is:
