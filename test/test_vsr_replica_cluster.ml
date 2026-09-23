@@ -111,7 +111,7 @@ let with_cluster ?(replica_count = default_replica_count)
     Array.init replica_count (fun i ->
         let my_id = i + 1 in
         let r =
-          Replica.create ~my_id ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
+          Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
               Sim_transport.send handles.(i) ~to_ bytes)
         in
         Replica.for_test_set_view_number r primary_view_number;

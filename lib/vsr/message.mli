@@ -37,12 +37,34 @@ type t =
   | Start_view_change of { v : int; i : int }  (** Tag ["StartViewChange"]. [v] is a view number. *)
   | Do_view_change of {
       v : int;
-      log : Riptide.Value.value list;
+      entries : (int * Riptide.Value.value) list;
+      nacks : int list;
       last_normal_view : int;
       n : int;
       k : int;
       i : int;
-    }  (** Tag ["DoViewChange"]. [v] is a view number. *)
+    }
+      (** Tag ["DoViewChange"]. [v] is a view number.
+
+          {b [entries] and [nacks] replace the single [log] field an earlier version of this
+          constructor carried}, transcribing [SendDVC]'s own record literal after
+          `spec/tla/VSR.tla`'s storage-fault-aware extension (VSR.tla:376-389, and the
+          explanation of why the evidence is piggybacked here rather than accumulated separately
+          at VSR.tla:348-375):
+
+          - [entries] is a {b partial} map from op-number to value — exactly the op-numbers this
+            replica can actually READ ([ReadableEntries(r)], VSR.tla:170), so a slot whose
+            checksum no longer verifies is simply not in it. It is deliberately not a list of
+            values: "a replica cannot send bytes it cannot read", and a corrupt slot in the
+            middle does not hide the readable slots after it, so the domain genuinely need not be
+            a contiguous prefix. Encoded as [Sequence [ Record [ "o"; "v" ]; ... ]].
+          - [nacks] is the set of op-numbers this replica can {b prove} it never durably held
+            ([{ o \in ops : CanNack(r, o) }], VSR.tla:383 / :157). A corrupt slot is never in it
+            — that is the single rule the whole nack-quorum truncation argument rests on
+            (VSR.tla:112-147). Encoded as [Sequence] of [Int] scalars.
+          - [n] is still the sender's own op-number, which it knows from durable superblock state
+            even when some slot bodies are unreadable — so [n] is NOT the length of [entries],
+            and a receiver must not check it as if it were. *)
   | Start_view of { v : int; log : Riptide.Value.value list; n : int; k : int }
       (** Tag ["StartView"]. [v] is a view number. Deliberately has no [i] field — the TLA+
           spec's own [StartView] record literal (in [SendSV]) has none either. *)

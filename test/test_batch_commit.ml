@@ -11,7 +11,7 @@ let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
    of this degenerate cluster size for propose-focused unit tests. *)
 let create_solo () =
   let send ~to_:_ (_ : string) = () in
-  Replica.create ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send
+  Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send
 
 let w ~actor ~causation ~correlation payload : Batch_commit.write =
   { actor; causation; correlation; payload }
@@ -272,9 +272,9 @@ let test_uncommitted_tail_is_excluded () =
   let replicas = Array.make replica_count None in
   let silent_send ~to_:_ (_ : string) = () in
   let primary_send ~to_ bytes = match replicas.(to_ - 1) with Some r -> Replica.handle_message r bytes | None -> ()  in
-  replicas.(0) <- Some (Replica.create ~my_id:1 ~replica_count ~svc_limit:3 ~send:primary_send);
-  replicas.(1) <- Some (Replica.create ~my_id:2 ~replica_count ~svc_limit:3 ~send:silent_send);
-  replicas.(2) <- Some (Replica.create ~my_id:3 ~replica_count ~svc_limit:3 ~send:silent_send);
+  replicas.(0) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count ~svc_limit:3 ~send:primary_send);
+  replicas.(1) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count ~svc_limit:3 ~send:silent_send);
+  replicas.(2) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count ~svc_limit:3 ~send:silent_send);
   (* Pin all replicas to view 1 so they can communicate -- Primary(1) = 1 for replica_count=3 *)
   List.iter (fun opt -> match opt with Some r -> Replica.for_test_set_view_number r 1 | None -> ()) (Array.to_list replicas);
   let primary = Option.get replicas.(0) in

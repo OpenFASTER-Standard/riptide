@@ -23,11 +23,29 @@ let test_round_trip_start_view_change () =
   let m = Message.Start_view_change { v = 4; i = 1 } in
   Alcotest.(check bool) "Start_view_change round-trips" true (Message.decode (Message.encode m) = m)
 
+(* [entries] is deliberately PARTIAL and NOT a prefix here (ops 1 and 3, no op 2), and [nacks]
+   sits strictly above [n] -- exactly the shape a replica with one corrupt slot produces, and the
+   shape a [Value.Sequence] of values could not have expressed at all. See message.mli's own note
+   on the two fields. *)
 let test_round_trip_do_view_change () =
   let m =
-    Message.Do_view_change { v = 4; log = sample_log (); last_normal_view = 3; n = 7; k = 5; i = 1 }
+    Message.Do_view_change
+      {
+        v = 4;
+        entries = (match sample_log () with a :: b :: _ -> [ (1, a); (3, b) ] | _ -> []);
+        nacks = [ 8; 9 ];
+        last_normal_view = 3;
+        n = 7;
+        k = 5;
+        i = 1;
+      }
   in
   Alcotest.(check bool) "Do_view_change round-trips" true (Message.decode (Message.encode m) = m)
+
+let test_round_trip_do_view_change_with_empty_evidence () =
+  let m = Message.Do_view_change { v = 4; entries = []; nacks = []; last_normal_view = 3; n = 0; k = 0; i = 1 } in
+  Alcotest.(check bool) "Do_view_change with no readable entries and no nacks round-trips" true
+    (Message.decode (Message.encode m) = m)
 
 let test_round_trip_start_view () =
   let m = Message.Start_view { v = 4; log = sample_log (); n = 7; k = 5 } in
@@ -78,7 +96,7 @@ let malformed_input_tests =
                       ("v", sample_value ());
                       ("k", Value.Scalar (Value.Int 5L));
                     ] ))));
-    expect_malformed "Do_view_change 'log' field has the wrong shape (Int instead of Sequence)" (fun () ->
+    expect_malformed "Do_view_change 'entries' field has the wrong shape (Int instead of Sequence)" (fun () ->
         Message.decode
           (Value.canonical_encode
              (Value.Sum
@@ -86,7 +104,8 @@ let malformed_input_tests =
                   Value.Record
                     [
                       ("v", Value.Scalar (Value.Int 4L));
-                      ("log", Value.Scalar (Value.Int 1L));
+                      ("entries", Value.Scalar (Value.Int 1L));
+                      ("nacks", Value.Sequence []);
                       ("last_normal_view", Value.Scalar (Value.Int 3L));
                       ("n", Value.Scalar (Value.Int 7L));
                       ("k", Value.Scalar (Value.Int 5L));
@@ -127,7 +146,17 @@ let message_gen =
       map (fun (view, n, i) -> Message.Prepare_ok { view; n; i }) (tup3 nonneg_int_gen nonneg_int_gen nonneg_int_gen);
       map (fun (v, i) -> Message.Start_view_change { v; i }) (pair nonneg_int_gen nonneg_int_gen);
       map
-        (fun (v, log, last_normal_view, n, k, i) -> Message.Do_view_change { v; log; last_normal_view; n; k; i })
+        (fun (v, log, last_normal_view, n, k, i) ->
+          Message.Do_view_change
+            {
+              v;
+              entries = List.mapi (fun idx value -> (idx + 1, value)) log;
+              nacks = [ n + 1; n + 2 ];
+              last_normal_view;
+              n;
+              k;
+              i;
+            })
         (tup6 nonneg_int_gen log_gen nonneg_int_gen nonneg_int_gen nonneg_int_gen nonneg_int_gen);
       map (fun (v, log, n, k) -> Message.Start_view { v; log; n; k })
         (tup4 nonneg_int_gen log_gen nonneg_int_gen nonneg_int_gen);
@@ -143,6 +172,9 @@ let tests =
     ("round-trip Prepare_ok", `Quick, test_round_trip_prepare_ok);
     ("round-trip Start_view_change", `Quick, test_round_trip_start_view_change);
     ("round-trip Do_view_change", `Quick, test_round_trip_do_view_change);
+    ( "round-trip Do_view_change with empty entries/nacks",
+      `Quick,
+      test_round_trip_do_view_change_with_empty_evidence );
     ("round-trip Start_view", `Quick, test_round_trip_start_view);
     QCheck_alcotest.to_alcotest round_trip_prop;
   ]

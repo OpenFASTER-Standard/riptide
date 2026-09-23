@@ -21,6 +21,74 @@ type status = Normal | View_change
    the count) and [Cardinality]. *)
 module Int_set = Set.Make (Int)
 
+(* ---- the durable side: [Riptide_storage.Storage_intf.S], as a record of closures ----
+
+   VSR.tla's storage-fault-aware extension makes durability part of the PROTOCOL, not an
+   orthogonal concern a caller bolts on: [CrashRestart] (VSR.tla:671-690) is only meaningful
+   because [rep_log]/[rep_op_number]/[rep_commit_number]/[rep_view_number]/[rep_last_normal_view]
+   survive it, and [CanNack] (VSR.tla:157) is only sound because the storage layer can tell
+   "never written" from "written, now unreadable". So [t] below owns a backend.
+
+   WHY A RECORD OF CLOSURES RATHER THAN A FIRST-CLASS MODULE STORED IN [t]. [Storage_intf.S] has
+   an abstract [type t], so storing "the module plus its value" inside [Replica.t] means either
+   making [Replica.t] itself polymorphic in the backend's type ([('s) Replica.t], which infects
+   every existing signature, every test, [Riptide_batch_commit], and the DST harness's own replica
+   array for no behavioural gain) or packing an existential (a GADT wrapper, which buys exactly
+   the same erasure this record buys, with more ceremony). The closure record erases the backend's
+   type at the single point of construction -- {!storage_of_module} -- exactly the way this module
+   already takes its transport as a value ([send : to_:int -> string -> unit]) rather than as a
+   functor parameter. [Replica.t] stays monomorphic, as it is today.
+
+   The field names, argument labels and doc semantics are verbatim {!Riptide_storage.Storage_intf.S};
+   this record adds nothing and hides nothing. *)
+type storage = {
+  wal_append : op_number:int -> string -> unit;
+  wal_read : op_number:int -> string option;
+  wal_truncate_after : op_number:int -> unit;
+  wal_highest_op_number : unit -> int;
+  superblock_write : string -> unit;
+  superblock_read : unit -> string option;
+}
+
+let storage_of_module (type a) (module S : Riptide_storage.Storage_intf.S with type t = a) (backend : a)
+    =
+  {
+    wal_append = (fun ~op_number bytes -> S.wal_append backend ~op_number bytes);
+    wal_read = (fun ~op_number -> S.wal_read backend ~op_number);
+    wal_truncate_after = (fun ~op_number -> S.wal_truncate_after backend ~op_number);
+    wal_highest_op_number = (fun () -> S.wal_highest_op_number backend);
+    superblock_write = (fun bytes -> S.superblock_write backend bytes);
+    superblock_read = (fun () -> S.superblock_read backend);
+  }
+
+let volatile_storage () = storage_of_module (module Riptide_storage.Memory_storage) (Riptide_storage.Memory_storage.create ())
+
+(* VSR.tla's own per-op tri-state [rep_storage[r][o]] (VSR.tla:77, :100-150), as read back through
+   a real {!Riptide_storage.Storage_intf.S}. The mapping is the single most safety-critical piece
+   of this file, so it is stated here once and used everywhere rather than re-derived per call
+   site:
+
+     [Present v] -- the slot is readable AND its bytes decode to a value ([Holds(r, o)]).
+     [Corrupt]   -- the op-number is within the replica's own DURABLE op-number range, but the
+                    backend will not return it (checksum mismatch, torn write, a ring slot already
+                    recycled) or the bytes no longer decode. The replica holds SOMETHING here it
+                    cannot verify, so it can neither ship it nor prove it never held it.
+     [Absent]    -- the op-number is beyond everything this replica has durable evidence of, so it
+                    can PROVE it never durably wrote an entry there ([CanNack], VSR.tla:157).
+
+   [Storage_intf.S.wal_read] deliberately returns [None] for BOTH "never written" and "corrupt"
+   (its own doc comment says so, and names this function as the thing that exists to tell them
+   apart "using cross-replica evidence this single-node signature has no access to"). What
+   disambiguates them here is the DURABLE op-number: [t.op_number] comes from the superblock, is
+   written only AFTER the WAL entry it describes is durable, and therefore bounds exactly the
+   range this replica has already promised to hold. The [max] with the backend's own
+   [wal_highest_op_number] is the conservative direction and is deliberate: an entry physically on
+   disk but not yet covered by the superblock (a crash between the two writes) is treated as
+   CORRUPT rather than ABSENT, i.e. it is never nacked. Erring this way costs liveness only;
+   erring the other way is precisely the mutation VSR.tla:118-147 records TLC breaking
+   [NoCommittedOpProvablyAbsent] on at depth 6. *)
+type slot_state = Present of Value.value | Corrupt | Absent
+
 (* One received DOVIEWCHANGE, as an element of VSR.tla's own [rep_recv_dvc[r]] (VSR.tla:34, typed
    [SUBSET [message]] -- a set of message RECORDS). Exactly the six fields [SendDVC]'s own record
    literal carries (VSR.tla:222-224), minus [type]/[dest] (constant/implied here -- see
@@ -36,7 +104,18 @@ module Int_set = Set.Make (Int)
    [handle_do_view_change] below. *)
 type dvc = {
   dvc_v : int;
-  dvc_log : Value.value list;
+  dvc_entries : (int * Value.value) list;
+      (* [ReadableEntries(r)] (VSR.tla:170) as shipped by [SendDVC] (VSR.tla:381-382): a PARTIAL
+         map, op-number -> value, defined exactly on the slots the sender could read. NOT a list
+         of values and NOT necessarily a contiguous prefix -- a corrupt slot does not hide the
+         readable slots after it. Validated on arrival to have every op-number within [1, dvc_n]
+         and no duplicates (see [handle_do_view_change]), so every reader below may index it
+         freely. *)
+  dvc_nacks : int list;
+      (* [{ o \in ops : CanNack(r, o) }] (VSR.tla:383): op-numbers the sender PROVES it never
+         durably held. Validated on arrival to be positive and strictly greater than [dvc_n] --
+         see [handle_do_view_change]'s own guard for why a nack at or below the sender's own
+         op-number is a self-contradiction rather than merely unusual. *)
   dvc_last_normal_view : int;
   dvc_n : int;
   dvc_k : int;
@@ -49,6 +128,23 @@ type t = {
   svc_limit : int; (* StartViewOnTimerLimit -- bounds check_timeout; read by check_timeout
                        itself, below in this same file. *)
   log : Replica_log.t;
+  (* The in-memory, fast-path copy of [rep_log[r]]. The DURABLE copy lives in [storage]'s WAL and
+     is authoritative across a restart; this one is what a running process reads. They advance
+     together (every append/adoption writes both), with exactly one documented way for them to
+     differ: after a restart that discovered a corrupt slot, this holds only the READABLE PREFIX
+     of the durable log, while [op_number] below still carries the full durable op-number. See
+     [restart]. *)
+  storage : storage;
+  mutable op_number : int;
+  (* VSR.tla's [rep_op_number[r]] (VSR.tla:52), now a field of its own rather than (as before this
+     task) a synonym for [Replica_log.length t.log]. It has to be: [rep_op_number] is DURABLE
+     across [CrashRestart] (VSR.tla:592-593) and comes back from the superblock, whereas the
+     in-memory log after a restart may be shorter than it -- and SendDVC's own comment
+     (VSR.tla:358-359) turns on exactly that distinction: "n -- its op-number, which it still
+     knows from durable superblock state even when some slot bodies are unreadable". Keeping the
+     two in lockstep is now this module's own obligation ([LogLengthMatchesOpNumber],
+     VSR.tla:728-729, holds whenever the log has no unreadable slot); every writer below updates
+     both in the same step. *)
   mutable status : status; (* VSR.tla's [rep_status[r]] (VSR.tla:29). *)
   mutable view_number : int; (* VSR.tla's [rep_view_number[r]] (VSR.tla:30), i.e. [View(r)]. *)
   mutable last_normal_view : int;
@@ -145,30 +241,97 @@ type t = {
   send : to_:int -> string -> unit;
 }
 
-let create ~my_id ~replica_count ~svc_limit ~send =
-  if replica_count < 1 then invalid_arg "Replica.create: replica_count must be >= 1";
+(* ---- the superblock record: VSR.tla's DURABLE per-replica state ----
+   [CrashRestart]'s own list (VSR.tla:592-596), minus the log itself (which lives in the WAL):
+   [rep_op_number], [rep_commit_number], [rep_view_number], [rep_last_normal_view]. The last two
+   are the point of Decision 4 -- persisted rather than reconstructed by VSR's textbook in-memory
+   Recovery sub-protocol -- and [rep_status] is deliberately NOT among them: it is RECONSTRUCTED
+   from [view > log_view] at restart (VSR.tla:596-597, :680-682), which is exactly what the
+   durable pair buys.
+
+   Encoded with {!Riptide.Value.canonical_encode}, the same primitive {!Message} uses, rather than
+   a second hand-rolled format. *)
+let superblock_encode ~view_number ~last_normal_view ~op_number ~commit_number =
+  let int_field name i = (name, Value.Scalar (Value.Int (Int64.of_int i))) in
+  Value.canonical_encode
+    (Value.Record
+       [
+         int_field "commit_number" commit_number;
+         int_field "last_normal_view" last_normal_view;
+         int_field "op_number" op_number;
+         int_field "view_number" view_number;
+       ])
+
+(* Tolerant by construction: anything that does not decode as the exact record shape above yields
+   [None], i.e. "this replica has no usable durable state", never an exception. A superblock that
+   fails to read back is the storage layer's own already-documented failure mode
+   ({!Riptide_storage.Storage_intf.S.superblock_read} returns [None] when fewer than a majority of
+   its copies agree), and a partially-decodable one is no more trustworthy than a missing one. *)
+let superblock_decode (bytes : string) =
+  match Value.canonical_decode bytes with
+  | exception Invalid_argument _ -> None
+  | Value.Record fields ->
+    let int_field name =
+      match List.assoc_opt name fields with
+      | Some (Value.Scalar (Value.Int i)) ->
+        let i = Int64.to_int i in
+        if i < 0 then None else Some i
+      | _ -> None
+    in
+    (match
+       (int_field "view_number", int_field "last_normal_view", int_field "op_number", int_field "commit_number")
+     with
+    | Some view_number, Some last_normal_view, Some op_number, Some commit_number
+      when commit_number <= op_number ->
+      (* [CommitNumberNeverHigherThanOpNumber] (VSR.tla:721-722) applied to durable state as it is
+         read back, not merely as it is written: a superblock that violates it would put this
+         replica into a state no reachable execution can produce, so it is discarded whole. *)
+      Some (view_number, last_normal_view, op_number, commit_number)
+    | _ -> None)
+  | _ -> None
+
+let persist_superblock t =
+  t.storage.superblock_write
+    (superblock_encode ~view_number:t.view_number ~last_normal_view:t.last_normal_view
+       ~op_number:t.op_number ~commit_number:t.commit_number)
+
+let validate_create_args ~fn ~my_id ~replica_count ~svc_limit =
+  if replica_count < 1 then invalid_arg (fn ^ ": replica_count must be >= 1");
   if replica_count mod 2 = 0 then
     invalid_arg
-      "Replica.create: replica_count must be odd -- VSR.tla:140's own comment assumes 2f+1 = \
-       ReplicaCount, and VSR.cfg never instantiates an even count";
+      (fn
+     ^ ": replica_count must be odd -- VSR.tla:140's own comment assumes 2f+1 = ReplicaCount, and \
+        VSR.cfg never instantiates an even count");
   if my_id < 1 || my_id > replica_count then
-    invalid_arg "Replica.create: my_id must be in [1, replica_count] (VSR.tla's replicas == 1..ReplicaCount)";
+    invalid_arg (fn ^ ": my_id must be in [1, replica_count] (VSR.tla's replicas == 1..ReplicaCount)");
   if svc_limit < 1 then
     invalid_arg
-      "Replica.create: svc_limit must be >= 1 -- VSR.tla:163's own [aux_svc_count[r] < \
-       StartViewOnTimerLimit] guard on TimerSendSVC is never satisfiable at aux_svc_count[r] = 0 \
-       (Init's own starting value) for a non-positive limit, which would permanently and silently \
-       disable view-change from ever starting on this replica";
+      (fn
+     ^ ": svc_limit must be >= 1 -- VSR.tla:163's own [aux_svc_count[r] < StartViewOnTimerLimit] \
+        guard on TimerSendSVC is never satisfiable at aux_svc_count[r] = 0 (Init's own starting \
+        value) for a non-positive limit, which would permanently and silently disable view-change \
+        from ever starting on this replica")
+
+(* The shared skeleton of [create] and [restart]: everything VOLATILE is at its [Init] value here
+   (VSR.tla:198-214), and the caller supplies whatever DURABLE state it has -- zeros for [create],
+   the superblock's contents for [restart]. Keeping this in one place is what makes the
+   durable/volatile split auditable in one read rather than by diffing two constructors:
+   [CrashRestart] (VSR.tla:599-601) resets exactly [rep_peer_op_number], [rep_recv_svc],
+   [rep_recv_dvc] and [rep_sent_dvc], and every one of them is initialized below, unconditionally,
+   for both entry points. *)
+let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
+    ~commit_number ~status =
   {
     my_id;
     replica_count;
     svc_limit;
     log = Replica_log.create ();
-    status = Normal;
-    view_number = 0;
-    (* VSR.tla's [Init] (VSR.tla:79): [rep_view_number = [r \in replicas |-> 0]]. *)
-    last_normal_view = 0;
-    commit_number = 0;
+    storage;
+    op_number;
+    status;
+    view_number;
+    last_normal_view;
+    commit_number;
     recv_svc = Int_set.empty;
     recv_dvc = Hashtbl.create (max 1 replica_count);
     sent_dvc = false;
@@ -176,6 +339,24 @@ let create ~my_id ~replica_count ~svc_limit ~send =
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
     send;
   }
+
+let create ~my_id ~replica_count ~svc_limit ~send ~storage =
+  validate_create_args ~fn:"Replica.create" ~my_id ~replica_count ~svc_limit;
+  if storage.wal_highest_op_number () > 0 || storage.superblock_read () <> None then
+    invalid_arg
+      "Replica.create: this storage backend already holds durable state -- use Replica.restart to \
+       recover it (VSR.tla's CrashRestart, :671-690), never Replica.create, which would silently \
+       discard the durable view_number/last_normal_view pair the whole recovery mechanism is built \
+       on";
+  let t =
+    make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number:0 (* VSR.tla's [Init] (:206) *)
+      ~last_normal_view:0 ~op_number:0 ~commit_number:0 ~status:Normal
+  in
+  (* Claim the backend immediately, so this replica's very first durable state is a well-formed
+     superblock rather than "nothing at all" -- otherwise a crash before the first client request
+     would leave [restart] unable to tell an initialized replica from an empty disk. *)
+  persist_superblock t;
+  t
 
 (* [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18). TLA+'s [%] is Euclidean (floored)
    modulo, always non-negative; OCaml's [mod] follows the sign of the DIVIDEND, so [(v-1) mod
@@ -188,7 +369,7 @@ let create ~my_id ~replica_count ~svc_limit ~send =
 let primary t = 1 + (((t.view_number - 1) mod t.replica_count + t.replica_count) mod t.replica_count)
 
 let is_primary t = t.my_id = primary t
-let op_number t = Replica_log.length t.log
+let op_number t = t.op_number
 let commit_number t = t.commit_number
 let view_number t = t.view_number
 let last_normal_view t = t.last_normal_view
@@ -223,7 +404,12 @@ let entries t = Replica_log.to_list t.log
    test-support constructor, rather than repurposing this one. *)
 let for_test_set_view_number t v =
   t.view_number <- v;
-  t.last_normal_view <- v
+  t.last_normal_view <- v;
+  (* Both fields are DURABLE (VSR.tla:58-62), so a setter that moved them only in memory would
+     leave [t] in a state no real transition can produce and, worse, one that {!restart} would
+     silently undo. Persisting here keeps every route to a given state -- real action or test
+     setter -- agreeing about what is on disk. *)
+  persist_superblock t
 
 (* Prescribed by replica.mli's own note on [for_test_set_view_number] (task-1-review.md's M3
    fix-round finding): [for_test_set_view_number] is correct ONLY for [status = Normal] (it forces
@@ -241,12 +427,202 @@ let for_test_set_view_number t v =
 let for_test_set_view t ~status:s ~view_number ~last_normal_view =
   t.status <- s;
   t.view_number <- view_number;
-  t.last_normal_view <- last_normal_view
+  t.last_normal_view <- last_normal_view;
+  (* Persisted for the same reason as {!for_test_set_view_number} above. Note [status] itself is
+     deliberately NOT persisted -- it is not durable state at all; a restart RECONSTRUCTS it from
+     [view_number > last_normal_view] (VSR.tla:680-682), so setting a status here that contradicts
+     that pair is a test-only state that will not survive a {!restart}, by design. *)
+  persist_superblock t
 
 (* [Value.value] identity for dedup/is_committed purposes: canonical-encoding equality, not
    OCaml's structural [=] -- see replica.mli's own doc comment on [propose] for why (lib/value.mli's
    [Float] case is content-addressed by raw bit pattern, not by OCaml's [=]/[compare]). *)
 let value_equal (a : Value.value) (b : Value.value) = Value.canonical_encode a = Value.canonical_encode b
+
+(* ============================================================================================
+   The durable side, part 2: the operations every protocol action below goes through. Nothing in
+   this module calls [t.storage.*] outside this block, so the guards here are the ONLY guards
+   needed -- the pattern [peer_op_number]'s own doc comment establishes for [handle_prepare_ok]'s
+   range check ("one enforcement site a new reader cannot forget to repeat"), applied to storage.
+   ============================================================================================ *)
+
+(* VSR.tla's [rep_storage[r][o]] as read back from a real backend -- see [slot_state]'s type
+   declaration at the top of this file for the full mapping and its safety argument. *)
+let slot_state t ~op_number : slot_state =
+  if op_number < 1 then Absent
+  else
+    match t.storage.wal_read ~op_number with
+    | Some bytes -> (
+      match Value.canonical_decode bytes with
+      | v -> Present v
+      | exception Invalid_argument _ ->
+        (* Readable bytes that are not a decodable value: the backend's own checksum passed but
+           the entry is not usable, which is "holds something I cannot verify" -- corrupt, never
+           absent. *)
+        Corrupt)
+    | None -> if op_number <= max t.op_number (t.storage.wal_highest_op_number ()) then Corrupt else Absent
+
+(* [ReadableEntries(r)] (VSR.tla:170), materialized as the partial map [SendDVC] ships
+   (VSR.tla:381-382). Deliberately not a prefix scan: a corrupt slot does not hide the readable
+   slots after it, and "a replica that can read op 2 but not op 1 is a real state this model must
+   be able to express". *)
+let readable_entries t =
+  let rec loop o acc =
+    if o < 1 then acc
+    else loop (o - 1) (match slot_state t ~op_number:o with Present v -> (o, v) :: acc | Corrupt | Absent -> acc)
+  in
+  loop t.op_number []
+
+(* [{ o \in ops : CanNack(r, o) }] (VSR.tla:383, :157) restricted to the op-numbers this replica
+   has any durable trace of.
+
+   DISCLOSED AND DELIBERATE, because it is the one place this transcription's shape differs
+   visibly from the spec's: VSR.tla quantifies over [ops == 1..MaxOp], a bounded universe the
+   model has and a real replica does not, so the set it computes is infinite here (EVERY op-number
+   above this replica's own log is provably absent). It cannot be shipped as an explicit list, and
+   it does not need to be: under the spec's own [StorageWellFormed] (VSR.tla:742-745) and
+   [LogLengthMatchesOpNumber] (:728-729) -- both exhaustively TLC-checked -- [CanNack(r, o)] holds
+   PRECISELY for [o > rep_op_number[r]], so the sender's own [n] field already carries the whole
+   infinite set, exactly. [nack_proves_absent] below is where the receiving side spends it.
+
+   What this function therefore computes is the remainder: an explicitly-proven-absent op-number
+   at or below the sender's own op-number. Under the current storage layer that set is always
+   EMPTY (a slot within the durable range reads back present or corrupt, never absent -- that is
+   [slot_state]'s own construction, and it is the property the whole nack-soundness argument
+   rests on). It is computed for real, rather than hard-coded to [[]], so that a storage layer or
+   partial-repair path that can one day report a genuine in-range hole starts producing real
+   evidence here without a second edit -- and because the receiving side already accepts and
+   counts such evidence (with a test). *)
+let provable_nacks t =
+  let horizon = max t.op_number (t.storage.wal_highest_op_number ()) in
+  let rec loop o acc =
+    if o < 1 then acc
+    else loop (o - 1) (match slot_state t ~op_number:o with Absent -> o :: acc | Present _ | Corrupt -> acc)
+  in
+  loop horizon []
+
+(* THE REVIEW-FOCUS GUARD (this plan's own Review Focus list, Task 7): "VSR's own safety guarantee
+   is that committed entries never disappear -- this must be rejected by the caller (replica.ml),
+   not silently accepted by the storage primitive".
+
+   [~resulting_length] is what makes this guard say what it means rather than something narrower.
+   The property to protect is the NET effect on durable state: no committed entry may be gone once
+   the operation this truncate is part of has finished. Two callers, two different values:
+
+   - A pure discard (the only one that exists today is {!for_test_truncate_wal}) passes
+     [~resulting_length:op_number] -- nothing is written back afterwards, so the guard reduces
+     to exactly "op_number >= commit_number".
+   - A log ADOPTION ([adopt_log] below, i.e. [SendSV]/[ReceiveSV]) truncates to the longest
+     already-correct prefix and then re-appends the rest of the canonical log in the same step, so
+     the durable log ends at the canonical length. Checking that length is what lets a corrupt
+     slot BELOW the commit point be repaired -- rewriting op 2 when commit_number is 3 requires
+     truncating to 1 first, and a guard stated on the truncate's own argument would reject exactly
+     the repair the recovery protocol exists to perform, while permitting nothing safer.
+
+   [~committed] is likewise the commit-number IN EFFECT for the operation, not necessarily
+   [t.commit_number] at entry: [SendSV] establishes a new commit-number from the DVC quorum in the
+   same step it installs the new log (VSR.tla:506-509), and [ValidCompletion]'s own
+   [L >= HighestCommitNumber(r)] clause (VSR.tla:460) is the spec's statement of this very guard
+   against that new value. *)
+let truncate_wal t ~op_number ~committed ~resulting_length =
+  if resulting_length < committed then invalid_arg "recovery: refusing to truncate below commit_number";
+  t.storage.wal_truncate_after ~op_number
+
+(* A durable append that reports refusal instead of raising. A backend may legitimately reject an
+   entry ({!Riptide_storage.File_storage} raises [Invalid_argument] for anything larger than one
+   aligned data slot), and a rejected write means the entry is NOT durable -- so the replica must
+   not go on to acknowledge it. VSR.tla:243-245's own note is that appending and replying
+   PREPAREOK are one step precisely because the entry is durable before it is acknowledged; this
+   is that coupling, made real. Returning [false] keeps [handle_message] total on adversarial
+   input (an oversized value on the wire must drop the message, never escape as an exception). *)
+let durable_append t ~op_number (v : Value.value) =
+  match t.storage.wal_append ~op_number (Value.canonical_encode v) with
+  | () -> true
+  | exception Invalid_argument _ -> false
+
+(* The durable half of [SendSV]/[ReceiveSV]'s wholesale log replacement, and of VSR.tla's
+   [rep_storage' = FreshStorage(L)] (VSR.tla:509, :573): after this returns [true], op-numbers
+   [1..Len(values)] are durably present and verified, and everything above is gone.
+
+   Written as "keep the longest already-correct prefix, truncate, re-append the rest" rather than
+   "rewrite everything", because the prefix is the common case by far (a view change usually keeps
+   the whole log) and because {!Riptide_storage.Storage_intf.S} has no random-access write at all:
+   [wal_append] only ever extends by exactly one.
+
+   CRASH ORDERING, stated because it is load-bearing rather than incidental: the WAL is rewritten
+   FIRST and the superblock is updated by the caller afterwards. A crash in between therefore
+   leaves a superblock whose [op_number] is at least the durable log's real length, which is the
+   conservative direction -- the not-yet-rewritten slots read back as CORRUPT (in range, not
+   returnable), never as ABSENT, so a replica interrupted mid-adoption cannot nack an op it might
+   still have been holding. *)
+let adopt_durable_log t (values : Value.value list) ~committed =
+  let target_length = List.length values in
+  let prefix_ok =
+    let rec loop o = function
+      | [] -> o - 1
+      | v :: rest ->
+        (* [value_equal], never OCaml's structural [=]: canonical-encoding identity is this
+           codebase's value identity (see [value_equal]'s own comment). *)
+        (match slot_state t ~op_number:o with
+        | Present stored when value_equal stored v -> loop (o + 1) rest
+        | Present _ | Corrupt | Absent -> o - 1)
+    in
+    loop 1 values
+  in
+  truncate_wal t ~op_number:prefix_ok ~committed ~resulting_length:target_length;
+  let rec append_rest o = function
+    | [] -> true
+    | v :: rest -> if o <= prefix_ok then append_rest (o + 1) rest else durable_append t ~op_number:o v && append_rest (o + 1) rest
+  in
+  append_rest 1 values
+
+(* ---- CrashRestart (VSR.tla:671-690) ----
+   The real-code counterpart of the spec's single fused storage-fault-discovery-and-restart
+   action: build a fresh [t] over storage that already holds durable state. Constructing the
+   replica IS the restart -- everything volatile is at its [Init] value by construction (see
+   [make]), and nothing from the previous [t] can leak in, because there is no previous [t] in
+   scope.
+
+   DURABLE (survives, VSR.tla:592-596): log, op_number, commit_number, view_number,
+   last_normal_view -- the first from the WAL, the rest from the superblock.
+   VOLATILE (lost, VSR.tla:599-601): peer_op_number, recv_svc, recv_dvc, sent_dvc.
+   STATUS is RECONSTRUCTED from [view_number > last_normal_view] (VSR.tla:680-682), never stored.
+
+   Two real-storage reconciliations the abstract model does not need, both conservative:
+
+   1. The WAL may hold entries the superblock does not know about (a crash between [wal_append]
+      and [persist_superblock]). Those were never acknowledged -- the PREPAREOK that would have
+      exposed them is sent only after both writes -- so they are discarded here, which also
+      restores the [wal_highest_op_number = op_number] agreement every later [wal_append] depends
+      on. The truncate goes through the same guarded path as every other: dropping unacknowledged
+      entries can never drop a committed one, and [truncate_wal] is what checks that rather than
+      this comment.
+   2. The in-memory log is rebuilt only as far as the first unreadable slot, while [op_number]
+      keeps its full durable value. That gap is exactly VSR.tla's "corrupt" state, and it is why
+      [op_number] is a field rather than [Replica_log.length]: the replica still knows what it
+      owes ([n] on its DoViewChange), it just cannot read all of it. Until a StartView repairs it,
+      such a replica declines new Prepares (see [handle_prepare]) -- state transfer is out of
+      scope for this spec, disclosed in spec/tla/README.md. *)
+let restart ~my_id ~replica_count ~svc_limit ~send ~storage =
+  validate_create_args ~fn:"Replica.restart" ~my_id ~replica_count ~svc_limit;
+  let view_number, last_normal_view, op_number, commit_number =
+    match Option.bind (storage.superblock_read ()) superblock_decode with
+    | Some (v, lnv, n, k) -> (v, lnv, n, k)
+    | None -> (0, 0, 0, 0)
+  in
+  let t =
+    make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
+      ~commit_number
+      ~status:(if view_number > last_normal_view then View_change else Normal)
+  in
+  if storage.wal_highest_op_number () > op_number then
+    truncate_wal t ~op_number ~committed:commit_number ~resulting_length:op_number;
+  let rec readable_prefix o acc =
+    if o > op_number then List.rev acc
+    else match slot_state t ~op_number:o with Present v -> readable_prefix (o + 1) (v :: acc) | Corrupt | Absent -> List.rev acc
+  in
+  Replica_log.replace_with t.log (readable_prefix 1 []);
+  t
 
 let is_committed t v =
   let rec loop n =
@@ -296,13 +672,24 @@ let is_committed_quorum t ~op_number =
    immediately after [ReceiveClientRequest] in that case). *)
 let primary_execute_op t =
   let continue_ = ref true in
+  let advanced = ref false in
   while !continue_ do
     if t.commit_number >= op_number t then continue_ := false
     else begin
       let next = t.commit_number + 1 in
-      if is_committed_quorum t ~op_number:next then t.commit_number <- next else continue_ := false
+      (* Storage-fault-aware addition to the normal path (VSR.tla:282-291): the primary must be
+         able to READ the entry it is about to execute ([Holds(r, next)]). Counting itself toward
+         the f+1 while its own copy is unreadable would let a cluster commit with only f readable
+         copies. *)
+      let readable = match slot_state t ~op_number:next with Present _ -> true | Corrupt | Absent -> false in
+      if readable && is_committed_quorum t ~op_number:next then begin
+        t.commit_number <- next;
+        advanced := true
+      end
+      else continue_ := false
     end
-  done
+  done;
+  if !advanced then persist_superblock t
 
 (* ---- ReceiveClientRequest (VSR.tla:91-102) ---- *)
 
@@ -310,14 +697,30 @@ let propose t (v : Value.value) =
   if t.status <> Normal then () (* IsNormalPrimary(r) guard: not enabled outside status="Normal" *)
   else if not (is_primary t) then () (* IsNormalPrimary(r) guard's other conjunct: r = Primary(View(r)) *)
   else if List.exists (fun existing -> value_equal existing v) (entries t) then ()
+  else if Replica_log.length t.log <> t.op_number then
+    () (* This replica has an unreadable slot below its own op-number (only reachable via
+          [restart]), so its in-memory log is a strict prefix of what it durably owes. Minting a
+          NEW op-number on top of that would require appending at [op_number + 1] over a gap --
+          [Replica_log.append]'s own out-of-order guard would raise, and the durable and in-memory
+          copies would disagree about what op [n] holds. Declining until a StartView repairs the
+          hole is the same "guard failure => total no-op" discipline used throughout this module,
+          and costs liveness only: a primary in this state cannot serve clients, which is exactly
+          the condition a view change exists to resolve. *)
   else begin
-    let n = op_number t + 1 in
-    Replica_log.append t.log ~op_number:n v;
-    let bytes = Message.encode (Message.Prepare { view = t.view_number; n; v; k = t.commit_number }) in
-    for peer = 1 to t.replica_count do
-      if peer <> t.my_id then t.send ~to_:peer bytes
-    done;
-    primary_execute_op t (* see primary_execute_op's own doc comment for why this call is needed *)
+    let n = t.op_number + 1 in
+    (* DURABLE FIRST, then in-memory, then the broadcast. VSR.tla:243-245: the entry is durable
+       before it is acknowledged, so a backend that refuses the write must stop the whole action
+       rather than leave the in-memory log ahead of the WAL. *)
+    if durable_append t ~op_number:n v then begin
+      Replica_log.append t.log ~op_number:n v;
+      t.op_number <- n;
+      persist_superblock t;
+      let bytes = Message.encode (Message.Prepare { view = t.view_number; n; v; k = t.commit_number }) in
+      for peer = 1 to t.replica_count do
+        if peer <> t.my_id then t.send ~to_:peer bytes
+      done;
+      primary_execute_op t (* see primary_execute_op's own doc comment for why this call is needed *)
+    end
   end
 
 (* ---- ReceivePrepareMsg (VSR.tla:104-123) ---- *)
@@ -326,11 +729,23 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
   if t.status <> Normal then () (* IsNormalBackup(r) guard: not enabled outside status="Normal" *)
   else if is_primary t then () (* IsNormalBackup(r) guard's other conjunct: not enabled for the primary itself *)
   else if view <> t.view_number then ()
+  else if n <> t.op_number + 1 then
+    () (* VSR.tla:251's own [rep_op_number[r] + 1 = m.n]: backups process PREPARE strictly in
+          op-number order. Checked against the DURABLE op-number here (and re-checked structurally
+          by [Replica_log.append] below) -- after a restart that found a hole, the two disagree,
+          and it is the durable one the rest of the cluster is talking about. *)
+  else if Replica_log.length t.log <> t.op_number then
+    () (* Unrepaired hole below our own op-number -- see [propose]'s identical guard for why this
+          replica must decline until a StartView repairs it, rather than append over the gap. *)
+  else if not (durable_append t ~op_number:n v) then
+    () (* The backend refused the write, so the entry is NOT durable and must NOT be acknowledged
+          (VSR.tla:243-245). Total no-op, exactly like any other guard failure here. *)
   else
     match Replica_log.append t.log ~op_number:n v with
     | exception Replica_log.Out_of_order_append _ ->
       () (* out-of-order: action not enabled, per VSR.tla -- silently drop, no reply, no state change *)
     | () ->
+      t.op_number <- n;
       (* VSR.tla:106-109's own comment argues the unguarded [m.k > @] update (VSR.tla:118) is safe
          because a well-formed [Prepare] always has [m.k < m.n] -- a property only true of
          messages produced by the spec's OWN actions, which a decoded, possibly network-corrupted
@@ -360,6 +775,11 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
          k-boundary tests pin all three of [k = n-1] (well-formed, accepted), [k = n] (now
          rejected) and [k = n+1] (rejected). *)
       if k > t.commit_number && k < op_number t then t.commit_number <- k;
+      (* One superblock write covers BOTH durable changes this action makes (the new op_number and
+         any commit_number advance), and it happens BEFORE the PREPAREOK goes out: the reply is
+         this replica's promise that the entry is durable, so every durable field the entry's
+         acknowledgement implies must already be on disk when it is sent. *)
+      persist_superblock t;
       let reply = Message.encode (Message.Prepare_ok { view = t.view_number; n; i = t.my_id }) in
       t.send ~to_:(primary t) reply
 
@@ -410,7 +830,14 @@ let try_send_dvc t =
         (Message.Do_view_change
            {
              v = t.view_number;
-             log = entries t;
+             (* VSR.tla:381-383's own two new fields. [entries] is [ReadableEntries(r)] read back
+                through the real backend, NOT [Replica_log.to_list] -- a replica must ship what it
+                can actually read off its disk, not what a stale in-memory copy says it once had,
+                which is the whole point of the partial-function shape (VSR.tla:166-170). [nacks]
+                is the explicitly-proven-absent remainder; see [provable_nacks] for why the rest of
+                [CanNack]'s (infinite) set rides on [n] instead. *)
+             entries = readable_entries t;
+             nacks = provable_nacks t;
              last_normal_view = t.last_normal_view;
              n = op_number t;
              k = t.commit_number;
@@ -419,35 +846,6 @@ let try_send_dvc t =
     in
     t.send ~to_:(primary t) bytes;
     t.sent_dvc <- true
-  end
-
-(* ---- TimerSendSVC (VSR.tla:161-174) ----
-   research §2.1: VSR.tla deliberately does not model real timeouts -- this is an unconditional,
-   always-enabled (once its guard holds) action, not something driven by a clock; a caller decides
-   when to invoke [check_timeout] (e.g. on an actual timer firing with no Prepare/heartbeat seen
-   recently), matching the spec's own framing of it as "bounded by a state-space-limiting counter"
-   rather than real wall-clock logic. *)
-let check_timeout t =
-  if t.svc_count >= t.svc_limit then
-    () (* [aux_svc_count[r] < StartViewOnTimerLimit] guard (VSR.tla:163) -- see [svc_count]'s own
-          doc comment on [t] for why this bound is NOT permanent in this implementation despite
-          [aux_svc_count] never resetting in the literal TLA+ transcription: Task 3's [SendSV]/
-          [ReceiveSV] reset it back to 0 on every successful return to [Normal], giving each new
-          failure its own fresh budget. *)
-  else if t.status <> Normal then () (* [rep_status[r] = "Normal"] guard (VSR.tla:164) *)
-  else begin
-    let v = t.view_number + 1 in
-    t.view_number <- v;
-    t.status <- View_change;
-    t.recv_svc <- Int_set.empty;
-    Hashtbl.reset t.recv_dvc;
-    t.sent_dvc <- false;
-    t.svc_count <- t.svc_count + 1;
-    let bytes = Message.encode (Message.Start_view_change { v; i = t.my_id }) in
-    for peer = 1 to t.replica_count do
-      if peer <> t.my_id then t.send ~to_:peer bytes
-    done;
-    try_send_dvc t (* see try_send_dvc's own doc comment for why this call is included *)
   end
 
 (* ---- ReceiveHigherSVC (VSR.tla:183-194) / ReceiveMatchingSVC (VSR.tla:196-205) ----
@@ -487,6 +885,12 @@ let handle_start_view_change t ~(v : int) ~(i : int) =
     t.recv_svc <- Int_set.singleton i;
     Hashtbl.reset t.recv_dvc;
     t.sent_dvc <- false;
+    (* [rep_view_number] is DURABLE (VSR.tla:58-59, and [CrashRestart]'s own UNCHANGED list at
+       :688-690 keeps it across a restart), and this is one of the four actions that moves it. It
+       has to reach the superblock BEFORE this replica tells anyone it has adopted the new view --
+       a replica that forgot an already-announced view bump across a restart would re-enter the
+       old view, which is exactly what Decision 4's durable view/log_view pair exists to prevent. *)
+    persist_superblock t;
     try_send_dvc t
   end
   else if v = t.view_number && t.status = View_change then begin
@@ -564,122 +968,381 @@ let winning_dvc (dvcs : dvc list) =
 let highest_commit_number (dvcs : dvc list) =
   List.fold_left (fun acc d -> if d.dvc_k > acc then d.dvc_k else acc) 0 dvcs
 
-(* ---- SendSV (VSR.tla:264-280) ----
+(* ================= multi-step view-change completion (VSR.tla:403-516) =================
+   The would-be primary of the new view collects DVCs, then resolves EVERY op in the candidate
+   range before it may complete. VSR.tla:403-409 is explicit that this is structural rather than
+   cosmetic: with storage faults, the evidence needed to complete may simply not have arrived yet,
+   so the coordinator must be able to WAIT (stay in View_change, keep accepting DVCs -- what
+   [try_send_sv] does by returning without effect) or GIVE UP ([try_forfeit_view_change]), and be
+   interrupted at any point by a higher view (the existing [handle_start_view_change] path, which
+   resets this whole accumulator).
+
+   The functions below transcribe, in the spec's own order: HasDvcQuorum, EntrySources/CanFill/
+   FillValue, NackCount/ProvenAbsent, ValidCompletion/CanComplete/CompletionPoint. *)
+
+(* ---- HasDvcQuorum (VSR.tla:488-491) ----
+   [Cardinality({ m.i : m \in ValidDvcs(r) }) >= Quorum] -- the [{ m.i : ... }] projection is THE
+   POINT, and spec/tla/README.md records it as a real safety defect found by TLC at the widened
+   bound, not a stylistic preference: counting MESSAGES lets one replica that sent two different
+   DOVIEWCHANGEs in one episode look like a two-replica quorum, and the entire truncation argument
+   ("a committed op is durably held by f+1 replicas, any two f+1 sets intersect") is a statement
+   about f+1 DISTINCT REPLICAS that says nothing at all about f+1 messages.
+
+   This module already had the right structure for the wrong-ish reason, and both reasons now
+   apply: [recv_dvc] is a table KEYED BY SENDER with first-wins semantics (see its own doc comment
+   on [t] -- originally motivated by the simulated transport's duplicate/corrupt injection), so
+   [valid_dvcs] can contain at most one record per sender and its length already equals the
+   distinct-sender count. The projection is nonetheless written out EXPLICITLY here, over
+   [dvc_i], rather than left as [List.length dvcs]: the safety property is "distinct senders",
+   the keying is an implementation detail that a future change to [recv_dvc]'s representation
+   could alter, and the spec's own history on this exact line is the argument for not making a
+   reader re-derive the equivalence. [nack_count] below projects the same way, for the same
+   reason. *)
+let dvc_senders (dvcs : dvc list) =
+  List.fold_left (fun acc d -> Int_set.add d.dvc_i acc) Int_set.empty dvcs
+
+let has_dvc_quorum t (dvcs : dvc list) =
+  let f = (t.replica_count - 1) / 2 in
+  t.status = View_change (* VSR.tla:489 *)
+  && is_primary t (* VSR.tla:490: r = Primary(View(r)) *)
+  && Int_set.cardinal (dvc_senders dvcs) >= f + 1
+(* VSR.tla:491, Quorum == f + 1. Deliberately a separate expression from [try_send_dvc]'s own
+   [>= f] threshold (VSR.tla:380, "f STARTVIEWCHANGE from OTHER replicas") -- two different
+   citations, two different thresholds, never one shared constant that a later edit could drift. *)
+
+(* ---- EntrySources / CanFill / FillValue (VSR.tla:440-444) ----
+   [EntrySources(r, o) == { m \in ValidDvcs(r) : m.last_normal_view = CanonicalView(r) /\
+                            o \in DOMAIN m.entries }]
+
+   Replicas that share a log_view received their entries from the same primary, which assigns each
+   op-number exactly once, so they cannot disagree about the value at an op -- that is what makes
+   any same-log_view DVC an admissible source for an entry the WINNER itself cannot read, i.e. how
+   a corrupt slot on the would-be primary gets repaired from a peer instead of forcing a
+   truncation. Entries from a LOWER log_view are NOT admissible: those may be superseded values
+   from an abandoned view. (VSR.tla's [DvcEntriesAgreeWithinLogView], :768-773, is the checked
+   statement of the premise.)
+
+   [FillValue]'s [CHOOSE] is free to return any source. This implementation prefers the WINNER's
+   own entry when it has one, then the lowest sender id ([valid_dvcs] is sorted) -- both are legal
+   refinements of [CHOOSE], and preferring the winner keeps the reconstructed log identical to the
+   pre-storage-fault behaviour ("adopt the winner's log") in every fault-free execution, so a
+   fault-free cluster's observable behaviour is unchanged by this task. *)
+let entry_sources (dvcs : dvc list) ~(winner : dvc) ~op_number =
+  let canonical_view = winner.dvc_last_normal_view (* CanonicalView(r), VSR.tla:432 *) in
+  List.filter
+    (fun d -> d.dvc_last_normal_view = canonical_view && List.mem_assoc op_number d.dvc_entries)
+    dvcs
+
+let can_fill (dvcs : dvc list) ~winner ~op_number = entry_sources dvcs ~winner ~op_number <> []
+
+let fill_value (dvcs : dvc list) ~winner ~op_number =
+  match entry_sources dvcs ~winner ~op_number with
+  | [] -> None
+  | sources -> (
+    match List.assoc_opt op_number winner.dvc_entries with
+    | Some v -> Some v
+    | None -> List.assoc_opt op_number (List.hd sources).dvc_entries)
+
+(* ---- NackCount / ProvenAbsent (VSR.tla:452-453) ----
+   [NackCount(r, o) == Cardinality({ m.i : m \in { d \in ValidDvcs(r) : o \in d.nacks } })] --
+   again projected onto DISTINCT SENDERS, and again written out explicitly rather than as a list
+   length. An op nacked by f+1 distinct replicas cannot have been committed (committing needs f+1
+   replicas to have durably held it, any two f+1 sets of 2f+1 intersect, and a replica that
+   durably held an entry can never nack it), which is exactly what makes dropping it safe.
+
+   [sender_proves_absent] is where this transcription spends the equivalence [provable_nacks]
+   documents: a DVC proves op [o] absent either explicitly (it is in the message's own [nacks]
+   set) or structurally (it lies above the sender's own durable op-number [n], which by
+   [StorageWellFormed] (VSR.tla:742-745) and [LogLengthMatchesOpNumber] (:728-729) is PRECISELY
+   the condition [CanNack] tests). The second disjunct is not an extra liberty taken on top of the
+   spec -- it is the spec's own [CanNack], restated in the only form a real, unbounded op-number
+   space can carry it in. The first is kept because the wire field is real and a future storage
+   layer able to report an in-range hole must be honoured without a second edit; arrivals are
+   validated (see [handle_do_view_change]) so an explicit nack can never CONTRADICT the sender's
+   own [n], only refine it. *)
+let sender_proves_absent (d : dvc) ~op_number = op_number > d.dvc_n || List.mem op_number d.dvc_nacks
+
+let nack_count (dvcs : dvc list) ~op_number =
+  Int_set.cardinal
+    (List.fold_left
+       (fun acc d -> if sender_proves_absent d ~op_number then Int_set.add d.dvc_i acc else acc)
+       Int_set.empty dvcs)
+
+let proven_absent t (dvcs : dvc list) ~op_number =
+  let f = (t.replica_count - 1) / 2 in
+  nack_count dvcs ~op_number >= f + 1 (* VSR.tla:453, Quorum == f + 1 *)
+
+(* ---- ValidCompletion / CanComplete / CompletionPoint (VSR.tla:459-471) ----
+   [ValidCompletion(r, L)] is three clauses: [L >= HighestCommitNumber(r)], every op in [1..L]
+   fillable, every op in [(L+1)..WinningDVC(r).n] proven absent. An op in neither category is
+   CONTESTED and blocks completion outright ("a quorum simply hasn't reported yet (must wait)").
+   [CanComplete] is the existence of such an [L]; [CompletionPoint] is the LONGEST one, because
+   truncation is a last resort taken only where a nack quorum forces it.
+
+   Computed here in one pass each rather than by searching [0..n] and re-checking both universal
+   quantifiers per candidate, which is the same set by a cheaper route:
+
+     - [fillable_prefix] = the largest [p] with every op in [1..p] fillable. Every admissible [L]
+       is [<= fillable_prefix], and [fillable_prefix] itself satisfies the fillability clause.
+     - [highest_contested] = the largest op in [1..n] NOT proven absent (0 if all are). Every
+       admissible [L] is [>= highest_contested], since an op above [L] that is not proven absent
+       violates the third clause.
+
+   So the admissible set is exactly the integers in [[max(highest_commit, highest_contested),
+   fillable_prefix]], and its maximum -- CompletionPoint -- is [fillable_prefix] whenever that
+   interval is non-empty. Returning [None] for an empty interval is [~CanComplete], which is
+   precisely [try_forfeit_view_change]'s own enabling condition below. *)
+let completion_point t (dvcs : dvc list) ~(winner : dvc) ~highest_commit =
+  let f = (t.replica_count - 1) / 2 in
+  let n = winner.dvc_n in
+  let rec fillable_prefix o = if o > n || not (can_fill dvcs ~winner ~op_number:o) then o - 1 else fillable_prefix (o + 1) in
+  (* WHERE THE DOWNWARD SCAN STARTS, and why it is not simply [n]. [n] is a decoded field: a
+     forged DoViewChange may claim an op-number of 10^9 with no way for a receiver to disprove it
+     (unlike the old wire format, [n] is no longer bounded by the length of a log carried in the
+     same message -- [entries] is partial now, so it cannot bound [n] any more). Scanning down from
+     [n] is then a real denial of service, not a slow path: with the winner claiming 10^9 and f+1
+     honest senders reporting small [n]s, EVERY op down to their own op-numbers genuinely is
+     proven absent, so the scan does not exit early -- it walks a billion op-numbers inside
+     [handle_message]. Reproduced as a hanging test before this bound existed, and pinned by
+     [test_forged_huge_n_does_not_hang].
+
+     The bound is exact, not a heuristic cap. Sort the senders' op-numbers ascending; an op [o] is
+     structurally proven absent by [sender_proves_absent]'s [o > d.dvc_n] disjunct exactly when
+     more than f of them are below it, i.e. for every [o > n_(f+1)] (the (f+1)-th smallest). So
+     every op in [(n_(f+1), n]] is already proven and cannot be the highest contested one; the
+     search may start at [min(n, n_(f+1))] and lose nothing. Explicit nacks can only prove MORE
+     ops absent, so they can only push the answer further down -- which is why the loop below still
+     runs, but now for at most (number of explicit nacks + 1) steps rather than for [n] of them.
+
+     COUPLING TO WATCH: the [f] index below IS [proven_absent]'s own [f + 1] quorum, restated as
+     "the (f+1)-th smallest". Raising one threshold without the other would make this skip a range
+     it only ASSUMES is proven -- so if [proven_absent]'s quorum ever changes, this must change
+     with it. (Lowering only [proven_absent] stays sound, since the skipped range would then be
+     proven a fortiori; raising it does not.) *)
+  let structural_threshold =
+    match List.nth_opt (List.sort compare (List.map (fun d -> d.dvc_n) dvcs)) f with
+    | Some n_q -> n_q
+    | None -> n (* fewer than f+1 senders: nothing is structurally proven. Unreachable from both
+                   callers, which check [has_dvc_quorum] first. *)
+  in
+  let rec highest_contested o =
+    if o < 1 then 0 else if proven_absent t dvcs ~op_number:o then highest_contested (o - 1) else o
+  in
+  let start = min n structural_threshold in
+  let contested =
+    (* The skip above is an ARGUMENT about [proven_absent], so it is checked against
+       [proven_absent] rather than trusted: if the first skipped op is not actually proven absent,
+       the argument does not hold here and the skipped range is treated as contested (blocking the
+       completion) instead of silently assumed away. One extra call, and it is what keeps this
+       optimization from becoming a second, drifting definition of the nack rule -- a mutation
+       that deletes [sender_proves_absent]'s structural disjunct is caught here rather than
+       masked. Every op above the first skipped one is covered by the same threshold argument, so
+       checking the boundary is checking the claim. *)
+    if start < n && not (proven_absent t dvcs ~op_number:(start + 1)) then start + 1
+    else highest_contested start
+  in
+  let longest = fillable_prefix 1 in
+  if longest >= max highest_commit contested then Some longest else None
+
+(* ---- SendSV (VSR.tla:499-516) ----
    Driven from [handle_do_view_change] ([ReceiveDVC]) below, mirroring [try_send_dvc]'s own
    established "drive the derived action from every point its enabling condition can change"
-   pattern. Unlike [try_send_dvc], NO call is needed from [check_timeout] or
-   [handle_start_view_change]: those two are the only other actions that touch anything this guard
-   reads, and both set [recv_dvc] to EMPTY in the same step, so the threshold conjunct
-   [Cardinality(valid recv_dvc) >= f + 1] is provably false immediately after either of them --
-   [f + 1 >= 1 > 0] for EVERY [replica_count], including the degenerate [f = 0] cluster that made
-   [try_send_dvc]'s own extra call worth including. That is a proof for all cluster sizes, not an
-   "always a no-op in practice" assumption.
+   pattern: [ReceiveDVC] is the only action that adds evidence, and evidence is all this guard
+   reads. [check_timeout]/[handle_start_view_change] need no call because both set [recv_dvc] to
+   EMPTY in the same step, making the quorum conjunct provably false immediately afterwards for
+   EVERY [replica_count] (the threshold is [f + 1 >= 1 > 0]).
 
-   Note the threshold is [>= f + 1] (VSR.tla:269), NOT [SendDVC]'s [>= f] (VSR.tla:221): "f+1
-   DOVIEWCHANGE from different replicas, INCLUDING ITSELF" (VSR.tla:262-263) vs. "f STARTVIEWCHANGE
-   from OTHER replicas" (VSR.tla:207). The two are kept as two textually separate expressions, each
-   citing its own spec line, per this plan's Global Constraints -- deliberately not factored into
-   one shared constant that a later edit could drift. *)
+   Two conjuncts now, not one (VSR.tla:501-502): [HasDvcQuorum(r)] AND [CanComplete(r)]. And the
+   new log is reconstructed op-by-op from [FillValue] rather than copied wholesale from the winner
+   -- because the winner may not be able to read all of its own entries, which is the entire
+   reason [entries] is a partial function on the wire. *)
 let try_send_sv t =
-  let f = (t.replica_count - 1) / 2 in
   let dvcs = valid_dvcs t in
-  if t.status = View_change (* VSR.tla:267 *) && is_primary t (* VSR.tla:268: r = Primary(View(r)) *)
-     && List.length dvcs >= f + 1 (* VSR.tla:269 *)
-  then
+  if not (has_dvc_quorum t dvcs) then ()
+  else
     match winning_dvc dvcs with
-    | None -> () (* unreachable, see [winning_dvc] *)
+    | None -> () (* unreachable, see [winning_dvc]: the quorum guard implies a non-empty list *)
     | Some winner ->
       let new_k = highest_commit_number dvcs in
       if new_k > winner.dvc_n then
-        () (* DEFENSIVE, NOT IN VSR.tla -- and inert for every correct execution the model can
-              reach. The two independent maxima above disagree here in a way no well-formed DVC set
-              can produce: some valid DVC claims a commit_number beyond the END of the log this
-              view is about to adopt. Applying it would set [commit_number > op_number] on the new
-              primary and then broadcast that same [k] cluster-wide in [StartView], violating
-              [CommitNumberNeverHigherThanOpNumber] (VSR.tla:330-331) on every replica that accepts
-              it. Since each individual DVC is already field-validated on arrival (see
-              [handle_do_view_change]), reaching this branch means at least one DVC in the set is
-              corrupt/forged in a way only CROSS-message comparison can expose, and there is no way
-              to tell which -- so the whole action is refused, no state changes at all (this
-              module's established "guard failure => total no-op" convention), rather than
-              inventing a bounded substitute. Deliberately NOT a clamp to [winner.dvc_n]: that
-              targets the maximum legal value, i.e. it would declare the entire adopted log
-              committed off the back of one corrupted integer -- exactly the reasoning
-              [handle_prepare]'s own [k] bound already rejects clamping for. Cost of refusing is
-              liveness only, but NOT bounded to one episode (task-3-review.md's F1, correcting an
-              earlier draft of this comment): [recv_dvc] is wiped at the start of the next
-              view-change episode, but a single corrupted [Prepare] that already inflated a
-              BACKUP's own [commit_number] (see [handle_prepare]'s own bound) rides into every
-              subsequent episode's [DoViewChange.k] that backup ever sends, since a backup's
-              [commit_number] only ever advances, never regresses -- so this refusal can re-fire
-              on every future view-change attempt for as long as that corrupted replica keeps
-              participating, which in a cluster where the survivors are exactly the [f+1] quorum
-              is an unbounded, cluster-wide liveness loss from a single corrupted message, not a
-              one-episode wedge. Refusing is still the right choice over clamping or accepting
-              (both would trade a liveness cost for a SAFETY one), but the true cost is disclosed
-              here accurately rather than understated. EVIDENCE this never fires for well-formed
-              traffic: a scratch copy of
-              spec/tla/VSR.tla with the invariant [T3_SendSvCommitWithinWinnerLog] (SendSV enabled
-              => HighestCommitNumber(r) <= WinningDVC(r).n) was TLC-checked over the shipped
-              VSR.cfg bound -- no violation, 553,084 states generated / 264,376 distinct / 0 left
-              on queue, the same exhaustive state graph spec/tla/README.md quotes; a companion
-              vacuity check ([SendSV] is never enabled) IS violated, confirming the invariant was
-              exercised against real states rather than passing vacuously. *)
-      else begin
-        (* VSR.tla:272-273: [rep_log' = winner.log] and [rep_op_number' = winner.n]. This module
-           tracks op_number AS the log's own length (see [op_number] above), so the second
-           assignment is not separate code -- it is implied by the first, and is correct ONLY
-           because [handle_do_view_change] rejects any DVC whose [n] disagrees with its own log's
-           length. That check is what keeps VSR.tla's [LogLengthMatchesOpNumber] (VSR.tla:337-338)
-           true by construction here for adversarial input too, not just well-formed input. *)
-        Replica_log.replace_with t.log winner.dvc_log;
-        t.commit_number <- new_k;
-        (* VSR.tla:274 -- unconditional, NOT monotonic-guarded: unlike [ReceiveSV]'s own update,
-           this replica is the one STARTING the new view, and [new_k] is the maximum over a
-           quorum's worth of DVCs including (normally) its own.
+        () (* DEFENSIVE, NOT IN VSR.tla, and now SUBSUMED by [completion_point] (no [L <=
+              winner.dvc_n] can satisfy [L >= highest_commit] when [highest_commit > winner.dvc_n],
+              so [CanComplete] is already false) -- kept as its own explicit, separately-cited
+              branch because it states a DIFFERENT property than the completion arithmetic does:
+              some valid DVC claims a commit_number beyond the end of the log this view is about to
+              adopt, which no well-formed DVC set can produce and which only CROSS-message
+              comparison can expose (each message is already field-validated on arrival). Refused
+              wholesale rather than clamped to [winner.dvc_n]: clamping targets the maximum legal
+              value, i.e. it would declare the entire adopted log committed off the back of one
+              corrupted integer. The cost of refusing is liveness, and it is NOT bounded to one
+              episode -- a backup whose own commit_number was inflated by a corrupted Prepare
+              re-sends that [k] in every later episode's DVC -- but it is a liveness cost, where
+              both alternatives are safety costs. EVIDENCE it never fires for well-formed traffic:
+              TLC over the shipped bound with [T3_SendSvCommitWithinWinnerLog], 553,084 states
+              generated / 264,376 distinct, no violation, with a companion vacuity check confirming
+              SendSV really is enabled in that graph. *)
+      else (
+        match completion_point t dvcs ~winner ~highest_commit:new_k with
+        | None ->
+          () (* ~CanComplete: at least one op in the candidate range is neither reconstructible
+                from canonical evidence nor proven absent by a nack quorum. WAIT -- stay in
+                View_change with all evidence intact and keep accepting DVCs; more DVCs can only
+                ADD evidence, never remove it. Giving up is a separate, timer-driven decision
+                ([try_forfeit_view_change] below), never something this send path takes on its
+                own. *)
+        | Some l -> (
+          let rec build o acc =
+            if o > l then Some (List.rev acc)
+            else
+              match fill_value dvcs ~winner ~op_number:o with
+              | Some v -> build (o + 1) (v :: acc)
+              | None -> None (* unreachable: [completion_point] returned [l], so every op in
+                                [1..l] has a source. Handled rather than asserted, per this
+                                module's "guard failure => total no-op" convention. *)
+          in
+          match build 1 [] with
+          | None -> ()
+          | Some new_log ->
+            (* VSR.tla:509's [rep_storage' = FreshStorage(L)]: the new primary has just durably
+               written and verified the canonical log. Done FIRST, so that a backend that refuses
+               the write leaves this action a total no-op instead of a replica whose in-memory
+               state claims a completion its disk never took. *)
+            if adopt_durable_log t new_log ~committed:new_k then begin
+              Replica_log.replace_with t.log new_log (* VSR.tla:506 *);
+              t.op_number <- l (* VSR.tla:507 -- now an explicit assignment, since [op_number] is
+                                  its own durable field rather than the log's length *);
+              t.commit_number <- new_k;
+              (* VSR.tla:508 -- unconditional, NOT monotonic-guarded: unlike [ReceiveSV]'s own
+                 update, this replica is the one STARTING the new view, and [new_k] is the maximum
+                 over a quorum's worth of DVCs including (normally) its own. Pinned by
+                 [test_vsr_replica.ml]'s own
+                 [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic].
 
-           DISCLOSED, KNOWINGLY UNGUARDED cross-message hazard, found during this plan's own final
-           review, same family as the [new_k > winner.dvc_n] refusal above: nothing here checks
-           [winner.dvc_n] (the length of the log this replica is about to adopt) against THIS
-           replica's OWN pre-existing [t.commit_number]. [handle_start_view] (this module's other
-           SendSV-shaped effect, for a BACKUP adopting a [StartView] it did not send itself) DOES
-           carry that guard (VSR.tla-adjacent, not itself in VSR.tla -- see its own doc comment):
-           it refuses a [StartView] whose [n] is below its own [commit_number], on the grounds that
-           adopting it would discard already-committed entries outright. This primary-side
-           assignment has no counterpart. It is inert for every correct execution the model can
-           reach -- quorum intersection plus [winning_dvc]'s own (last_normal_view, n) selection
-           together guarantee [winner.dvc_n] dominates any already-committed prefix -- consistent
-           with (though not itself confirmed by a dedicated TLC invariant against this specific
-           comparison; the two invariants that DO exist here, [T3_ReceiveSvNeverTruncatesBelowCommit]
-           and [T3_SendSvCommitWithinWinnerLog], cover the BACKUP-side guard and the [new_k >
-           winner.dvc_n] refusal above, respectively, not this one) the fact that
-           [test_vsr_replica.ml]'s own [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic]
-           (task-3-review.md's own F2) had to hand-build an otherwise-protocol-unreachable DVC set
-           to pin that this assignment really is unconditional. The new primary IS NOT GUARANTEED
-           to be part of its own DVC quorum (its own [try_send_dvc] needs [Cardinality(recv_svc) >=
-           f], which can fail to fire before it still collects [f + 1] DVCs from others), so
-           [winner.dvc_n] need not dominate THIS replica's own [commit_number] by construction
-           alone -- only by the protocol-level guarantee above, which nothing here checks locally.
-           Adding the guard is real design work (it would need that same hand-built, protocol-
-           unreachable regression scenario
-           re-derived into one that IS reachable, so the "unconditional, not monotonic" property
-           and a would-be truncation refusal don't end up fighting each other) -- disclosed here,
-           not fixed, deliberately out of scope for this plan. *)
-        t.last_normal_view <- t.view_number (* VSR.tla:276 *);
-        t.svc_count <- 0
-        (* Disclosed divergence -- see [svc_count]'s own doc comment on [t]. Unconditional here
-           because VSR.tla:267's own guard already restricts this action to [status = View_change],
-           so reaching this point IS a real View_change -> Normal transition. *);
-        t.status <- Normal (* VSR.tla:275 *);
-        let bytes =
-          Message.encode (Message.Start_view { v = t.view_number; log = winner.dvc_log; n = winner.dvc_n; k = new_k })
-        in
-        (* VSR.tla:277-278's own [Broadcast(..., r)] -- every OTHER replica, never self (VSR.tla:56's
-           [replicas \ {source}]), exactly like [propose]'s and [check_timeout]'s broadcasts. *)
-        for peer = 1 to t.replica_count do
-          if peer <> t.my_id then t.send ~to_:peer bytes
-        done
-      end
+                 The cross-message hazard an earlier version of this comment disclosed as
+                 KNOWINGLY UNGUARDED -- nothing checked the adopted log's length against THIS
+                 replica's own pre-existing [commit_number] -- is now guarded, but by the spec's
+                 own clause rather than by a bolted-on check: [ValidCompletion]'s
+                 [L >= HighestCommitNumber(r)] (VSR.tla:460) is exactly that bound, stated against
+                 the commit-number this step establishes ([new_k]) rather than against the one it
+                 replaces. [adopt_durable_log] re-checks it on the durable side through
+                 [truncate_wal]'s own [~committed] argument, which is the Review Focus guard. Note
+                 what this deliberately does NOT do: it does not refuse a completion whose [L] is
+                 below the coordinator's OWN prior [commit_number], because that is precisely the
+                 unconditional assignment above, and the two would fight. *)
+              t.last_normal_view <- t.view_number (* VSR.tla:511 *);
+              t.svc_count <- 0
+              (* Disclosed divergence -- see [svc_count]'s own doc comment on [t]. Unconditional
+                 here because [HasDvcQuorum] already restricts this action to [status =
+                 View_change], so reaching this point IS a real View_change -> Normal transition. *);
+              t.status <- Normal (* VSR.tla:510 *);
+              persist_superblock t;
+              let bytes = Message.encode (Message.Start_view { v = t.view_number; log = new_log; n = l; k = new_k }) in
+              (* VSR.tla:512-513's own [Broadcast(..., r)] -- every OTHER replica, never self
+                 (VSR.tla:177's [replicas \ {source}]). *)
+              for peer = 1 to t.replica_count do
+                if peer <> t.my_id then t.send ~to_:peer bytes
+              done
+            end))
+
+(* ---- ForfeitViewChange (VSR.tla:542-556) ----
+   Enabled precisely when this replica has everything the OLD, storage-fault-unaware protocol
+   needed to complete -- primary of its own view, in View_change, holding a valid f+1 DVC quorum --
+   and STILL cannot complete, because at least one op in the candidate range is neither
+   reconstructible nor proven absent. That is the one situation storage-fault-awareness newly
+   creates and that no amount of waiting is GUARANTEED to resolve: the remaining f replicas may
+   all be unreachable, or may all report the same corrupt slot.
+
+   Effect: abandon this attempt at view+1 so a different replica -- one whose storage may be
+   intact where this one's is not -- gets to coordinate. The replica STAYS in View_change; it does
+   not fall back to Normal, because its durable view has already advanced.
+
+   Deliberately NOT enabled below a DVC quorum (VSR.tla:528-531): more DVCs only ever add
+   evidence, so forfeiting early would abandon an attempt that was still making progress.
+
+   TWO DELIBERATE DIVERGENCES from the literal spec text, both disclosed:
+
+   1. WHO DRIVES IT. In TLA+ this is an always-enabled disjunct of [Next], free to fire the
+      instant the quorum is reached. Firing it eagerly here would be wrong for a real deployment
+      -- the f+1st DVC and the DVC that resolves the contested op can arrive microseconds apart,
+      and an eager forfeit would abandon a completable view change every time. VSR.tla:536-537
+      says as much ("Bounded by ForfeitLimit ...; a real implementation bounds it with a timer"),
+      so this is driven from [check_timeout]: the caller's own "nothing is progressing" signal.
+   2. WHAT BOUNDS IT. The spec's [aux_forfeit_count < ForfeitLimit] is a state-space device. Here
+      the budget is [svc_count]/[svc_limit], shared with [TimerSendSVC] -- both are "this replica
+      gives up on the current view and tries to start a newer one", both are reset by a successful
+      return to Normal, and giving forfeits a second, independent budget would let a wedged
+      replica burn view numbers at twice the configured rate for no stated reason. *)
+let try_forfeit_view_change t =
+  let dvcs = valid_dvcs t in
+  if not (has_dvc_quorum t dvcs) then ()
+  else
+    let can_complete =
+      match winning_dvc dvcs with
+      | None -> false
+      | Some winner ->
+        let new_k = highest_commit_number dvcs in
+        new_k <= winner.dvc_n && completion_point t dvcs ~winner ~highest_commit:new_k <> None
+    in
+    if can_complete then
+      () (* [~CanComplete(r)] is the other half of VSR.tla:545-546's guard: with a quorum that CAN
+            complete, [SendSV] is the enabled action, not this one. Reached only if a caller fires
+            the timer between the arrival of the completing evidence and the send -- which cannot
+            happen through [handle_message], since [try_send_sv] runs in the same call. *)
+    else begin
+      let v = t.view_number + 1 in
+      t.view_number <- v (* VSR.tla:548 *);
+      t.recv_svc <- Int_set.empty (* VSR.tla:549 *);
+      Hashtbl.reset t.recv_dvc (* VSR.tla:550 *);
+      t.sent_dvc <- false (* VSR.tla:551 *);
+      t.svc_count <- t.svc_count + 1 (* see divergence 2 above *);
+      (* [rep_status] is deliberately absent from the effects: VSR.tla:554-555 lists it UNCHANGED,
+         and it is already "ViewChange" by [HasDvcQuorum]'s own first conjunct. *)
+      persist_superblock t;
+      let bytes = Message.encode (Message.Start_view_change { v; i = t.my_id }) in
+      for peer = 1 to t.replica_count do
+        if peer <> t.my_id then t.send ~to_:peer bytes
+      done
+    end
+
+(* ---- TimerSendSVC (VSR.tla:302-315), plus the forfeit escape's trigger ----
+   research §2.1: VSR.tla deliberately does not model real timeouts -- this is an unconditional,
+   always-enabled (once its guard holds) action, not something driven by a clock; a caller decides
+   when to invoke [check_timeout] (e.g. on an actual timer firing with no Prepare/heartbeat seen
+   recently), matching the spec's own framing of it as "bounded by a state-space-limiting counter"
+   rather than real wall-clock logic.
+
+   ONE ENTRY POINT, TWO ACTIONS, selected by status -- and they are disjoint by construction:
+   [TimerSendSVC] guards on [rep_status[r] = "Normal"] (VSR.tla:305) and [ForfeitViewChange]'s own
+   [HasDvcQuorum] guards on [rep_status[r] = "ViewChange"] (VSR.tla:489), so no call can ever
+   trigger both. Keeping them behind one function is what makes the caller's contract "tell the
+   replica that nothing has progressed recently" rather than "know which recovery action is
+   currently applicable", which the caller has no way to determine. *)
+let check_timeout t =
+  if t.svc_count >= t.svc_limit then
+    () (* [aux_svc_count[r] < StartViewOnTimerLimit] guard (VSR.tla:304) -- see [svc_count]'s own
+          doc comment on [t] for why this bound is NOT permanent in this implementation despite
+          [aux_svc_count] never resetting in the literal TLA+ transcription: [SendSV]/[ReceiveSV]
+          reset it to 0 on every successful return to [Normal], giving each new failure its own
+          fresh budget. Bounds the forfeit path too -- see [try_forfeit_view_change]'s divergence
+          2. *)
+  else if t.status = View_change then try_forfeit_view_change t
+  else begin
+    let v = t.view_number + 1 in
+    t.view_number <- v;
+    t.status <- View_change;
+    t.recv_svc <- Int_set.empty;
+    Hashtbl.reset t.recv_dvc;
+    t.sent_dvc <- false;
+    t.svc_count <- t.svc_count + 1;
+    persist_superblock t
+    (* [rep_view_number] is durable (VSR.tla:58-59); on disk before the new view is announced, for
+       the same reason [handle_start_view_change]'s own bump is. *);
+    let bytes = Message.encode (Message.Start_view_change { v; i = t.my_id }) in
+    for peer = 1 to t.replica_count do
+      if peer <> t.my_id then t.send ~to_:peer bytes
+    done;
+    try_send_dvc t (* see try_send_dvc's own doc comment for why this call is included *)
+  end
 
 (* ---- ReceiveDVC (VSR.tla:232-240) ----
    Guard: [ValidDvc(r, m)] and nothing else -- in particular NO status conjunct (a DVC matching this
@@ -698,8 +1361,48 @@ let try_send_sv t =
    [Len(m.log) = m.n /\ m.k <= m.n /\ m.last_normal_view < m.v /\ m.i \in replicas]) -- no
    violation over the full 264,376-distinct-state graph, with a companion vacuity check confirming
    DoViewChange messages really do occur there. *)
-let handle_do_view_change t ~(v : int) ~(log : Value.value list) ~(last_normal_view : int) ~(n : int) ~(k : int)
-    ~(i : int) =
+let handle_do_view_change t ~(v : int) ~(entries : (int * Value.value) list) ~(nacks : int list)
+    ~(last_normal_view : int) ~(n : int) ~(k : int) ~(i : int) =
+  (* [entries] is a partial map, so it is validated as one: every op-number inside the sender's
+     own [1..n] range, and no op-number twice. Both checks are load-bearing rather than tidiness.
+     An out-of-range key would let a forged DVC supply a value for an op outside the range the
+     completion arithmetic reasons about (and, at [o <= 0], for an op-number that cannot exist at
+     all -- VSR.tla's [ops == 1..MaxOp] is 1-indexed). A DUPLICATE key would make [List.assoc]'s
+     first-wins silently decide which of two values for the SAME op-number this coordinator
+     reconstructs the cluster's log from, which is a log-content decision taken by message
+     ordering rather than by the protocol. *)
+  let entries_wellformed =
+    let rec loop seen = function
+      | [] -> true
+      | (o, _) :: rest -> if o < 1 || o > n || List.mem o seen then false else loop (o :: seen) rest
+    in
+    loop [] entries
+  in
+  (* THE NACK RANGE CHECK (this plan's own Review Focus list, Task 7: "a nack referencing an
+     op-number outside any replica's real log range ... must be handled as a malformed/out-of-range
+     input without crashing, matching this codebase's established 'guard failure => total no-op'
+     convention").
+
+     The range a nack must fall in is [o > n] (and [o >= 1]), NOT [1..n] and not the RECEIVER's own
+     op-number range. Both narrower readings are wrong in a way worth recording, because the
+     natural-looking one is the dangerous one:
+
+     - [o] at or below the SENDER's own [n] is exactly the forgery this check exists to stop. By
+       [StorageWellFormed] (VSR.tla:742-745) + [LogLengthMatchesOpNumber] (:728-729), [CanNack(r,
+       o)] holds precisely for [o > rep_op_number[r]], so a nack within the sender's own claimed
+       log range is a self-contradiction -- the message says in one field that it durably holds op
+       [o] and in another that it can prove it never did. Accepting it would let one forged DVC
+       supply a nack for a COMMITTED op, which is one half of a false [ProvenAbsent] quorum.
+     - Bounding by the RECEIVER's own op-number would reject the legitimate, load-bearing case:
+       nacks for ops ABOVE this replica's own log are precisely the evidence that licenses
+       truncating the winning DVC's longer log down to [CompletionPoint]. A coordinator whose own
+       log is short would refuse exactly the messages it needs.
+
+     A nack far above [n] (the "outside any replica's real log range" case) is therefore ACCEPTED
+     and provably inert: the completion arithmetic only ever asks about ops in [1..WinningDVC.n],
+     nothing is indexed or allocated per nack, and [sender_proves_absent] already treats every op
+     above [n] as proven regardless. *)
+  let nacks_wellformed = List.for_all (fun o -> o >= 1 && o > n) nacks in
   if i < 1 || i > t.replica_count then
     () (* VSR.tla:15's own [replicas == 1..ReplicaCount]. Note this check does NOT exclude
           [i = t.my_id], unlike [handle_start_view_change]'s otherwise-identical-looking check: a
@@ -716,13 +1419,29 @@ let handle_do_view_change t ~(v : int) ~(log : Value.value list) ~(last_normal_v
           known-simplifications list, and VSR.tla:176-182's own scope note): a DOVIEWCHANGE is
           unicast, so any view it could announce was already broadcast to everyone as a
           STARTVIEWCHANGE first. *)
-  else if n < 0 || n <> List.length log then
-    () (* [n] must be exactly the length of the log the same message carries -- VSR.tla's own
-          [LogLengthMatchesOpNumber] (VSR.tla:337-338) applied to the sender's state, since
-          [SendDVC] builds [log] and [n] from [rep_log[r]] and [rep_op_number[r]] in one step
-          (VSR.tla:222-223). Load-bearing rather than cosmetic: [try_send_sv] adopts [winner.log]
-          and relies on the resulting log length BEING [winner.n] (this module has no separate
-          op_number field to assign), and [StartView.n] is then broadcast cluster-wide. *)
+  else if n < 0 then
+    () (* [rep_op_number] is typed [Nat] (VSR.tla:53).
+
+          NOTE WHAT IS NO LONGER CHECKED HERE, since it is the one validation this task removed:
+          the old [n <> List.length log] check, which required the message's op-number to equal
+          the length of the log it carried. That is no longer a property of a well-formed
+          DoViewChange: [entries] is a PARTIAL function over [1..n] (VSR.tla:381-382), so
+          [Cardinality(DOMAIN m.entries) < m.n] is exactly what a replica with an unreadable slot
+          reports, and [n] itself comes from durable superblock state that stays trustworthy when
+          entry bodies do not (VSR.tla:358-359). The property the old check protected --
+          [LogLengthMatchesOpNumber] on the log this coordinator ends up adopting -- is now
+          established constructively instead: [try_send_sv] builds the new log as ops [1..L] from
+          [FillValue] and assigns [op_number <- L] in the same step, so its length and op-number
+          agree by construction rather than by trusting a sender's field. The in-range/no-duplicate
+          check on [entries] above is what keeps that construction well-defined. *)
+  else if not entries_wellformed then
+    () (* see [entries_wellformed] above *)
+  else if not nacks_wellformed then
+    () (* see [nacks_wellformed] above -- THE REVIEW FOCUS GUARD. Dropped WHOLESALE (no entry is
+          recorded, no field is applied, nothing is sent), per this module's established "guard
+          failure => total no-op" convention, rather than by filtering the offending nacks out of
+          an otherwise-accepted message: a DVC that contradicts its own [n] is evidence about the
+          sender's trustworthiness, not a message with one bad field. *)
   else if k < 0 || k > n then
     () (* [CommitNumberNeverHigherThanOpNumber] (VSR.tla:330-331) applied to the sender's own state.
           Note [<=], not [<], is the right bound HERE, unlike [handle_prepare]'s [k < n]: a DVC's
@@ -747,7 +1466,15 @@ let handle_do_view_change t ~(v : int) ~(log : Value.value list) ~(last_normal_v
           DOVIEWCHANGE records themselves. *)
   else begin
     let d =
-      { dvc_v = v; dvc_log = log; dvc_last_normal_view = last_normal_view; dvc_n = n; dvc_k = k; dvc_i = i }
+      {
+        dvc_v = v;
+        dvc_entries = entries;
+        dvc_nacks = nacks;
+        dvc_last_normal_view = last_normal_view;
+        dvc_n = n;
+        dvc_k = k;
+        dvc_i = i;
+      }
     in
     (* FIRST-WINS, per sender, per EPISODE -- see [recv_dvc]'s own doc comment on [t] for the full
        reasoning. [already_this_episode] deliberately checks the stored entry's own [dvc_v] rather
@@ -798,8 +1525,19 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
           rejects nothing a correct primary ever sends -- it is purely a bound on forged/corrupted
           input. Dropped WHOLESALE (view_number/status untouched), per this module's "guard failure
           => total no-op" convention. *)
+  else if
+    not
+      (adopt_durable_log t log ~committed:(max t.commit_number k)
+      (* VSR.tla:573's [rep_storage' = FreshStorage(m.n)]: adopting the canonical log means durably
+         writing and verifying it, which is how a corrupt slot on THIS replica gets repaired. Done
+         before any in-memory effect, so a backend that refuses the write leaves the action a total
+         no-op. [~committed] is the commit-number in effect AFTER this step (the monotonic update
+         below can only raise it), so the Review Focus truncate guard is checked against the value
+         this replica will actually be claiming, not the one it is leaving behind. *))
+  then ()
   else begin
-    Replica_log.replace_with t.log log (* VSR.tla:296-297: log and op_number adopted wholesale *);
+    Replica_log.replace_with t.log log (* VSR.tla:571-572: log and op_number adopted wholesale *);
+    t.op_number <- n;
     if k > t.commit_number then t.commit_number <- k;
     (* VSR.tla:298-299's own [IF m.k > @ THEN m.k ELSE @] -- MONOTONIC ONLY. research §5.7 Part 4:
        applying [m.k] unconditionally is a REAL, documented defect (it caused a
@@ -815,7 +1553,12 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
        StartView for a view this replica is already Normal in; an unconditional reset would let such
        duplicates refresh the timeout budget indefinitely and quietly nullify [svc_limit]. Must be
        read BEFORE the [status <- Normal] write below. *)
-    t.status <- Normal (* VSR.tla:301 *)
+    t.status <- Normal (* VSR.tla:577 *);
+    persist_superblock t
+    (* One write for all four durable fields this action moves (op_number, commit_number,
+       view_number, last_normal_view), AFTER the WAL has already been rewritten by
+       [adopt_durable_log] -- see that function's own CRASH ORDERING note for why this order is
+       the conservative one. *)
     (* [recv_dvc] and [recv_svc] are deliberately NOT reset -- VSR.tla:304 lists both as UNCHANGED,
        and spec/tla/README.md ("What the ValidDvc filter is actually doing here") has the detailed,
        TLC-backed argument for why the stale entries this genuinely leaves behind can never be READ:
@@ -831,8 +1574,8 @@ let handle_message t (bytes : string) =
   | Message.Prepare { view; n; v; k } -> handle_prepare t ~view ~n ~v ~k
   | Message.Prepare_ok { view; n; i } -> handle_prepare_ok t ~view ~n ~i
   | Message.Start_view_change { v; i } -> handle_start_view_change t ~v ~i
-  | Message.Do_view_change { v; log; last_normal_view; n; k; i } ->
-    handle_do_view_change t ~v ~log ~last_normal_view ~n ~k ~i
+  | Message.Do_view_change { v; entries; nacks; last_normal_view; n; k; i } ->
+    handle_do_view_change t ~v ~entries ~nacks ~last_normal_view ~n ~k ~i
   | Message.Start_view { v; log; n; k } -> handle_start_view t ~v ~log ~n ~k
 
 (* ---- Test-support surface (continued): read-only views of the two view-change accumulators ----
@@ -844,3 +1587,20 @@ let handle_message t (bytes : string) =
    dedup. Both return sorted sender ids so a test can assert on an exact list. *)
 let for_test_recv_dvc_senders t = Hashtbl.fold (fun i _ acc -> i :: acc) t.recv_dvc [] |> List.sort compare
 let for_test_recv_svc_senders t = Int_set.elements t.recv_svc
+
+(* The pure-discard entry point into [truncate_wal] -- see that function's own comment for the
+   [~resulting_length] argument this passes and why. Test-support, not protocol: no VSR action
+   truncates the WAL without writing the canonical log back in the same step, so this is the only
+   caller for which the guard reduces to the plain "op_number >= commit_number" form the plan's
+   Review Focus item states. *)
+let for_test_truncate_wal t ~op_number =
+  truncate_wal t ~op_number ~committed:t.commit_number ~resulting_length:op_number;
+  if op_number < t.op_number then begin
+    t.op_number <- op_number;
+    Replica_log.replace_with t.log
+      (List.filteri (fun idx _ -> idx < op_number) (Replica_log.to_list t.log));
+    persist_superblock t
+  end
+
+let for_test_wal_read t ~op_number =
+  match slot_state t ~op_number with Present v -> Some v | Corrupt | Absent -> None

@@ -127,3 +127,16 @@ let with_fault_injecting_storage f =
 
 let fault_injecting_storage_tests =
   Fault_injecting_storage_tests.shared_tests with_fault_injecting_storage
+
+(* -- Memory_storage glue: the ONLY implementation-specific code for this instantiation --
+
+   The shortest [with_storage] of the three, and that is the point: [Memory_storage.t] holds no
+   Eio resource, so there is no [Eio_main.run]/[Eio.Switch.run]/temp-dir scope to keep open around
+   the callback. It is run through the same shared body as the other two precisely so "the backend
+   the VSR replica unit tests construct" is a conformance-checked [Storage_intf.S], not a stub
+   that only happens to satisfy the calls those tests make. *)
+
+module Memory_storage_tests = Make_storage_tests (Memory_storage)
+
+let with_memory_storage f = f (Memory_storage.create ())
+let memory_storage_tests = Memory_storage_tests.shared_tests with_memory_storage

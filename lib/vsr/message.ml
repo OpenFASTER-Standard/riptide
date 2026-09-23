@@ -9,7 +9,8 @@ type t =
   | Start_view_change of { v : int; i : int }
   | Do_view_change of {
       v : int;
-      log : Value.value list;
+      entries : (int * Value.value) list;
+      nacks : int list;
       last_normal_view : int;
       n : int;
       k : int;
@@ -31,6 +32,20 @@ let tag_start_view = "StartView"
 let int_field name i : string * Value.value = (name, Value.Scalar (Value.Int (Int64.of_int i)))
 let log_field log : string * Value.value = ("log", Value.Sequence log)
 
+(* [DoViewChange]'s own [entries] field is a PARTIAL FUNCTION in the spec (VSR.tla:381-382,
+   [ReadableEntries(r)], VSR.tla:170) -- defined exactly on the op-numbers the sender can actually
+   READ, with corrupt slots simply absent from its domain. A [Value.Sequence] of values cannot
+   express that (a sequence's domain is always a contiguous [1..Len]), so each entry carries its
+   own op-number: [Sequence [ Record [ o; v ]; ... ]], the wire shape of TLA+'s own
+   [[ o \in {...} |-> ...]]. *)
+let entries_field entries : string * Value.value =
+  ( "entries",
+    Value.Sequence
+      (List.map (fun (o, value) -> Value.Record [ int_field "o" o; ("v", value) ]) entries) )
+
+let int_list_field name l : string * Value.value =
+  (name, Value.Sequence (List.map (fun i -> Value.Scalar (Value.Int (Int64.of_int i))) l))
+
 let to_value (t : t) : Value.value =
   match t with
   | Prepare { view; n; v; k } ->
@@ -39,13 +54,14 @@ let to_value (t : t) : Value.value =
     Value.Sum (tag_prepare_ok, Value.Record [ int_field "view" view; int_field "n" n; int_field "i" i ])
   | Start_view_change { v; i } ->
     Value.Sum (tag_start_view_change, Value.Record [ int_field "v" v; int_field "i" i ])
-  | Do_view_change { v; log; last_normal_view; n; k; i } ->
+  | Do_view_change { v; entries; nacks; last_normal_view; n; k; i } ->
     Value.Sum
       ( tag_do_view_change,
         Value.Record
           [
             int_field "v" v;
-            log_field log;
+            entries_field entries;
+            int_list_field "nacks" nacks;
             int_field "last_normal_view" last_normal_view;
             int_field "n" n;
             int_field "k" k;
@@ -74,6 +90,30 @@ let value_list_of_field tag fields name : Value.value list =
   | Value.Sequence l -> l
   | _ -> raise (Malformed_message (Printf.sprintf "%s: field %S is not a Sequence" tag name))
 
+let int_list_of_field tag fields name : int list =
+  List.map
+    (fun v ->
+      match v with
+      | Value.Scalar (Value.Int i) -> Int64.to_int i
+      | _ ->
+        raise (Malformed_message (Printf.sprintf "%s: field %S holds a non-Int element" tag name)))
+    (value_list_of_field tag fields name)
+
+(* The inverse of [entries_field] above. Note what is NOT checked here: nothing about whether the
+   op-numbers are in range, ordered, unique, or consistent with the message's own [n]. This module
+   validates SHAPE only -- [Replica.handle_do_view_change] carries every protocol-level bound, per
+   the established split documented on {!decode}. *)
+let entries_of_field tag fields name : (int * Value.value) list =
+  List.map
+    (fun v ->
+      match v with
+      | Value.Record entry_fields ->
+        (int_of_field tag entry_fields "o", field_exn tag entry_fields "v")
+      | _ ->
+        raise
+          (Malformed_message (Printf.sprintf "%s: field %S holds a non-Record element" tag name)))
+    (value_list_of_field tag fields name)
+
 let of_value (v : Value.value) : t =
   match v with
   | Value.Sum (tag, inner) ->
@@ -99,7 +139,8 @@ let of_value (v : Value.value) : t =
       Do_view_change
         {
           v = int_of_field tag fields "v";
-          log = value_list_of_field tag fields "log";
+          entries = entries_of_field tag fields "entries";
+          nacks = int_list_of_field tag fields "nacks";
           last_normal_view = int_of_field tag fields "last_normal_view";
           n = int_of_field tag fields "n";
           k = int_of_field tag fields "k";

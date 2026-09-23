@@ -40,7 +40,7 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
   let replicas =
     Array.init replica_count (fun i ->
         let r =
-          Replica.create ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
+          Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
               Sim_transport.send handles.(i) ~to_ bytes)
         in
         (* A freshly created replica starts at view_number = 0, where Primary(0) = replica_count

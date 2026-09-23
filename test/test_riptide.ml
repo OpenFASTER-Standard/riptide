@@ -59,6 +59,7 @@ let () =
       ("file_storage", Test_file_storage.tests);
       ("storage_shared_file_storage", Test_storage_shared.file_storage_tests);
       ("storage_shared_fault_injecting_storage", Test_storage_shared.fault_injecting_storage_tests);
+      ("storage_shared_memory_storage", Test_storage_shared.memory_storage_tests);
       ("fault_injecting_storage", Test_fault_injecting_storage.tests);
       ("transport_tcp", Test_transport_tcp.tests);
       ("transport_shared_sim", Test_transport_shared.sim_tests);
@@ -68,4 +69,5 @@ let () =
       ("vsr_replica", Test_vsr_replica.tests);
       ("vsr_replica_cluster", Test_vsr_replica_cluster.tests);
       ("vsr_replica_view_change", Test_vsr_replica_view_change.tests);
+      ("vsr_replica_recovery", Test_vsr_replica_recovery.tests);
     ]

@@ -18,9 +18,21 @@
     no separate entry points of their own — both are derived actions driven from whichever handler
     changes what their guards read (see {!handle_message}'s own doc comment).
 
+    {b Storage-fault-aware recovery is now in scope too} — the remaining actions of
+    `spec/tla/VSR.tla`'s own extension: the multi-step, interruptible view-change completion
+    ([HasDvcQuorum]/[NackCount]/[ProvenAbsent]/[EntrySources]/[CanFill]/[FillValue]/
+    [ValidCompletion]/[CanComplete]/[CompletionPoint], VSR.tla:403-516, driven from
+    {!handle_message}'s [Do_view_change] dispatch), the forfeit escape ([ForfeitViewChange],
+    VSR.tla:542-556, driven from {!check_timeout}), and crash/restart with a durable/volatile
+    split ([CrashRestart], VSR.tla:671-690, which is {!restart}). All of it reads and writes
+    through a real {!Riptide_storage.Storage_intf.S} backend supplied at construction — see
+    {!storage}.
+
     {b Still out of scope}, as for `spec/tla/VSR.tla` itself (see `spec/tla/README.md`):
-    state-transfer, storage-fault-aware recovery, crash modeling, reconfiguration, the client
-    table, and COMMIT messages. Two disclosed, liveness-only simplifications are inherited
+    state-transfer (so a replica that restarts with an unreadable slot below its own op-number
+    waits for a [StartView] to repair it rather than fetching the missing entry from a peer),
+    reconfiguration, the client table, and COMMIT messages. Two disclosed, liveness-only
+    simplifications are inherited
     directly from the spec: no [PrepareOk] re-send on [StartView], and only a higher-view
     [StartViewChange] (never a higher-view [DoViewChange]) makes a replica adopt a higher view.
 
@@ -61,12 +73,45 @@ type status = Normal | View_change
     convention, no semantic change. *)
 
 type t
-(** One replica's mutable state: its log, op-number (tracked implicitly as the log's own length —
-    see {!op_number}), commit-number, view-change status/view-number/last-normal-view (see the
-    top-level scope note above for what is and isn't yet wired up), and (primary-only) per-peer
-    acknowledgment high-water marks. *)
+(** One replica's mutable state: its log, op-number, commit-number, view-change
+    status/view-number/last-normal-view, (primary-only) per-peer acknowledgment high-water marks,
+    and — since the storage-fault-tolerant-recovery work — the durable {!storage} backend all of
+    the above is written through. *)
 
-val create : my_id:int -> replica_count:int -> svc_limit:int -> send:(to_:int -> string -> unit) -> t
+type storage
+(** A {!Riptide_storage.Storage_intf.S} backend, with its own [type t] already erased — build one
+    with {!storage_of_module} (or {!volatile_storage}) and hand it to {!create}/{!restart}.
+
+    Erasing the backend's type at construction is what keeps {!t} monomorphic. The alternative,
+    storing the module and its value inside {!t}, would make it [('backend) Replica.t] and infect
+    every signature in this module, {!Riptide_batch_commit}, and every test — for no behavioural
+    difference, since nothing here ever needs to recover the backend's concrete type. This mirrors
+    how {!create} already takes its transport as a value ([send]) rather than as a functor
+    parameter. *)
+
+val storage_of_module : (module Riptide_storage.Storage_intf.S with type t = 'a) -> 'a -> storage
+(** [storage_of_module (module B) backend] packages an already-constructed backend value. Nothing
+    is copied and no state is read: the returned {!storage} is a view of [backend], so two
+    replicas given views of the SAME backend share one durable log (which is what makes
+    {!restart} able to recover a replica's own state, and what makes handing one backend to two
+    different replicas a bug). *)
+
+val volatile_storage : unit -> storage
+(** A fresh {!Riptide_storage.Memory_storage} backend, packaged.
+
+    {b Not durable across a process exit} — it is in-process memory. It is the right choice for
+    tests that never exercise a restart, and for any caller that wants VSR's protocol behaviour
+    without real durability; it is the wrong choice for anything that must survive a crash, which
+    is {!Riptide_storage.File_storage}'s job. Named [volatile_] rather than [memory_] for exactly
+    that reason: the property that matters at a call site is what is lost, not where it is kept. *)
+
+val create :
+  my_id:int ->
+  replica_count:int ->
+  svc_limit:int ->
+  send:(to_:int -> string -> unit) ->
+  storage:storage ->
+  t
 (** [create ~my_id ~replica_count ~svc_limit ~send] is a fresh replica matching VSR.tla's [Init]
     (VSR.tla:71-84) restricted to this replica [my_id]: empty log, [op_number = 0],
     [commit_number = 0], [status = Normal], [view_number = 0], [last_normal_view = 0],
@@ -104,7 +149,49 @@ val create : my_id:int -> replica_count:int -> svc_limit:int -> send:(to_:int ->
     future transport implementation that can produce a closure of this shape. [send] is called
     synchronously, inline, from within {!propose} and {!handle_message} — never queued or
     deferred — so a caller supplying a closure that itself blocks will block the caller of
-    {!propose}/{!handle_message} too. *)
+    {!propose}/{!handle_message} too.
+
+    [storage] is the durable backend this replica writes its WAL and superblock through — see
+    {!storage_of_module}/{!volatile_storage}. {b It must be empty}: [create] raises
+    [Invalid_argument] if the backend already holds a WAL entry or a superblock, because a
+    non-empty backend means a previous life whose durable [view_number]/[last_normal_view] this
+    constructor would silently discard — and those two surviving a crash is the whole basis of
+    the recovery mechanism (VSR.tla's Decision 4). {!restart} is the constructor for that case. *)
+
+val restart :
+  my_id:int ->
+  replica_count:int ->
+  svc_limit:int ->
+  send:(to_:int -> string -> unit) ->
+  storage:storage ->
+  t
+(** [restart ~my_id ~replica_count ~svc_limit ~send ~storage] is VSR.tla's [CrashRestart]
+    (VSR.tla:671-690): a replica coming back up on top of storage that already holds its durable
+    state. Same argument validation as {!create}, and the same [Invalid_argument] cases for
+    [my_id]/[replica_count]/[svc_limit] — but no emptiness requirement, since recovering existing
+    durable state is the point. An empty backend is accepted and yields exactly {!create}'s
+    [Init] state.
+
+    {b DURABLE, recovered here} (VSR.tla:592-596): the log (from the WAL), [op_number],
+    [commit_number], [view_number], [last_normal_view]. The last two are Decision 4's whole point
+    — persisted rather than reconstructed by VSR's textbook in-memory Recovery sub-protocol.
+
+    {b VOLATILE, deliberately lost} (VSR.tla:599-601): [peer_op_number], [recv_svc], [recv_dvc],
+    [sent_dvc]. All in-memory view-change bookkeeping; a restarted replica re-collects it. Note in
+    particular that clearing [sent_dvc] means a restarted replica WILL send a second
+    [Do_view_change] for an episode it had already spoken in — which is exactly why
+    [HasDvcQuorum] must count distinct senders rather than messages (VSR.tla:473-487).
+
+    {b [status] is RECONSTRUCTED, never stored}: [view_number > last_normal_view] means this
+    replica was mid-view-change when it went down and resumes there ([View_change]); otherwise
+    [Normal] (VSR.tla:596-597, :680-682).
+
+    Two reconciliations the abstract model does not need, both conservative in the safe direction:
+    WAL entries beyond the durable [op_number] (a crash between the entry's write and the
+    superblock's) are discarded, since they were never acknowledged; and the in-memory log is
+    rebuilt only up to the first unreadable slot, while [op_number] keeps its full durable value —
+    so {!op_number} can legitimately exceed [List.length (entries t)] after a restart that
+    discovered corruption. See {!op_number}. *)
 
 val primary : t -> int
 (** [primary t] is VSR.tla's own [Primary(View(r)) == 1 + ((View(r)-1) % ReplicaCount)]
@@ -117,12 +204,21 @@ val is_primary : t -> bool
 (** [is_primary t] is VSR.tla's own [r = Primary(View(r))] test — exactly [t.my_id = primary t]. *)
 
 val op_number : t -> int
-(** [op_number t] is VSR.tla's [rep_op_number[r]] (VSR.tla:24). Always equals the number of
-    entries in this replica's log — VSR.tla's own [LogLengthMatchesOpNumber] invariant
-    (VSR.tla:337-338) — because this module tracks op-number AS the log's length ({!
-    Riptide_vsr.Replica_log.length}) rather than as separate mutable state kept in lockstep by
-    hand, which makes that invariant true by construction instead of something a caller (or a
-    future refactor) could accidentally violate. *)
+(** [op_number t] is VSR.tla's [rep_op_number[r]] (VSR.tla:53) — {b durable} state, recovered from
+    the superblock by {!restart}.
+
+    {b This changed with the storage-fault-tolerant-recovery work, and the change is visible
+    here.} It used to be defined AS the in-memory log's length, which made
+    [LogLengthMatchesOpNumber] (VSR.tla:728-729) true by construction. That definition cannot
+    survive real storage faults: [rep_op_number] is durable across a restart while individual log
+    entries may come back unreadable, and VSR.tla:358-359 turns on exactly that gap ("[n] — its
+    op-number, which it still knows from durable superblock state even when some slot bodies are
+    unreadable"). So this is now its own field, and the two can differ in exactly one documented
+    way: after a {!restart} that discovered a corrupt slot, [op_number t] is the full durable
+    op-number while [entries t] holds only the readable prefix. In every other state they agree,
+    and every writer in this module maintains that in the same step. A replica in the
+    differing state declines new client requests and new [Prepare]s until a [StartView] repairs
+    it (state transfer is out of scope — see [spec/tla/README.md]'s known simplifications). *)
 
 val commit_number : t -> int
 (** [commit_number t] is VSR.tla's [rep_commit_number[r]] (VSR.tla:25) — the highest op-number
@@ -284,7 +380,33 @@ val propose : t -> Riptide.Value.value -> unit
     matching what VSR.tla's own [Next] would allow. *)
 
 val check_timeout : t -> unit
-(** [check_timeout t] is VSR.tla's [TimerSendSVC] (VSR.tla:161-174) — the entry point a caller
+(** {b Two actions behind one entry point, selected by [status]} — the second added by the
+    storage-fault-tolerant-recovery work:
+
+    - [status = Normal]: VSR.tla's [TimerSendSVC] (VSR.tla:302-315), described in full below.
+    - [status = View_change]: VSR.tla's [ForfeitViewChange] (VSR.tla:542-556) — the escape hatch
+      for a coordinator that holds a full [f+1] [DoViewChange] quorum and STILL cannot complete,
+      because some op in the candidate range is neither reconstructible from the quorum's readable
+      entries nor proven absent by a nack quorum. It bumps to [view + 1], clears the view-change
+      bookkeeping and broadcasts [StartViewChange], so a replica whose own storage may be intact
+      gets to coordinate instead; it deliberately does NOT return to [Normal] (this replica's
+      durable view has already advanced), and it deliberately does nothing at all below a quorum
+      (more [DoViewChange]s can only add evidence, so forfeiting early would abandon an attempt
+      that was still making progress — VSR.tla:528-531).
+
+      In the spec this is a free-firing [Next] disjunct; here it is timer-driven, because firing
+      it the instant a quorum is reached would abandon completable view changes whenever the
+      resolving message is merely a few microseconds behind the quorum-completing one
+      (VSR.tla:536-537 says a real implementation bounds it with a timer, and this is that). It
+      shares [svc_limit] as its budget with [TimerSendSVC] — both are "give up on this view and
+      try a newer one", and both budgets are reset by a successful return to [Normal].
+
+    The two are disjoint by construction ([TimerSendSVC] requires [Normal], the forfeit path
+    requires [View_change]), so one call can never trigger both, and a caller never has to know
+    which recovery action is currently applicable — it only has to report that nothing is
+    progressing.
+
+    [check_timeout t] is VSR.tla's [TimerSendSVC] (VSR.tla:161-174) — the entry point a caller
     invokes when it decides (by whatever real wall-clock/timer policy it uses — VSR.tla itself
     deliberately does not model real timeouts, per research §2.1's own comment quoted at
     VSR.tla:158-159) that this replica has gone too long without hearing from its current primary
@@ -647,3 +769,33 @@ val for_test_recv_svc_senders : t -> int list
     current view-change episode, the set [SendDVC]'s own [Cardinality(...) >= f] threshold counts.
     Same rationale as {!for_test_recv_dvc_senders} above: it exists so a test can pin [ReceiveSV]'s
     deliberate non-reset (VSR.tla:304) and the episode resets directly. *)
+
+val for_test_truncate_wal : t -> op_number:int -> unit
+(** [for_test_truncate_wal t ~op_number] discards every durable WAL entry above [op_number] (and
+    the matching in-memory entries), going through the same guarded path every protocol action
+    uses.
+
+    {b Raises [Invalid_argument "recovery: refusing to truncate below commit_number"]} when
+    [op_number < commit_number t] — this plan's own Review Focus item: "VSR's own safety guarantee
+    is that committed entries never disappear; this must be rejected by the caller ([replica.ml]),
+    not silently accepted by the storage primitive". The boundary itself ([op_number =
+    commit_number t]) is accepted: discarding the UNCOMMITTED suffix is exactly what a legal
+    view-change completion does.
+
+    Test-support, not protocol. No VSR action truncates the WAL without writing the canonical log
+    back in the same step, so this is the only caller for which the guard takes this simple form —
+    a log ADOPTION ([SendSV]/[ReceiveSV]) is checked against the length the durable log will have
+    once the adoption finishes, which is what lets it repair a corrupt slot BELOW the commit point
+    by rewriting it (see the implementation's own [truncate_wal]). *)
+
+val for_test_wal_read : t -> op_number:int -> Riptide.Value.value option
+(** [for_test_wal_read t ~op_number] is what this replica can actually READ back off its durable
+    storage at [op_number] — [None] for a slot that is beyond the log, or present but unreadable
+    ([VSR.tla]'s ["absent"] and ["corrupt"] respectively, which this accessor deliberately does not
+    distinguish: telling them apart is a protocol decision, made inside this module against the
+    durable op-number, not something a test should be able to shortcut).
+
+    Test-support, not protocol. It exists so a test can assert on DURABILITY directly — that an
+    entry really reached the WAL, or that a truncation really removed it — rather than inferring it
+    from {!entries}, which is the in-memory copy and would pass even if nothing were ever written
+    through to storage at all. *)

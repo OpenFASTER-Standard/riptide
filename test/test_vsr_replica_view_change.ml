@@ -176,7 +176,7 @@ let with_cluster ~replica_count ~svc_limit
     Array.init replica_count (fun i ->
         let my_id = i + 1 in
         let r =
-          Replica.create ~my_id ~replica_count ~svc_limit ~send:(fun ~to_ bytes ->
+          Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit ~send:(fun ~to_ bytes ->
               if isolated.(to_) then ()
                 (* Dropped at the point of send -- see [isolated]'s own doc comment: never queued,
                    so there is nothing left to deliver once [to_] is later reconnected. *)
