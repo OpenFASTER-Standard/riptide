@@ -4,5 +4,5 @@
    riptide_materialize riptide_pki riptide_sim riptide_storage riptide_transport riptide_vsr
    golden_fixtures
    alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix
-   mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt)
+   mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt tls tls-eio)
  (deps ../spec/golden/vectors.txt))

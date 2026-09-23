@@ -1,3 +1,3 @@
 (library
  (name riptide_transport)
- (libraries eio eio.unix))
+ (libraries eio eio.unix tls tls-eio x509 ptime ptime.clock.os mirage-crypto-rng.unix fmt))

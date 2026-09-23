@@ -98,8 +98,26 @@ let test_sim_echo_between_peers () =
    [Eio.Switch.fail] once the shared test body returns, rather than let [Eio.Switch.run] block
    forever waiting for the never-ending listener/reader/writer fibers [Tcp.create] forks onto it.
    Distinct ports (19401-19403) from every range test_transport_tcp.ml already uses, so the two
-   files' tests can never collide even if run back-to-back. *)
+   files' tests can never collide even if run back-to-back.
+
+   [Tcp] is unconditionally mutually-authenticated, so this glue also has to mint a real X.509
+   identity per peer (one shared CA, one leaf each -- see test_transport_tcp.ml's own material for
+   the same pattern). That is genuinely implementation-specific setup and belongs here rather than
+   in the shared body: [Transport_intf.S] says nothing about transport security, and
+   [Sim_transport] has no equivalent notion. *)
 exception Shared_tcp_mesh_torn_down
+
+let () = Mirage_crypto_rng_unix.use_default ()
+
+let shared_tcp_ca = Riptide_pki.Ca.generate_root ~common_name:"riptide-shared-transport-test-root"
+
+let shared_tcp_identity id =
+  let cert, priv_key =
+    Riptide_pki.Ca.sign_leaf shared_tcp_ca
+      ~common_name:(Printf.sprintf "shared-peer-%d.riptide.test" id)
+      ~valid_days:1
+  in
+  Tls_identity.create ~trust_anchor:shared_tcp_ca.Riptide_pki.Ca.cert ~cert ~priv_key
 
 let test_tcp_echo_between_peers () =
   let peer_specs = [ (0, "127.0.0.1", 19401); (1, "127.0.0.1", 19402); (2, "127.0.0.1", 19403) ] in
@@ -114,7 +132,10 @@ let test_tcp_echo_between_peers () =
             (List.map
                (fun (my_id, _, _) ->
                  fun () ->
-                   let t = Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs in
+                   let t =
+                     Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs
+                       ~tls:(shared_tcp_identity my_id)
+                   in
                    Hashtbl.replace handles my_id t)
                peer_specs);
           Array.init (List.length peer_specs) (fun i -> Hashtbl.find handles i)

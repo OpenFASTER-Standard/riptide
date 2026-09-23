@@ -1,9 +1,41 @@
 (** Real, TCP-backed implementation of {!Transport_intf.S}.
 
+    {2 Authentication}
+
+    Every connection in the mesh is {b mutually authenticated TLS}, unconditionally: there is no
+    plaintext mode, no opt-in flag, and no way to construct a [t] without supplying the X.509
+    material ({!Tls_identity.t}) to do it. Both ends verify the other -- the dialing side verifies
+    the accepting side's certificate against the trust anchor it was given, and the accepting side
+    verifies the dialing side's, against the same anchor. A peer holding no certificate, or one
+    issued by any other authority, cannot establish a connection in either direction. See
+    {!Tls_identity} for how the two configurations are built and what is checked at startup.
+
+    Unconditional rather than optional is a deliberate call. This transport has exactly one
+    production caller (a VSR replica's message path), it carries consensus traffic whose forgery
+    would let an attacker rewrite replicated state, and its listening port is reachable by anyone
+    who can route to it. An optional-security flag on a module like that has one realistic
+    outcome: some deployment path silently not setting it. The cost of the choice is that every
+    caller, including every test, must supply real certificates -- which is the intended cost.
+
+    {b What mTLS here does and does not establish.} It establishes that the party on the other end
+    holds a certificate this cluster's CA issued, and that every byte exchanged afterwards is
+    confidential, integrity-protected, and not replayable onto the connection by anyone else. It
+    does {e not} establish {e which} cluster member that party is: the peer id below is still the
+    one the preamble claims, and nothing binds it to the certificate presented. So one holder of a
+    cluster certificate can still claim another member's id. That is a real, remaining gap, and it
+    is stated rather than closed here because closing it means deciding a naming convention
+    between certificate subjects and peer ids -- policy this repo has no running code needing yet.
+    The gap it {e does} close is the one that mattered most: an arbitrary party on the network can
+    no longer inject, read, or tamper with cluster traffic at all.
+
     {2 Wire format}
 
+    Everything described below happens {e inside} the TLS session, not before it: the first bytes
+    on a new socket are always a TLS handshake, and the preamble and framing that follow are
+    application data within that session, never plaintext on the wire.
+
     - {b Handshake preamble}: a plain [accept] does not tell you which peer just connected, so
-      immediately after a TCP connection is established, the {e connecting} side (the peer with
+      immediately after the TLS handshake completes, the {e connecting} side (the peer with
       the {e lower} id, per the connection-topology convention below) writes its own peer id as a
       raw, unframed 8-byte big-endian integer -- no length prefix, and before any framed message.
       The {e accepting} side (the peer with the {e higher} id) reads exactly these 8 bytes first,
@@ -11,19 +43,17 @@
       belongs to. The accepting side does {e not} send a reciprocal preamble back: only one
       direction needs it, since the connecting side already knows which peer it dialed.
 
-      {b This preamble is trusted, not verified.} Nothing checks that the id an accepted socket
-      claims is actually who it says it is, and a second connection claiming an id already present
-      in this peer's connection table silently replaces the first one (an implementation detail of
-      [Hashtbl.replace], not a validated "reconnect" feature). This is deliberate, not an
-      oversight: real authentication is out of scope for this module, per Decision 1's
-      single-operator-cluster framing in the design this implements. It is called out here so a
-      future reader doesn't have to rediscover it by reading the source.
+      {b This preamble is authenticated as coming from some cluster member, but the id it claims
+      is not verified} -- see the Authentication section above. A second connection claiming an id
+      already present in this peer's connection table silently replaces the first one (an
+      implementation detail of [Hashtbl.replace], not a validated "reconnect" feature).
 
-      The accepting side's wait for this preamble is bounded (~10s): a connection that is accepted
-      but sends nothing is dropped and its fd released, rather than parking a fiber and a file
-      descriptor for the lifetime of the process. This matters because the listening port is
-      reachable by anyone who can route to it (see the authentication note above), so an unbounded
-      wait here would be an unbounded resource leak.
+      The accepting side's waits are bounded, at both layers and for the same reason: ~10s for the
+      TLS handshake to complete, then ~10s for the preamble. A connection that is accepted but
+      says nothing -- at either layer, and the TLS one needs no certificate to reach -- is dropped
+      and its fd released, rather than parking a fiber and a file descriptor for the lifetime of
+      the process. This matters because the listening port is reachable by anyone who can route to
+      it, so an unbounded wait at either layer would be an unbounded resource leak.
     - {b Message framing}: every message thereafter, in both directions, is wrapped as an 8-byte
       big-endian length prefix followed by exactly that many raw payload bytes -- the same
       convention as [Value.buf_add_len_prefixed] (see [lib/value.ml]), so that concatenating two
@@ -77,10 +107,14 @@
     - {b At-most-once delivery}: nothing in this module ever duplicates a message. Messages can
       still be lost (a connection that dies discards whatever it had buffered -- see above), so
       this is at-most-once, never at-least-once or exactly-once.
-    - {b Payload integrity}: a delivered message is byte-identical to what was sent, to the extent
-      TCP's own checksums and the length-prefix framing above guarantee. This module adds no
-      integrity check of its own, and specifically no cryptographic one -- an active attacker on
-      the path is out of scope for the same reason authentication is.
+    - {b Payload integrity and confidentiality}: a delivered message is byte-identical to what was
+      sent, and was sent by a party holding a certificate this cluster's CA issued. This is a
+      cryptographic guarantee, not merely TCP's checksums: every byte travels inside the mutually
+      authenticated TLS session described above, so an active attacker on the path can drop or
+      delay a connection but cannot read, forge, or alter a message on it. ({!Transport_intf.S}
+      itself still promises none of this -- {!Riptide_sim.Sim_transport} corrupts payloads
+      deliberately, as fault injection -- so protocol code that must stay portable across
+      implementations keeps its own end-to-end checks regardless.)
 
     {2 Listener error handling}
 
@@ -93,11 +127,18 @@
 
     Because there is no cap on the number of concurrent accepted connections, any party able to
     reach this listener's port can drive it into fd exhaustion (and therefore the unrecoverable
-    case above) simply by opening connections and never sending a valid preamble. Real
-    authentication and connection-count limiting are out of scope for the same single-operator-
-    cluster reason given elsewhere in this file -- noted here because this is the specific
-    mechanism by which that trust assumption becomes a liveness concern, not just an
-    authenticity one.
+    case above) simply by opening connections and stalling. Mutual TLS does not fix this: an
+    attacker with no certificate at all still gets a socket, a fiber and an fd for as long as the
+    handshake wait allows. What bounds it is that both waits are bounded (~10s for the handshake,
+    ~10s for the preamble), so each such connection is a transient cost rather than a permanent
+    one. Connection-count limiting and per-source rate limiting remain out of scope -- noted here
+    because this is the specific mechanism by which reachability of the port stays a liveness
+    concern even though it is no longer an authenticity one.
+
+    A connection whose TLS handshake is {e refused} -- no certificate, or one from an authority
+    this cluster does not trust -- is logged and dropped, and deliberately does {e not} count
+    toward the consecutive-accept-error budget above. Otherwise an unauthenticated attacker could
+    shut this listener down on demand simply by connecting repeatedly with a bad certificate.
 
     {2 Send failures}
 
@@ -120,7 +161,9 @@
 
     No reconnection/retry once a connection has been established (only the initial "wait for the
     rest of the cluster to come up" retry during {!create} exists, bounded -- see {!create}); no
-    TLS or authentication of any kind (see the handshake preamble note above); no explicit
+    binding of a peer's claimed id to the certificate it presented (see "Authentication" above);
+    no certificate revocation, rotation or expiry handling of any kind -- {!create} takes the
+    material it is given, and an expired certificate simply starts failing handshakes; no explicit
     shutdown/close (see the note at the end of this comment); no backpressure or flow control of
     any kind -- despite an earlier draft of this comment claiming {!Eio.Buf_write} provides some,
     it does not: both the per-connection write buffer and the receive-side inbox
@@ -175,20 +218,33 @@ val create :
   clock:_ Eio.Time.clock ->
   my_id:int ->
   peers:(int * string * int) list ->
+  tls:Tls_identity.t ->
   t
-(** [create ~sw ~net ~clock ~my_id ~peers] brings up this peer's side of the transport mesh:
+(** [create ~sw ~net ~clock ~my_id ~peers ~tls] brings up this peer's side of the transport mesh:
 
     - Starts a listener on [my_id]'s own [(host, port)] entry in [peers].
     - Dials every peer in [peers] with an id greater than [my_id] (retrying with a short sleep,
       driven by [clock], for a bounded number of attempts, up to ~20s total -- this is only for
       the "wait for the rest of a small, fixed cluster to finish starting up" case, not general
-      reconnection).
-    - Accepts connections from every peer in [peers] with an id less than [my_id], reading the
-      handshake preamble documented above to learn which peer each accepted socket belongs to.
+      reconnection). The TLS handshake for a dialed peer happens {e during} [create], inline, so a
+      refused one is reported by [create] itself rather than surfacing later as an unexplained
+      missing peer. It is not retried: a rejected certificate is a settled disagreement, not a
+      peer that has not started yet.
+    - Accepts connections from every peer in [peers] with an id less than [my_id], completing the
+      TLS handshake and then reading the handshake preamble documented above to learn which peer
+      each accepted socket belongs to.
+
     - For each connection, runs a coupled reader/writer pair (see "Connection topology" above)
-      matching this module's wire format. A dialed connection's pair runs in one fiber forked onto
-      [sw]; an accepted connection's pair runs directly inside the fiber
-      {!Eio.Net.accept_fork} itself creates for that connection.
+      matching this module's wire format, over the TLS flow -- never over the socket underneath
+      it. A dialed connection's pair runs in one fiber forked onto [sw]; an accepted connection's
+      pair runs directly inside the fiber {!Eio.Net.accept_fork} itself creates for that
+      connection.
+
+    [tls] is this replica's own X.509 identity -- the anchor it verifies peers against, plus the
+    certificate and key it presents to them. It is a single required argument rather than three
+    separate optional ones on purpose: the three values are only meaningful together (see
+    {!Tls_identity.create}, which validates their mutual consistency once, up front), and there is
+    no supported configuration of this transport that omits them.
 
     [peers] is the full membership table, including an entry for [my_id] itself. [create] blocks
     until this peer has an outbound path ready to {e each specific} other peer id in [peers] (not
@@ -207,14 +263,22 @@ val create :
     are attached to it.
 
     @raise Invalid_argument if [my_id] is not present in [peers].
-    @raise Failure if some peer in [peers] never showed up. Both ways that can happen raise this
-      one exception type, each with a message naming the peer(s) involved:
+    @raise Failure if some peer in [peers] never showed up, or refused this peer's credentials.
+      All three ways that can happen raise this one exception type, each with a message naming the
+      peer(s) involved:
       - a higher-id peer never accepted this peer's dial (it never started, or is unreachable):
         raised once that peer's ~20s dial budget is spent, with the underlying [Eio.Io] error's
         own text appended;
-      - a lower-id peer never dialed this peer (so no connection from it was ever accepted and
-        handshaken): raised once the separate ~20s mesh-formation budget is spent, listing every
-        still-missing peer id.
+      - a higher-id peer accepted the TCP connection but the mutual TLS handshake with it failed
+        (its certificate did not chain to this peer's trust anchor, or it rejected this peer's):
+        raised {e immediately}, not after any retry budget, with a message naming the TLS
+        handshake specifically so it is not mistaken for unreachability, and carrying the
+        underlying [tls] failure or alert;
+      - a lower-id peer never dialed this peer, or dialed and failed the handshake (so no
+        connection from it was ever accepted and handshaken): raised once the separate ~20s
+        mesh-formation budget is spent, listing every still-missing peer id. A handshake this peer
+        {e refused} is visible only in the log as a rejected connection, and is not distinguished
+        from silence here -- from the accepting side the two are the same observation.
 
       Dialing is {e sequential}, one higher-id peer at a time -- but a peer's exhausted dial
       budget now raises {e immediately} for that peer, it does not wait for any remaining
