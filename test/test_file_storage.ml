@@ -8,6 +8,11 @@
 
 open Riptide_storage
 
+(* Small, so a wraparound test is cheap to write. Passed explicitly at every [create] below:
+   [~ring_capacity] is a required argument (final-review finding I4), so there is no longer any
+   such thing as "the default ring capacity" for a test to silently inherit. *)
+let ring_capacity = 8
+
 let with_tmp_dir f =
   let dir = Filename.temp_file "riptide_storage_test" "" in
   Unix.unlink dir;
@@ -20,7 +25,7 @@ let test_write_then_read_same_handle () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.wal_append t ~op_number:1 "first entry";
       Alcotest.(check (option string))
         "read back what was written" (Some "first entry")
@@ -32,10 +37,10 @@ let test_write_then_read_after_reopen () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        File_storage.wal_append t ~op_number:1 "survives a restart");
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check (option string))
         "still there after reopen" (Some "survives a restart")
         (File_storage.wal_read t2 ~op_number:1))
@@ -44,7 +49,7 @@ let test_out_of_order_append_rejected () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.wal_append t ~op_number:1 "one";
       Alcotest.check_raises "op_number 3 after 1 is out of order"
         (Invalid_argument "wal_append: op_number 3 is not wal_highest_op_number t + 1")
@@ -54,7 +59,7 @@ let test_append_over_chunk_size_rejected () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       let oversized = String.make 4097 'x' in
       Alcotest.check_raises "entry larger than one aligned data slot is rejected"
         (Invalid_argument
@@ -66,7 +71,7 @@ let test_read_never_written_is_none () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check (option string))
         "nothing written yet" None
         (File_storage.wal_read t ~op_number:1))
@@ -75,7 +80,7 @@ let test_highest_op_number_tracks_appends () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check int) "empty WAL" 0 (File_storage.wal_highest_op_number t);
       File_storage.wal_append t ~op_number:1 "a";
       File_storage.wal_append t ~op_number:2 "b";
@@ -85,7 +90,7 @@ let test_empty_entry_round_trips () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.wal_append t ~op_number:1 "";
       Alcotest.(check (option string))
         "an appended empty string reads back as Some \"\", not None" (Some "")
@@ -93,13 +98,11 @@ let test_empty_entry_round_trips () =
 
 (* --- Task 2: fixed-size ring WAL, redundant headers, checksum verification --- *)
 
-let ring_capacity = 8 (* the default -- small, so a wraparound test is cheap to write *)
-
 let test_ring_wraps_around () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       for op = 1 to ring_capacity + 3 do
         File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
       done;
@@ -110,7 +113,7 @@ let test_ring_wraps_around () =
         (File_storage.wal_read t ~op_number:(ring_capacity + 3)))
 
 let test_custom_ring_capacity_is_honored () =
-  (* Proves the [?ring_capacity] knob on [create] is real, not just accepted and ignored --
+  (* Proves the [~ring_capacity] argument to [create] is real, not just accepted and ignored --
      with a ring of 3, the 4th append must evict op 1. *)
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -128,7 +131,7 @@ let test_truncate_after () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       List.iter
         (fun op -> File_storage.wal_append t ~op_number:op (Printf.sprintf "e%d" op))
         [ 1; 2; 3 ];
@@ -159,14 +162,14 @@ let test_truncate_after_survives_reopen () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        for op = 1 to 5 do
          File_storage.wal_append t ~op_number:op (Printf.sprintf "e%d" op)
        done;
        File_storage.wal_truncate_after t ~op_number:2;
        Alcotest.(check int) "truncated in memory" 2 (File_storage.wal_highest_op_number t));
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check int) "the truncation survived the reopen -- entries 3..5 are NOT resurrected"
         2 (File_storage.wal_highest_op_number t2);
       List.iter
@@ -217,7 +220,7 @@ let test_truncate_after_is_noop_above_highest () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.wal_append t ~op_number:1 "one";
       File_storage.wal_truncate_after t ~op_number:5;
       Alcotest.(check int) "highest op number unchanged" 1 (File_storage.wal_highest_op_number t);
@@ -228,7 +231,7 @@ let test_corrupted_entry_reads_as_none () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        File_storage.wal_append t ~op_number:1 "will be corrupted on disk");
       (* Simulate corruption directly on disk, outside the Storage.S API -- this test is what
          proves the checksum path is real, not a no-op. The whole ring lives in one file named
@@ -250,7 +253,7 @@ let test_corrupted_entry_reads_as_none () =
       output_bytes oc corrupted;
       close_out oc;
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check (option string)) "corrupted entry reads as None, not garbage" None
         (File_storage.wal_read t2 ~op_number:1))
 
@@ -321,12 +324,12 @@ let test_highest_op_number_recovered_across_reopen_with_ring_layout () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        for op = 1 to ring_capacity + 2 do
          File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
        done);
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check int) "highest op number recovered across reopen" (ring_capacity + 2)
         (File_storage.wal_highest_op_number t2);
       Alcotest.(check (option string)) "most recent entry survives reopen"
@@ -339,7 +342,7 @@ let test_superblock_write_then_read () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.superblock_write t "view=3,commit=7";
       Alcotest.(check (option string)) "superblock read back" (Some "view=3,commit=7")
         (File_storage.superblock_read t))
@@ -348,14 +351,14 @@ let test_superblock_survives_one_corrupted_copy () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        File_storage.superblock_write t "view=5,commit=10");
       let copy0 = Filename.concat dir "superblock-0" in
       let oc = open_out_bin copy0 in
       output_string oc "garbage, wrong length and checksum";
       close_out oc;
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check (option string)) "majority (2 of 3) still readable" (Some "view=5,commit=10")
         (File_storage.superblock_read t2))
 
@@ -363,7 +366,7 @@ let test_superblock_none_without_majority () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
        File_storage.superblock_write t "view=1,commit=0");
       List.iter
         (fun i ->
@@ -371,7 +374,7 @@ let test_superblock_none_without_majority () =
           output_string oc "garbage"; close_out oc)
         [ 0; 1 ];
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       Alcotest.(check (option string)) "2 of 3 corrupted -- no majority, honest None" None
         (File_storage.superblock_read t2))
 
@@ -387,7 +390,7 @@ let tests =
     ("wal_highest_op_number tracks appends", `Quick, test_highest_op_number_tracks_appends);
     ("empty entry round-trips as Some \"\"", `Quick, test_empty_entry_round_trips);
     ("ring wraps around, evicting the oldest entry", `Quick, test_ring_wraps_around);
-    ("custom ?ring_capacity is honored", `Quick, test_custom_ring_capacity_is_honored);
+    ("custom ~ring_capacity is honored", `Quick, test_custom_ring_capacity_is_honored);
     ("wal_truncate_after discards later entries", `Quick, test_truncate_after);
     ( "I3: wal_truncate_after is DURABLE -- truncated entries are not resurrected by a reopen",
       `Quick,

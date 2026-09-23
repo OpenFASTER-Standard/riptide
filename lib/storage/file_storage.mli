@@ -11,11 +11,22 @@
 include Storage_intf.S
 
 val create :
-  sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> ?ring_capacity:int -> string -> t
-(** [create ~sw ~fs ?ring_capacity dir_path] opens (creating if necessary) a ring WAL directory
-    at [dir_path]. [ring_capacity] (default 8) is the number of fixed-size slots the ring holds
+  sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> ring_capacity:int -> string -> t
+(** [create ~sw ~fs ~ring_capacity dir_path] opens (creating if necessary) a ring WAL directory
+    at [dir_path]. [ring_capacity] is the number of fixed-size slots the ring holds
     -- [wal_append] of op_number [n] overwrites whatever was previously at op_number
     [n - ring_capacity], if anything.
+
+    {b [ring_capacity] is REQUIRED, with no default}, which is a deliberate change (final-review
+    finding I4): it used to default to [8]. Overwriting op_number [n - ring_capacity] means
+    silently destroying an entry this module's own [wal_append] already promised was durable, and
+    nothing in this system ever truncates a committed prefix away (there is no checkpointing), so
+    every entry stays live forever and a log longer than the ring destroys committed,
+    client-acknowledged data with no signal to any caller. The protocol-level consequence is
+    total and needs no injected faults — see [test/test_dst_scenarios.ml]'s own ring-capacity
+    boundary test, which reproduces a permanently wedged cluster past the bound. Pairing that with
+    a small, invisible default was backwards; raising the default would only have made it a
+    less-likely-to-bite invisible default. A caller must now state the bound it is accepting.
 
     [wal_highest_op_number] is recovered by scanning every slot's header (and validating each
     one's checksum against that slot's own data) on [dir_path] as it already exists on disk, so

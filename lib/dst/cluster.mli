@@ -179,8 +179,11 @@ val run_on_file_storage :
     the mock-clock one. Prefer {!run} for seed sweeps; use this when the property under test is
     about the real persistence layer.
 
-    [ring_capacity] defaults to [4096] here, NOT to {!Riptide_storage.File_storage.create}'s own
-    default of [8]. This is not a cosmetic choice and it is worth understanding before lowering it:
+    [ring_capacity] defaults to [4096] here. {!Riptide_storage.File_storage.create} itself has no
+    default at all any more — the argument is required there (final-review finding I4), precisely
+    so the sizing decision cannot be inherited silently; this harness makes one explicit, generous
+    choice on its callers' behalf and documents it. That is not a cosmetic choice and it is worth
+    understanding before lowering it:
     {!Riptide_storage.File_storage}'s WAL is a fixed-size ring that silently EVICTS the entry at
     [op_number - ring_capacity] on every append, and nothing in this system ever truncates a
     committed prefix away (there is no checkpointing -- explicitly out of scope for this plan), so

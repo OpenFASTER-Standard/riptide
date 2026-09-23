@@ -20,7 +20,7 @@ let with_wrapped ?fault_config ~replication_quorum ~seed f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir in
       let prng = Riptide_sim.Prng.create seed in
       let t =
         Fault_injecting_storage.create ~prng ?fault_config ~replication_quorum
@@ -100,7 +100,7 @@ let test_drop_then_legitimate_append_does_not_raise () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir in
       let prng = Riptide_sim.Prng.create 5 in
       let dropping =
         Fault_injecting_storage.create ~prng
@@ -158,7 +158,7 @@ let with_wrapped_and_underlying ?fault_config ~replication_quorum ~seed f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir in
       let prng = Riptide_sim.Prng.create seed in
       let t =
         Fault_injecting_storage.create ~prng ?fault_config ~replication_quorum

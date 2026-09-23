@@ -100,7 +100,7 @@ let with_file_storage f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      f (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir))
+      f (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir))
 
 let file_storage_tests = File_storage_tests.shared_tests with_file_storage
 
@@ -117,7 +117,7 @@ let with_fault_injecting_storage f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir in
       let prng = Riptide_sim.Prng.create 1 in
       let t =
         Fault_injecting_storage.create ~prng ~replication_quorum:3

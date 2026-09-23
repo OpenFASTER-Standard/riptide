@@ -102,7 +102,6 @@ type t = {
 }
 
 let ring_file_name = "ring"
-let default_ring_capacity = 8
 let superblock_copies = 3
 let superblock_file_name i = Printf.sprintf "superblock-%d" i
 
@@ -265,7 +264,16 @@ let recover_highest_op_number t =
   done;
   !best
 
-let create ~sw ~fs ?(ring_capacity = default_ring_capacity) dir_path =
+(* [~ring_capacity] is REQUIRED, deliberately -- it used to default to 8 (final-review finding
+   I4). Pairing "silently destroys committed, acknowledged data past this bound" (see
+   [test_dst_scenarios.ml]'s own ring-capacity boundary test, which reproduces the total
+   protocol-level consequence with zero injected faults) with a small, invisible default is
+   backwards: the caller that most needs to think about the bound is exactly the one that would
+   never see it. Raising the default instead would have kept the same shape, just with a
+   less-likely-to-bite number -- a caller still could not tell from its own call site what bound
+   it had accepted. Making it explicit costs every call site one argument and makes the sizing
+   decision impossible to inherit by accident. *)
+let create ~sw ~fs ~ring_capacity dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
   let superblocks =
