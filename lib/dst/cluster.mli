@@ -106,11 +106,28 @@ val run :
     {!Riptide_storage.Fault_injecting_storage.default_fault_config} is never rejected regardless of
     [replica_count], including the degenerate [faults_max = 0] single-replica case) -- i.e. whenever
     a single slot going unrecoverable is already the EXPECTED outcome under that config, not merely
-    a tail probability worth quantifying with an otherwise-arbitrary confidence threshold. This is a
-    static, conservative, cluster-level check only; {!Riptide_storage.Fault_injecting_storage}'s own
-    per-instance runtime enforcement remains the actual last line of defense during a run, catching
-    whatever this preflight check cannot rule out in advance (e.g. a config that passes this check
-    but still happens to corrupt a bad run of consecutive slots on one replica).
+    a tail probability worth quantifying with an otherwise-arbitrary confidence threshold.
+
+    {b This is a static, expectation-based estimate, not a hard guarantee, and it has no runtime
+    backstop for the specific danger it targets.} It only models one arbitrary slot in isolation,
+    using nothing but [replica_count] and [corrupt_probability] (the only inputs available at
+    cluster-creation time, before any op_number or run length is known) -- a config whose
+    expectation sits just under the threshold can still, on an unlucky seed, produce
+    [faults_max] or more corrupted copies of some slot at runtime, and nothing anywhere in this
+    codebase will detect that when it happens. It also does not account for how many op_numbers a
+    real run actually touches: every additional write is another independent trial of the same
+    per-slot risk, so the true probability that *some* slot in a run crosses the threshold is
+    higher than this single-slot expectation suggests -- structurally unavoidable at
+    cluster-creation time, before run length is known, but worth naming as a real scope boundary.
+    {!Riptide_storage.Fault_injecting_storage}'s own per-instance runtime enforcement is NOT a
+    backstop for this risk, despite guarding a superficially similar-sounding thing: it bounds how
+    many distinct op_numbers *one* replica's own storage has itself corrupted, checked only against
+    that one replica's own corruption history, with zero visibility into any other replica's state
+    (each replica draws from its own independently-seeded {!Riptide_sim.Prng.t}). It cannot detect,
+    let alone prevent, multiple replicas each independently corrupting their own copy of the *same*
+    slot -- the exact cross-replica failure mode this preflight check exists to reduce. There is
+    currently no runtime detection anywhere in this codebase for that failure mode; this check
+    lowers its likelihood at config-selection time, it does not bound it.
 
     {b Why {!Riptide_storage.Memory_storage} under the wrapper, not
     {!Riptide_storage.File_storage}} (the brief's own "Interfaces" line lists [File_storage] as
