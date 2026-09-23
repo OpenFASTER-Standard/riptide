@@ -56,6 +56,7 @@ let () =
       ("sim_network", Test_sim_network.tests);
       ("sim_faults", Test_sim_faults.tests);
       ("sim_workload", Test_sim_workload.tests);
+      ("file_storage", Test_file_storage.tests);
       ("transport_tcp", Test_transport_tcp.tests);
       ("transport_shared_sim", Test_transport_shared.sim_tests);
       ("transport_shared_tcp", Test_transport_shared.tcp_tests);

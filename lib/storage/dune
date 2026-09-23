@@ -1,0 +1,3 @@
+(library
+ (name riptide_storage)
+ (libraries riptide eio eio.unix eio_linux uring))
