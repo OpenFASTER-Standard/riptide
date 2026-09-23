@@ -1,0 +1,3 @@
+(library
+ (name riptide_crypto)
+ (libraries mirage-crypto mirage-crypto-rng))
