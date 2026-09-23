@@ -476,11 +476,8 @@ Expected: FAIL — current `superblock_write`/`superblock_read` are `failwith`.
 - `superblock_read t`: read all 3 copies, verify each against its own checksum, group the
   successfully-verified ones by exact byte content, and return `Some data` only if at least 2 of
   the (up to 3) verified copies agree — otherwise `None`. This is the "read tolerates one
-  corrupted/missing copy" half.
-- Update `create` to leave `t.superblock` alone (Task 1's field is unused scaffolding since state
-  isn't cached — `superblock_read` re-reads from disk every call, matching `wal_read`'s own
-  no-hidden-cache approach); it's fine to delete the unused `mutable superblock` field from `t` in
-  this step if the compiler flags it unused.
+  corrupted/missing copy" half. `superblock_read` re-reads from disk on every call — no cached
+  field on `t` — matching `wal_read`'s own no-hidden-cache approach.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -640,10 +637,13 @@ concretely, now run against both implementations from one body.)
 - [ ] **Step 2: Instantiate it against `File_storage` (already passing) and `Fault_injecting_storage` (new, not yet written)**
 
 In `test/test_file_storage.ml` (or a new small file), call
-`Storage_shared.shared_tests (module File_storage) (fun () -> File_storage.create ~sw ~fs dir)`
-and similarly for `Fault_injecting_storage` once it exists — with the fault config set to
-all-zero probabilities for this conformance check (a faulty backend under zero faults must behave
-identically to a non-faulty one; that's the whole point of it conforming to the same signature).
+`Test_storage_shared.shared_tests (module File_storage) (fun () -> File_storage.create ~sw ~fs dir)`
+(dune names the module after the file — `test/test_storage_shared.ml` compiles to
+`Test_storage_shared`, matching `test/dune`'s single-executable-with-many-modules layout the same
+way `test_transport_shared.ml` already works) and similarly for `Fault_injecting_storage` once it
+exists — with the fault config set to all-zero probabilities for this conformance check (a faulty
+backend under zero faults must behave identically to a non-faulty one; that's the whole point of it
+conforming to the same signature).
 
 - [ ] **Step 3: Run to verify the `Fault_injecting_storage` half fails (doesn't exist yet)**
 
@@ -776,6 +776,7 @@ git commit -m "vsr: multi-step interruptible view-change completion, wired to St
 
 **Files:**
 - Modify: `test/test_vsr_replica_recovery.ml`
+- Modify: `lib/storage/fault_injecting_storage.ml`, `.mli` (adds `for_test_corrupt_entry`)
 
 **Interfaces:**
 - Consumes: `test_vsr_replica_view_change.ml`'s existing `with_cluster` harness (exact signature
