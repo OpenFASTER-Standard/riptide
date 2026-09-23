@@ -50,6 +50,18 @@ let test_out_of_order_append_rejected () =
         (Invalid_argument "wal_append: op_number 3 is not wal_highest_op_number t + 1")
         (fun () -> File_storage.wal_append t ~op_number:3 "skips two"))
 
+let test_append_over_chunk_size_rejected () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let oversized = String.make 4097 'x' in
+      Alcotest.check_raises "entry larger than one fixed-buffer chunk is rejected"
+        (Invalid_argument
+           "wal_append: entry of 4097 bytes exceeds this primitive's max entry size of 4096 \
+            bytes (one fixed-buffer chunk)")
+        (fun () -> File_storage.wal_append t ~op_number:1 oversized))
+
 let test_read_never_written_is_none () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -84,6 +96,9 @@ let tests =
     ("write then read, same handle", `Quick, test_write_then_read_same_handle);
     ("write then read, after reopen (real durability)", `Quick, test_write_then_read_after_reopen);
     ("out-of-order append rejected", `Quick, test_out_of_order_append_rejected);
+    ( "append of an entry over the chunk-size limit is rejected",
+      `Quick,
+      test_append_over_chunk_size_rejected );
     ("read of never-written op_number is None", `Quick, test_read_never_written_is_none);
     ("wal_highest_op_number tracks appends", `Quick, test_highest_op_number_tracks_appends);
     ("empty entry round-trips as Some \"\"", `Quick, test_empty_entry_round_trips);

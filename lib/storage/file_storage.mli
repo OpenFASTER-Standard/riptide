@@ -13,4 +13,9 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> string -> t
 (** [create ~sw ~fs dir_path] opens (creating if necessary) a WAL directory at [dir_path].
     [wal_highest_op_number] is recovered from whatever entry files already exist on disk at
     [dir_path], so reopening the same directory after a process restart picks up exactly where
-    the previous process left off. *)
+    the previous process left off.
+
+    [File_storage]-specific limitation, not part of the abstract {!Storage_intf.S} contract:
+    [wal_append] raises [Invalid_argument] for any entry larger than one fixed-buffer chunk
+    (currently 4096 bytes), since this primitive writes each entry in a single fixed-buffer
+    [io_uring] write. *)
