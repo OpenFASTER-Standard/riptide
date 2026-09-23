@@ -1,169 +1,288 @@
-(* One WAL entry per file, named by op-number -- Task 2 replaces this with the real fixed-size
-   ring; this task only needs to prove the durable-write-then-read-after-restart primitive itself
-   works against the real installed [eio_linux]. No directory file descriptor is needed:
-   [Eio_linux.Low_level.openat2] accepts a full path with [?dir] omitted (an absolute-style path
-   resolves on its own, the same as passing no [dirfd] to POSIX [openat]), so directory handling
-   stays on the portable [Eio.Path] API and only individual entry files go through the low-level
-   [io_uring] path.
+(* A fixed-size ring WAL with redundant, physically-separate headers, backed by real
+   [O_DIRECT]+[O_DSYNC]-durable writes via [eio_linux]'s low-level [io_uring] API where the
+   underlying filesystem supports it (falling back to [O_DSYNC] alone, gracefully and
+   automatically, where it doesn't -- see "O_DIRECT: second attempt, this time it works" below).
 
-   {b Real behaviors confirmed live against this box's actual installed [eio_linux v0.12]/[uring
-   v2.7.0], on both ext4 ([/work]) and overlayfs ([/tmp]) -- none obvious from the [.mli]s alone.
-   See this plan's Task 1 report for the full experiment trail:}
+   {b On-disk layout.} One ring file per storage [t], named [ring] inside the storage
+   directory. [ring_capacity] fixed-size slots, each with two physically separate regions:
 
-   - {b [O_DIRECT] dropped; [O_DSYNC] alone is what this module actually opens WAL entry files
-     with.} A first version of this module used [O_DIRECT]+[O_DSYNC], per this task's own brief.
-     [O_DIRECT] enforces the standard Linux rule that a transfer's length (and offset, and memory
-     buffer address) be a multiple of the filesystem's logical block size (512 bytes here) --
-     already enough to make the brief's own sketch fail every real test payload (none are
-     512-byte multiples) -- but padding around that wasn't the real blocker. The actual blocker:
-     writes through [eio_linux]'s shared fixed-buffer pool (the only buffer [Low_level.write]
-     accepts) were {e intermittently} rejected with [EINVAL] -- same code, same payload, same
-     file, sometimes fails, sometimes doesn't, at roughly a 40-60% failure rate once this test
-     suite's full binary (not a small standalone repro) was doing the writing. That pattern
-     -- correctness that depends on the surrounding binary/process, not just the code -- matches
-     [O_DIRECT]'s memory-buffer alignment requirement (typically page-granularity) landing on a
-     Bigarray whose actual base-pointer alignment [eio_linux] does not itself guarantee: whether
-     the shared 256KB fixed buffer happens to land at a page-aligned address depends on allocator
-     behavior outside this module's control (and, empirically, on what else is linked into and
-     has already allocated inside the same process). [O_DIRECT] is a bypass-the-page-cache
-     {e performance} optimization, not a requirement for the durability [Storage.S] actually
-     promises: [O_DSYNC] alone already guarantees a [write] does not return until the data (and
-     any metadata needed to retrieve it) has reached stable storage -- POSIX's definition of
-     synchronized I/O data integrity completion -- with no alignment requirement on length,
-     offset, or buffer address at all. Dropping [O_DIRECT] and keeping only [O_DSYNC] made the
-     flakiness disappear entirely across dozens of repeated full-suite runs (see the report), so
-     that is what ships here. A later task revisiting this for performance (bypassing the page
-     cache on the hot write path) would need to either pin down why [eio_linux]'s fixed-buffer
-     allocation isn't reliably page-aligned on this box, or hand [O_DIRECT] a buffer this code
-     allocates and aligns itself instead of relying on the shared pool.
+   - {b Header region} (bytes [0 .. ring_capacity * header_slot_size - 1]): slot [i]'s header
+     lives at byte offset [i * header_slot_size]. A header's logical content is 48 bytes --
+     [op_number] (int64 big-endian, 8B), [length] (int64 big-endian, 8B), [checksum] (32 raw
+     bytes of {!Riptide.Value.content_hash} over the entry's data) -- zero-padded out to
+     [header_slot_size] on disk.
+   - {b Data region} (bytes [ring_capacity * header_slot_size ..]): slot [i]'s data lives at
+     byte offset [ring_capacity * header_slot_size + i * data_slot_size], the entry's own bytes
+     zero-padded out to [data_slot_size].
+
+   Redundant/separate headers (Decision 6) means exactly this: a slot's header and its data
+   are never adjacent or interleaved, so a torn/partial write of one can never be mistaken for
+   a torn/partial write of the other -- {!wal_append} always writes the header first, so a
+   crash between the two writes leaves a header durably pointing at *stale* data (the previous
+   occupant's), which {!wal_read}'s checksum-plus-op_number check on the data catches, rather
+   than ever leaving a header pointing at fresh, correct data with no header covering it at all.
+
+   {b [O_DIRECT]: second attempt, this time it works.} Task 1's own version of this module
+   (see its report for the full experiment trail) tried [O_DIRECT]+[O_DSYNC] for its one-
+   file-per-entry, arbitrary-length design and dropped [O_DIRECT] after finding real,
+   {e intermittent} [EINVAL] failures (~40-60% of writes, under the full test-suite binary, not
+   a small standalone repro) that traced to [eio_linux]'s shared fixed-buffer pool
+   ([Low_level.alloc_fixed_or_wait]/[Uring.Region]) not guaranteeing the page-aligned base
+   address [O_DIRECT] requires -- a plain [Bigarray.Array1.create] with no alignment call,
+   confirmed against [eio_linux]'s actual source.
+
+   This module's fixed-size ring makes the *length/offset* half of [O_DIRECT]'s alignment
+   requirement trivial (every header/data write is exactly [header_slot_size]/[data_slot_size]
+   bytes, both multiples of [slot_alignment], at offsets that are themselves always multiples
+   of [slot_alignment]). The *buffer-address* half -- the thing that actually broke Task 1 --
+   is solved by {!alloc_aligned_buffer} below: instead of the shared pool, every read/write
+   allocates its own buffer via [Unix.map_file] over a throwaway, immediately-unlinked temp
+   file. [mmap(2)] is required by POSIX to return page-aligned addresses, and (unlike
+   [Bigarray.Array1.create]'s plain [malloc]) [Unix.map_file] goes through a real [mmap(2)]
+   call for every allocation (confirmed by reading the OCaml runtime's own
+   [otherlibs/unix/mmap_unix.c]: [caml_unix_map_file] calls [mmap(NULL, ...)] and returns that
+   address, adjusted only by [start_pos mod page_size] -- zero when mapping from offset 0, as
+   here) -- so alignment holds regardless of what else the surrounding binary/process has
+   already allocated, which is exactly the property Task 1's shared-pool version lacked.
+   [Eio_linux.Low_level.writev]/[readv] (rather than [write]/[read_upto], which only accept the
+   shared pool's [Uring.Region.chunk]) are what let this module hand [io_uring] an arbitrary,
+   self-allocated [Cstruct.t] instead.
+
+   {b Real evidence, not a guess:} a standalone probe performing this exact
+   allocate-aligned-buffer-then-[O_DIRECT]-write-then-read cycle was run 5 times x 500
+   iterations (2500 operations) against a real file on {e both} this box's ext4 mount
+   ([/work]) and its overlayfs mount ([/tmp], the temp-dir filesystem this very test suite
+   runs against) -- 0 failures across all 5000 operations on either filesystem. See Task 2's
+   own report for the probe source and full output. This module still keeps a defensive,
+   automatic runtime fallback ({!downgrade_to_dsync_only}) for any [t] that hits a genuine
+   [EINVAL] anyway (e.g. a filesystem that rejects [O_DIRECT] outright, such as tmpfs) -- it is
+   not required to reproduce the above evidence, but costs nothing to keep as a safety net for
+   filesystems this box's own mounts don't happen to cover.
+
+   {b Everything below this point is carried over verbatim from Task 1's own experiment trail
+   (still true, unchanged by the ring rewrite):}
+
    - [Eio_linux.Low_level.openat2]'s [~perm] argument is passed straight through to the real
      Linux [openat2(2)] syscall, which -- unlike the legacy [open(2)] -- is strict about it:
      [openat2(2)] returns [EINVAL] if [how.mode <> 0] while neither [O_CREAT] nor [O_TMPFILE] is
-     set in [how.flags]. Opening an existing entry for reading (no [creat] flag) with a nonzero
-     [~perm] therefore fails outright -- which a broad [Eio.Io _ -> None] catch (matching this
-     module's documented "no entry / corrupt entry" collapse) would otherwise silently misreport
-     as "nothing was ever written here" even for an entry that exists and was written
-     successfully. Read opens below always pass [~perm:0] for exactly this reason.
+     set in [how.flags]. Read opens below always pass [~perm:0] for exactly this reason
+     ([O_CREAT] is only ever combined with a real [~perm] on the ring file's own open, which is
+     always [~access:`RW] with [creat] set).
    - The installed Eio 0.12's [Eio.Path] has no [kind]/[stat]-on-a-path existence check (only
      [File.stat] on an already-{e open} file), so {!create} cannot check-then-create a directory
      the way an initial sketch assumed. It instead just attempts [Eio.Path.mkdir] and ignores the
-     [Eio.Io] ([EEXIST]) that raises when [dir_path] already exists.
-   - A zero-length transfer is mishandled in both directions by this [eio_linux] version:
-     [Eio_linux.Low_level.write fd chunk 0] raises [End_of_file] (confirmed deterministic,
-     independent of file offset) instead of succeeding as the true no-op a POSIX [write(2)] of
-     zero bytes is; symmetrically, [read_upto] on a real, existing, genuinely-empty file also
-     raises [End_of_file] instead of returning [0]. {!durable_write} skips the [write] call
-     entirely for an empty entry (the preceding [openat2] with [creat] already created the file
-     with the right, empty content), and {!durable_read} catches the read side's [End_of_file]
-     and treats it as the empty string -- safe to do there specifically because it only runs
-     after [openat2] has already confirmed the entry exists, so [End_of_file] at that point can
-     only mean "zero bytes", never "missing". *)
+     [Eio.Io] ([EEXIST]) that raises when [dir_path] already exists. *)
+
+type header = { op_number : int; length : int; checksum : string }
 
 type t = {
   sw : Eio.Switch.t;
-  dir_path : string;
+  ring_path : string;
+  ring_capacity : int;
+  mutable fd : Eio_unix.Fd.t;
+  mutable direct_capable : bool;
   mutable highest_op_number : int;
 }
 
-let open_flags_write = Uring.Open_flags.(dsync + creat)
-let open_flags_read = Uring.Open_flags.empty
+let ring_file_name = "ring"
+let default_ring_capacity = 8
 
-(* Every entry file is named [entry_prefix ^ "%010d"] (the op-number, zero-padded) -- used both
-   to build a specific entry's path ({!entry_path}) and, in {!create}, to recover
-   [highest_op_number] from whatever is already on disk when reopening an existing directory
-   after a restart: nothing else records that number durably in this task's minimal per-file
-   layout, so it must be re-derived from the directory listing itself every time. *)
-let entry_prefix = "wal-"
+(* One page. Also this box's own confirmed [O_DIRECT] memory/offset/length alignment
+   requirement on both its ext4 and overlayfs mounts (see this file's top comment) -- used
+   uniformly as the slot size for both regions rather than tuning header/data slots
+   separately, since simplicity here matters more than the wasted space of a 4096-byte slot
+   holding a 48-byte header. *)
+let slot_alignment = 4096
 
-let op_number_of_entry_name name =
-  let prefix_len = String.length entry_prefix in
-  if String.length name > prefix_len && String.sub name 0 prefix_len = entry_prefix then
-    int_of_string_opt (String.sub name prefix_len (String.length name - prefix_len))
-  else None
+let header_record_size = 8 (* op_number *) + 8 (* length *) + 32 (* checksum *)
+let () = assert (header_record_size <= slot_alignment)
+let header_slot_size = slot_alignment
+let data_slot_size = slot_alignment
+let max_entry_size = data_slot_size
 
-let create ~sw ~fs dir_path =
-  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
-  let highest_op_number =
-    Eio.Path.read_dir Eio.Path.(fs / dir_path)
-    |> List.filter_map op_number_of_entry_name
-    |> List.fold_left max 0
-  in
-  { sw; dir_path; highest_op_number }
+let open_flags_direct = Uring.Open_flags.(dsync + creat + direct)
+let open_flags_dsync_only = Uring.Open_flags.(dsync + creat)
 
-let entry_path t ~op_number = Printf.sprintf "%s/%s%010d" t.dir_path entry_prefix op_number
-
-let durable_write t path (data : string) =
-  let fd =
-    Eio_linux.Low_level.openat2 ~sw:t.sw ~seekable:true ~access:`RW ~flags:open_flags_write
-      ~perm:0o600 ~resolve:Uring.Resolve.empty path
-  in
+(* {!Unix.map_file} is required (POSIX [mmap(2)]) to return a page-aligned address when
+   mapping starts at file offset 0, unlike a plain [Bigarray.Array1.create]'s [malloc] -- see
+   this file's own top comment for why that distinction is exactly what makes [O_DIRECT] work
+   here where Task 1's shared-pool version couldn't. The backing file is purely a vehicle for
+   getting a real [mmap(2)] call; it is created, sized, mapped [~shared:false] (so nothing
+   written into the returned buffer ever touches disk through it), and then closed + unlinked
+   immediately -- the mapping itself stays valid (a standard, portable POSIX property) for as
+   long as the returned [Cstruct.t] is reachable. *)
+let alloc_aligned_buffer n =
+  let path = Filename.temp_file "riptide_storage_aligned" "" in
+  let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
   Fun.protect
-    ~finally:(fun () -> ignore (Eio_unix.Fd.close fd))
+    ~finally:(fun () ->
+      Unix.close fd;
+      try Unix.unlink path with Unix.Unix_error _ -> ())
     (fun () ->
-      let len = String.length data in
-      (* [Eio_linux.Low_level.write]'s zero-length case raises [End_of_file] rather than
-         succeeding as a no-op (confirmed live, deterministic, independent of file offset -- see
-         this file's own top comment). A zero-byte entry needs no write() at all: [openat2] with
-         [creat] above already created the file with exactly the right (empty) content by the
-         time it returned, so just skip straight to a no-op here instead of calling into the
-         buggy zero-length path. *)
-      if len = 0 then ()
-      else begin
-        let chunk = Eio_linux.Low_level.alloc_fixed_or_wait () in
-        Fun.protect
-          ~finally:(fun () -> Eio_linux.Low_level.free_fixed chunk)
-          (fun () ->
-            let chunk_len = Uring.Region.length chunk in
-            if len > chunk_len then
-              invalid_arg
-                (Printf.sprintf
-                   "wal_append: entry of %d bytes exceeds this primitive's max entry size of %d \
-                    bytes (one fixed-buffer chunk)"
-                   len chunk_len);
-            let cs = Uring.Region.to_cstruct chunk in
-            Cstruct.blit_from_string data 0 cs 0 len;
-            Eio_linux.Low_level.write fd chunk len)
-      end)
+      Unix.ftruncate fd n;
+      let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
+      Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
 
-let durable_read t path =
-  match
-    (* [~perm:0]: see this file's own top comment -- a nonzero mode on a non-[creat] open fails
-       real [openat2(2)] with [EINVAL], not the [ENOENT] a caller might expect here. *)
-    Eio_linux.Low_level.openat2 ~sw:t.sw ~seekable:true ~access:`R ~flags:open_flags_read ~perm:0
-      ~resolve:Uring.Resolve.empty path
-  with
-  | exception Eio.Io _ -> None (* ENOENT: nothing was ever written at this path *)
-  | fd ->
-    Fun.protect
-      ~finally:(fun () -> ignore (Eio_unix.Fd.close fd))
-      (fun () ->
-        let chunk = Eio_linux.Low_level.alloc_fixed_or_wait () in
-        Fun.protect
-          ~finally:(fun () -> Eio_linux.Low_level.free_fixed chunk)
-          (fun () ->
-            (* [read_upto] raises [End_of_file] for a genuinely empty file rather than returning
-               [0] (confirmed live -- the mirror image of {!durable_write}'s zero-length [write]
-               quirk noted in this file's own top comment). The [openat2] above already succeeded,
-               so the entry does exist; [End_of_file] here unambiguously means "zero bytes were
-               written", i.e. the empty string, not "missing". *)
-            match Eio_linux.Low_level.read_upto fd chunk (Uring.Region.length chunk) with
-            | exception End_of_file -> Some ""
-            | n -> Some (Uring.Region.to_string ~len:n chunk)))
+let header_offset ~slot = slot * header_slot_size
+let header_region_size t = t.ring_capacity * header_slot_size
+let data_offset t ~slot = header_region_size t + (slot * data_slot_size)
+
+let encode_header ~op_number ~length ~checksum =
+  let buf = Bytes.make header_slot_size '\000' in
+  Bytes.set_int64_be buf 0 (Int64.of_int op_number);
+  Bytes.set_int64_be buf 8 (Int64.of_int length);
+  Bytes.blit_string checksum 0 buf 16 32;
+  Bytes.unsafe_to_string buf
+
+let decode_header s =
+  let b = Bytes.unsafe_of_string s in
+  {
+    op_number = Int64.to_int (Bytes.get_int64_be b 0);
+    length = Int64.to_int (Bytes.get_int64_be b 8);
+    checksum = String.sub s 16 32;
+  }
+
+(* Closes [t]'s current (O_DIRECT) fd and reopens the same ring file with [O_DSYNC] alone --
+   permanent for the rest of this [t]'s lifetime, mirroring Task 1's own ruling for the
+   filesystems where [O_DIRECT] genuinely doesn't work (e.g. tmpfs rejects it outright). Only
+   ever called after a real [Eio.Io] failure while [t.direct_capable] was still [true]; see
+   this file's top comment for why this is believed to be a dead path on this box's own
+   mounts (ext4, overlayfs) rather than the routine case it was for Task 1. *)
+let downgrade_to_dsync_only t =
+  if t.direct_capable then begin
+    ignore (Eio_unix.Fd.close t.fd);
+    t.fd <-
+      Eio_linux.Low_level.openat2 ~sw:t.sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
+        ~perm:0o600 ~resolve:Uring.Resolve.empty t.ring_path;
+    t.direct_capable <- false
+  end
+
+let perform_write t ~offset (buf : Cstruct.t) =
+  let rec go () =
+    try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) t.fd [ buf ]
+    with Eio.Io _ when t.direct_capable ->
+      downgrade_to_dsync_only t;
+      go ()
+  in
+  go ()
+
+(* [None] means "nothing durable at this offset yet" (a short/empty read -- i.e. this part of
+   the ring file has never been written, whether because it's a fresh ring or because [t]'s
+   [ring_capacity] differs from a previous run and this slot is past the old high-water mark).
+   Any other outcome either returns exactly the [len] bytes requested or raises. *)
+let perform_read t ~offset ~len =
+  let buf = alloc_aligned_buffer len in
+  let rec go () =
+    match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) t.fd [ buf ] with
+    | exception End_of_file -> None
+    | exception Eio.Io _ when t.direct_capable ->
+      downgrade_to_dsync_only t;
+      go ()
+    | n -> if n = len then Some buf else None
+  in
+  go ()
+
+let write_header t ~slot ~op_number ~length ~checksum =
+  let encoded = encode_header ~op_number ~length ~checksum in
+  let buf = alloc_aligned_buffer header_slot_size in
+  Cstruct.blit_from_string encoded 0 buf 0 header_slot_size;
+  perform_write t ~offset:(header_offset ~slot) buf
+
+let read_header t ~slot =
+  match perform_read t ~offset:(header_offset ~slot) ~len:header_slot_size with
+  | None -> None
+  | Some buf -> Some (decode_header (Cstruct.to_string buf))
+
+let write_data t ~slot data =
+  let buf = alloc_aligned_buffer data_slot_size in
+  (* [buf] is already zero-filled (freshly [ftruncate]d backing file) beyond [data]'s own
+     length, so no separate zero-padding step is needed before writing the full slot. *)
+  Cstruct.blit_from_string data 0 buf 0 (String.length data);
+  perform_write t ~offset:(data_offset t ~slot) buf
+
+let read_data t ~slot ~length =
+  if length < 0 || length > data_slot_size then None
+  else
+    match perform_read t ~offset:(data_offset t ~slot) ~len:data_slot_size with
+    | None -> None
+    | Some buf -> Some (Cstruct.to_string ~len:length buf)
+
+let checksum_of data =
+  Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String data))
+
+(* Reconstructs [highest_op_number] from whatever is already durable on disk: scans every
+   slot's header, and for each one that (a) round-trips a matching checksum against that
+   slot's own data and (b) whose own [op_number] actually maps back to this slot (defends
+   against a header that coincidentally checksum-matches stale data but was never real --
+   astronomically unlikely on its own, but cheap to also check), takes the max [op_number]
+   found. Mirrors {!wal_read}'s own two-check (checksum + op_number) validation exactly. *)
+let recover_highest_op_number t =
+  let best = ref 0 in
+  for slot = 0 to t.ring_capacity - 1 do
+    match read_header t ~slot with
+    | None -> ()
+    | Some header ->
+      if header.op_number > 0 && (header.op_number - 1) mod t.ring_capacity = slot then
+        match read_data t ~slot ~length:header.length with
+        | None -> ()
+        | Some data -> if checksum_of data = header.checksum then best := max !best header.op_number
+  done;
+  !best
+
+let create ~sw ~fs ?(ring_capacity = default_ring_capacity) dir_path =
+  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
+  let ring_path = Filename.concat dir_path ring_file_name in
+  let fd, direct_capable =
+    try
+      ( Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_direct
+          ~perm:0o600 ~resolve:Uring.Resolve.empty ring_path,
+        true )
+    with Eio.Io _ ->
+      ( Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
+          ~perm:0o600 ~resolve:Uring.Resolve.empty ring_path,
+        false )
+  in
+  let t = { sw; ring_path; ring_capacity; fd; direct_capable; highest_op_number = 0 } in
+  t.highest_op_number <- recover_highest_op_number t;
+  t
 
 let wal_append t ~op_number data =
   if op_number <> t.highest_op_number + 1 then
     invalid_arg
       (Printf.sprintf "wal_append: op_number %d is not wal_highest_op_number t + 1" op_number)
   else begin
-    durable_write t (entry_path t ~op_number) data;
+    let len = String.length data in
+    if len > max_entry_size then
+      invalid_arg
+        (Printf.sprintf
+           "wal_append: entry of %d bytes exceeds this ring's max entry size of %d bytes (one \
+            aligned data slot)"
+           len max_entry_size);
+    let slot = (op_number - 1) mod t.ring_capacity in
+    let checksum = checksum_of data in
+    write_header t ~slot ~op_number ~length:len ~checksum;
+    write_data t ~slot data;
     t.highest_op_number <- op_number
   end
 
 let wal_read t ~op_number =
   if op_number < 1 || op_number > t.highest_op_number then None
-  else durable_read t (entry_path t ~op_number)
+  else
+    let slot = (op_number - 1) mod t.ring_capacity in
+    match read_header t ~slot with
+    | None -> None
+    | Some header ->
+      if header.op_number <> op_number then None
+      else begin
+        match read_data t ~slot ~length:header.length with
+        | None -> None
+        | Some data -> if checksum_of data = header.checksum then Some data else None
+      end
 
 let wal_highest_op_number t = t.highest_op_number
-let wal_truncate_after (_ : t) ~op_number:(_ : int) = failwith "not implemented until Task 2"
+
+let wal_truncate_after t ~op_number =
+  if op_number < t.highest_op_number then t.highest_op_number <- op_number
+
 let superblock_write (_ : t) (_ : string) = failwith "not implemented until Task 3"
 let superblock_read (_ : t) = failwith "not implemented until Task 3"
