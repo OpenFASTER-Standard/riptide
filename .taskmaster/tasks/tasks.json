@@ -16,6 +16,10 @@
             "title": "Define and document the 'no spec without running code' rule",
             "description": "Write the actual project-level rule (e.g. in a CONTRIBUTING or CLAUDE.md-equivalent doc) that no Layer 0 formal rule may be merged without a working, tested implementation in the same change.",
             "status": "done",
+            "evidence": {
+              "commits": ["a4cc672d5812141ae24fd4da00e042bba6be624a"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "This is the single variable that separated every historical success from every failure researched. Write it down where it can't be quietly bypassed under time pressure.",
             "testStrategy": "",
@@ -27,6 +31,10 @@
             "title": "Establish the small-aligned-group governance model for Layer 0 changes",
             "description": "Define who can propose/approve changes to Layer 0 specifically, keeping the group small and requiring each approver to have actually implemented against the change.",
             "status": "done",
+            "evidence": {
+              "commits": ["a4cc672d5812141ae24fd4da00e042bba6be624a"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Mirrors WASM's CG (four browser vendors, each shipping) vs OSI's sprawling committee; mirrors IETF's running-code requirement for standards-track advancement.",
             "testStrategy": "",
@@ -52,7 +60,11 @@
             "id": 1,
             "title": "Define the content-addressed algebraic value universe",
             "description": "Scalars, records, sums, sequences, finite maps - a small typed core category (schemas as categories, instances as functors, per Spivak's functorial data model) that RDF, JSON, or any other domain payload becomes ONE instance of, not the universal substrate.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": ["ba855e3abf84463d882c411df4de9263f56bce5d", "5a6a720ac39fd9a4681901a6614a1443177d0218"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Directly fixes the RDF-only limitation the euro-office bridge integration hit (had to build a whole separate JSON codec). Borrow the schema-morphism IDEA from CQL/Conexus without adopting the full boutique tooling wholesale.",
             "testStrategy": "",
@@ -62,7 +74,11 @@
             "id": 2,
             "title": "Define the event envelope: actor, causation, correlation, predecessor hash, sequence - all mandatory",
             "description": "Every field is required, none optional, none droppable at any layer. This is the audit-trail fix for both Riptide's actual bug and StreamLD's total silence on provenance.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": ["94f1cda1d79707b6f0f74555ccd48f62af32fb9a"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Validate: an event literally cannot be constructed without a real actor identity - not merely a documented best practice.",
             "testStrategy": "",
@@ -72,7 +88,11 @@
             "id": 3,
             "title": "Implement single-node append-only log with hash-chaining",
             "description": "No replication yet. Tamper-evidence (Merkle/hash-chain linkage) is structural from the first commit, not retrofitted - Riptide's `force_delete` had zero production safeguards because this wasn't designed in from the start.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": ["eed3a51fb5bd89cd12d0281abc05907df425294a", "a33ab9a7162b5e234b011fdbf1733b81d21b326c"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Test: any single-byte alteration anywhere in history is detectable via hash-chain verification.",
             "testStrategy": "",
@@ -82,7 +102,11 @@
             "id": 4,
             "title": "Build the SpecTec-style single formal source generating spec + reference implementation + conformance tests",
             "description": "One formal definition of the envelope format generates the prose spec, a reference interpreter, and the test suite - never three hand-maintained artifacts drifting apart. This is what let WASM's formal semantics catch a real pre-standardization type-soundness bug; Ethereum's weaker 'executable reference implementation as spec' model is what let it ship two real spec-level chain-splitting bugs.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": ["b9826467b79bf9a43b4a0daf02bbba7e58247385", "c3f2fcef8a532f65526a5ef233c404cc08868501"],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Verify: changing the formal definition regenerates all three artifacts with no manual sync step.",
             "testStrategy": "",
@@ -95,7 +119,7 @@
         "id": "3",
         "title": "Distributed consensus, deterministic-simulation-tested from the first commit",
         "description": "Turn the single-node log into a genuinely replicated system: TLA+-specified consensus/replication protocol, atomic multi-entity commit, with deterministic simulation testing (virtual clock, seeded fault injection) built into the concurrency model from day one.",
-        "status": "pending",
+        "status": "in-progress",
         "priority": "high",
         "dependencies": [
           "2"
@@ -108,6 +132,10 @@
             "title": "Choose and TLA+-specify the consensus/replication protocol",
             "description": "VSR-derived (TigerBeetle's choice, storage-fault-aware) vs Raft (simpler, larger ecosystem) - make the call explicitly, with the tradeoff reasoning documented, and get it model-checked before implementation, the way AWS's TLA+ practice found 35-step bugs that survived design review, code review, and testing.",
             "status": "done",
+            "evidence": {
+              "commits": ["dd8b236d12fcb91e649d3189a80e0ba015e6e0bc"],
+              "prs": ["https://github.com/OpenFASTER-Standard/riptide/pull/138"]
+            },
             "dependencies": [],
             "details": "Deliverable: a TLA+ spec, model-checked, with no known counterexamples in the checked state space. DONE, with honest scope caveats (see spec/tla/README.md for the full account): spec/tla/VSR.tla models VSR core safety only (normal-case + view change; storage-fault-aware recovery, state-transfer, and reconfiguration are explicitly out of scope, deferred to a follow-up plan). Exhaustively model-checked at ReplicaCount=3, Values={v1}, StartViewOnTimerLimit=1: 264,376 distinct states, 0 states left on queue, zero invariant violations. Pre-fixes two real published VSR defects (ValidDvc view-filtered DVC quorum counting; commit-number monotonicity on STARTVIEW). A final-review fix wave caught and fixed a real bug (SendDVC was an unguarded self-loop making the state space genuinely infinite, previously misattributed to inherent spec-class size) and settled with real TLC evidence whether the ValidDvc filter is reachable-relevant at this bound (it is not, but is kept as correct defense-in-depth, with a new regression invariant wired in). Known limitation disclosed, not hidden: NoLogDivergence is structurally vacuous at Values={v1}; the real safety evidence at this bound comes from CommitNumberNeverHigherThanOpNumber and AcknowledgedWritesExistOnMajority. Merged to main via PR #138 (commit dd8b236), 2026-09-18.",
             "testStrategy": "",
@@ -118,6 +146,10 @@
             "title": "Design the concurrency model for simulation-testability as a day-one input",
             "description": "Choose an effect-mediated or actor-style concurrency model (algebraic effect handlers, per OCaml 5/Eio's real 2025 production adoption, are a live candidate) specifically because it's what makes full-system deterministic simulation possible, not because it's fashionable.",
             "status": "done",
+            "evidence": {
+              "commits": ["9d87bc78b84dbf2870ec4cc435156132a0765028", "1c46a619ea806227fdbab0c80ea327e5fb038f49", "ab191ec4b8afd5b6580eab1eab8cea03a663ebd0"],
+              "prs": ["https://github.com/OpenFASTER-Standard/riptide/pull/141", "https://github.com/OpenFASTER-Standard/riptide/pull/142", "https://github.com/OpenFASTER-Standard/riptide/pull/143"]
+            },
             "dependencies": [],
             "details": "Test: the exact same code path must run identically against a real network and a simulated one.\n\n PoC complete (merged to main, commits c78c698..93fc798): OCaml 5 / Eio (single-domain, effect-handler-based) confirmed as the right substrate for this. Concretely validated with real, running, tested code (not by inference): Eio's cooperative fiber scheduling is deterministic (an explicit maintainer guarantee, empirically re-confirmed); a from-scratch fault-injecting network (delay/drop/duplicate/byte-level-corrupt, seeded PRNG) composes correctly with genuinely blocking fibers under active faults, reproducing byte-identical traces; a fiber can genuinely sleep on simulated virtual time and be woken only by the simulation's own delivery mechanism (not a parallel clock); and the whole thing runs correctly under Eio_mock.Backend (Eio's own deterministic no-IO backend) rather than a real OS backend, which is what any real DST harness must use. Full design spec: docs/superpowers/specs/2026-09-16-distributed-consensus-design.md (Decision 2). Full plan + code: docs/superpowers/plans/2026-09-16-dst-proof-of-concept.md, lib/sim/. This closes the PoC/de-risking step only - the REAL concurrency model for the actual VSR-derived protocol (subtask 3.1) still needs to be designed and built against this now-validated substrate; this subtask is not done, the highest-risk unknown blocking it is. Part 1 of the real implementation now merged (PR #141, commit 9d87bc7): Value.canonical_decode (the missing inverse of canonical_encode, needed to turn bytes arriving over Transport.S back into structured data), lib/vsr/message.ml (wire format for all 5 VSR message types, transcribed field-for-field from spec/tla/VSR.tla), and lib/vsr/replica_log.ml (the log shape rep_log[r] actually needs - ordered append, indexed read, wholesale replace on view-change). Still not done: the actual replica state machine (all 11 TLA+ actions transcribed into OCaml, wired to Transport.S, a real per-replica main loop that works identically against both Tcp and Sim_transport) and a real multi-replica DST-driven test proving the running implementation - not just the TLA+ model - exhibits VSR's safety properties. These are separate, larger, sequenced plans (per this project's own small-plans discipline), not yet started as of this note. Part 2 now merged (PR #142, commit 1c46a61): lib/vsr/replica.ml - a real OCaml replica implementing spec/tla/VSR.tla's normal-case actions (ReceiveClientRequest, ReceivePrepareMsg, ReceivePrepareOkMsg, PrimaryExecuteOp) with a fixed primary, deliberately mirroring how the TLA+ spec itself was built incrementally. Went through a rigorous review cycle that found and fixed THREE real safety bugs (forged peer id inflating quorum with zero real acks; unbounded commit-number field; unbounded op-number field), each independently reproduced live by separate reviewers against the final shipped code, plus a ~90,000-message adversarial fuzz finding zero violations. A real multi-replica cluster test (test/test_vsr_replica_cluster.ml) proves actual running code - not just the TLA+ model - replicates and commits a value over a real (simulated) transport, satisfying this repo's own no-spec-without-running-code rule. Still not done: view-change (TimerSendSVC through ReceiveSV - a separate, sequenced plan, deliberately deferred the same way spec/tla/VSR.tla itself was built incrementally) and a real multi-replica DST-driven fault-injection test. Known forward blocker for the view-change plan, already flagged: Sim_transport's underlying simulated clock never advances past t=0.0 at the default (reliable) fault config, since every delay is 0.0 there - a TimerSendSVC fiber sleeping on it would never wake; that plan's own research grounding must resolve this before writing its first test.\n\n View-change (part 3, TimerSendSVC through ReceiveSV) now merged (PR #143, commit ab191ec): lib/vsr/replica.ml gained check_timeout/ReceiveHigherSVC/ReceiveMatchingSVC (detecting a dead primary, starting a view-change episode), try_send_dvc/handle_do_view_change (accumulating a DoViewChange quorum), winning_dvc (the single highest-risk judgment call in this plan - correct lexicographic (last_normal_view, n) selection among divergent survivor logs, not the real historical VRR bug class of selecting by n alone), highest_commit_number (a separate, independent maximum, deliberately not derived from the winning DVC), and try_send_sv/handle_start_view (completing the view change, backups adopting it). Proven over real multi-replica clusters via Sim_transport (test/test_vsr_replica_view_change.ml), not just against the TLA+ model or hand-built unit messages - including a real cluster-level test proving winning_dvc's selection composes correctly over genuinely divergent survivor logs built through actual message flow, not asserted by construction. Went through 4 per-task review cycles plus a full whole-branch review plus two re-review rounds on the resulting fixes, all clean. Found and disclosed two genuinely new liveness gaps not previously known to this project, both liveness-only (no safety impact, no committed data ever lost): (1) two consecutive dead Primary-designates can wedge a live-quorum cluster in View_change permanently; (2) a related, MORE reachable gap - a single primary failure can wedge the cluster if survivors' real wall-clock timers don't fire near-simultaneously (the ordinary case for independent timers, not an edge case), since ReceiveHigherSVC adopts a higher view passively but never re-broadcasts, diverging from the original paper's own algorithm though faithful to VSR.tla itself. Both documented in spec/tla/README.md's Known Simplifications list and cross-referenced from replica.mli's own check_timeout doc comment. This completes subtask 3.2's own scope (the real concurrency model for the VSR-derived protocol, proven against both Tcp and Sim_transport uniformly) - marking done. Remaining, separate, sequenced work: subtask 3.3 (atomic multi-entity commit) and subtask 3.4 (a real fault-injection DST harness, VOPR-style - this plan's own Task 4 deliberately used default_fault_config/no faults, per Task 3's own forward note about self-addressed DoViewChange being subject to fault injection too, leaving genuine fault-injected view-change testing to 3.4's own dedicated scope).",
             "testStrategy": "",
@@ -128,6 +160,10 @@
             "title": "Implement atomic multi-entity commit",
             "description": "Real cross-resource transactions - fixes the confirmed Riptide defect where the only multi-resource write pattern was a best-effort saga logging 'manual cleanup needed' on failure.",
             "status": "done",
+            "evidence": {
+              "commits": ["56d214b862526bcbea717f6dda9bd91c4c89ebf7"],
+              "prs": ["https://github.com/OpenFASTER-Standard/riptide/pull/144"]
+            },
             "dependencies": [],
             "details": "Test: a delta touching N entities either all commits or none does, verified under injected mid-commit node failure.\n\n Done (PR #144, merge commit 56d214b): reframed \"atomic multi-entity commit\" in Layer 0's own vocabulary after tracing the actual v1 defect it references (per-resource Raft sharding - every LDP resource its own Ra cluster - with a best-effort compensating delete that logged \"manual cleanup needed\" and gave up on double failure) and finding no \"entity\" concept belongs at Layer 0 at all: CLAUDE.md is explicit that Layer 0 must not encode domain-specific meaning, and no Layer 2 module has been built yet (task-master Task 6, not started) to define what an entity even is. Also closed a real, previously-untracked gap: Envelope/Log (Task 2) and VSR replication (Task 3.1/3.2) had never been wired together at all - Replica.propose replicated raw Value.value blobs with no awareness of Envelope's actor/causation/correlation or hash-chaining. Built lib/batch_commit/ (module Batch_commit), a new library sitting entirely on top of the unchanged, already-merged VSR/Envelope/Log - no changes to lib/vsr/*, lib/envelope.*, or lib/log.* anywhere in this work. A batch is one Value.value (an idempotency key plus a sequence of writes) proposed through the existing, unmodified Replica.propose; atomicity needed no new protocol mechanism since VSR already commits one log entry indivisibly. A pure, lazy decode function (committed_envelopes, fully recomputed on every call - the real incremental-materialization fix is deliberately left to Task 4's own scope, not duplicated here) walks a replica's committed prefix and deterministically reconstructs N separate, individually hash-chained Envelopes - never one wrapper envelope - deduplicating by idempotency key (first-wins), which is what actually makes a retried batch commit safe to apply at most once (not anything on the write side, which only adds a non-load-bearing duplicate-bloat-avoidance check). Proven atomic under a real crash via a cluster-level test reusing the view-change branch's own harness: a batch that reached quorum survives a primary crash and view change with all its envelopes intact and correctly identified by payload, and a batch that never reaches quorum commits nowhere, not even partially. Went through 3 per-task reviews (the cluster test's own review found its first version passed identically whether or not the crash/view-change actually happened - a real rigor gap, fixed in one round) plus a full whole-branch review that found one genuine trust-boundary gap: Envelope's causation/correlation fields (each a raw 32-byte hash) weren't length-validated at the one point this module first converts untrusted, VSR-replicated bytes into them - fixed to make a wrong-length hash render the whole batch malformed (zero envelopes), matching this module's own established guard-failure-is-total-no-op convention, confirmed live to have previously produced an Envelope that made Value.hash_to_hex raise downstream. This completes subtask 3.3. Remaining, separate, sequenced Task 3 work: subtask 3.4 (a real fault-injection DST harness, VOPR-style).",
             "testStrategy": "",
@@ -148,6 +184,10 @@
             "title": "Choose the transport carrier (QUIC recommended) behind an abstract network interface",
             "description": "Per every top-tier system researched (TigerBeetle, FoundationDB, CockroachDB, DFINITY): formalize the message semantics riding on the wire, treat the literal carrier as swappable and verified by simulation/fuzzing, not proof. QUIC has a real production consensus precedent (DFINITY's Internet Computer) for exactly the head-of-line-blocking and lossy-network reasons relevant here.",
             "status": "done",
+            "evidence": {
+              "commits": ["7d8388729d7d06125b1ef14e6ce88599405e7b6a"],
+              "prs": ["https://github.com/OpenFASTER-Standard/riptide/pull/140"]
+            },
             "dependencies": [],
             "details": "Test: swapping the transport carrier implementation must not require touching the application-level protocol code. DONE, proven not asserted (see spec/tla/README.md-style honesty applied here too): lib/transport/transport_intf.ml defines Transport.S (byte-oriented, int peer ids, send/receive/receive_nonblocking). Two conforming implementations: lib/transport/tcp.ml (real Eio-backed TCP, lower-dials-higher topology, 8-byte peer-id handshake preamble, length-prefixed framing matching lib/value.ml convention) and lib/sim/sim_transport.ml (adapts the existing, UNMODIFIED DST-PoC simulated network to the same signature). Substitutability proven via one shared functor test body (test/test_transport_shared.ml) instantiated unmodified against both - verified non-vacuous via adversarial mutation testing (a deliberately injected misrouting bug was caught by the TCP suite, correctly not caught by the sim suite). Two hard fix-round cycles on the TCP implementation found and fixed real process-crashing bugs (send-to-dead-peer and corrupt-frame crashes, both with a dial-vs-accept asymmetry rooted in uncoupled reader/writer fiber lifecycles, fixed via Eio.Fiber.first coupling) - each independently re-verified with live reproduction evidence. The final whole-branch review then found and fixed two more real bugs (an unguarded accept loop crashing on transient OS errors; a logic bug letting the mesh-readiness check return claiming a cluster was ready when it wasn't). Transport_intf.S honestly documents real behavioral differences between the two implementations (ordering, delivery-driving requirements) rather than papering over them. Out of scope, disclosed not hidden: reconnection/retry after initial mesh formation, TLS/authentication (single-operator-cluster fault model per Decision 1), fault injection against real TCP sockets (subtask 3.4), a close/shutdown path in Transport_intf.S. Merged to main via PR #140 (commit 7d83887), 2026-09-18.",
             "testStrategy": "",
@@ -572,7 +612,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-16T09:39:14.999Z",
+      "lastModified": "2026-09-23T07:29:50.412Z",
       "taskCount": 11,
       "completedCount": 2,
       "tags": [

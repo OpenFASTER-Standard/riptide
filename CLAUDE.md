@@ -69,3 +69,34 @@ to revise the boundary once, and don't mistake that revision for failure.
 **How to apply:** when Task 6 is underway, keep a running, concrete list of every place the
 Task 5 boundary made something harder than it should have been. That list *is* Task 7's scope —
 nothing more, nothing speculative added on top of what real usage actually exposed.
+
+## Task status is derived, never asserted
+
+A parent task's `status` in `.taskmaster/tasks/tasks.json` is never set directly — it is always
+the mechanical result of its subtasks' statuses (all done → done; all pending → pending; anything
+else → in-progress), and every `"done"` status, parent or leaf, must be provable, not asserted: a
+leaf task or subtask claiming `"done"` carries an `evidence.commits` array of real, git-resolvable
+commit SHAs, proven to be ancestors of the branch making the claim, not a bare sentence saying so.
+
+**Why:** this project already lived the exact failure this rule closes, not a hypothetical one.
+`task-master-ai`'s own CLI correctly derives a parent's status from its children when a subtask is
+updated *through the tool* — but does not enforce that derivation when a parent's status is set
+directly, and its documentation claims the cascade is automatic when, in the version installed
+here, it verifiably is not. Bulk JSON edits made directly against `tasks.json` this session,
+bypassing the CLI, walked straight into that gap: Task 2 sat at `"done"` while all four of its
+subtasks were still `"pending"`, and Task 3 sat at `"pending"` while four of its five subtasks
+were `"done"` — drift a status field alone can't be told apart from a genuinely false completion
+claim once it exists. This is the same class of failure this document's other rules already name
+for code and governance — a task tracker's status column is not exempt just because it looks like
+metadata rather than a system component.
+
+**How to apply:** update a subtask's status directly (`task-master set-status --id=<id>.<n>
+--status=<status>`); never hand-set a parent's. If the tool's derivation disagrees with what you
+believe the parent's status should be, that's a signal the subtask breakdown needs revising, not
+a reason to override the parent by hand. `evidence` is not something `task-master`'s CLI knows how
+to write — add it via the same direct, careful JSON edit this project already uses for structural
+changes to `tasks.json`, in the same change that moves a leaf to `"done"`, citing the real commit
+SHA(s) (and PR URL, where one exists) that shipped the work. Run `scripts/validate-tasks` before
+trusting any status read from this file locally — CI (`.github/workflows/validate-tasks.yml`) runs
+it on every push/PR that touches `tasks.json`, but don't wait for CI to find out what running it
+locally would have told you sooner.

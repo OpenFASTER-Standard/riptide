@@ -1,0 +1,29 @@
+name: Validate task-master status tree
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".taskmaster/tasks/tasks.json"
+      - "scripts/validate-tasks"
+      - ".github/workflows/validate-tasks.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".taskmaster/tasks/tasks.json"
+      - "scripts/validate-tasks"
+      - ".github/workflows/validate-tasks.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not the default shallow clone: the evidence-ancestry
+          # check below needs `git merge-base --is-ancestor` against real history.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: scripts/validate-tasks

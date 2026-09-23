@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Checks .taskmaster/tasks/tasks.json for status drift and unverifiable "done" claims.
+
+Usage: scripts/validate-tasks [FILE]  (default: .taskmaster/tasks/tasks.json)
+
+Rules enforced:
+  1. A "cancelled" parent may not have any "done" subtask.
+  2. A parent's status (when pending/in-progress/done) must match what task-master's
+     own derivation rule computes from its subtasks: all done -> done; all pending ->
+     pending; anything else (including a subtask sitting in deferred/blocked/review) ->
+     in-progress. This is a simplification task-master's own docs don't spell out for
+     every edge case, but it matches the tool's real, observed CLI behavior.
+  3. Every leaf (a subtask, or a top-level task with no subtasks) whose status is
+     "done" must carry a non-empty evidence.commits array.
+  4. Every evidence.commits entry must be a full 40-char lowercase hex SHA, must
+     resolve via `git cat-file -e <sha>^{commit}`, and must be an ancestor of HEAD.
+     Every evidence.prs entry must look like a real GitHub PR URL (format only, no
+     network call).
+  5. metadata.taskCount/completedCount must match the actual top-level tasks.
+
+Exit codes: 0 clean, 1 validation errors found, 2 usage/environment error.
+"""
+import json
+import re
+import subprocess
+import sys
+
+PR_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/\d+$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def repo_root() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("error: not inside a git repository", file=sys.stderr)
+        sys.exit(2)
+    return result.stdout.strip()
+
+
+def derive_status(subtasks: list) -> str:
+    statuses = [s.get("status") for s in subtasks]
+    if all(s == "done" for s in statuses):
+        return "done"
+    if all(s == "pending" for s in statuses):
+        return "pending"
+    return "in-progress"
+
+
+def check_evidence(root: str, owner_id: str, evidence: dict, errors: list) -> None:
+    for sha in evidence.get("commits", []):
+        if not SHA_RE.match(sha):
+            errors.append(f"evidence commit '{sha}' on {owner_id} is not a full 40-character lowercase hex SHA")
+            continue
+        exists = subprocess.run(
+            ["git", "-C", root, "cat-file", "-e", f"{sha}^{{commit}}"],
+            capture_output=True,
+        ).returncode == 0
+        if not exists:
+            errors.append(f"evidence commit {sha} on {owner_id} does not exist in this repository")
+            continue
+        is_ancestor = subprocess.run(
+            ["git", "-C", root, "merge-base", "--is-ancestor", sha, "HEAD"],
+            capture_output=True,
+        ).returncode == 0
+        if not is_ancestor:
+            errors.append(f"evidence commit {sha} on {owner_id} is not an ancestor of HEAD (not merged)")
+    for pr in evidence.get("prs", []):
+        if not PR_RE.match(pr):
+            errors.append(f"evidence PR url '{pr}' on {owner_id} is not a well-formed GitHub PR URL")
+
+
+def main() -> int:
+    if len(sys.argv) > 2:
+        print("usage: scripts/validate-tasks [FILE]", file=sys.stderr)
+        return 2
+
+    root = repo_root()
+    path = sys.argv[1] if len(sys.argv) == 2 else f"{root}/.taskmaster/tasks/tasks.json"
+
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"error: could not read/parse {path}: {e}", file=sys.stderr)
+        return 2
+
+    tasks = data["master"]["tasks"]
+    errors: list = []
+    evidence_count = 0
+    subtask_count = 0
+
+    for task in tasks:
+        task_id = task["id"]
+        subtasks = task.get("subtasks", [])
+        subtask_count += len(subtasks)
+        status = task.get("status")
+
+        if status == "cancelled":
+            done_children = [s["id"] for s in subtasks if s.get("status") == "done"]
+            if done_children:
+                errors.append(
+                    f"task {task_id} status is 'cancelled' but has done subtasks: {done_children}"
+                )
+        elif status in ("pending", "in-progress", "done") and subtasks:
+            derived = derive_status(subtasks)
+            if status != derived:
+                breakdown = ", ".join(f"{task_id}.{s['id']}={s.get('status')}" for s in subtasks)
+                errors.append(
+                    f"task {task_id} status is '{status}' but derives to '{derived}' "
+                    f"from its {len(subtasks)} subtasks ({breakdown})"
+                )
+
+        if not subtasks and status == "done":
+            evidence = task.get("evidence")
+            if not evidence or not evidence.get("commits"):
+                errors.append(f"task {task_id} is 'done' with no evidence.commits")
+            else:
+                evidence_count += 1
+                check_evidence(root, str(task_id), evidence, errors)
+
+        for sub in subtasks:
+            sub_id = f"{task_id}.{sub['id']}"
+            if sub.get("status") == "done":
+                evidence = sub.get("evidence")
+                if not evidence or not evidence.get("commits"):
+                    errors.append(f"task {sub_id} is 'done' with no evidence.commits")
+                else:
+                    evidence_count += 1
+                    check_evidence(root, sub_id, evidence, errors)
+
+    metadata = data["master"].get("metadata", {})
+    actual_task_count = len(tasks)
+    actual_completed_count = sum(1 for t in tasks if t.get("status") == "done")
+    if metadata.get("taskCount") != actual_task_count:
+        errors.append(
+            f"metadata.taskCount is {metadata.get('taskCount')} but there are {actual_task_count} top-level tasks"
+        )
+    if metadata.get("completedCount") != actual_completed_count:
+        errors.append(
+            f"metadata.completedCount is {metadata.get('completedCount')} "
+            f"but {actual_completed_count} top-level tasks are 'done'"
+        )
+
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}")
+        print(f"{len(errors)} error(s) across {len(tasks)} tasks / {subtask_count} subtasks")
+        return 1
+
+    print(f"ok: {len(tasks)} tasks / {subtask_count} subtasks, {evidence_count} evidence blocks verified against HEAD")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

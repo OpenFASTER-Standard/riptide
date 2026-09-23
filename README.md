@@ -21,7 +21,15 @@ npx -p task-master-ai task-master list          # see all tasks
 npx -p task-master-ai task-master next           # what to work on next
 npx -p task-master-ai task-master show <id>      # full detail on one task
 npx -p task-master-ai task-master set-status --id=<id> --status=in-progress
+npx -p task-master-ai task-master set-status --id=3.4 --status=done  # subtasks, never parents
 ```
+
+Only ever set a *subtask's* status directly — a parent task's status is always derived from its
+subtasks, never asserted by hand (see `CLAUDE.md`'s "Task status is derived, never asserted").
+Every subtask moving to `done` needs an `evidence` object in `tasks.json` citing a real,
+git-verifiable commit SHA for the work, added by hand in the same change (`task-master`'s CLI has
+no concept of this field). `scripts/validate-tasks` checks both — parent/child status agreement
+and evidence resolvability — and runs in CI on every change to `tasks.json`.
 
 Task 1 first: the process discipline it establishes (small aligned team, no spec ever ships
 without real running code in the same cycle) is the single variable that separated every
