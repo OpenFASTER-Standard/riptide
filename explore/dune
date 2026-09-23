@@ -1,0 +1,4 @@
+(executables
+ (names explore_dst trace_dst file_cluster)
+ (libraries riptide riptide_dst riptide_sim riptide_storage riptide_vsr eio eio.mock eio_main
+   eio_linux unix))
