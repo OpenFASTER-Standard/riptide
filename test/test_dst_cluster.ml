@@ -85,8 +85,47 @@ let test_different_seeds_can_diverge () =
     true
     (List.exists (fun r -> r <> List.hd results) results)
 
+(* Task 10: [Cluster.run] must refuse, statically and BEFORE standing up any replica/storage, a
+   [storage_fault_config] whose [corrupt_probability] could plausibly push the cluster's simultaneous
+   corrupted-slot count for a single WAL slot to or past [faults_max = replication_quorum - 1] --
+   a second, cluster-wide line of defense alongside (not a replacement for) each replica's own
+   [Fault_injecting_storage]'s per-instance runtime enforcement (Task 6/8), which only ever catches
+   an actual over-cap corruption on ITS OWN storage, in isolation, and only at the moment a
+   corrupting write is attempted.
+
+   [replica_count = 3] here means: [replication_quorum = ((3 - 1) / 2) + 1 = 2] (VSR's own [f + 1],
+   the same formula [Cluster.run] already computes for [Fault_injecting_storage.create] -- reused,
+   not reinvented), so [faults_max = 1]. At [corrupt_probability = 1.0], every replica's copy of a
+   given slot is corrupted with certainty, so the cluster-wide expected count of simultaneously-
+   corrupted copies of any one slot is [replica_count * corrupt_probability = 3.0], far past
+   [faults_max = 1] -- exactly the "could plausibly exceed" case the static check exists to reject.
+
+   [body] is a no-op that never calls [propose]/[settle], so NO [wal_append] -- and hence no
+   corrupting write -- is ever attempted on any replica's storage. This is deliberate: it makes the
+   per-instance runtime enforcement structurally unable to fire at all in this test (it only ever
+   triggers from an actual write), so an [Invalid_argument] here can only have come from the new
+   cluster-level pre-flight check, never from the per-instance guard firing "late" and merely
+   looking like this test passed for the right reason. [body_invoked] additionally proves the
+   exception was raised before [body] ever ran -- i.e. before [Cluster.run] got as far as handing
+   back a wired-up [replicas] array at all, not merely before [body]'s own logic executed. *)
+let test_fault_config_exceeding_cap_is_rejected_at_cluster_creation () =
+  let body_invoked = ref false in
+  Alcotest.check_raises "cluster refuses a storage fault config that could exceed faults_max"
+    (Invalid_argument
+       "storage fault config could corrupt more than faults_max = replication_quorum - 1 replicas' \
+        copies of the same slot")
+    (fun () ->
+      Riptide_dst.Cluster.run ~seed:1 ~replica_count:3
+        ~storage_fault_config:
+          { Riptide_storage.Fault_injecting_storage.default_fault_config with corrupt_probability = 1.0 }
+        (fun ~replicas:_ ~settle:_ -> body_invoked := true));
+  Alcotest.(check bool) "body (and thus replica/storage construction) never ran" false !body_invoked
+
 let tests =
   [
     ("same seed reproduces byte-identical trace", `Quick, test_same_seed_reproduces_byte_identical_trace);
     ("different seeds can diverge", `Quick, test_different_seeds_can_diverge);
+    ( "fault config exceeding the cap is rejected at cluster creation",
+      `Quick,
+      test_fault_config_exceeding_cap_is_rejected_at_cluster_creation );
   ]

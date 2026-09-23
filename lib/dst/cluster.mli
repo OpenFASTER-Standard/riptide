@@ -87,6 +87,31 @@ val run :
     simulation) is exposed, since neither of this task's two required tests needs it and Tasks
     10/11 are explicitly out of this task's scope.
 
+    {b Task 10: rejects an unsafe [storage_fault_config] before standing up any replica or storage
+    at all}: {!Riptide_storage.Fault_injecting_storage}'s own [faults_max = replication_quorum - 1]
+    enforcement (Tasks 6/8) is per-instance -- it only ever bounds how many op_numbers one replica's
+    own storage may have simultaneously corrupted, in isolation, and only at the moment a corrupting
+    write is attempted. It does nothing to stop every replica from independently corrupting its own
+    copy of the SAME slot (each replica's corruption decisions are drawn from its own independently
+    seeded {!Riptide_sim.Prng.t}), which is the actual cluster-wide danger: if
+    [replication_quorum] or more replicas simultaneously hold a corrupted copy of one slot, no
+    quorum read can recover it. [run] estimates this risk the only way available at
+    cluster-creation time (no op_number or run length is known yet): for one slot every replica
+    eventually writes (VSR's own happy-path replication), the number of replicas whose copy gets
+    corrupted is Binomial(replica_count, corrupt_probability), whose expectation is [replica_count
+    * corrupt_probability]. [run] raises [Invalid_argument
+    "storage fault config could corrupt more than faults_max = replication_quorum - 1 replicas'
+    copies of the same slot"] whenever that expectation alone already reaches or exceeds
+    [faults_max] (and [corrupt_probability > 0.], so the safe, zero-risk
+    {!Riptide_storage.Fault_injecting_storage.default_fault_config} is never rejected regardless of
+    [replica_count], including the degenerate [faults_max = 0] single-replica case) -- i.e. whenever
+    a single slot going unrecoverable is already the EXPECTED outcome under that config, not merely
+    a tail probability worth quantifying with an otherwise-arbitrary confidence threshold. This is a
+    static, conservative, cluster-level check only; {!Riptide_storage.Fault_injecting_storage}'s own
+    per-instance runtime enforcement remains the actual last line of defense during a run, catching
+    whatever this preflight check cannot rule out in advance (e.g. a config that passes this check
+    but still happens to corrupt a bad run of consecutive slots on one replica).
+
     {b Why {!Riptide_storage.Memory_storage} under the wrapper, not
     {!Riptide_storage.File_storage}} (the brief's own "Interfaces" line lists [File_storage] as
     consumed, but its illustrative code never actually constructs one): {!Eio_mock.Backend.run} is

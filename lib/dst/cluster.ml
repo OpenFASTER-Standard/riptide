@@ -60,6 +60,40 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
   (* VSR's own replication quorum, f + 1 (VSR.tla:140's [f = (ReplicaCount-1) \div 2]) -- see
      [Fault_injecting_storage.create]'s own doc comment for what this bounds. *)
   let replication_quorum = ((replica_count - 1) / 2) + 1 in
+  (* Task 10: a SECOND, cluster-wide line of defense, static and preflight -- distinct from (and
+     strictly in addition to) [Fault_injecting_storage]'s own per-instance runtime enforcement of
+     [faults_max = replication_quorum - 1] (Tasks 6/8, [fault_injecting_storage.mli]'s own doc
+     comment on [create]), which only ever bounds how many DISTINCT op_numbers can be simultaneously
+     corrupted WITHIN ONE replica's own WAL, in isolation. That per-instance cap does nothing to
+     stop every replica from independently corrupting ITS OWN copy of the SAME op_number: each
+     replica's [corrupt_probability] draw is an independent Bernoulli trial (its own freshly-seeded
+     [Prng.t], per [split_seed] above), so nothing about the per-instance cap prevents
+     [replication_quorum] or more replicas from simultaneously holding a corrupted copy of one
+     slot -- which is exactly the case a quorum read cannot recover from (out of [replica_count]
+     copies, fewer than [replication_quorum] remain readable/correct).
+
+     This check estimates that cluster-wide risk the only way available at cluster-creation time,
+     before any op_number or run length is known: for one arbitrary slot that every replica
+     eventually writes its own copy of (VSR's own happy-path replication), the number of replicas
+     whose copy gets corrupted is Binomial(replica_count, corrupt_probability), so its EXPECTATION
+     is [replica_count * corrupt_probability]. Reject up front, conservatively, whenever that
+     expectation alone already reaches or exceeds [faults_max] (the same [>=] boundary
+     [Fault_injecting_storage] itself uses: a live-corrupted count of exactly [faults_max] is
+     already unsafe, not just "one past safe") -- i.e. whenever a single slot going unrecoverable is
+     already the EXPECTED outcome, not merely a tail-probability worth quantifying with an otherwise-
+     arbitrary confidence threshold. [corrupt_probability > 0.] is required too, so the safe,
+     zero-risk default ([default_fault_config], every existing test's implicit config) is never
+     rejected regardless of [replica_count] -- without it, a [faults_max = 0] cluster (a lone
+     replica, no redundancy at all to tolerate even one fault) would reject [corrupt_probability =
+     0.] itself, which corrupts nothing and is trivially safe. *)
+  let faults_max = replication_quorum - 1 in
+  if
+    storage_fault_config.Riptide_storage.Fault_injecting_storage.corrupt_probability > 0.
+    && Float.of_int replica_count *. storage_fault_config.corrupt_probability >= Float.of_int faults_max
+  then
+    invalid_arg
+      "storage fault config could corrupt more than faults_max = replication_quorum - 1 replicas' \
+       copies of the same slot";
   let storages =
     Array.init replica_count (fun i ->
         Riptide_storage.Fault_injecting_storage.create
