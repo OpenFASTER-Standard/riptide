@@ -67,7 +67,7 @@ let check_storage_fault_config ~replica_count ~faults_max
    --------------------------------------------------------------------------------------------- *)
 
 let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
-    ~make_storage ~wait_io body =
+    ~make_storage ~wait_io ~delivery_rounds body =
   let net_seed, storage_seeds = split_seed seed ~replica_count in
   let net =
     Riptide_sim.Network.create ~faults:net_fault_config (Riptide_sim.Prng.create net_seed) ()
@@ -124,12 +124,21 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
         r)
   in
   let settle () =
-    (* Two independent budgets, deliberately not one. [delivery_rounds] is the original bound,
-       unchanged in meaning: 20 rounds that each actually delivered something, which is the real
-       livelock signal (a cluster generating messages forever). [io_waits] bounds only the new
-       waiting-for-a-suspended-handler path, which delivers nothing by definition and so would
-       never consume the first budget; folding the two together would have meant either weakening
-       the livelock detector by an order of magnitude or timing out legitimate real-I/O runs. *)
+    (* Two independent budgets, deliberately not one. [delivery_rounds] bounds rounds that each
+       actually delivered something, which is the real livelock signal (a cluster generating
+       messages forever); [io_waits] bounds only the waiting-for-a-suspended-handler path, which
+       delivers nothing by definition and so could never consume the first budget. Folding them
+       together would have meant either weakening the livelock detector by an order of magnitude or
+       timing out legitimate real-I/O runs.
+
+       [delivery_rounds] is per-mode, and that is not a fudge factor: a round delivers whatever is
+       pending at that instant, so the number of rounds needed to settle scales with how BATCHED
+       the replies are, not with how much work the protocol does. With synchronous handlers every
+       reply to a delivered batch is queued before the next round begins, so one round covers one
+       protocol hop -- 20 is ample, and it is the bound this harness has always used. With real
+       io_uring I/O the same hop's replies complete at different times and dribble out over many
+       rounds, so one view change can legitimately need an order of magnitude more (measured: a
+       3-replica view change over File_storage exhausts 20 and raises Did_not_settle). *)
     let rec loop delivery_rounds io_waits =
       if delivery_rounds <= 0 || io_waits <= 0 then raise Did_not_settle
       else begin
@@ -147,7 +156,7 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
         else if !delivered then loop delivery_rounds io_waits
       end
     in
-    loop 20 5000
+    loop delivery_rounds 5000
   in
   try
     Eio.Switch.run (fun sw ->
@@ -194,7 +203,7 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
       (* Under [Eio_mock.Backend.run] every storage operation is synchronous, so there is no I/O to
          wait for; a further [yield] is the strongest "let everything runnable run" this scheduler
          has, and matches the second yield the original loop always performed. *)
-    ~wait_io:Eio.Fiber.yield body
+    ~wait_io:Eio.Fiber.yield ~delivery_rounds:20 body
 
 let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc_limit)
     ?(ring_capacity = default_ring_capacity)
@@ -222,4 +231,4 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
          the one place this harness genuinely spends wall-clock time; every DECISION in the run
          stays seeded and deterministic (Prng-driven), only the real I/O's timing does not. *)
     ~wait_io:(fun () -> Eio.Time.sleep clock 0.0001)
-    body
+    ~delivery_rounds:500 body

@@ -19,10 +19,14 @@ exception Did_not_settle
 
     {b Quiesced means two things, not one} (the second added by Task 11): nothing further was
     delivered, AND no already-delivered message is still being handled. [settle] bounds those two
-    with separate budgets -- 20 rounds that each actually delivered something (the original bound,
-    unchanged: a cluster generating messages forever is the real livelock signal) and 5000 waits
-    for an in-flight handler (which by definition deliver nothing, so they could never consume the
-    first budget). Either budget running out raises this. *)
+    with separate budgets: rounds that each actually delivered something (a cluster generating
+    messages forever is the real livelock signal) and 5000 waits for an in-flight handler (which by
+    definition deliver nothing, so they could never consume the first budget). Either running out
+    raises this. The delivery-round budget is per-mode -- 20 for {!run}, the bound this harness has
+    always used, and 500 for {!run_on_file_storage}, because real io_uring replies to one protocol
+    hop complete at different times and dribble across many more rounds than the same hop does when
+    every handler is synchronous. See [cluster.ml]'s own comment at the budget for the measurement
+    behind that. *)
 
 val run :
   seed:int ->
