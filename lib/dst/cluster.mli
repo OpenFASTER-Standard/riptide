@@ -11,11 +11,18 @@
     predates it) and why. *)
 
 exception Did_not_settle
-(** Raised by the [settle] function passed to a [run] body if the cluster has not quiesced (no
-    message pumped, nothing new delivered) within a generous, bounded number of rounds -- signals
-    likely non-termination rather than hanging the test suite forever. Mirrors
-    [with_cluster_and_storage]'s own [Alcotest.fail "cluster did not quiesce..."], restated as a
-    real exception since this is a library, not a test file, and cannot depend on Alcotest. *)
+(** Raised by the [settle] function passed to a [run]/{!run_on_file_storage} body if the cluster
+    has not quiesced within a generous, bounded number of rounds -- signals likely non-termination
+    rather than hanging the test suite forever. Mirrors [with_cluster_and_storage]'s own
+    [Alcotest.fail "cluster did not quiesce..."], restated as a real exception since this is a
+    library, not a test file, and cannot depend on Alcotest.
+
+    {b Quiesced means two things, not one} (the second added by Task 11): nothing further was
+    delivered, AND no already-delivered message is still being handled. [settle] bounds those two
+    with separate budgets -- 20 rounds that each actually delivered something (the original bound,
+    unchanged: a cluster generating messages forever is the real livelock signal) and 5000 waits
+    for an in-flight handler (which by definition deliver nothing, so they could never consume the
+    first budget). Either budget running out raises this. *)
 
 val run :
   seed:int ->
@@ -78,9 +85,11 @@ val run :
     {!Riptide_vsr.Replica.propose}'s own doc comment), so nothing about a proposer's own raw log
     length ever depends on message delivery -- a body with no way to drive delivery can only ever
     observe that one, delivery-independent fact, never anything about replication, commitment, or
-    a fault's actual effect. [settle] (the same bounded pump-then-yield-twice loop
-    [with_cluster_and_storage] already uses, raising {!Did_not_settle} rather than
-    [Alcotest.fail] past 20 rounds of a round producing no delivery) is the second, and only other,
+    a fault's actual effect. [settle] (originally the same bounded pump-then-yield-twice loop
+    [with_cluster_and_storage] already uses, raising {!Did_not_settle} rather than [Alcotest.fail];
+    corrected in Task 11 to also wait out messages whose handler has started but not returned --
+    see {!Did_not_settle} and [cluster.ml]'s own comment at the [inflight] counter for what that
+    loop silently got wrong and the measured before/after) is the second, and only other,
     divergence from the brief's literal sketch, needed for exactly this reason -- both are called
     out in this task's own report as deliberate, justified deviations from a stale illustrative
     sketch, not scope creep: no [stop]/[isolate]/[reconnect] (Task 8's own crash/partition
@@ -138,3 +147,44 @@ val run :
     the same way, for the same reason (this harness asserts PROTOCOL behavior under a storage
     fault, not File_storage's own on-disk behavior, which is covered separately by
     [test/test_file_storage.ml] and [test/test_fault_injecting_storage.ml]). *)
+
+val run_on_file_storage :
+  env:Eio_unix.Stdenv.base ->
+  dir:string ->
+  seed:int ->
+  replica_count:int ->
+  ?svc_limit:int ->
+  ?ring_capacity:int ->
+  ?net_fault_config:Riptide_sim.Network.fault_config ->
+  ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
+  (replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) ->
+  unit
+(** Task 11. Exactly {!run}, with exactly the same seed splitting, view pin, [settle], Task 10
+    pre-flight check and teardown -- except that each replica's
+    {!Riptide_storage.Fault_injecting_storage} wraps a real {!Riptide_storage.File_storage} (its
+    own subdirectory [dir/1], [dir/2], ... of the caller-supplied, caller-owned [dir], which must
+    already exist) instead of a {!Riptide_storage.Memory_storage}.
+
+    {b Call it from inside the caller's own [Eio_main.run], never from inside
+    [Eio_mock.Backend.run]}: it takes [env] rather than establishing a backend itself, because
+    {!Riptide_storage.File_storage.create} needs a real [~fs] and a real io_uring scope, which is
+    precisely what {!run}'s own [Eio_mock.Backend.run] cannot provide (see {!run}'s own closing
+    paragraph). The trade is real wall-clock time for real durability: every DECISION in the run is
+    still drawn from [seed] through the same {!Riptide_sim.Prng.t} split, so the run stays
+    reproducible, but real I/O timing is not virtual and a run is orders of magnitude slower than
+    the mock-clock one. Prefer {!run} for seed sweeps; use this when the property under test is
+    about the real persistence layer.
+
+    [ring_capacity] defaults to [4096] here, NOT to {!Riptide_storage.File_storage.create}'s own
+    default of [8]. This is not a cosmetic choice and it is worth understanding before lowering it:
+    {!Riptide_storage.File_storage}'s WAL is a fixed-size ring that silently EVICTS the entry at
+    [op_number - ring_capacity] on every append, and nothing in this system ever truncates a
+    committed prefix away (there is no checkpointing -- explicitly out of scope for this plan), so
+    every entry stays live forever and a log longer than the ring means committed entries are
+    destroyed on disk with no signal to anyone. The protocol-level consequence is total, and was
+    reproduced deterministically with ZERO injected faults (see [test/test_dst_scenarios.ml]'s own
+    ring-boundary test): once the log passes [ring_capacity], every replica's [Do_view_change]
+    permanently omits the evicted ops, no replica can either supply them or prove them absent, so
+    the first view change after that point never completes -- the cluster forfeits, bumps its view,
+    and repeats forever, never returning to [Normal]. A ring big enough to hold the whole run's log
+    is the only configuration in which this harness tests the protocol rather than that limit. *)

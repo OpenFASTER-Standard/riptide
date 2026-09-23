@@ -13,7 +13,9 @@
       [cluster.mli].
    3. [Memory_storage], not [File_storage], underlies each [Fault_injecting_storage] -- same
       reasoning [with_cluster_and_storage] already established (Eio_mock.Backend.run has no real
-      filesystem capability), restated in [cluster.mli].
+      filesystem capability), restated in [cluster.mli]. Task 11 added {!run_on_file_storage} as a
+      SECOND entry point rather than changing this one: it runs the identical wiring inside the
+      CALLER's [Eio_main.run], where a real [File_storage] is constructible.
    4. No [stop]/[isolate]/[reconnect] -- Task 8's crash/partition simulation, not needed by this
       task's two required tests and out of scope for Tasks 10/11's own later work. *)
 
@@ -24,6 +26,7 @@ exception Cluster_test_done
    same name, as [with_cluster_and_storage]'s own (a different module, so no clash). *)
 
 let default_svc_limit = 3
+let default_ring_capacity = 4096
 
 (* Draws the network's own sub-seed first, then one storage sub-seed per replica, index order
    [0, 1, ..., replica_count - 1], all from the same root [Prng.t] -- see [cluster.mli]'s own
@@ -43,13 +46,29 @@ let split_seed seed ~replica_count =
   in
   (net_seed, storage_seeds)
 
-let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
-    ?(net_fault_config = Riptide_sim.Network.default_fault_config)
-    ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
-    (body :
-      replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) =
+(* Task 10's cluster-wide, static, pre-flight rejection -- see [cluster.mli]'s own paragraph on it
+   for the full reasoning, and this file's git history for the version that lived inline in [run].
+   Factored out only so both entry points enforce it identically, from one statement of it. *)
+let check_storage_fault_config ~replica_count ~faults_max
+    (storage_fault_config : Riptide_storage.Fault_injecting_storage.fault_config) =
+  if
+    storage_fault_config.corrupt_probability > 0.
+    && Float.of_int replica_count *. storage_fault_config.corrupt_probability
+       >= Float.of_int faults_max
+  then
+    invalid_arg
+      "storage fault config could corrupt more than faults_max = replication_quorum - 1 replicas' \
+       copies of the same slot"
+
+(* ---------------------------------------------------------------------------------------------
+   THE SHARED WIRING, parameterised by exactly the two things the two entry points differ in:
+   how a replica's storage is built ([make_storage]) and what "let in-flight I/O make progress"
+   means ([wait_io]).
+   --------------------------------------------------------------------------------------------- *)
+
+let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
+    ~make_storage ~wait_io body =
   let net_seed, storage_seeds = split_seed seed ~replica_count in
-  Eio_mock.Backend.run @@ fun () ->
   let net =
     Riptide_sim.Network.create ~faults:net_fault_config (Riptide_sim.Prng.create net_seed) ()
   in
@@ -60,58 +79,42 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
   (* VSR's own replication quorum, f + 1 (VSR.tla:140's [f = (ReplicaCount-1) \div 2]) -- see
      [Fault_injecting_storage.create]'s own doc comment for what this bounds. *)
   let replication_quorum = ((replica_count - 1) / 2) + 1 in
-  (* Task 10: a SECOND, cluster-wide line of defense, static and preflight -- distinct from (and
-     strictly in addition to) [Fault_injecting_storage]'s own per-instance runtime enforcement of
-     [faults_max = replication_quorum - 1] (Tasks 6/8, [fault_injecting_storage.mli]'s own doc
-     comment on [create]), which only ever bounds how many DISTINCT op_numbers can be simultaneously
-     corrupted WITHIN ONE replica's own WAL, in isolation. That per-instance cap does nothing to
-     stop every replica from independently corrupting ITS OWN copy of the SAME op_number: each
-     replica's [corrupt_probability] draw is an independent Bernoulli trial (its own freshly-seeded
-     [Prng.t], per [split_seed] above), so nothing about the per-instance cap prevents
-     [replication_quorum] or more replicas from simultaneously holding a corrupted copy of one
-     slot -- which is exactly the case a quorum read cannot recover from (out of [replica_count]
-     copies, fewer than [replication_quorum] remain readable/correct).
-
-     This check estimates that cluster-wide risk the only way available at cluster-creation time,
-     before any op_number or run length is known: for one arbitrary slot that every replica
-     eventually writes its own copy of (VSR's own happy-path replication), the number of replicas
-     whose copy gets corrupted is Binomial(replica_count, corrupt_probability), so its EXPECTATION
-     is [replica_count * corrupt_probability]. Reject up front, conservatively, whenever that
-     expectation alone already reaches or exceeds [faults_max] (the same [>=] boundary
-     [Fault_injecting_storage] itself uses: a live-corrupted count of exactly [faults_max] is
-     already unsafe, not just "one past safe") -- i.e. whenever a single slot going unrecoverable is
-     already the EXPECTED outcome, not merely a tail-probability worth quantifying with an otherwise-
-     arbitrary confidence threshold. [corrupt_probability > 0.] is required too, so the safe,
-     zero-risk default ([default_fault_config], every existing test's implicit config) is never
-     rejected regardless of [replica_count] -- without it, a [faults_max = 0] cluster (a lone
-     replica, no redundancy at all to tolerate even one fault) would reject [corrupt_probability =
-     0.] itself, which corrupts nothing and is trivially safe. *)
   let faults_max = replication_quorum - 1 in
-  if
-    storage_fault_config.Riptide_storage.Fault_injecting_storage.corrupt_probability > 0.
-    && Float.of_int replica_count *. storage_fault_config.corrupt_probability >= Float.of_int faults_max
-  then
-    invalid_arg
-      "storage fault config could corrupt more than faults_max = replication_quorum - 1 replicas' \
-       copies of the same slot";
+  check_storage_fault_config ~replica_count ~faults_max storage_fault_config;
+  (* [inflight] is the count of messages this harness has DELIVERED into a replica's inbox but
+     whose [handle_message] has not yet returned.
+
+     TASK 11, AND THE REASON THIS COUNTER EXISTS AT ALL. The original [settle] was "pump everything
+     pending, yield twice, repeat until a round delivers nothing", with no counter: it inferred
+     quiescence purely from the network's own pending queue being empty. That inference is only
+     valid while [handle_message] is SYNCHRONOUS -- true for [Memory_storage] under
+     [Eio_mock.Backend.run], and false for any backend whose operations suspend the fiber. Against
+     a real [File_storage] every [wal_append]/[superblock_write] suspends on io_uring, so
+     [Eio.Fiber.yield] returns with the handler only STARTED, the pending queue is (correctly)
+     empty because the replies have not been sent yet, and [settle] returns with the cluster
+     mid-flight -- silently, with no error, just less replication than the caller was promised.
+
+     Measured, zero-fault, 3 replicas over real [File_storage], 9 proposals in 3 bursts of 3 with a
+     [settle] after each: 3 of 9 ops committed with the old loop, 9 of 9 with this one, identically
+     for every seed tried (see [explore/file_cluster.ml]'s own [OLD_SETTLE=1] switch, which keeps
+     the old loop verbatim for exactly this before/after comparison).
+
+     Counting in-flight handlers makes the test SOUND rather than merely quiescent-looking: a
+     handler that has not returned yet is work the cluster still owes, whether or not it is
+     currently parked in a syscall. Under [Eio_mock.Backend.run] + [Memory_storage] the counter is
+     back at zero after the first [yield] of every round, so [run]'s own behaviour is unchanged --
+     which is exactly why this defect could sit here undetected. *)
+  let inflight = ref 0 in
   let storages =
     Array.init replica_count (fun i ->
-        Riptide_storage.Fault_injecting_storage.create
-          ~prng:(Riptide_sim.Prng.create storage_seeds.(i))
-          ~fault_config:storage_fault_config ~replication_quorum
-          ~underlying:(module Riptide_storage.Memory_storage)
-          (Riptide_storage.Memory_storage.create ()))
+        make_storage ~index:i ~replication_quorum
+          ~prng:(Riptide_sim.Prng.create storage_seeds.(i)))
   in
   let replicas =
     Array.init replica_count (fun i ->
         let my_id = i + 1 in
         let r =
-          Riptide_vsr.Replica.create
-            ~storage:
-              (Riptide_vsr.Replica.storage_of_module
-                 (module Riptide_storage.Fault_injecting_storage)
-                 storages.(i))
-            ~my_id ~replica_count ~svc_limit
+          Riptide_vsr.Replica.create ~storage:storages.(i) ~my_id ~replica_count ~svc_limit
             ~send:(fun ~to_ bytes -> Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes)
         in
         (* Deviation 1 (see this file's own top comment and [cluster.mli]): pin every replica's
@@ -121,19 +124,30 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
         r)
   in
   let settle () =
-    let rec loop rounds_left =
-      if rounds_left <= 0 then raise Did_not_settle
+    (* Two independent budgets, deliberately not one. [delivery_rounds] is the original bound,
+       unchanged in meaning: 20 rounds that each actually delivered something, which is the real
+       livelock signal (a cluster generating messages forever). [io_waits] bounds only the new
+       waiting-for-a-suspended-handler path, which delivers nothing by definition and so would
+       never consume the first budget; folding the two together would have meant either weakening
+       the livelock detector by an order of magnitude or timing out legitimate real-I/O runs. *)
+    let rec loop delivery_rounds io_waits =
+      if delivery_rounds <= 0 || io_waits <= 0 then raise Did_not_settle
       else begin
         let delivered = ref false in
         while Riptide_sim.Network.pump_one net do
-          delivered := true
+          delivered := true;
+          incr inflight
         done;
         Eio.Fiber.yield ();
-        Eio.Fiber.yield ();
-        if !delivered then loop (rounds_left - 1)
+        let delivery_rounds = if !delivered then delivery_rounds - 1 else delivery_rounds in
+        if !inflight > 0 then begin
+          wait_io ();
+          loop delivery_rounds (io_waits - 1)
+        end
+        else if !delivered then loop delivery_rounds io_waits
       end
     in
-    loop 20
+    loop 20 5000
   in
   try
     Eio.Switch.run (fun sw ->
@@ -142,7 +156,12 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
             Eio.Fiber.fork ~sw (fun () ->
                 let rec dispatch_loop () =
                   let msg = Riptide_sim.Sim_transport.receive handles.(i) in
+                  (* [decr] in a [Fun.protect]-free tail position is deliberate: [handle_message]
+                     is total on adversarial input (replica.mli's own guarantee), so it does not
+                     raise, and a counter that leaked on an exception would hang [settle] rather
+                     than surface it. *)
                   Riptide_vsr.Replica.handle_message replica msg;
+                  decr inflight;
                   dispatch_loop ()
                 in
                 dispatch_loop ()))
@@ -150,3 +169,57 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
         body ~replicas ~settle;
         Eio.Switch.fail sw Cluster_test_done)
   with Cluster_test_done -> ()
+
+let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
+    ?(net_fault_config = Riptide_sim.Network.default_fault_config)
+    ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
+    (body : replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) =
+  (* Task 10's pre-flight must reject BEFORE [Eio_mock.Backend.run] is entered, not just before any
+     replica is built: [test_dst_cluster.ml]'s own test asserts the [Invalid_argument] escapes to
+     the caller, and an exception raised inside the mock backend would be reported by the backend
+     instead. (It is re-checked inside [with_cluster] too -- one statement of the rule, enforced on
+     every path into a cluster.) *)
+  check_storage_fault_config ~replica_count
+    ~faults_max:((replica_count - 1) / 2)
+    storage_fault_config;
+  Eio_mock.Backend.run @@ fun () ->
+  with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
+    ~make_storage:(fun ~index:_ ~replication_quorum ~prng ->
+      Riptide_vsr.Replica.storage_of_module
+        (module Riptide_storage.Fault_injecting_storage)
+        (Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
+           ~replication_quorum
+           ~underlying:(module Riptide_storage.Memory_storage)
+           (Riptide_storage.Memory_storage.create ())))
+      (* Under [Eio_mock.Backend.run] every storage operation is synchronous, so there is no I/O to
+         wait for; a further [yield] is the strongest "let everything runnable run" this scheduler
+         has, and matches the second yield the original loop always performed. *)
+    ~wait_io:Eio.Fiber.yield body
+
+let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc_limit)
+    ?(ring_capacity = default_ring_capacity)
+    ?(net_fault_config = Riptide_sim.Network.default_fault_config)
+    ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
+    (body : replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) =
+  check_storage_fault_config ~replica_count
+    ~faults_max:((replica_count - 1) / 2)
+    storage_fault_config;
+  let fs = Eio.Stdenv.fs env in
+  let clock = Eio.Stdenv.clock env in
+  Eio.Switch.run @@ fun storage_sw ->
+  with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
+    ~make_storage:(fun ~index ~replication_quorum ~prng ->
+      let path = Filename.concat dir (string_of_int (index + 1)) in
+      Riptide_vsr.Replica.storage_of_module
+        (module Riptide_storage.Fault_injecting_storage)
+        (Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
+           ~replication_quorum
+           ~underlying:(module Riptide_storage.File_storage)
+           (Riptide_storage.File_storage.create ~sw:storage_sw ~fs ~ring_capacity path)))
+      (* A real, tiny sleep on the REAL clock, not [Eio.Fiber.yield]: a fiber parked on an io_uring
+         completion is not runnable, so yielding to it achieves nothing -- eio_linux only reaps
+         completions when its run queue empties, which a yield-only loop never lets happen. This is
+         the one place this harness genuinely spends wall-clock time; every DECISION in the run
+         stays seeded and deterministic (Prng-driven), only the real I/O's timing does not. *)
+    ~wait_io:(fun () -> Eio.Time.sleep clock 0.0001)
+    body
