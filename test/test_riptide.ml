@@ -90,6 +90,7 @@ let () =
          ("batch_commit_cluster", Test_batch_commit_cluster.tests);
          ("batch_commit_materialize", Test_batch_commit_materialize.tests);
          ("dek", Test_dek.tests);
+         ("redaction", Test_redaction.tests);
          ("sim_prng", Test_sim_prng.tests);
          ("sim_network", Test_sim_network.tests);
          ("sim_faults", Test_sim_faults.tests);

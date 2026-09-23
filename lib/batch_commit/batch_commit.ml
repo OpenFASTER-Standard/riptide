@@ -107,11 +107,53 @@ let already_committed (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : 
     (committed_batch_values t)
 
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
+type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
+
+(* The keystore key for one write, derived from data available BEFORE the write enters the
+   replicated log -- which is the only moment encryption can happen, since Envelope.content_hash
+   covers the payload (lib/envelope.ml's to_value) and is therefore already committed to whatever
+   bytes the log holds. The envelope's own event_id (= its content_hash) is unusable here: it also
+   covers predecessor_hash and sequence, which only exist once the write's position in the
+   committed log is settled, i.e. strictly after the payload had to be final. See
+   batch_commit.mli's [redaction_event_id] and Riptide_crypto.Redaction_store's own header.
+
+   Length-prefixing the idempotency key makes the derivation injective by construction rather than
+   by argument: ("a", 1) and ("a#1", 0) produce "1:a#1" and "3:a#1#0", which cannot collide for
+   any pair of inputs, whatever characters an opaque caller-supplied idempotency key contains. *)
+let redaction_event_id ~idempotency_key ~index =
+  Printf.sprintf "%d:%s#%d" (String.length idempotency_key) idempotency_key index
 
 let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materialize : materialize_sink option)
-    (writes : write list) : unit =
-  if not (already_committed t ~idempotency_key) then
-    Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes);
+    ?(encryption : encryption_sink option) (writes : write list) : unit =
+  (* Encrypted and materialized are mutually exclusive, and this fails loudly rather than
+     silently: the materializer's accumulator holds joined plaintext, lives in its own KV store,
+     and is structurally outside the redaction keystore -- so deleting a record's DEK would leave
+     that record's contribution to the accumulator fully readable. A redaction that does not
+     redact is worse than a rejected write. See batch_commit.mli for the full statement. *)
+  (match encryption with
+  | None -> ()
+  | Some _ ->
+    if List.exists (fun (w : write) -> Option.is_some w.merge_key) writes then
+      invalid_arg
+        "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
+         (~encryption): the materialized accumulator is outside the redaction keystore, so \
+         deleting the DEK would not erase it");
+  if not (already_committed t ~idempotency_key) then begin
+    (* Encryption happens HERE, inside the "not already committed" guard, and not a line earlier:
+       encrypting mints a fresh DEK and overwrites the keystore entry for this event_id. Doing
+       that on a retry of an ALREADY-committed batch would orphan the DEK for the ciphertext
+       already immutably in the log, permanently destroying a record nobody asked to redact. *)
+    let writes_to_propose =
+      match encryption with
+      | None -> writes
+      | Some sink ->
+        List.mapi
+          (fun index (w : write) ->
+            { w with payload = sink.encrypt ~event_id:(redaction_event_id ~idempotency_key ~index) w.payload })
+          writes
+    in
+    Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes_to_propose)
+  end;
   (* Deliberately NOT gated behind "did THIS call perform the durable commit" -- a batch
      committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
      above) is materialized here just the same. This makes materialization safe to retry: if a
@@ -132,7 +174,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
           match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
         writes
 
-let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
+let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =
   let seen_keys = Hashtbl.create 16 in
   let _final_sequence, _final_predecessor_hash, envelopes_rev =
     List.fold_left
@@ -143,23 +185,33 @@ let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
           if Hashtbl.mem seen_keys idempotency_key then (sequence, predecessor_hash, acc)
           else begin
             Hashtbl.add seen_keys idempotency_key ();
-            List.fold_left
-              (fun (sequence, predecessor_hash, acc) (w : write) ->
-                let sequence = Int64.add sequence 1L in
-                let envelope : Envelope.envelope =
-                  {
-                    actor = w.actor;
-                    causation = w.causation;
-                    correlation = w.correlation;
-                    predecessor_hash;
-                    sequence;
-                    payload = w.payload;
-                  }
-                in
-                (sequence, Envelope.content_hash envelope, envelope :: acc))
-              (sequence, predecessor_hash, acc) writes
+            let _final_index, folded =
+              List.fold_left
+                (fun (index, (sequence, predecessor_hash, acc)) (w : write) ->
+                  let sequence = Int64.add sequence 1L in
+                  let envelope : Envelope.envelope =
+                    {
+                      actor = w.actor;
+                      causation = w.causation;
+                      correlation = w.correlation;
+                      predecessor_hash;
+                      sequence;
+                      payload = w.payload;
+                    }
+                  in
+                  ( index + 1,
+                    ( sequence,
+                      Envelope.content_hash envelope,
+                      (redaction_event_id ~idempotency_key ~index, envelope) :: acc ) ))
+                (0, (sequence, predecessor_hash, acc))
+                writes
+            in
+            folded
           end)
       (0L, Envelope.genesis_marker, [])
       (committed_batch_values t)
   in
   List.rev envelopes_rev
+
+let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
+  List.map snd (committed_envelopes_keyed t)
