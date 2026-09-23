@@ -311,8 +311,46 @@ let wal_read t ~op_number =
 
 let wal_highest_op_number t = t.highest_op_number
 
+(* DURABLE, not merely a counter decrement (final-review finding I3).
+
+   This used to lower [highest_op_number] and nothing else. The discarded entries' headers and
+   data stayed on disk, so [recover_highest_op_number] found them again on the next {!create} and
+   resurrected them -- diverging from {!Riptide_storage.Memory_storage}, which physically deletes,
+   on the one operation whose entire purpose is to make entries go away. [test_storage_shared.ml]'s
+   conformance suite structurally could not catch that (it has no reopen case, since Memory_storage
+   has no restart semantics to have one against), so the divergence lived behind a passing suite.
+
+   WHY IT IS A REAL DEFECT AND NOT COSMETIC. A truncation is how a view change discards an
+   uncommitted suffix. With a non-durable truncate, a crash between the truncate and the superblock
+   write brings the replica back with the DISCARDED entries readable, and it then presents them as
+   live log entries in its next DoViewChange -- stale values a peer can adopt. Made durable, the
+   same crash leaves those slots unreadable-but-in-range, i.e. VSR.tla's "corrupt" rather than
+   anything a replica would ship or nack, which is the conservative direction this whole storage
+   model is built on.
+
+   HOW: overwrite each discarded slot's HEADER with zeros. [recover_highest_op_number] and
+   {!wal_read} both require [header.op_number > 0] and a checksum that verifies against the slot's
+   own data, so a zeroed header makes the slot unrecoverable by either -- without any new on-disk
+   format, using the same header write the ring already performs. The data region is deliberately
+   left alone: nothing can reach it without a header, and rewriting it would double the I/O for no
+   change in what any reader can observe.
+
+   The loop is clamped to at most [ring_capacity] slots. Op-numbers [op_number + 1 ..
+   highest_op_number] can span far more than the ring holds, and the slots repeat modulo capacity,
+   so the last [ring_capacity] of them already cover every DISTINCT slot exactly once. Clamping is
+   also what keeps a truncation over a long log from costing one write per discarded op-number.
+   It cannot zero a slot that is still live: any op at or below [op_number] sharing a slot with a
+   discarded one was already physically overwritten by that discarded one when it was appended --
+   the ring had destroyed it long before this call. *)
 let wal_truncate_after t ~op_number =
-  if op_number < t.highest_op_number then t.highest_op_number <- op_number
+  if op_number < t.highest_op_number then begin
+    let first = max (op_number + 1) (t.highest_op_number - t.ring_capacity + 1) in
+    for o = first to t.highest_op_number do
+      write_header t ~slot:((o - 1) mod t.ring_capacity) ~op_number:0 ~length:0
+        ~checksum:(String.make 32 '\000')
+    done;
+    t.highest_op_number <- op_number
+  end
 
 (* Each superblock file holds exactly one record (unlike the ring, which packs many slots into
    one shared file) -- so there's only ever one header offset and one data offset, both fixed,

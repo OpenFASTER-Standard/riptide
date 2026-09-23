@@ -21,7 +21,22 @@ module type S = sig
   val wal_read : t -> op_number:int -> string option
 
   (** [wal_truncate_after t ~op_number] discards every WAL entry with a
-      higher op-number. No-op if [op_number >= wal_highest_op_number t]. *)
+      higher op-number. No-op if [op_number >= wal_highest_op_number t].
+
+      {b The discard is DURABLE}, in exactly the sense [wal_append] is:
+      reopening the same backend afterwards must not resurrect a discarded
+      entry, and must not report a [wal_highest_op_number] above
+      [op_number]. Stated here as a contract clause because it was a real
+      divergence between two conforming implementations (final-review
+      finding I3): [Memory_storage] physically deleted while [File_storage]
+      only lowered an in-memory counter, leaving the discarded entries'
+      headers and data on disk for its own recovery scan to find again.
+      [test/test_storage_shared.ml]'s conformance suite structurally cannot
+      check this — it has no reopen case, because [Memory_storage] has no
+      restart semantics to have one against — so the clause is pinned by
+      [test/test_file_storage.ml]'s own reopen-after-truncate tests instead.
+      A backend that cannot honour it must say so at its own [create], not
+      leave callers to discover it after a crash. *)
   val wal_truncate_after : t -> op_number:int -> unit
 
   (** 0 if the WAL is empty. *)

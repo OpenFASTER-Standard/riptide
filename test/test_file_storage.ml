@@ -139,6 +139,80 @@ let test_truncate_after () =
       Alcotest.(check (option string)) "new entry 2 present" (Some "replaces old entry 2")
         (File_storage.wal_read t ~op_number:2))
 
+(* FINAL-REVIEW FINDING I3: [wal_truncate_after] must be DURABLE, like every other write in this
+   module, not merely an in-memory counter decrement.
+
+   It used to lower [highest_op_number] and nothing else. The truncated entries' headers and data
+   stayed on disk, so [recover_highest_op_number] found them again on the next [create] and
+   RESURRECTED them -- [Memory_storage], which physically deletes, diverged from this module on the
+   one operation whose whole purpose is to make entries go away. That divergence was structurally
+   invisible to [test_storage_shared.ml]'s conformance suite, which has no reopen case at all
+   (Memory_storage has no restart semantics to have one against), so it needs a test here.
+
+   Why it matters rather than being cosmetic: a truncation is how a view change discards an
+   uncommitted suffix. With a non-durable truncate, a crash between the truncate and the superblock
+   write brings the replica back with the DISCARDED entries readable and presented as real, live
+   log entries in its next DoViewChange -- stale values a peer can then adopt. With a durable one
+   the same crash leaves those slots unreadable-in-range, i.e. VSR.tla's "corrupt", which is the
+   conservative direction the whole storage model is built on. *)
+let test_truncate_after_survives_reopen () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       for op = 1 to 5 do
+         File_storage.wal_append t ~op_number:op (Printf.sprintf "e%d" op)
+       done;
+       File_storage.wal_truncate_after t ~op_number:2;
+       Alcotest.(check int) "truncated in memory" 2 (File_storage.wal_highest_op_number t));
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      Alcotest.(check int) "the truncation survived the reopen -- entries 3..5 are NOT resurrected"
+        2 (File_storage.wal_highest_op_number t2);
+      List.iter
+        (fun op ->
+          Alcotest.(check (option string))
+            (Printf.sprintf "op %d stays gone after reopen" op)
+            None
+            (File_storage.wal_read t2 ~op_number:op))
+        [ 3; 4; 5 ];
+      (* The surviving prefix is untouched, which is the other half of "durable": a truncate must
+         not take anything below its own boundary with it. *)
+      Alcotest.(check (option string)) "op 2 survived" (Some "e2") (File_storage.wal_read t2 ~op_number:2);
+      Alcotest.(check (option string)) "op 1 survived" (Some "e1") (File_storage.wal_read t2 ~op_number:1);
+      (* And the reopened backend is usable: the next append continues from the truncated point. *)
+      File_storage.wal_append t2 ~op_number:3 "written after the reopen";
+      Alcotest.(check (option string)) "op 3 is the newly written entry, not the resurrected one"
+        (Some "written after the reopen")
+        (File_storage.wal_read t2 ~op_number:3))
+
+(* The same property where the ring makes it least obvious: a truncation spanning MORE op-numbers
+   than the ring has slots. Every distinct slot must be invalidated exactly once, and nothing that
+   is still live may be taken down with it. *)
+let test_truncate_after_survives_reopen_past_a_full_ring () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:3 dir in
+       for op = 1 to 10 do
+         File_storage.wal_append t ~op_number:op (Printf.sprintf "e%d" op)
+       done;
+       (* 10 -> 8 discards two ops across a ring of 3; ops 1..7 are already physically evicted. *)
+       File_storage.wal_truncate_after t ~op_number:8);
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:3 dir in
+      Alcotest.(check int) "highest is the truncated value, not the resurrected 10" 8
+        (File_storage.wal_highest_op_number t2);
+      Alcotest.(check (option string)) "op 8 (still live) survived" (Some "e8")
+        (File_storage.wal_read t2 ~op_number:8);
+      List.iter
+        (fun op ->
+          Alcotest.(check (option string))
+            (Printf.sprintf "op %d stays gone after reopen" op)
+            None
+            (File_storage.wal_read t2 ~op_number:op))
+        [ 9; 10 ])
+
 let test_truncate_after_is_noop_above_highest () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -315,6 +389,12 @@ let tests =
     ("ring wraps around, evicting the oldest entry", `Quick, test_ring_wraps_around);
     ("custom ?ring_capacity is honored", `Quick, test_custom_ring_capacity_is_honored);
     ("wal_truncate_after discards later entries", `Quick, test_truncate_after);
+    ( "I3: wal_truncate_after is DURABLE -- truncated entries are not resurrected by a reopen",
+      `Quick,
+      test_truncate_after_survives_reopen );
+    ( "I3: the same, for a truncation spanning more op-numbers than the ring has slots",
+      `Quick,
+      test_truncate_after_survives_reopen_past_a_full_ring );
     ( "wal_truncate_after is a no-op above the current highest",
       `Quick,
       test_truncate_after_is_noop_above_highest );
