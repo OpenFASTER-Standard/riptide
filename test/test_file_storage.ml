@@ -259,6 +259,48 @@ let test_highest_op_number_recovered_across_reopen_with_ring_layout () =
         (Some (Printf.sprintf "entry-%d" (ring_capacity + 2)))
         (File_storage.wal_read t2 ~op_number:(ring_capacity + 2)))
 
+(* --- Task 3: 3-copy superblock with flexible read/write quorum --- *)
+
+let test_superblock_write_then_read () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      File_storage.superblock_write t "view=3,commit=7";
+      Alcotest.(check (option string)) "superblock read back" (Some "view=3,commit=7")
+        (File_storage.superblock_read t))
+
+let test_superblock_survives_one_corrupted_copy () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       File_storage.superblock_write t "view=5,commit=10");
+      let copy0 = Filename.concat dir "superblock-0" in
+      let oc = open_out_bin copy0 in
+      output_string oc "garbage, wrong length and checksum";
+      close_out oc;
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      Alcotest.(check (option string)) "majority (2 of 3) still readable" (Some "view=5,commit=10")
+        (File_storage.superblock_read t2))
+
+let test_superblock_none_without_majority () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       File_storage.superblock_write t "view=1,commit=0");
+      List.iter
+        (fun i ->
+          let oc = open_out_bin (Filename.concat dir (Printf.sprintf "superblock-%d" i)) in
+          output_string oc "garbage"; close_out oc)
+        [ 0; 1 ];
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      Alcotest.(check (option string)) "2 of 3 corrupted -- no majority, honest None" None
+        (File_storage.superblock_read t2))
+
 let tests =
   [
     ("write then read, same handle", `Quick, test_write_then_read_same_handle);
@@ -284,4 +326,11 @@ let tests =
     ( "highest op number recovered across reopen, with ring layout",
       `Quick,
       test_highest_op_number_recovered_across_reopen_with_ring_layout );
+    ("superblock write then read", `Quick, test_superblock_write_then_read);
+    ( "superblock read survives one corrupted copy (majority)",
+      `Quick,
+      test_superblock_survives_one_corrupted_copy );
+    ( "superblock read returns None without a majority (2 of 3 corrupted)",
+      `Quick,
+      test_superblock_none_without_majority );
   ]

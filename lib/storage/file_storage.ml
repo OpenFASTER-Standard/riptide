@@ -71,21 +71,40 @@
    - The installed Eio 0.12's [Eio.Path] has no [kind]/[stat]-on-a-path existence check (only
      [File.stat] on an already-{e open} file), so {!create} cannot check-then-create a directory
      the way an initial sketch assumed. It instead just attempts [Eio.Path.mkdir] and ignores the
-     [Eio.Io] ([EEXIST]) that raises when [dir_path] already exists. *)
+     [Eio.Io] ([EEXIST]) that raises when [dir_path] already exists.
+
+   {b Task 3: the superblock.} 3 independent files, [superblock-0]..[superblock-2] in the same
+   storage directory -- physically separate files rather than slots in one shared file, so a
+   whole-file corruption of one copy can never take a second copy down with it. Each file holds
+   exactly one record, reusing the ring WAL's own header-then-data shape from above ([op_number]
+   unused here, always encoded as 0) at fixed offsets 0 / [header_slot_size]. The flexible
+   quorum (Decision 6): {!superblock_write} requires all 3 writes to succeed (the strict side);
+   {!superblock_read} re-verifies each copy's own checksum independently and returns [Some] only
+   if at least 2 of the (up to 3) verified copies agree byte-for-byte, tolerating up to 1
+   corrupted or missing copy. *)
 
 type header = { op_number : int; length : int; checksum : string }
 
+(* A single open file plus its current O_DIRECT-capability state -- shared by the ring WAL file
+   and each of the superblock's 3 copies (Task 3) so the O_DIRECT-with-automatic-O_DSYNC-
+   fallback dance ({!perform_write}/{!perform_read}/{!downgrade_to_dsync_only} below) is written
+   once and reused across all of them, rather than duplicated per file. *)
+type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_capable : bool }
+
 type t = {
   sw : Eio.Switch.t;
-  ring_path : string;
+  ring : file_handle;
   ring_capacity : int;
-  mutable fd : Eio_unix.Fd.t;
-  mutable direct_capable : bool;
   mutable highest_op_number : int;
+  superblocks : file_handle array;
+      (* [superblock_copies] (3) independent files -- see this file's own top comment,
+         "Task 3: the superblock", for the on-disk layout and quorum this backs. *)
 }
 
 let ring_file_name = "ring"
 let default_ring_capacity = 8
+let superblock_copies = 3
+let superblock_file_name i = Printf.sprintf "superblock-%d" i
 
 (* One page. Also this box's own confirmed [O_DIRECT] memory/offset/length alignment
    requirement on both its ext4 and overlayfs mounts (see this file's top comment) -- used
@@ -142,41 +161,58 @@ let decode_header s =
     checksum = String.sub s 16 32;
   }
 
-(* Closes [t]'s current (O_DIRECT) fd and reopens the same ring file with [O_DSYNC] alone --
-   permanent for the rest of this [t]'s lifetime, mirroring Task 1's own ruling for the
+(* Opens [path] O_DIRECT-capable if the filesystem allows it, falling back to [O_DSYNC] alone
+   otherwise -- the same open-with-fallback [create] itself used to do inline for the ring file
+   alone; factored out here so it's shared with the superblock's 3 files too (Task 3). *)
+let open_file_handle ~sw path =
+  try
+    let fd =
+      Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_direct
+        ~perm:0o600 ~resolve:Uring.Resolve.empty path
+    in
+    { path; fd; direct_capable = true }
+  with Eio.Io _ ->
+    let fd =
+      Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
+        ~perm:0o600 ~resolve:Uring.Resolve.empty path
+    in
+    { path; fd; direct_capable = false }
+
+(* Closes [h]'s current (O_DIRECT) fd and reopens the same file with [O_DSYNC] alone --
+   permanent for the rest of this handle's lifetime, mirroring Task 1's own ruling for the
    filesystems where [O_DIRECT] genuinely doesn't work (e.g. tmpfs rejects it outright). Only
-   ever called after a real [Eio.Io] failure while [t.direct_capable] was still [true]; see
+   ever called after a real [Eio.Io] failure while [h.direct_capable] was still [true]; see
    this file's top comment for why this is believed to be a dead path on this box's own
    mounts (ext4, overlayfs) rather than the routine case it was for Task 1. *)
-let downgrade_to_dsync_only t =
-  if t.direct_capable then begin
-    ignore (Eio_unix.Fd.close t.fd);
-    t.fd <-
-      Eio_linux.Low_level.openat2 ~sw:t.sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
-        ~perm:0o600 ~resolve:Uring.Resolve.empty t.ring_path;
-    t.direct_capable <- false
+let downgrade_to_dsync_only ~sw (h : file_handle) =
+  if h.direct_capable then begin
+    ignore (Eio_unix.Fd.close h.fd);
+    h.fd <-
+      Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
+        ~perm:0o600 ~resolve:Uring.Resolve.empty h.path;
+    h.direct_capable <- false
   end
 
-let perform_write t ~offset (buf : Cstruct.t) =
+let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   let rec go () =
-    try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) t.fd [ buf ]
-    with Eio.Io _ when t.direct_capable ->
-      downgrade_to_dsync_only t;
+    try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ]
+    with Eio.Io _ when h.direct_capable ->
+      downgrade_to_dsync_only ~sw h;
       go ()
   in
   go ()
 
 (* [None] means "nothing durable at this offset yet" (a short/empty read -- i.e. this part of
-   the ring file has never been written, whether because it's a fresh ring or because [t]'s
-   [ring_capacity] differs from a previous run and this slot is past the old high-water mark).
-   Any other outcome either returns exactly the [len] bytes requested or raises. *)
-let perform_read t ~offset ~len =
+   the file has never been written, whether because it's fresh or because [t]'s [ring_capacity]
+   differs from a previous run and this slot is past the old high-water mark). Any other outcome
+   either returns exactly the [len] bytes requested or raises. *)
+let perform_read ~sw (h : file_handle) ~offset ~len =
   let buf = alloc_aligned_buffer len in
   let rec go () =
-    match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) t.fd [ buf ] with
+    match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
     | exception End_of_file -> None
-    | exception Eio.Io _ when t.direct_capable ->
-      downgrade_to_dsync_only t;
+    | exception Eio.Io _ when h.direct_capable ->
+      downgrade_to_dsync_only ~sw h;
       go ()
     | n -> if n = len then Some buf else None
   in
@@ -186,10 +222,10 @@ let write_header t ~slot ~op_number ~length ~checksum =
   let encoded = encode_header ~op_number ~length ~checksum in
   let buf = alloc_aligned_buffer header_slot_size in
   Cstruct.blit_from_string encoded 0 buf 0 header_slot_size;
-  perform_write t ~offset:(header_offset ~slot) buf
+  perform_write ~sw:t.sw t.ring ~offset:(header_offset ~slot) buf
 
 let read_header t ~slot =
-  match perform_read t ~offset:(header_offset ~slot) ~len:header_slot_size with
+  match perform_read ~sw:t.sw t.ring ~offset:(header_offset ~slot) ~len:header_slot_size with
   | None -> None
   | Some buf -> Some (decode_header (Cstruct.to_string buf))
 
@@ -198,12 +234,12 @@ let write_data t ~slot data =
   (* [buf] is already zero-filled (freshly [ftruncate]d backing file) beyond [data]'s own
      length, so no separate zero-padding step is needed before writing the full slot. *)
   Cstruct.blit_from_string data 0 buf 0 (String.length data);
-  perform_write t ~offset:(data_offset t ~slot) buf
+  perform_write ~sw:t.sw t.ring ~offset:(data_offset t ~slot) buf
 
 let read_data t ~slot ~length =
   if length < 0 || length > data_slot_size then None
   else
-    match perform_read t ~offset:(data_offset t ~slot) ~len:data_slot_size with
+    match perform_read ~sw:t.sw t.ring ~offset:(data_offset t ~slot) ~len:data_slot_size with
     | None -> None
     | Some buf -> Some (Cstruct.to_string ~len:length buf)
 
@@ -231,18 +267,12 @@ let recover_highest_op_number t =
 
 let create ~sw ~fs ?(ring_capacity = default_ring_capacity) dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
-  let ring_path = Filename.concat dir_path ring_file_name in
-  let fd, direct_capable =
-    try
-      ( Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_direct
-          ~perm:0o600 ~resolve:Uring.Resolve.empty ring_path,
-        true )
-    with Eio.Io _ ->
-      ( Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
-          ~perm:0o600 ~resolve:Uring.Resolve.empty ring_path,
-        false )
+  let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
+  let superblocks =
+    Array.init superblock_copies (fun i ->
+        open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
   in
-  let t = { sw; ring_path; ring_capacity; fd; direct_capable; highest_op_number = 0 } in
+  let t = { sw; ring; ring_capacity; highest_op_number = 0; superblocks } in
   t.highest_op_number <- recover_highest_op_number t;
   t
 
@@ -284,5 +314,58 @@ let wal_highest_op_number t = t.highest_op_number
 let wal_truncate_after t ~op_number =
   if op_number < t.highest_op_number then t.highest_op_number <- op_number
 
-let superblock_write (_ : t) (_ : string) = failwith "not implemented until Task 3"
-let superblock_read (_ : t) = failwith "not implemented until Task 3"
+(* Each superblock file holds exactly one record (unlike the ring, which packs many slots into
+   one shared file) -- so there's only ever one header offset and one data offset, both fixed,
+   mirroring a single WAL slot's own header-then-data layout (see this file's own top comment,
+   "Task 3: the superblock"). *)
+let superblock_header_offset = 0
+let superblock_data_offset = header_slot_size
+
+let write_superblock_copy t (h : file_handle) data =
+  let len = String.length data in
+  if len > max_entry_size then
+    invalid_arg
+      (Printf.sprintf
+         "superblock_write: data of %d bytes exceeds the superblock's max size of %d bytes (one \
+          aligned data slot)"
+         len max_entry_size);
+  let checksum = checksum_of data in
+  let header_buf = alloc_aligned_buffer header_slot_size in
+  Cstruct.blit_from_string
+    (encode_header ~op_number:0 ~length:len ~checksum)
+    0 header_buf 0 header_slot_size;
+  perform_write ~sw:t.sw h ~offset:superblock_header_offset header_buf;
+  let data_buf = alloc_aligned_buffer data_slot_size in
+  Cstruct.blit_from_string data 0 data_buf 0 len;
+  perform_write ~sw:t.sw h ~offset:superblock_data_offset data_buf
+
+(* [None] covers every way a single copy can fail to verify: missing/short file, a header that
+   doesn't even read back as [header_slot_size] bytes, a decoded length outside the one aligned
+   data slot this module ever writes, or (the main case) a checksum mismatch against that copy's
+   own data. Never raises on a corrupted copy -- corruption here is an expected, tolerated
+   condition, not a bug. *)
+let read_superblock_copy t (h : file_handle) =
+  match perform_read ~sw:t.sw h ~offset:superblock_header_offset ~len:header_slot_size with
+  | None -> None
+  | Some header_buf -> (
+    let header = decode_header (Cstruct.to_string header_buf) in
+    if header.length < 0 || header.length > data_slot_size then None
+    else
+      match perform_read ~sw:t.sw h ~offset:superblock_data_offset ~len:data_slot_size with
+      | None -> None
+      | Some data_buf ->
+        let data = Cstruct.to_string ~len:header.length data_buf in
+        if checksum_of data = header.checksum then Some data else None)
+
+(* Write is the strict side of the flexible quorum (Decision 6): all 3 copies must durably
+   succeed, or this raises (via [perform_write]'s own propagation, same as [wal_append] never
+   catching a genuine I/O failure either) rather than silently leaving some copies stale. *)
+let superblock_write t data = Array.iter (fun h -> write_superblock_copy t h data) t.superblocks
+
+(* Read is the tolerant side: verify all (up to 3) copies independently, then return [Some]
+   only if at least 2 of the verified ones agree byte-for-byte -- up to 1 corrupted or missing
+   copy is tolerated, 2 corrupted/missing is an honest [None] rather than trusting a lone
+   survivor. Re-reads from disk on every call, no cached field on [t], matching [wal_read]. *)
+let superblock_read t =
+  let verified = List.filter_map (read_superblock_copy t) (Array.to_list t.superblocks) in
+  List.find_opt (fun x -> List.length (List.filter (String.equal x) verified) >= 2) verified
