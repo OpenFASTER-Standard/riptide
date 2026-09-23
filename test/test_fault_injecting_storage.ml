@@ -145,6 +145,107 @@ let test_wal_truncate_after_clears_dropped_slots () =
         (Some "real data written after the truncate")
         (Fault_injecting_storage.wal_read t ~op_number:1))
 
+(* ============================================================================================
+   Task 8's own addition: [for_test_corrupt_entry], the DETERMINISTIC counterpart of the
+   probabilistic [corrupt_probability] path above. A cluster test that wants to prove recovery
+   from a specific replica's specific corrupted op-number cannot use the probabilistic path at
+   all: that one only ever fires at *write* time, on whichever appends happen to draw it, and a
+   test that has already settled a cluster into a known-good state has no write left to attach it
+   to. Everything below runs against a real [File_storage] (not [Memory_storage]) on purpose --
+   these are the tests that have to prove the bytes on the actual disk changed. *)
+
+let with_wrapped_and_underlying ?fault_config ~replication_quorum ~seed f =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let prng = Riptide_sim.Prng.create seed in
+      let t =
+        Fault_injecting_storage.create ~prng ?fault_config ~replication_quorum
+          ~underlying:(module File_storage) underlying
+      in
+      f t underlying)
+
+(* The core claim, and the reason this function exists rather than the test poking [wal_read]'s
+   result: the corruption is REAL and ON DISK. Proven three independent ways in one test --
+   (a) through this wrapper, the slot reads [None]; (b) through the underlying [File_storage]
+   directly, bypassing this wrapper's own [corrupted_slots] mask entirely, the bytes that come
+   back are NOT the ones that were written (the flip really reached the durable representation,
+   which is exactly what a later reader that does not share this wrapper's in-memory bookkeeping
+   would see); (c) [wal_highest_op_number] is UNCHANGED, which is what makes this VSR.tla's
+   "corrupt" state rather than its "absent" state -- the distinction the whole nack-soundness
+   argument rests on (see [Memory_storage.for_test_corrupt]'s own doc comment). *)
+let test_for_test_corrupt_entry_really_corrupts_the_durable_entry () =
+  with_wrapped_and_underlying ~replication_quorum:3 ~seed:7 (fun t underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "entry one";
+      Fault_injecting_storage.wal_append t ~op_number:2 "entry two, the victim";
+      Fault_injecting_storage.wal_append t ~op_number:3 "entry three";
+      Fault_injecting_storage.for_test_corrupt_entry t ~op_number:2;
+      Alcotest.(check (option string)) "(a) the corrupted slot reads back None through the wrapper" None
+        (Fault_injecting_storage.wal_read t ~op_number:2);
+      Alcotest.(check bool)
+        "(b) and the bytes on the real File_storage underneath are genuinely no longer the original"
+        true
+        (File_storage.wal_read underlying ~op_number:2 <> Some "entry two, the victim");
+      Alcotest.(check int) "(c) wal_highest_op_number is untouched: this is CORRUPT, never ABSENT" 3
+        (Fault_injecting_storage.wal_highest_op_number t);
+      (* The neighbours are collateral this must not damage: corrupting a MIDDLE entry goes through
+         a truncate-and-rewrite (Storage_intf.S has no random-access write), so the suffix above it
+         has to be restored byte-for-byte. *)
+      Alcotest.(check (option string)) "the entry below the victim is untouched" (Some "entry one")
+        (Fault_injecting_storage.wal_read t ~op_number:1);
+      Alcotest.(check (option string)) "the entry ABOVE the victim survived the rewrite verbatim"
+        (Some "entry three")
+        (Fault_injecting_storage.wal_read t ~op_number:3))
+
+(* The cap is the same one the probabilistic path enforces (Decision 7) -- deliberately NOT
+   bypassed just because this entry point is explicit and test-only. One invariant, one meaning,
+   whichever path got there: this wrapper never holds more than [faults_max] live corrupted slots. *)
+let test_for_test_corrupt_entry_respects_faults_max () =
+  with_wrapped_and_underlying ~replication_quorum:2 (* faults_max = 1 *) ~seed:8 (fun t _underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "a";
+      Fault_injecting_storage.wal_append t ~op_number:2 "b";
+      Fault_injecting_storage.for_test_corrupt_entry t ~op_number:1;
+      Alcotest.check_raises "a second live corrupted slot exceeds faults_max = 1"
+        (Invalid_argument "faults_max exceeded") (fun () ->
+          Fault_injecting_storage.for_test_corrupt_entry t ~op_number:2))
+
+(* An op-number with nothing durable behind it must RAISE, never be a silent no-op. A silent no-op
+   is the specific failure mode that makes a corruption-recovery test pass vacuously: the test
+   believes it injected a fault, nothing was injected, and the "recovery" it then asserts is just
+   an ordinary fault-free run. ([Memory_storage.for_test_corrupt] is documented as a no-op out of
+   range; this one deliberately diverges, because its only callers are tests whose whole premise is
+   that the fault landed.) *)
+let test_for_test_corrupt_entry_raises_out_of_range_rather_than_silently_doing_nothing () =
+  with_wrapped_and_underlying ~replication_quorum:3 ~seed:9 (fun t _underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "only entry";
+      Alcotest.check_raises "above the durable range"
+        (Invalid_argument "for_test_corrupt_entry: no readable durable entry at that op_number")
+        (fun () -> Fault_injecting_storage.for_test_corrupt_entry t ~op_number:2);
+      Alcotest.check_raises "below the durable range (op-numbers are 1-indexed)"
+        (Invalid_argument "for_test_corrupt_entry: no readable durable entry at that op_number")
+        (fun () -> Fault_injecting_storage.for_test_corrupt_entry t ~op_number:0);
+      Alcotest.(check (option string)) "and the real entry was left completely alone"
+        (Some "only entry")
+        (Fault_injecting_storage.wal_read t ~op_number:1))
+
+(* [wal_truncate_after] must free a [for_test_corrupt_entry]-corrupted slot's bookkeeping exactly
+   the way it frees a probabilistically-corrupted one -- the property the cluster tests' durable
+   REPAIR assertions rest on: [Replica]'s own log adoption truncates to the longest correct prefix
+   and re-appends, so a slot that stayed masked forever would make a genuinely repaired entry still
+   read back as [None]. *)
+let test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate () =
+  with_wrapped_and_underlying ~replication_quorum:3 ~seed:10 (fun t _underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "a";
+      Fault_injecting_storage.wal_append t ~op_number:2 "b";
+      Fault_injecting_storage.for_test_corrupt_entry t ~op_number:2;
+      Alcotest.(check (option string)) "corrupted" None (Fault_injecting_storage.wal_read t ~op_number:2);
+      Fault_injecting_storage.wal_truncate_after t ~op_number:1;
+      Fault_injecting_storage.wal_append t ~op_number:2 "b, rewritten by a repair";
+      Alcotest.(check (option string)) "the repaired entry is readable again, not masked by stale bookkeeping"
+        (Some "b, rewritten by a repair")
+        (Fault_injecting_storage.wal_read t ~op_number:2))
+
 let tests =
   [ ( "corrupt_probability = 1.0 really corrupts (wal_read returns None)", `Quick,
       test_corrupt_probability_one_makes_read_return_none );
@@ -156,5 +257,12 @@ let tests =
     ( "a drop followed by a legitimate sequential append does not raise", `Quick,
       test_drop_then_legitimate_append_does_not_raise );
     ( "wal_truncate_after clears dropped_slots bookkeeping the same way it clears corrupted_slots",
-      `Quick, test_wal_truncate_after_clears_dropped_slots )
+      `Quick, test_wal_truncate_after_clears_dropped_slots );
+    ( "for_test_corrupt_entry really corrupts the durable entry, leaving its neighbours intact",
+      `Quick, test_for_test_corrupt_entry_really_corrupts_the_durable_entry );
+    ("for_test_corrupt_entry respects faults_max too", `Quick, test_for_test_corrupt_entry_respects_faults_max);
+    ( "for_test_corrupt_entry raises out of range rather than silently doing nothing", `Quick,
+      test_for_test_corrupt_entry_raises_out_of_range_rather_than_silently_doing_nothing );
+    ( "a for_test_corrupt_entry slot's bookkeeping is cleared by a truncate, so a repair is visible",
+      `Quick, test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate )
   ]

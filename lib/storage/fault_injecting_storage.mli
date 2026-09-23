@@ -104,6 +104,45 @@ val create :
     the cap even after it is no longer really live -- a conservative (never permits more live
     faults than intended), not unsafe, approximation. *)
 
+val for_test_corrupt_entry : t -> op_number:int -> unit
+(** [for_test_corrupt_entry t ~op_number] corrupts exactly that one already-written WAL entry,
+    deterministically and immediately -- the counterpart of {!fault_config}'s own
+    [corrupt_probability] for a caller that needs a SPECIFIC replica's SPECIFIC op-number to fault
+    at a SPECIFIC moment (Task 8's cluster recovery tests), which the probabilistic path
+    structurally cannot express: that one only ever fires at write time, on whichever appends
+    happen to draw it, so a test that has already settled a cluster into a known-good state has no
+    write left to attach a fault to. Named [for_test_*] to match the convention
+    {!Riptide_vsr.Replica}'s own test-support surface already uses.
+
+    {b The effect is identical to the probabilistic path's}, by construction rather than by
+    coincidence: one byte of the entry is XOR-flipped (same [flip_one_byte], same [prng] draw) and
+    written back through the wrapped backend's own [wal_append], so the corruption is REAL and
+    durable on that backend -- a differently-implemented reader that bypasses this wrapper entirely
+    sees the flipped bytes, not the original -- and the [op_number] is recorded in the same
+    [corrupted_slots] bookkeeping, so {!wal_read} of it on THIS [t] returns [None]. It is
+    consequently subject to the same caveats documented on [corrupt_probability]: the [None]-masking
+    is this [t] value's own in-memory state and does not survive a fresh {!create} over the same
+    backend, and it is cleared for a slot once that slot is truncated away (which is what lets a
+    genuine repair -- truncate to the longest correct prefix, re-append -- become visible again).
+
+    {b Counts against [faults_max] exactly like a probabilistic corruption}, raising
+    [Invalid_argument "faults_max exceeded"] rather than corrupting beyond the cap: one invariant,
+    one meaning, whichever path reached it.
+
+    {b Raises [Invalid_argument] for an [op_number] with no readable durable entry behind it}
+    (below 1, above {!wal_highest_op_number}, or already corrupted/dropped on this [t]) rather than
+    being a silent no-op -- deliberately diverging from {!Riptide_storage.Memory_storage.for_test_corrupt},
+    which documents out-of-range as a no-op. Every caller of this function is a test whose whole
+    premise is that the fault landed; a silent no-op there does not fail, it produces a
+    fault-free run wearing a corruption test's name.
+
+    {b [wal_highest_op_number] is deliberately UNCHANGED}: this moves exactly one slot from
+    VSR.tla's ["present"] to its ["corrupt"] state, never to ["absent"] -- a slot the replica
+    durably wrote must never read back as provably-empty, or two replicas could jointly "prove" a
+    committed op was never held. A caller that wants ["absent"] wants {!wal_truncate_after}. Entries
+    above [op_number] are preserved byte-for-byte (reaching an already-written slot at all requires
+    truncating back to it first, since {!Storage_intf.S} has no random-access write). *)
+
 val set_fault_config : t -> fault_config -> unit
 (** Replaces [t]'s fault config for every subsequent [wal_append], without touching any
     already-recorded [corrupted_slots]/[dropped_slots] bookkeeping for op_numbers appended under

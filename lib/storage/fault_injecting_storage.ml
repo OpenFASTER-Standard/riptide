@@ -124,6 +124,57 @@ let wal_highest_op_number (T r) =
   let module U = (val r.module_) in
   U.wal_highest_op_number r.value
 
+(* The DETERMINISTIC counterpart of the [corrupt_probability] path above -- see the .mli for the
+   full rationale. Two implementation points worth stating next to the code:
+
+   1. WHY TRUNCATE-AND-REWRITE RATHER THAN AN IN-PLACE PATCH. [Storage_intf.S] has no
+      random-access write at all: [wal_append] extends by exactly one op_number and rejects
+      anything else. So the only way to reach an ALREADY-WRITTEN slot through the wrapped
+      backend's own machinery -- which is the point, the bytes must really change on the real
+      backend, not merely be masked here -- is to truncate back to just below it, rewrite it
+      flipped, and re-append whatever was above it. [replica.ml]'s own [adopt_durable_log] repairs
+      a corrupt slot by exactly the same three moves, for exactly the same reason.
+   2. WHY [U.*] DIRECTLY RATHER THAN THIS MODULE'S OWN [wal_truncate_after]/[wal_append]. Going
+      through this module's own operations would (a) run the truncate's [corrupted_slots]/
+      [dropped_slots] filter, wiping the bookkeeping for every slot above the victim even though
+      those slots are about to be restored verbatim, and (b) subject the restoring appends to the
+      probabilistic fault path, so restoring the suffix could itself inject unrelated faults. The
+      wrapped backend's own operations are the right level here; this function maintains the
+      wrapper's bookkeeping itself, in the one place it actually changes. *)
+let for_test_corrupt_entry (T r) ~op_number =
+  let module U = (val r.module_) in
+  let highest = U.wal_highest_op_number r.value in
+  let original =
+    if op_number < 1 || op_number > highest then None
+    else if Int_set.mem op_number r.dropped_slots then None
+    else U.wal_read r.value ~op_number
+  in
+  match original with
+  | None -> invalid_arg "for_test_corrupt_entry: no readable durable entry at that op_number"
+  | Some original ->
+    (* The same Decision 7 cap the probabilistic path enforces, for the same reason -- an explicit
+       test-only entry point is not a licence to exceed what the replication protocol can
+       tolerate. Note this counts slots ALREADY corrupted, so re-corrupting a slot that is already
+       in [corrupted_slots] is unreachable here: it has no readable entry, so it failed above. *)
+    if Int_set.cardinal r.corrupted_slots >= r.faults_max then invalid_arg "faults_max exceeded";
+    (* Everything strictly above the victim, as the wrapped backend itself sees it, so it can be
+       restored byte-for-byte. A slot the WRAPPED backend cannot read (already corrupt beneath
+       this wrapper) has no bytes to restore; it is rewritten as an empty entry, which is still
+       not a decodable value to any reader -- so it stays "holds something unreadable" (VSR.tla's
+       "corrupt"), never "provably never written" ("absent"), which is the distinction the whole
+       nack-soundness argument rests on. This wrapper's own [corrupted_slots]/[dropped_slots]
+       bookkeeping for those slots is deliberately left in place, so they also keep reading back
+       as [None] from here. *)
+    let suffix =
+      List.init (highest - op_number) (fun i ->
+          let o = op_number + 1 + i in
+          (o, U.wal_read r.value ~op_number:o))
+    in
+    U.wal_truncate_after r.value ~op_number:(op_number - 1);
+    U.wal_append r.value ~op_number (flip_one_byte r.prng original);
+    List.iter (fun (o, bytes) -> U.wal_append r.value ~op_number:o (Option.value bytes ~default:"")) suffix;
+    r.corrupted_slots <- Int_set.add op_number r.corrupted_slots
+
 let superblock_write (T r) data =
   let module U = (val r.module_) in
   U.superblock_write r.value data
