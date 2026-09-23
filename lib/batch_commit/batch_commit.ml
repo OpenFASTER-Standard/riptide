@@ -5,6 +5,7 @@ type write = {
   causation : Envelope.event_id;
   correlation : Envelope.event_id;
   payload : Value.value;
+  merge_key : string option;
 }
 
 (* ---- write <-> Value.value ----
@@ -17,6 +18,13 @@ type write = {
    Replica.entries never took that round-trip -- the two can have DIFFERENT in-memory field
    orders for the exact same logical batch. *)
 
+(* merge_key <-> Value.value: a Sum-tagged encoding, the same tagging convention
+   lib/vsr/message.ml already uses for its own variant wire shapes ("none"/"some" rather than a
+   native Option case, since Value.value has none). *)
+let merge_key_to_value = function
+  | None -> Value.Sum ("none", Value.Record [])
+  | Some k -> Value.Sum ("some", Value.Scalar (Value.String k))
+
 let write_to_value (w : write) : Value.value =
   Value.Record
     [
@@ -24,9 +32,21 @@ let write_to_value (w : write) : Value.value =
       ("causation", Value.Scalar (Value.Bytes w.causation));
       ("correlation", Value.Scalar (Value.Bytes w.correlation));
       ("payload", w.payload);
+      ("merge_key", merge_key_to_value w.merge_key);
     ]
 
 let field_opt fields name = List.assoc_opt name fields
+
+(* [None] (missing field entirely) is backward-compatible with every batch committed before this
+   field existed -- decodes as [Some None], i.e. a well-formed write with no merge_key, exactly as
+   if it had been proposed with [merge_key = None] all along. A field that IS present but not
+   shaped like [merge_key_to_value]'s own encoding is a genuinely malformed write, same discipline
+   as actor/causation/correlation/payload below: [None] here voids the whole write. *)
+let merge_key_of_field = function
+  | None -> Some None
+  | Some (Value.Sum ("none", Value.Record [])) -> Some None
+  | Some (Value.Sum ("some", Value.Scalar (Value.String k))) -> Some (Some k)
+  | Some _ -> None
 
 (* causation/correlation are Envelope.event_id = Value.hash, documented in lib/value.mli as "Raw
    32-byte SHA-256 digest" -- Value.hash_to_hex raises Invalid_argument on anything else. A
@@ -42,12 +62,13 @@ let write_of_value (v : Value.value) : write option =
       ( field_opt fields "actor",
         field_opt fields "causation",
         field_opt fields "correlation",
-        field_opt fields "payload" )
+        field_opt fields "payload",
+        merge_key_of_field (field_opt fields "merge_key") )
     with
     | Some (Value.Scalar (Value.String actor)), Some (Value.Scalar (Value.Bytes causation)),
-      Some (Value.Scalar (Value.Bytes correlation)), Some payload
+      Some (Value.Scalar (Value.Bytes correlation)), Some payload, Some merge_key
       when String.length causation = 32 && String.length correlation = 32 ->
-      Some { actor; causation; correlation; payload }
+      Some { actor; causation; correlation; payload; merge_key }
     | _ -> None)
   | _ -> None
 
@@ -85,9 +106,26 @@ let already_committed (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : 
     (fun v -> match batch_of_value v with Some (key, _) -> String.equal key idempotency_key | None -> false)
     (committed_batch_values t)
 
-let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) (writes : write list) : unit =
+type materialize_sink = { write : merge_key:string -> Value.value -> unit }
+
+let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materialize : materialize_sink option)
+    (writes : write list) : unit =
   if already_committed t ~idempotency_key then ()
-  else Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes)
+  else begin
+    Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes);
+    match materialize with
+    | None -> ()
+    | Some sink ->
+      (* Reuses the SAME commit-confirmation mechanism [already_committed] above already is --
+         see batch_commit.mli's own [propose] doc comment for why this, rather than a new,
+         separate notification path. Only fires for a commit this same call itself observes (the
+         degenerate replica_count = 1 case) -- see that doc comment's own "Scope" paragraph. *)
+      if already_committed t ~idempotency_key then
+        List.iter
+          (fun (w : write) ->
+            match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
+          writes
+  end
 
 let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
   let seen_keys = Hashtbl.create 16 in

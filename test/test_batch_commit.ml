@@ -13,8 +13,8 @@ let create_solo () =
   let send ~to_:_ (_ : string) = () in
   Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send
 
-let w ~actor ~causation ~correlation payload : Batch_commit.write =
-  { actor; causation; correlation; payload }
+let w ~actor ~causation ~correlation ?(merge_key = None) payload : Batch_commit.write =
+  { actor; causation; correlation; payload; merge_key }
 
 let test_empty_batch_commits_as_zero_envelopes () =
   let t = create_solo () in

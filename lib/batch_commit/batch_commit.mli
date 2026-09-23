@@ -14,11 +14,25 @@ type write = {
   causation : Riptide.Envelope.event_id;
   correlation : Riptide.Envelope.event_id;
   payload : Riptide.Value.value;
+  merge_key : string option;
 }
 (** One write within a batch -- everything {!Riptide.Envelope.envelope} needs except
     [predecessor_hash]/[sequence], which {!committed_envelopes} computes deterministically from
     each write's position once its batch commits, the same way {!Riptide.Log.append} computes
-    them for a locally-appended entry. *)
+    them for a locally-appended entry.
+
+    [merge_key] (task-master subtask 3.7's own closing mechanism, for writes that opt in): when
+    [Some k] and this write commits via {!propose}'s own [~materialize] argument, [payload] is
+    durably folded into a {!Riptide_materialize.Materializer}'s accumulator at key [k],
+    SYNCHRONOUSLY, as part of the very {!propose} call that commits it -- see {!materialize_sink}
+    and {!propose}'s own doc comment for the exact mechanism and its scope. [None] (the only
+    option before this field existed) leaves a write exactly as vulnerable to
+    {!Riptide_storage.File_storage}'s bounded ring WAL evicting it as before -- a disclosed,
+    intentional scope boundary, not a bug. On the wire ({!write_of_value}, not exposed by this
+    [.mli] but documented here since it governs what a REMOTE replica sees), a missing
+    [merge_key] field decodes as [None] -- backward-compatible with every batch committed before
+    this field existed -- while a field present but not shaped like this module's own encoding
+    voids the whole write, exactly like a malformed [actor]/[causation]/[correlation]/[payload]. *)
 
 val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope list
 (** [committed_envelopes t] is the real, hash-chained Envelope view of everything durably
@@ -45,8 +59,35 @@ val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope lis
 
     The result satisfies {!Riptide.Log.verify_chain_list}. *)
 
-val propose : Riptide_vsr.Replica.t -> idempotency_key:string -> write list -> unit
-(** [propose t ~idempotency_key writes] proposes [writes] as one atomic batch through
+type materialize_sink = {
+  write : merge_key:string -> Riptide.Value.value -> unit;
+}
+(** An erased, pre-applied sink for one concrete {!Riptide_materialize.Materializer}, exactly the
+    same "closure over an erased type" shape {!Riptide_vsr.Replica.storage_of_module}/[send]
+    already use in this codebase, and for the same reason: this module never becomes a functor
+    over the caller's own {!Riptide_lattice.Lattice_intf.S}/{!Riptide_storage.Kv_store_intf.S}
+    choice (Layer 2's/the caller's, per this plan's own Decision 1 -- {!Batch_commit} does not
+    hardcode a concrete lattice any more than {!Riptide_vsr.Replica} hardcodes a concrete
+    transport).
+
+    The caller builds one by pre-applying its own concrete
+    [Riptide_materialize.Materializer.Make(L)(KV).t] and its own
+    [decode : Riptide.Value.value -> L.t] (turning a write's own [payload] into the concrete
+    lattice value it represents -- this module has no way to derive that decoding itself, since it
+    never sees [L] at all), e.g.:
+    {[
+      let sink : Batch_commit.materialize_sink =
+        { write = (fun ~merge_key payload -> M.write materializer ~merge_key (decode payload)) }
+    ]}
+    By this module's own convention, a write's [payload] carrying [merge_key = Some _] IS the
+    lattice value being written -- [decode] is a pure [Value.value -> L.t] projection of it, not a
+    separate wire format; {!Riptide_materialize.Materializer.create}'s own [decode]/[encode] (a
+    DIFFERENT pair, [string -> L.t]/[L.t -> string], for the materializer's own KV codec) are
+    orthogonal to this one and not reused by it. *)
+
+val propose :
+  Riptide_vsr.Replica.t -> idempotency_key:string -> ?materialize:materialize_sink -> write list -> unit
+(** [propose t ~idempotency_key ?materialize writes] proposes [writes] as one atomic batch through
     {!Riptide_vsr.Replica.propose} -- matching that function's own fire-and-forget convention: no
     return value, no client acknowledgment. Telling a caller whether/when their batch committed is
     explicitly out of scope here (task-master Task 9's job).
@@ -62,4 +103,25 @@ val propose : Riptide_vsr.Replica.t -> idempotency_key:string -> write list -> u
     guarantee comes entirely from {!committed_envelopes}'s own first-wins-per-key dedup on the
     READ side, and holds regardless of how many times [propose] is called with the same key --
     this check is an optimization on top of an already-safe operation, not a precondition for
-    safety. *)
+    safety.
+
+    {b Materialization} (task-master subtask 3.7's own closing mechanism -- see {!write}'s own
+    [merge_key] doc comment): when [?materialize] is given, this function calls the underlying
+    {!Riptide_vsr.Replica.propose} and then immediately re-runs the SAME [idempotency_key]
+    commit-membership check {!committed_envelopes}'s own decode already performs (i.e., is this
+    exact batch now among [t]'s committed batches?) -- reusing that existing commit-confirmation
+    mechanism rather than adding a new, separate one. If and only if the batch is now committed,
+    every one of [writes] carrying [merge_key = Some k] has its [payload] handed to
+    [materialize.write ~merge_key:k] -- synchronously, before this call returns, and therefore
+    strictly before any LATER call on this replica could ever evict the WAL slot(s) this batch
+    just occupied.
+
+    {b Scope, stated precisely because it does not cover every commit path}: this hook only fires
+    for a commit this SAME [propose] call itself observes. Per {!Riptide_vsr.Replica.propose}'s
+    own doc comment, that happens unconditionally only for the degenerate [replica_count = 1]
+    ([f = 0]) cluster -- a normal [replica_count >= 3] cluster's primary never sees its own
+    proposal committed inside the [propose] call that made it (an acking quorum is required first,
+    arriving later via {!Riptide_vsr.Replica.handle_message}), so this specific hook does not
+    materialize writes committed that way. Closing that broader case is out of scope for this
+    function; see this task's own report for the full justification of why [propose]-time
+    threading was chosen over a broader hook. *)
