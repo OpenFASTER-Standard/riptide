@@ -1,0 +1,3 @@
+(library
+ (name riptide_pki)
+ (libraries x509 ptime ptime.clock.os domain-name fmt))

@@ -1,7 +1,8 @@
 (test
  (name test_riptide)
  (libraries riptide riptide_batch_commit riptide_crypto riptide_dst riptide_lattice
-   riptide_materialize riptide_sim riptide_storage riptide_transport riptide_vsr golden_fixtures
+   riptide_materialize riptide_pki riptide_sim riptide_storage riptide_transport riptide_vsr
+   golden_fixtures
    alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix
-   mirage-crypto-rng.unix str)
+   mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt)
  (deps ../spec/golden/vectors.txt))
