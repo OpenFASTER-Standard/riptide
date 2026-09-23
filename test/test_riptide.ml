@@ -85,6 +85,7 @@ let () =
          ("envelope", Test_envelope.tests);
          ("log", Test_log.tests);
          ("golden", Test_golden.tests);
+         ("lattice", Test_lattice.tests);
          ("batch_commit", Test_batch_commit.tests);
          ("batch_commit_cluster", Test_batch_commit_cluster.tests);
          ("sim_prng", Test_sim_prng.tests);

@@ -1,6 +1,6 @@
 (test
  (name test_riptide)
- (libraries riptide riptide_batch_commit riptide_dst riptide_sim riptide_storage riptide_transport
-   riptide_vsr golden_fixtures alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main
-   unix)
+ (libraries riptide riptide_batch_commit riptide_dst riptide_lattice riptide_sim riptide_storage
+   riptide_transport riptide_vsr golden_fixtures alcotest qcheck-core qcheck-alcotest eio eio.mock
+   eio_linux eio_main unix)
  (deps ../spec/golden/vectors.txt))
