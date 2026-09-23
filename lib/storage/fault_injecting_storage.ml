@@ -16,13 +16,18 @@ type t =
       module_ : (module Storage_intf.S with type t = 'a);
       value : 'a;
       prng : Riptide_sim.Prng.t;
-      fault_config : fault_config;
+      mutable fault_config : fault_config;
       faults_max : int;
       mutable corrupted_slots : Int_set.t;
           (* op_numbers this module has itself corrupted and that haven't since been truncated
              away -- see the .mli's [create] doc comment for why this is a conservative, not
              exact, count once the wrapped backend's own eviction (e.g. ring wraparound) is in
              play. *)
+      mutable dropped_slots : Int_set.t;
+          (* op_numbers this module has itself dropped and that haven't since been truncated away
+             -- see the .mli's [drop_probability] doc comment. Same masking technique as
+             [corrupted_slots], same restart-persistence limitation, deliberately *not* subject to
+             [faults_max] (see that doc comment for why). *)
     }
       -> t
 
@@ -34,8 +39,11 @@ let create (type a) ~prng ?(fault_config = default_fault_config) ~replication_qu
       prng;
       fault_config;
       faults_max = replication_quorum - 1;
-      corrupted_slots = Int_set.empty
+      corrupted_slots = Int_set.empty;
+      dropped_slots = Int_set.empty
     }
+
+let set_fault_config (T r) fault_config = r.fault_config <- fault_config
 
 (* XOR-flips one deterministically-chosen byte of [data], content-seeded via
    [Prng.int prng (String.length data)] -- so which byte gets flipped depends on both [prng]'s
@@ -61,11 +69,18 @@ let wal_append (T r) ~op_number data =
      discipline of drawing every fault decision unconditionally at the point of the call. *)
   let dropped = Riptide_sim.Prng.bool r.prng r.fault_config.drop_probability in
   let corrupt = Riptide_sim.Prng.bool r.prng r.fault_config.corrupt_probability in
-  if dropped then
-    (* Silently never delegated: the wrapped backend's own [wal_highest_op_number] does not
-       advance, and a later [wal_read t ~op_number] is [None] -- see the .mli's [drop_probability]
-       doc comment. *)
-    ()
+  if dropped then begin
+    (* Still delegated -- with empty content standing in for "nothing useful was actually
+       retained" -- so the wrapped backend's own [wal_highest_op_number] advances exactly as a
+       well-behaved caller expects (and so does this module's own, a direct passthrough below),
+       which is what keeps the caller's very next legitimate sequential [wal_append] from hitting
+       the wrapped backend's out-of-order guard. [wal_read] below unconditionally masks this
+       op_number to [None] regardless of what the wrapped backend reports -- see the .mli's
+       [drop_probability] doc comment for the full reasoning, including why an earlier version of
+       this module that skipped delegation outright was a real bug, not just an omission. *)
+    U.wal_append r.value ~op_number "";
+    r.dropped_slots <- Int_set.add op_number r.dropped_slots
+  end
   else if corrupt && String.length data > 0 then begin
     if Int_set.cardinal r.corrupted_slots >= r.faults_max then
       invalid_arg "faults_max exceeded"
@@ -88,7 +103,7 @@ let wal_append (T r) ~op_number data =
    that bypasses this wrapper entirely, e.g. a differently-implemented recovery path), not for
    this wrapper's own [wal_read]. *)
 let wal_read (T r) ~op_number =
-  if Int_set.mem op_number r.corrupted_slots then None
+  if Int_set.mem op_number r.corrupted_slots || Int_set.mem op_number r.dropped_slots then None
   else
     let module U = (val r.module_) in
     U.wal_read r.value ~op_number
@@ -96,8 +111,15 @@ let wal_read (T r) ~op_number =
 let wal_truncate_after (T r) ~op_number =
   let module U = (val r.module_) in
   U.wal_truncate_after r.value ~op_number;
-  r.corrupted_slots <- Int_set.filter (fun n -> n <= op_number) r.corrupted_slots
+  r.corrupted_slots <- Int_set.filter (fun n -> n <= op_number) r.corrupted_slots;
+  r.dropped_slots <- Int_set.filter (fun n -> n <= op_number) r.dropped_slots
 
+(* A direct passthrough is correct (not desynced from what a caller expects) precisely because
+   [wal_append] above always delegates now, dropped or not -- the wrapped backend's own
+   [wal_highest_op_number] advances on every call this module accepts, so there is no separate
+   "wrapper's own view" to maintain independently. This was the actual bug the drop-then-crash
+   regression traced to: an earlier version that skipped delegation on a drop left this passthrough
+   silently behind the wrapper's own bookkeeping instead of in sync with it. *)
 let wal_highest_op_number (T r) =
   let module U = (val r.module_) in
   U.wal_highest_op_number r.value

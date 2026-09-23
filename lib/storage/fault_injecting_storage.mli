@@ -19,11 +19,38 @@ include Storage_intf.S
 
 type fault_config = {
   drop_probability : float;
-      (** Probability a [wal_append] is silently never delegated to the wrapped backend -- the
-          call still returns [unit] (a caller sees no error), but nothing durable happens, so a
-          later [wal_read] of that [op_number] is [None] and the wrapped backend's own
-          [wal_highest_op_number] does not advance past it. Models a storage layer that falsely
-          acknowledges a write it never actually persisted. *)
+      (** Probability a [wal_append]'s data is lost rather than durably persisted. The call still
+          returns [unit] (a caller sees no error) -- but unlike an early version of this module,
+          the [op_number] itself *is* still delegated to the wrapped backend (as an empty-string
+          entry standing in for "nothing useful was actually retained"), so the wrapped backend's
+          own [wal_highest_op_number] -- and hence this module's own, a direct passthrough --
+          advances exactly as a well-behaved caller expects. [wal_read] of that [op_number] on
+          *this* [t] is unconditionally [None] regardless of what the wrapped backend reports
+          (tracked in [dropped_slots], the same masking technique [corrupted_slots] below already
+          uses for [corrupt_probability], with the same restart-persistence limitation: this
+          bookkeeping is this particular [t] value's own in-memory state, so it does not survive a
+          fresh {!create} wrapping a reopened backend). This matches
+          {!Storage_intf.S.wal_read}'s own documented ambiguity between "never written" and
+          "written, then lost" -- a caller cannot and need not tell those apart.
+
+          The earlier version of this module skipped delegation outright on a drop instead, which
+          left the wrapped backend's [wal_highest_op_number] one behind whatever the wrapper
+          itself considered current. That is a real defect, not a harmless simplification: the
+          caller's very next *legitimate*, sequential [wal_append] would fall through to the
+          normal passthrough branch, reach the wrapped backend's own out-of-order guard expecting
+          [op_number = wal_highest_op_number t + 1], and raise [Invalid_argument] -- an exception
+          that looks like a caller bug, not an observable storage fault, defeating this module's
+          whole purpose (driving the recovery protocol's fault-handling paths through *observable*
+          faults, never crashing the simulated replica). Always delegating instead closes that gap
+          structurally: this module's [wal_append] never again disagrees with the wrapped
+          backend's own bookkeeping about which op_number comes next, regardless of what fired.
+
+          Models a storage layer that falsely acknowledges a write it never actually persisted.
+          Unlike [corrupt_probability] below, dropped slots do not count against [faults_max] --
+          deferred; see the design doc's own report for the reasoning (a drop, unlike a
+          corruption, produces no persistent on-disk artifact for a differently-implemented
+          recovery path to trip over, so the two faults aren't obviously equally dangerous to cap
+          the same way, but this hasn't been worked through yet). *)
   corrupt_probability : float;
       (** Probability a [wal_append]'s data is XOR-flipped at one deterministically-chosen byte
           position before being delegated to the wrapped backend's own [wal_append] -- corruption
@@ -76,3 +103,10 @@ val create :
     internal eviction (not an explicit [wal_truncate_after] call) may continue to count against
     the cap even after it is no longer really live -- a conservative (never permits more live
     faults than intended), not unsafe, approximation. *)
+
+val set_fault_config : t -> fault_config -> unit
+(** Replaces [t]'s fault config for every subsequent [wal_append], without touching any
+    already-recorded [corrupted_slots]/[dropped_slots] bookkeeping for op_numbers appended under
+    the old config. Useful for a caller (e.g. a DST harness, Task 9) that wants to vary fault
+    rates over the course of one simulated run instead of fixing them for the wrapper's whole
+    lifetime. *)
