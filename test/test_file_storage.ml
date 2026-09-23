@@ -180,6 +180,65 @@ let test_corrupted_entry_reads_as_none () =
       Alcotest.(check (option string)) "corrupted entry reads as None, not garbage" None
         (File_storage.wal_read t2 ~op_number:1))
 
+let test_torn_write_header_updated_data_stale_reads_as_none () =
+  (* Exercises the specific safety argument this module's own top comment makes: [wal_append]
+     writes the header before the data precisely so that a crash between the two writes leaves
+     a header durably pointing at the *previous occupant's* stale data, which [wal_read]'s
+     combined checksum + op_number check must catch. [test_corrupted_entry_reads_as_none]
+     above only flips a checksum bit inside an entry whose header was never touched/reused --
+     it never exercises a header that was legitimately overwritten by a *later* real write (the
+     actual torn-write shape). This test constructs that shape directly:
+
+     - ring_capacity:2, so op_number 3 legitimately reuses op_number 1's slot (slot 0),
+       overwriting op 1's real data with op 3's real data -- both fully, correctly written.
+     - Then, past the [Storage.S] API, patch *only* slot 0's on-disk header bytes (not the data
+       region, which keeps op 3's real payload) to revert its op_number field to claim [1]
+       again and to corrupt its checksum -- i.e. a header whose op_number field matches a query
+       for op 1, but whose checksum does not match what is actually sitting in that slot's data
+       region (op 3's payload). This is exactly the header/data relationship a real torn write
+       leaves behind (header updated, data stale relative to the header), just reached by
+       reverting rather than advancing, since advancing is unreachable through the public API:
+       [wal_read]'s bounds check only ever admits an op_number that some real, fully-completed
+       [wal_append] (or a recovery scan that itself requires a matching checksum) already
+       advanced [wal_highest_op_number] past -- so a header patched to claim an op_number that
+       was *never* really, fully written is always rejected by the bounds check first, never
+       reaching the checksum comparison at all. Reopening (rather than reusing the live [t])
+       both proves the corruption is genuinely durable on disk and gives slot 1's still-valid,
+       untouched op 2 header enough headroom for [wal_highest_op_number] to admit a query for
+       op 1 past the bounds check, so the assertion below is actually exercising the checksum
+       comparison, not merely being rejected earlier for an unrelated reason. *)
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2 dir in
+       File_storage.wal_append t ~op_number:1 "first payload, slot 0";
+       File_storage.wal_append t ~op_number:2 "second payload, slot 1";
+       File_storage.wal_append t ~op_number:3 "third payload, legitimately overwrote slot 0");
+      let raw_path = Filename.concat dir "ring" in
+      let ic = open_in_bin raw_path in
+      let contents = really_input_string ic (in_channel_length ic) in
+      close_in ic;
+      let corrupted = Bytes.of_string contents in
+      (* Slot 0's header lives at file offset 0 (see this module's own top comment for the
+         layout): op_number is the first 8 bytes, big-endian, mirroring
+         [File_storage.encode_header]. Revert it from 3 (the real, current occupant) to 1. *)
+      Bytes.set_int64_be corrupted 0 1L;
+      (* Checksum field is bytes 16..47; flip one bit inside it, same byte offset and technique
+         as [test_corrupted_entry_reads_as_none] above. *)
+      let checksum_byte_offset = 20 in
+      Bytes.set corrupted checksum_byte_offset
+        (Char.chr (Char.code (Bytes.get corrupted checksum_byte_offset) lxor 0xFF));
+      let oc = open_out_bin raw_path in
+      output_bytes oc corrupted;
+      close_out oc;
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2 dir in
+      Alcotest.(check (option string))
+        "header claims op 1 but slot 0's real data is op 3's -- checksum mismatch against \
+         stale-relative-to-the-header data is caught, not returned as fresh-looking-but-wrong"
+        None
+        (File_storage.wal_read t2 ~op_number:1))
+
 let test_highest_op_number_recovered_across_reopen_with_ring_layout () =
   (* Task 1's own [test_write_then_read_after_reopen] already covers the single-entry case;
      this covers the ring-specific part of recovery: scanning every slot's header (not just
@@ -218,6 +277,10 @@ let tests =
       `Quick,
       test_truncate_after_is_noop_above_highest );
     ("corrupted entry reads as None, not garbage", `Quick, test_corrupted_entry_reads_as_none);
+    ( "torn write: header updated to a reused slot's op_number/checksum, data stale relative to \
+       it, reads as None",
+      `Quick,
+      test_torn_write_header_updated_data_stale_reads_as_none );
     ( "highest op number recovered across reopen, with ring layout",
       `Quick,
       test_highest_op_number_recovered_across_reopen_with_ring_layout );
