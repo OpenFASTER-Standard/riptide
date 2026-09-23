@@ -36,7 +36,10 @@ let run_scenario ~seed ~replica_count ~rounds ~ops_per_round ~timeout_prob ~net 
       (fun i r ->
         let cn = Replica.commit_number r in
         if cn < last_commit.(i) then
-          note "[%s] replica %d commit_number REGRESSED %d -> %d" phase (i + 1) last_commit.(i) cn;
+          note "[%s] replica %d commit_number REGRESSED %d -> %d (is_primary=%b status=%s view=%d lnv=%d)"
+            phase (i + 1) last_commit.(i) cn (Replica.is_primary r)
+            (match Replica.status r with Replica.Normal -> "N" | _ -> "VC")
+            (Replica.view_number r) (Replica.last_normal_view r);
         last_commit.(i) <- max last_commit.(i) cn;
         let entries = Array.of_list (Replica.entries r) in
         if cn > Array.length entries then
