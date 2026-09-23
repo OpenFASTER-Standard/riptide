@@ -677,17 +677,25 @@ let test_cluster_recovers_a_committed_entry_from_one_replicas_corrupted_storage 
         (Replica.entries healthy = [ v1; v2; v3 ]))
 
 (* --------------------------------------------------------------------------------------------
-   Test 2: the SAME scenario, hardened against the one thing test 1 cannot control -- which of the
-   two DoViewChanges wins.
+   Test 2: the SAME scenario, but no longer dependent on which of the two DoViewChanges wins the
+   tie -- see the correction below on why test 1 is not actually dependent on that either.
 
    Both survivors report the same [(last_normal_view, n) = (1, 2)], so [WinningDVC]'s maximum is a
-   TIE, and replica.ml's [winning_dvc] breaks ties by whichever element [recv_dvc]'s hashtable fold
-   happens to yield first. If the HEALTHY replica's DVC wins, test 1 would still pass with the
-   cross-replica fill (EntrySources/CanFill) removed entirely, because the winner's own log is
-   already complete. Here NEITHER survivor has a complete readable log -- replica 2 cannot read
-   op 1, replica 3 cannot read op 2 -- so whichever one wins, the other's entry is the ONLY source
-   for the missing op, and the completion is impossible without genuinely unioning evidence across
-   the quorum. One live corrupted slot per replica is exactly the Decision 7 budget
+   TIE. This is NOT resolved by hashtable fold order: [valid_dvcs] (replica.ml:942-944) sorts its
+   result by sender id specifically so the fold in [winning_dvc] is reproducible, and that fold
+   keeps the incumbent on a strict-inequality tie, so an exact [(last_normal_view, n)] tie resolves
+   deterministically to the LOWEST sender id (replica.ml:956-957). In test 1 the two survivors are
+   replicas 2 and 3 (replica 2's DVC to itself is in its own [recv_dvc] too), so replica 2 -- the
+   corrupted one -- deterministically wins every run, and test 1 always exercises the cross-replica
+   fill, not merely when the build/hashtable happens to order things that way.
+
+   So test 2 is not closing a present nondeterminism gap; it is defense against a FUTURE change to
+   that tie-break rule (e.g. if the sort or the comparison in [winning_dvc] is ever altered) making
+   test 1 vacuous again without anyone noticing. Here NEITHER survivor has a complete readable log
+   -- replica 2 cannot read op 1, replica 3 cannot read op 2 -- so whichever one wins, the other's
+   entry is the ONLY source for the missing op, and the completion is impossible without genuinely
+   unioning evidence across the quorum, regardless of which way the tie-break resolves now or ever
+   resolves in the future. One live corrupted slot per replica is exactly the Decision 7 budget
    ([faults_max = replication_quorum - 1 = 1] per storage) a 3-replica cluster is meant to absorb.
 
    This is also the shape that makes the whole thing fail under a mutation: neutering the fill so a
