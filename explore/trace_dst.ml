@@ -42,6 +42,7 @@ let () =
     {
       Riptide_storage.Fault_injecting_storage.corrupt_probability = a 8 0.0;
       drop_probability = a 9 0.0;
+      superblock_loss_probability = a 10 0.0;
     }
   in
   let timeout_prob = a 10 0.5 in
@@ -58,7 +59,7 @@ let () =
   in
   (try
      Riptide_dst.Cluster.run ~seed ~replica_count ~net_fault_config:net
-       ~storage_fault_config:storage (fun ~replicas ~settle ->
+       ~storage_fault_config:storage (fun ~replicas ~settle ~restart:_ ->
          let p = Riptide_sim.Prng.create (((seed * 7919) + 13) land 0x3FFFFFFF) in
          let next_val = ref 0 in
          let find_primary () =

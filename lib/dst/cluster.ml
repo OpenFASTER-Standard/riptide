@@ -17,7 +17,13 @@
       SECOND entry point rather than changing this one: it runs the identical wiring inside the
       CALLER's [Eio_main.run], where a real [File_storage] is constructible.
    4. No [stop]/[isolate]/[reconnect] -- Task 8's crash/partition simulation, not needed by this
-      task's two required tests and out of scope for Tasks 10/11's own later work. *)
+      task's two required tests and out of scope for Tasks 10/11's own later work.
+
+   FINAL-REVIEW FINDING I1 added the one capability whose absence let finding C1 through: a real
+   CRASH-AND-COME-BACK. Before it, [Riptide_vsr.Replica.restart] was exercised only by
+   [test_vsr_replica_recovery.ml]'s hand-driven single-replica unit tests and never by any running
+   cluster, so no amount of adversarial sweeping could ever have reached a restart-time defect. See
+   [restart] below and [cluster.mli]'s own paragraph on it. *)
 
 exception Did_not_settle
 
@@ -127,17 +133,35 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
      back at zero after the first [yield] of every round, so [run]'s own behaviour is unchanged --
      which is exactly why this defect could sit here undetected. *)
   let inflight = ref 0 in
-  let storages =
+  (* [make_storage] hands back the {!Riptide_storage.Fault_injecting_storage.t} itself, not an
+     already-erased [Replica.storage] view of it, so this harness keeps a handle it can still
+     inject faults through -- specifically [for_test_lose_superblock], which [restart] below needs.
+     Both entry points wrap that same module, so doing the type erasure here rather than in each
+     [make_storage] is one statement of it instead of two. *)
+  let fault_storages =
     Array.init replica_count (fun i ->
         make_storage ~index:i ~replication_quorum
           ~prng:(Riptide_sim.Prng.create storage_seeds.(i)))
   in
+  let storages =
+    Array.map
+      (fun fs ->
+        Riptide_vsr.Replica.storage_of_module
+          (module Riptide_storage.Fault_injecting_storage)
+          fs)
+      fault_storages
+  in
+  (* Which replicas are currently running. A replica goes down only by REFUSING to restart (see
+     [restart]); a down replica is never handed another message, so its state is frozen at the
+     moment it crashed. *)
+  let alive = Array.make replica_count true in
+  let send_for i ~to_ bytes = Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes in
   let replicas =
     Array.init replica_count (fun i ->
         let my_id = i + 1 in
         let r =
           Riptide_vsr.Replica.create ~storage:storages.(i) ~my_id ~replica_count ~svc_limit
-            ~send:(fun ~to_ bytes -> Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes)
+            ~send:(send_for i)
         in
         (* Deviation 1 (see this file's own top comment and [cluster.mli]): pin every replica's
            view to 1 so [Primary(1) = 1] and [replicas.(0)] is the primary a caller can [propose]
@@ -180,31 +204,83 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
     in
     loop delivery_rounds 5000
   in
+  (* FINAL-REVIEW FINDING I1: a real crash-and-come-back, the capability whose absence meant
+     nothing in this branch could ever have caught finding C1.
+
+     WHY CRASH AND RESTART ARE ONE OPERATION rather than a [stop] plus a later [start]. The crash
+     IS the discarding of volatile state, and here that is expressed by building a brand-new
+     {!Riptide_vsr.Replica.t} over the same durable backend -- which is exactly what
+     [Replica.restart] is (VSR.tla's [CrashRestart]) and exactly what the previous [t] losing
+     [recv_svc]/[recv_dvc]/[sent_dvc]/[peer_op_number] means. Splitting it into two calls would add
+     a "crashed but not yet back" state that nothing needs and that every caller would have to
+     remember to leave.
+
+     [?lose_superblock] folds in the ONE storage fault that makes a restart interesting rather than
+     routine: a crash partway through [File_storage.superblock_write]'s 3 sequential, non-atomic
+     copy writes, which leaves the superblock unreadable and the WAL fully intact. That is a single
+     coherent event ("this replica crashed, and its superblock did not survive the crash"), not two,
+     which is why it is an argument here rather than a separate entry point.
+
+     RETURNS [false], and leaves the replica DOWN, when [Replica.restart] refuses -- which since
+     finding C1's fix is precisely what it does for a lost superblock over a non-empty WAL. A
+     machine that will not boot is a real outcome a simulation must be able to represent; turning it
+     into an exception here would make every caller wrap it. The [Invalid_argument] catch is narrow
+     in practice even though it is written broadly: [my_id]/[replica_count]/[svc_limit] are the same
+     values [Replica.create] already accepted for this replica moments earlier, so the only
+     precondition left for [restart] to fail is the superblock one. *)
+  let restart ?(lose_superblock = false) i =
+    if i < 0 || i >= replica_count then
+      invalid_arg "Cluster.restart: replica index out of range (they are 0-based, like [replicas])";
+    if lose_superblock then
+      Riptide_storage.Fault_injecting_storage.for_test_lose_superblock fault_storages.(i);
+    match
+      Riptide_vsr.Replica.restart ~storage:storages.(i) ~my_id:(i + 1) ~replica_count ~svc_limit
+        ~send:(send_for i)
+    with
+    | r ->
+      replicas.(i) <- r;
+      alive.(i) <- true;
+      true
+    | exception Invalid_argument _ ->
+      alive.(i) <- false;
+      false
+  in
   try
     Eio.Switch.run (fun sw ->
         Array.iteri
-          (fun i replica ->
+          (fun i _replica ->
             Eio.Fiber.fork ~sw (fun () ->
                 let rec dispatch_loop () =
                   let msg = Riptide_sim.Sim_transport.receive handles.(i) in
-                  (* [decr] in a [Fun.protect]-free tail position is deliberate: [handle_message]
+                  (* [replicas.(i)], read fresh on every message rather than captured once at fork
+                     time: [restart] SWAPS the array element, and a fiber holding the pre-crash
+                     value would keep feeding the dead replica forever -- the restart would appear
+                     to work and change nothing. A down replica (a refused restart) is skipped
+                     entirely; the message is discarded, exactly as a message to a machine that is
+                     not running is.
+
+                     [decr] in a [Fun.protect]-free tail position is deliberate: [handle_message]
                      is total on adversarial input (replica.mli's own guarantee), so it does not
                      raise, and a counter that leaked on an exception would hang [settle] rather
                      than surface it. *)
-                  Riptide_vsr.Replica.handle_message replica msg;
+                  if alive.(i) then Riptide_vsr.Replica.handle_message replicas.(i) msg;
                   decr inflight;
                   dispatch_loop ()
                 in
                 dispatch_loop ()))
           replicas;
-        body ~replicas ~settle;
+        body ~replicas ~settle ~restart;
         Eio.Switch.fail sw Cluster_test_done)
   with Cluster_test_done -> ()
 
 let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
     ?(net_fault_config = Riptide_sim.Network.default_fault_config)
     ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
-    (body : replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) =
+    (body :
+      replicas:Riptide_vsr.Replica.t array ->
+      settle:(unit -> unit) ->
+      restart:(?lose_superblock:bool -> int -> bool) ->
+      unit) =
   (* Task 10's pre-flight must reject BEFORE [Eio_mock.Backend.run] is entered, not just before any
      replica is built: [test_dst_cluster.ml]'s own test asserts the [Invalid_argument] escapes to
      the caller, and an exception raised inside the mock backend would be reported by the backend
@@ -216,12 +292,10 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
   Eio_mock.Backend.run @@ fun () ->
   with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
     ~make_storage:(fun ~index:_ ~replication_quorum ~prng ->
-      Riptide_vsr.Replica.storage_of_module
-        (module Riptide_storage.Fault_injecting_storage)
-        (Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
-           ~replication_quorum
-           ~underlying:(module Riptide_storage.Memory_storage)
-           (Riptide_storage.Memory_storage.create ())))
+      Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
+        ~replication_quorum
+        ~underlying:(module Riptide_storage.Memory_storage)
+        (Riptide_storage.Memory_storage.create ()))
       (* Under [Eio_mock.Backend.run] every storage operation is synchronous, so there is no I/O to
          wait for; a further [yield] is the strongest "let everything runnable run" this scheduler
          has, and matches the second yield the original loop always performed. *)
@@ -231,7 +305,11 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
     ?(ring_capacity = default_ring_capacity)
     ?(net_fault_config = Riptide_sim.Network.default_fault_config)
     ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
-    (body : replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) =
+    (body :
+      replicas:Riptide_vsr.Replica.t array ->
+      settle:(unit -> unit) ->
+      restart:(?lose_superblock:bool -> int -> bool) ->
+      unit) =
   check_storage_fault_config ~replica_count
     ~faults_max:((replica_count - 1) / 2)
     storage_fault_config;
@@ -241,12 +319,10 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
   with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
     ~make_storage:(fun ~index ~replication_quorum ~prng ->
       let path = Filename.concat dir (string_of_int (index + 1)) in
-      Riptide_vsr.Replica.storage_of_module
-        (module Riptide_storage.Fault_injecting_storage)
-        (Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
-           ~replication_quorum
-           ~underlying:(module Riptide_storage.File_storage)
-           (Riptide_storage.File_storage.create ~sw:storage_sw ~fs ~ring_capacity path)))
+      Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
+        ~replication_quorum
+        ~underlying:(module Riptide_storage.File_storage)
+        (Riptide_storage.File_storage.create ~sw:storage_sw ~fs ~ring_capacity path))
       (* A real, tiny sleep on the REAL clock, not [Eio.Fiber.yield]: a fiber parked on an io_uring
          completion is not runnable, so yielding to it achieves nothing -- eio_linux only reaps
          completions when its run queue empties, which a yield-only loop never lets happen. This is

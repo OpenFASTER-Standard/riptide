@@ -573,7 +573,8 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
   let backend =
     Riptide_storage.Fault_injecting_storage.create
       ~prng:(Riptide_sim.Prng.create 1)
-      ~fault_config:{ Riptide_storage.Fault_injecting_storage.corrupt_probability = 1.0; drop_probability = 0.0 }
+      ~fault_config:
+        { Riptide_storage.Fault_injecting_storage.default_fault_config with corrupt_probability = 1.0 }
       ~replication_quorum:1
       ~underlying:(module Riptide_storage.Memory_storage)
       (Riptide_storage.Memory_storage.create ())

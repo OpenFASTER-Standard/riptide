@@ -34,7 +34,10 @@ val run :
   ?svc_limit:int ->
   ?net_fault_config:Riptide_sim.Network.fault_config ->
   ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
-  (replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) ->
+  (replicas:Riptide_vsr.Replica.t array ->
+   settle:(unit -> unit) ->
+   restart:(?lose_superblock:bool -> int -> bool) ->
+   unit) ->
   unit
 (** [run ~seed ~replica_count ?svc_limit ?net_fault_config ?storage_fault_config body] stands up
     [replica_count] real {!Riptide_vsr.Replica.t}s wired over one shared, freshly-created
@@ -100,6 +103,46 @@ val run :
     simulation) is exposed, since neither of this task's two required tests needs it and Tasks
     10/11 are explicitly out of this task's scope.
 
+    {b [restart] (final-review finding I1): a real crash-and-come-back, and the capability whose
+    absence is why nothing in this branch could ever have caught finding C1.}
+    {!Riptide_vsr.Replica.restart} was, until this change, exercised only by
+    [test/test_vsr_replica_recovery.ml]'s hand-driven single-replica unit tests — never by any
+    running cluster, and never by the adversarial sweep. The sweep's own crash simulation could
+    only ever stop a replica and leave it stopped, so a defect that lives in the act of coming
+    BACK was structurally unreachable no matter how many seeds were swept.
+
+    [restart ?lose_superblock i] crashes replica index [i] (0-based, like [replicas]) and brings it
+    back over the same durable backend. Crash and restart are one operation because the crash IS
+    the loss of volatile state, which here is expressed by constructing a brand-new
+    {!Riptide_vsr.Replica.t} — exactly VSR.tla's [CrashRestart], and exactly what the previous
+    replica's [recv_svc]/[recv_dvc]/[sent_dvc]/[peer_op_number] going away means. [replicas.(i)] is
+    replaced in place, and the dispatch fiber picks the new value up (it re-reads the array per
+    message), so a caller's own [replicas] handle stays valid.
+
+    [?lose_superblock:true] (default [false]) folds in the one storage fault that makes a restart
+    interesting rather than routine: the replica's superblock does not survive the crash, while its
+    WAL does. That is a single coherent event, not two — a crash partway through
+    {!Riptide_storage.File_storage}'s 3 sequential, non-atomic superblock copy writes produces
+    exactly it, with no injected fault needed in production.
+
+    {b Returns [false] when the replica refuses to come back}, which since finding C1's fix is
+    precisely what {!Riptide_vsr.Replica.restart} does for a lost superblock over a non-empty WAL.
+    A refused replica is left DOWN: it is never handed another message, and its array slot keeps
+    the pre-crash value, frozen at the moment it crashed. A caller that must not credit a down
+    replica's frozen state (a safety checker reading {!Riptide_vsr.Replica.entries}, say) should
+    track the [false] return — this harness deliberately does not also expose an aliveness
+    predicate, since the return value already carries it and a second source of the same fact is a
+    second thing to keep in sync. A machine that will not boot is a real outcome a simulation must
+    be able to represent, which is why this is a return value rather than an exception.
+
+    {b A down replica must also stop being DRIVEN, which this harness cannot do for you.} It stops
+    delivering incoming messages to one, but the frozen [Replica.t] in [replicas.(i)] is still a
+    fully functional object: calling {!Riptide_vsr.Replica.propose} or
+    {!Riptide_vsr.Replica.check_timeout} on it would append to its log and send real messages, from
+    a machine that is supposed to be off. A body that uses [restart] must skip down replicas in its
+    own propose/timeout loops. (Making the array hold an inert placeholder instead would change
+    [replicas]' element type for every caller, including the ones that never restart anything.)
+
     {b Task 10: rejects an unsafe [storage_fault_config] before standing up any replica or storage
     at all}: {!Riptide_storage.Fault_injecting_storage}'s own [faults_max = replication_quorum - 1]
     enforcement (Tasks 6/8) is per-instance -- it only ever bounds how many op_numbers one replica's
@@ -161,7 +204,10 @@ val run_on_file_storage :
   ?ring_capacity:int ->
   ?net_fault_config:Riptide_sim.Network.fault_config ->
   ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
-  (replicas:Riptide_vsr.Replica.t array -> settle:(unit -> unit) -> unit) ->
+  (replicas:Riptide_vsr.Replica.t array ->
+   settle:(unit -> unit) ->
+   restart:(?lose_superblock:bool -> int -> bool) ->
+   unit) ->
   unit
 (** Task 11. Exactly {!run}, with exactly the same seed splitting, view pin, [settle], Task 10
     pre-flight check and teardown -- except that each replica's

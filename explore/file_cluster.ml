@@ -188,7 +188,11 @@ let () =
       }
   in
   let storage_faults =
-    { Riptide_storage.Fault_injecting_storage.corrupt_probability = a 10 0.0; drop_probability = 0.0 }
+    {
+      Riptide_storage.Fault_injecting_storage.corrupt_probability = a 10 0.0;
+      drop_probability = 0.0;
+      superblock_loss_probability = a 11 0.0;
+    }
   in
   let timeout_prob = a 11 0.0 in
   Eio_main.run @@ fun env ->

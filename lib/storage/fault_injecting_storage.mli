@@ -74,11 +74,53 @@ type fault_config = {
           [test/test_file_storage.ml]'s own direct-file-corruption tests for that pattern) -- out
           of scope for this generic, implementation-agnostic wrapper; left to whichever later task
           wires restart scenarios together. *)
+  superblock_loss_probability : float;
+      (** Probability a [superblock_write] is TORN: the superblock does not become usable, and
+          [superblock_read] returns [None] until some later, untorn [superblock_write] repairs it.
+
+          {b Added by final-review finding I1}, which found that this module passed
+          [superblock_write]/[superblock_read] straight through with no fault-injection awareness
+          at all — so nothing in the entire branch could ever exercise the one storage fault that
+          turned out to carry the wave's only critical safety defect (finding C1: a replica whose
+          superblock is lost while its WAL is intact used to come back claiming [op_number = 0] and
+          proceed to prove absent every op it durably held).
+
+          {b Modelled at write time, like the two faults above, because that is where the real
+          event happens.} {!Riptide_storage.File_storage}'s superblock is 3 independent copies,
+          written by 3 sequential, non-atomic header-then-data write pairs. A copy whose header
+          landed but whose data did not fails its own checksum and does not verify, so a crash
+          partway through can leave 1 new + 1 unverifiable + 1 old — no two copies agreeing, which
+          is precisely when [superblock_read] honestly returns [None]. This needs no injected
+          fault in production; it is an ordinary crash.
+
+          {b Two things happen, not one.} This wrapper masks its own [superblock_read] to [None]
+          (the same technique [corrupt_probability] uses for WAL slots), AND the wrapped backend's
+          own superblock is durably overwritten with a fixed record that cannot decode as a
+          superblock. Both are needed: without the first, a caller holding this [t] would observe
+          nothing; without the second, re-wrapping the same backend — which is exactly what a real
+          process restart does — would silently "heal" the fault. Note this is strictly stronger
+          than what [corrupt_probability] can offer for the WAL, whose masking genuinely does not
+          survive re-wrapping (see its own doc comment above): a superblock has no per-entry
+          checksum bookkeeping to reproduce, so replacing the record wholesale is enough.
+
+          A FIXED unusable record, deliberately, not a byte-flip of the real one: flipping a byte
+          of a canonically-encoded superblock can yield a record that still DECODES with different
+          field values — a plausible-looking WRONG superblock, a different and nastier fault than
+          the one being modelled, and one whose effect would depend on which byte the flip landed
+          in.
+
+          {b Not subject to [faults_max]}, deliberately (see {!create}). That cap bounds
+          simultaneously-corrupted copies of the same WAL slot, which is a SAFETY property: past
+          the cap, no quorum read can recover the slot. A lost superblock is local to one replica
+          and, since finding C1's fix, makes that replica refuse to restart — i.e. it is down.
+          Losing it everywhere costs liveness, not safety, and liveness loss is what a sweep's own
+          non-vacuity assertions detect. Capping it would also make the fault undeliverable in the
+          regime that matters most: several replicas crashing with torn superblocks at once. *)
 }
 
 val default_fault_config : fault_config
-(** Both probabilities [0.0] -- i.e. every operation passes straight through, unchanged, to the
-    wrapped backend. *)
+(** All three probabilities [0.0] -- i.e. every operation passes straight through, unchanged, to
+    the wrapped backend. *)
 
 val create :
   prng:Riptide_sim.Prng.t ->
@@ -142,6 +184,24 @@ val for_test_corrupt_entry : t -> op_number:int -> unit
     committed op was never held. A caller that wants ["absent"] wants {!wal_truncate_after}. Entries
     above [op_number] are preserved byte-for-byte (reaching an already-written slot at all requires
     truncating back to it first, since {!Storage_intf.S} has no random-access write). *)
+
+val for_test_lose_superblock : t -> unit
+(** [for_test_lose_superblock t] makes {!superblock_read} return [None] immediately and
+    deterministically, and durably replaces the wrapped backend's own superblock record with one
+    that cannot decode — the same two halves, and the same durable marker, as
+    [superblock_loss_probability]'s own torn write.
+
+    The counterpart of that probability for a caller needing the fault at a SPECIFIC moment on a
+    SPECIFIC replica, exactly as {!for_test_corrupt_entry} is for [corrupt_probability], and for
+    the same structural reason: the probabilistic path only fires at write time, so a test that has
+    already settled a cluster into a known-good state has no write left to attach a fault to.
+
+    {b The WAL is untouched}, which is the entire point: "superblock lost, WAL intact" is the state
+    {!Riptide_vsr.Replica.restart}'s fail-stop guard exists for (final-review finding C1), and the
+    state an ordinary crash partway through a 3-copy [superblock_write] produces on its own.
+
+    Repaired by any later untorn [superblock_write], like the probabilistic version. Not subject to
+    [faults_max] — see [superblock_loss_probability] for why. *)
 
 val set_fault_config : t -> fault_config -> unit
 (** Replaces [t]'s fault config for every subsequent [wal_append], without touching any

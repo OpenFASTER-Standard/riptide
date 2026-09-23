@@ -255,6 +255,103 @@ let test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate () =
         (Some "b, rewritten by a repair")
         (Fault_injecting_storage.wal_read t ~op_number:2))
 
+(* ============================================================================================
+   FINAL-REVIEW FINDING I1, half 1: the SUPERBLOCK fault.
+
+   Until this change, [superblock_write]/[superblock_read] were straight passthroughs with no
+   fault-injection awareness at all -- so nothing in the entire branch could exercise the one
+   storage fault that carried its only critical safety defect (finding C1: a replica whose
+   superblock is lost while its WAL is intact used to come back claiming op_number = 0 and then
+   prove absent every op it durably held).
+
+   These tests pin both halves of the injected fault, because both are load-bearing: the wrapper's
+   own [superblock_read] must return [None], AND the WRAPPED backend's durable record must itself
+   become unusable -- otherwise re-wrapping the same backend, which is exactly what a real process
+   restart does, would silently heal the fault. *)
+
+let with_wrapped_pair ?fault_config ~replication_quorum ~seed f =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let underlying = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir in
+      let prng = Riptide_sim.Prng.create seed in
+      let t =
+        Fault_injecting_storage.create ~prng ?fault_config ~replication_quorum
+          ~underlying:(module File_storage) underlying
+      in
+      f t underlying)
+
+let test_superblock_loss_probability_one_makes_the_superblock_unreadable () =
+  with_wrapped_pair
+    ~fault_config:
+      { Fault_injecting_storage.default_fault_config with superblock_loss_probability = 1.0 }
+    ~replication_quorum:3 ~seed:11
+    (fun t underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "a durable entry";
+      Fault_injecting_storage.superblock_write t "the record that never lands";
+      Alcotest.(check (option string))
+        "superblock_loss_probability = 1.0: the wrapper reports the superblock as gone" None
+        (Fault_injecting_storage.superblock_read t);
+      (* The second half: the fault is REAL on the wrapped backend, not just masked up here, so a
+         fresh reader of the same backend cannot use it either. *)
+      Alcotest.(check bool)
+        "and the wrapped backend's own record is not the one the caller wrote" true
+        (File_storage.superblock_read underlying <> Some "the record that never lands");
+      (* And the WAL is untouched -- "superblock lost, WAL intact" is the whole point. *)
+      Alcotest.(check (option string))
+        "the WAL is completely untouched by a superblock fault" (Some "a durable entry")
+        (Fault_injecting_storage.wal_read t ~op_number:1))
+
+let test_superblock_loss_probability_zero_passes_through () =
+  with_wrapped_pair ~replication_quorum:3 ~seed:12 (fun t _underlying ->
+      Fault_injecting_storage.superblock_write t "lands cleanly";
+      Alcotest.(check (option string))
+        "superblock_loss_probability = 0.0 (the default) never tears a write"
+        (Some "lands cleanly")
+        (Fault_injecting_storage.superblock_read t))
+
+(* A torn superblock is not permanent: the replica that comes back and writes a fresh superblock
+   has a usable one again. Pinned because the masking is wrapper state, and state that is only ever
+   set is a latch, not a fault. *)
+let test_a_later_untorn_superblock_write_repairs_a_torn_one () =
+  with_wrapped_pair
+    ~fault_config:
+      { Fault_injecting_storage.default_fault_config with superblock_loss_probability = 1.0 }
+    ~replication_quorum:3 ~seed:13
+    (fun t _underlying ->
+      Fault_injecting_storage.superblock_write t "torn";
+      Alcotest.(check (option string)) "torn" None (Fault_injecting_storage.superblock_read t);
+      Fault_injecting_storage.set_fault_config t Fault_injecting_storage.default_fault_config;
+      Fault_injecting_storage.superblock_write t "written after recovery";
+      Alcotest.(check (option string))
+        "an untorn write afterwards repairs it" (Some "written after recovery")
+        (Fault_injecting_storage.superblock_read t))
+
+(* The deterministic entry point, the counterpart of for_test_corrupt_entry: a caller that has
+   already settled a cluster into a known-good state has no superblock write left to attach a
+   probabilistic fault to. *)
+let test_for_test_lose_superblock_is_deterministic_and_leaves_the_wal_alone () =
+  with_wrapped_pair ~replication_quorum:3 ~seed:14 (fun t underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "entry one";
+      Fault_injecting_storage.wal_append t ~op_number:2 "entry two";
+      Fault_injecting_storage.superblock_write t "a perfectly good superblock";
+      Alcotest.(check (option string))
+        "precondition: the superblock is readable first" (Some "a perfectly good superblock")
+        (Fault_injecting_storage.superblock_read t);
+      Fault_injecting_storage.for_test_lose_superblock t;
+      Alcotest.(check (option string))
+        "for_test_lose_superblock loses it immediately, no probability involved" None
+        (Fault_injecting_storage.superblock_read t);
+      Alcotest.(check bool)
+        "durably, on the wrapped backend too" true
+        (File_storage.superblock_read underlying <> Some "a perfectly good superblock");
+      Alcotest.(check int) "the WAL is untouched: highest op_number" 2
+        (Fault_injecting_storage.wal_highest_op_number t);
+      Alcotest.(check (option string)) "the WAL is untouched: op 1" (Some "entry one")
+        (Fault_injecting_storage.wal_read t ~op_number:1);
+      Alcotest.(check (option string)) "the WAL is untouched: op 2" (Some "entry two")
+        (Fault_injecting_storage.wal_read t ~op_number:2))
+
 let tests =
   [ ( "corrupt_probability = 1.0 really corrupts (wal_read returns None)", `Quick,
       test_corrupt_probability_one_makes_read_return_none );
@@ -272,6 +369,14 @@ let tests =
     ("for_test_corrupt_entry respects faults_max too", `Quick, test_for_test_corrupt_entry_respects_faults_max);
     ( "for_test_corrupt_entry raises out of range rather than silently doing nothing", `Quick,
       test_for_test_corrupt_entry_raises_out_of_range_rather_than_silently_doing_nothing );
+    ( "I1: superblock_loss_probability = 1.0 makes the superblock unreadable, WAL untouched",
+      `Quick, test_superblock_loss_probability_one_makes_the_superblock_unreadable );
+    ( "I1: superblock_loss_probability = 0.0 passes superblock writes through",
+      `Quick, test_superblock_loss_probability_zero_passes_through );
+    ( "I1: a later untorn superblock write repairs a torn one", `Quick,
+      test_a_later_untorn_superblock_write_repairs_a_torn_one );
+    ( "I1: for_test_lose_superblock is deterministic and leaves the WAL alone", `Quick,
+      test_for_test_lose_superblock_is_deterministic_and_leaves_the_wal_alone );
     ( "a for_test_corrupt_entry slot's bookkeeping is cleared by a truncate, so a repair is visible",
       `Quick, test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate )
   ]

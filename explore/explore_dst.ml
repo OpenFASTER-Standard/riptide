@@ -97,7 +97,7 @@ let run_scenario ~seed ~replica_count ~rounds ~ops_per_round ~timeout_prob ~net 
   let unreadable_slots = ref 0 in
   (try
      Riptide_dst.Cluster.run ~seed ~replica_count ~net_fault_config:net
-       ~storage_fault_config:storage (fun ~replicas ~settle ->
+       ~storage_fault_config:storage (fun ~replicas ~settle ~restart:_ ->
          let p = Riptide_sim.Prng.create (((seed * 7919) + 13) land 0x3FFFFFFF) in
          let next_val = ref 0 in
          let find_primary () =
@@ -182,6 +182,7 @@ let () =
     {
       Riptide_storage.Fault_injecting_storage.corrupt_probability = a 9 0.05;
       drop_probability = a 10 0.0;
+      superblock_loss_probability = a 11 0.0;
     }
   in
   let timeout_prob = a 11 0.2 in

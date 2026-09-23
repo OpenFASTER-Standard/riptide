@@ -29,7 +29,7 @@ let v s = Value.Scalar (Value.String s)
    real quorum-committed state, not just what [propose] appended locally. *)
 let primary_trace_of seed =
   let trace = ref ([], 0) in
-  Riptide_dst.Cluster.run ~seed ~replica_count:3 (fun ~replicas ~settle ->
+  Riptide_dst.Cluster.run ~seed ~replica_count:3 (fun ~replicas ~settle ~restart:_ ->
       for i = 0 to 4 do
         Replica.propose replicas.(0) (v (Printf.sprintf "payload-%d" i))
       done;
@@ -66,7 +66,7 @@ let backup_log_length_of seed =
           min_delay = 0.0;
           max_delay = 0.0;
         }
-    (fun ~replicas ~settle ->
+    (fun ~replicas ~settle ~restart:_ ->
       for i = 0 to 9 do
         Replica.propose replicas.(0) (v (Printf.sprintf "payload-%d" i))
       done;
@@ -118,7 +118,7 @@ let test_fault_config_exceeding_cap_is_rejected_at_cluster_creation () =
       Riptide_dst.Cluster.run ~seed:1 ~replica_count:3
         ~storage_fault_config:
           { Riptide_storage.Fault_injecting_storage.default_fault_config with corrupt_probability = 1.0 }
-        (fun ~replicas:_ ~settle:_ -> body_invoked := true));
+        (fun ~replicas:_ ~settle:_ ~restart:_ -> body_invoked := true));
   Alcotest.(check bool) "body (and thus replica/storage construction) never ran" false !body_invoked
 
 let tests =

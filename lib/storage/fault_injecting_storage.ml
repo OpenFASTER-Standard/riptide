@@ -7,9 +7,14 @@
 
 module Int_set = Set.Make (Int) (* same local convention as lib/vsr/replica.ml's own recv_svc *)
 
-type fault_config = { drop_probability : float; corrupt_probability : float }
+type fault_config = {
+  drop_probability : float;
+  corrupt_probability : float;
+  superblock_loss_probability : float;
+}
 
-let default_fault_config = { drop_probability = 0.0; corrupt_probability = 0.0 }
+let default_fault_config =
+  { drop_probability = 0.0; corrupt_probability = 0.0; superblock_loss_probability = 0.0 }
 
 type t =
   | T : {
@@ -28,6 +33,12 @@ type t =
              -- see the .mli's [drop_probability] doc comment. Same masking technique as
              [corrupted_slots], same restart-persistence limitation, deliberately *not* subject to
              [faults_max] (see that doc comment for why). *)
+      mutable superblock_lost : bool;
+          (* Set when a [superblock_write] is torn by [superblock_loss_probability] (or by
+             [for_test_lose_superblock]); cleared by the next superblock write that is NOT torn.
+             Masks [superblock_read] to [None] here, the same technique [corrupted_slots] uses for
+             the WAL -- see the .mli's own [superblock_loss_probability] doc comment for what is
+             also done to the WRAPPED backend's copy, and why both halves are needed. *)
     }
       -> t
 
@@ -40,7 +51,8 @@ let create (type a) ~prng ?(fault_config = default_fault_config) ~replication_qu
       fault_config;
       faults_max = replication_quorum - 1;
       corrupted_slots = Int_set.empty;
-      dropped_slots = Int_set.empty
+      dropped_slots = Int_set.empty;
+      superblock_lost = false
     }
 
 let set_fault_config (T r) fault_config = r.fault_config <- fault_config
@@ -181,10 +193,70 @@ let for_test_corrupt_entry (T r) ~op_number =
     List.iter (fun (o, bytes) -> U.wal_append r.value ~op_number:o (Option.value bytes ~default:"")) suffix;
     r.corrupted_slots <- Int_set.add op_number r.corrupted_slots
 
+(* The durable artifact a torn superblock write leaves behind on the WRAPPED backend. Deliberately
+   a FIXED, self-describing string rather than a byte-flip of the real record: flipping a byte of a
+   canonically-encoded superblock can perfectly well yield a record that still DECODES, just with
+   different field values -- a plausible-looking wrong superblock, which is a different and nastier
+   fault than the one being modelled ("this replica's superblock is gone") and would make a seeded
+   run's outcome depend on which byte the flip happened to land in. This string cannot decode as
+   the 4-integer record [Riptide_vsr.Replica]'s own [superblock_decode] requires, so every reader
+   of the wrapped backend -- including one that bypasses this wrapper entirely, e.g. a fresh
+   process reopening a real [File_storage] -- gets "unusable", never "usable but wrong". *)
+let torn_superblock_marker = "riptide: fault-injected torn superblock write"
+
+(* THE SUPERBLOCK FAULT (final-review finding I1). Modelled at WRITE time, like [wal_append]'s own
+   drop/corrupt faults and for the same reason: the real-world event is a CRASH partway through
+   [File_storage.superblock_write]'s 3 sequential, non-atomic copy writes (each itself a header
+   write then a data write). A copy whose header landed but whose data did not fails its own
+   checksum, so it does not verify at all -- and 1 new + 1 torn + 1 old leaves no 2 copies
+   agreeing, which is exactly when [superblock_read] honestly returns [None].
+
+   BOTH halves are performed, matching what [for_test_corrupt_entry] already does for the WAL:
+   this wrapper masks its own [superblock_read] to [None] (so the fault is observable through the
+   [t] the harness is holding), AND the wrapped backend's own copy is durably replaced with an
+   unusable record (so the fault is real down there too, not merely bookkeeping up here). Without
+   the first half a caller holding this [t] would see nothing; without the second, re-wrapping the
+   same backend -- exactly what a real process restart does -- would silently "heal" it.
+
+   The draw is unconditional, before the branch, keeping this module's own documented discipline:
+   the sequence of draws from [r.prng] depends only on the sequence of calls, never on which faults
+   fired.
+
+   DELIBERATELY NOT SUBJECT TO [faults_max], and this is a judgment call worth stating. That cap
+   exists because more than [replication_quorum - 1] corrupted copies of the SAME WAL SLOT makes
+   that slot unrecoverable by any quorum read -- a safety property. A lost superblock is not that:
+   it is local to one replica, and (since finding C1's fix) its consequence is that the replica
+   REFUSES TO RESTART, i.e. it is down. Losing it on every replica at once therefore costs
+   liveness, not safety, and liveness loss is exactly what the sweep's own non-vacuity assertions
+   already detect. Capping it would also make the fault undeliverable in the regime that matters
+   most -- a cluster where several replicas crash with torn superblocks is the interesting one. *)
 let superblock_write (T r) data =
   let module U = (val r.module_) in
-  U.superblock_write r.value data
+  let torn = Riptide_sim.Prng.bool r.prng r.fault_config.superblock_loss_probability in
+  if torn then begin
+    U.superblock_write r.value torn_superblock_marker;
+    r.superblock_lost <- true
+  end
+  else begin
+    U.superblock_write r.value data;
+    (* A superblock write that COMPLETES repairs a previously torn one -- which is a real
+       property, not a convenience: a replica that comes back up and writes a fresh superblock has
+       a usable one again. *)
+    r.superblock_lost <- false
+  end
 
 let superblock_read (T r) =
+  if r.superblock_lost then None
+  else
+    let module U = (val r.module_) in
+    U.superblock_read r.value
+
+(* The DETERMINISTIC counterpart of [superblock_loss_probability], exactly as
+   [for_test_corrupt_entry] is the deterministic counterpart of [corrupt_probability], and for the
+   same reason: the probabilistic path only ever fires at write time, so a test that has already
+   settled a cluster into a known-good state has no write left to attach the fault to. Same two
+   halves, same durable marker. *)
+let for_test_lose_superblock (T r) =
   let module U = (val r.module_) in
-  U.superblock_read r.value
+  U.superblock_write r.value torn_superblock_marker;
+  r.superblock_lost <- true
