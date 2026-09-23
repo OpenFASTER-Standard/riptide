@@ -46,9 +46,14 @@ let test_convergence_regardless_of_fold_order () =
   let forward = converged_via writes in
   let reversed = converged_via (List.rev writes) in
   let shuffled = converged_via [ List.nth writes 1; List.nth writes 2; List.nth writes 0 ] in
+  (* Check that all orderings converge to the same value *)
   Alcotest.(check bool) "forward and reversed order converge to the same value" true
     (forward = reversed);
   Alcotest.(check bool) "shuffled order also converges to the same value" true
-    (forward = shuffled)
+    (forward = shuffled);
+  (* Check that the converged value equals the expected result: timestamp 3, value "c" *)
+  let expected = { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String "c"); timestamp = 3L } in
+  Alcotest.(check bool) "converges to the expected LWW value (highest timestamp wins)" true
+    (forward = expected)
 
 let tests = [ ("convergence regardless of fold order", `Quick, test_convergence_regardless_of_fold_order) ]
