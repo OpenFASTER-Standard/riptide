@@ -13,8 +13,19 @@ Toolchain: TLC 2.19 via `tla2tools.jar`, durably installed at `/work/toolchain/t
 
 ## Scope
 
-`VSR.tla` specifies VSR's **core safety protocol**: normal-case replication and view change,
-model-checked at `ReplicaCount=3, Values={v1}, StartViewOnTimerLimit=1` (`spec/tla/VSR.cfg`).
+`VSR.tla` specifies VSR's **core safety protocol** — normal-case replication and view change —
+**plus storage-fault-aware recovery**: a per-op tri-state `{present, absent, corrupt}` storage
+abstraction, nack evidence piggybacked on `DOVIEWCHANGE`, nack-quorum-driven log truncation, a
+multi-step and interruptible view-change completion with a forfeit escape, and durable
+`view`/`log_view` across a simulated crash/restart. Model-checked at `ReplicaCount=3,
+Values={v1}, StartViewOnTimerLimit=1, MaxOp=1, CorruptLimit=1, RestartLimit=1, ForfeitLimit=1`
+(`spec/tla/VSR.cfg`).
+
+Storage-fault-aware recovery was "explicitly out of scope, for a follow-up plan" in the version of
+this file that shipped with the core spec. That follow-up plan is
+`docs/superpowers/plans/2026-09-23-storage-fault-tolerant-recovery.md`, and this is it — see
+"Storage-fault-aware recovery: what is modeled, and the evidence for it" below for the mechanism
+and its disclosed gaps.
 
 **The run is exhaustive and clean.** Reproduce it with `scripts/tlc VSR`; the result, quoted
 verbatim from TLC 2.19 so a reader of this branch can check the claim without access to any
@@ -22,16 +33,29 @@ out-of-tree scratch directory:
 
 ```
 Model checking completed. No error has been found.
-553084 states generated, 264376 distinct states found, 0 states left on queue.
-The depth of the complete state graph search is 40.
-Finished in 23s
+9341066 states generated, 3728294 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 45.
+Finished in 02min 41s
 ```
 
 `0 states left on queue` is the part that matters: the entire reachable state space at this bound
-was explored, and all five invariants (`TypeOK`, `CommitNumberNeverHigherThanOpNumber`,
-`LogLengthMatchesOpNumber`, `NoLogDivergence`, `AcknowledgedWritesExistOnMajority`) hold on every
-reachable state. See the caveat below on how much of that is real evidence — three of the five
-discriminate less than they look at `Values = {v1}`.
+was explored, and all **fifteen** invariants listed in `VSR.cfg` hold on every reachable state. See
+the caveat below on how much of that is real evidence — several of the fifteen discriminate less
+than they look at `Values = {v1}`, and this file names which.
+
+Two notes on reproducing this exact block, both of which are differences from the core spec's own
+earlier numbers rather than anything about the protocol:
+
+- **Wall-clock is not comparable across runs with different worker counts; state counts are.**
+  `scripts/tlc` now passes `-workers auto` (TLC defaults to a single worker), so `02min 41s` is a
+  16-core figure. The state counts — `9341066` / `3728294` / depth `45` — are properties of the
+  state graph and are unaffected by worker count. Compare those, not the clock.
+- **The fingerprint-collision estimate is `1.7E-6`**, three orders of magnitude larger than the
+  core spec's `4.4E-9`, because the run is 14x bigger. This file's own earlier advice was to
+  re-check with a second `fp` seed whenever that number is load-bearing for a real safety claim,
+  which it now is, so that was done: `scripts/tlc VSR -fp 7` returns
+  `9341066 states generated, 3728294 distinct states found, 0 states left on queue`, depth `45` —
+  byte-identical counts under an independent fingerprint function, and no error.
 
 Every documented defect in the original VSR paper (Liskov & Cowling, 2012) that this scope touches
 is pre-fixed, not left for TLC to (re)discover: the `ValidDvc` view-filtered DVC quorum counting
@@ -168,29 +192,40 @@ safety-critical
 `WinningDVC` comparison is still caught in seconds — but by `CommitNumberNeverHigherThanOpNumber`,
 not by `NoLogDivergence`).
 
-**The real evidence this scope's model-checking provides therefore comes from exactly two of the
-five invariants**: `CommitNumberNeverHigherThanOpNumber` (the one that actually catches the
-`WinningDVC` mutation, in 9s) and `AcknowledgedWritesExistOnMajority` (a genuine discriminator even
-at `Values = {v1}`, since it depends on *which replicas* hold an entry, not on distinguishing entry
-content). The other three are weaker than they look and should not be counted as safety evidence:
+**So the fifteen invariants are not fifteen independent pieces of evidence.** Sorted by how much
+each actually discriminates at the shipped bound, so a reader can weight them rather than counting
+them:
 
-- `NoLogDivergence` — structurally unfalsifiable at `Values = {v1}`, as described above.
-- `TypeOK` — a type-shape check, not a safety discriminator. It covers 5 of the module's 13
-  variables and asserts only `\in Nat` for three numeric ones, a two-element domain for
-  `rep_status`, and `\in BOOLEAN` for `rep_sent_dvc`. No action in the module can assign anything
-  outside those domains (there is no subtraction anywhere except inside `DiscardFunc`, which
-  touches none of them), so it cannot fail on a reachable state. It is worth keeping as a
-  cheap regression guard against future edits, not as evidence about the protocol.
-- `LogLengthMatchesOpNumber` — a structural well-formedness check (`Len(rep_log[r]) =
-  rep_op_number[r]`), added because `NoLogDivergence` indexes `rep_log[r][op_number]` and its
-  freedom from out-of-domain application rests on this relationship holding. It is genuinely
-  falsifiable by a bad edit — unlike `TypeOK` — but it constrains bookkeeping, not agreement.
+*Genuine discriminators (the evidence):*
+- `AcknowledgedWritesExistOnMajority` — real even at `Values = {v1}`, since it depends on *which
+  replicas* hold an entry, not on distinguishing entry content.
+- `CommitNumberNeverHigherThanOpNumber` — the invariant that actually catches the `WinningDVC`
+  mutation (in 9s), and the one that catches a `ReceiveSV` truncating below its own destination's
+  commit point.
+- `NoCommittedOpProvablyAbsent`, `AcknowledgedWritesReadableSomewhere`,
+  `StartViewNeverDropsACommittedOp`, `StartViewCoversItsOwnCommitPoint` — the four new
+  storage-fault-aware ones. All four are non-vacuous at this bound by *measurement*, not by
+  argument; see the probe table in the storage-fault section below.
+- `DvcEntriesAgreeWithinLogView` — the premise that licenses repairing a corrupt slot from a
+  same-`log_view` peer. Falsifiable and load-bearing.
 
-A follow-up plan that wants `NoLogDivergence` to mean something should widen `Values` to at least
-2 elements for that specific check — expect a state-space cost when doing so, though see the note
-at the end of this file: with the `SendDVC` self-loop fixed, that cost is now far lower than this
-plan's own earlier runs suggested, and re-testing a wider `Values` is a cheap first experiment
-rather than the expensive one it was assumed to be.
+*Structural / regression guards (keep them, don't count them as safety evidence):*
+- `NoLogDivergence` — still structurally unfalsifiable at `Values = {v1}`, as described above. The
+  storage-fault extension makes this gap matter *more* than it did for the core spec, because
+  nack-quorum-driven truncation is a brand-new way for two logs to end up disagreeing. This is
+  measured rather than left as a worry — see "Widening `Values`" below.
+- `TypeOK` — a type-shape check, not a safety discriminator, for the same reason as before. It now
+  also asserts the tri-state domain for `rep_storage`, which is the one part of it a bad edit
+  could plausibly break.
+- `LogLengthMatchesOpNumber`, `OpNumberWithinMaxOp`, `StorageWellFormed` — well-formedness.
+  `OpNumberWithinMaxOp` and `StorageWellFormed` are the runtime checks of the two domain-boundedness
+  arguments `VSR.tla`'s `ASSUME`s state, added because `rep_storage` is indexed by `1..MaxOp` and an
+  escaped op-number would be an out-of-domain index, not merely a large number.
+- `NeverNackCorruptOrHeld` — structural at this scope (`CanNack` is *defined* as
+  `rep_storage[r][o] = "absent"`), kept so that an edit widening `CanNack` has to confront
+  research §4.2's rule explicitly rather than silently drop it.
+- `RecvDvcValidWhenViewChange` — the reset-discipline regression check; see the `ValidDvc` section.
+- `NoUnboundedGrowth` — a finiteness tripwire, not a safety property at all. See the last section.
 
 ## What the `ValidDvc` filter is actually doing here
 
@@ -207,18 +242,58 @@ received DVCs regardless of view, the exact historical bug — and model-checked
 At the larger bounds tried while the `SendDVC` self-loop described below was still present, that
 run was **inconclusive**: no violation was found, but no run terminated either, so nothing was
 proven in either direction. No commit was made for that experiment; it was a pure verification
-exercise, reverted afterwards. With the self-loop fixed, the same weakened spec now runs to
-completion at the shipped bound, and the result is not "inconclusive" but a precise negative:
+exercise, reverted afterwards. With the self-loop fixed, the same weakened spec ran to completion
+against the **pre-recovery core spec**, and the result was not "inconclusive" but a precise
+negative:
 
 ```
 Model checking completed. No error has been found.
 553084 states generated, 264376 distinct states found, 0 states left on queue.
 ```
 
-Those are the *same* counts, state for state, as the unmodified spec quoted at the top of this
-file — and, as the next paragraph shows, that is a proof rather than a coincidence: at this bound
-the weakened spec and the correct spec have the same reachable state graph, so removing the filter
-changes nothing, exhaustively.
+Those were the *same* counts, state for state, as the core spec's own run — at that bound the
+weakened spec and the correct spec had the same reachable state graph, so removing the filter
+changed nothing, exhaustively. (Those numbers are the core spec's, at commit `169a4d3`, before
+storage-fault-aware recovery was added; they are no longer what `scripts/tlc VSR` prints. The
+current numbers are at the top of this file.)
+
+**That conclusion has now expired, exactly as the last paragraph of this section warned it might.**
+It said a follow-up plan adding "state transfer, recovery, or multi-step view-change completion
+(all of which add new ways to change a replica's view or status) could easily open a path where a
+stale DVC does reach `SendSV`", and asked whoever touched the view-transition actions next to
+re-run the check rather than assume. This plan touched them — it added `ForfeitViewChange` and
+`CrashRestart`, two new ways to change a replica's view or status — so it was re-run, twice:
+
+- `RecvDvcValidWhenViewChange` **still holds**, exhaustively, on all `3678650` reachable states of
+  the current spec, `0 states left on queue`. It is in the shipped `VSR.cfg`. The reset discipline
+  it checks now covers **four** actions, not two — `TimerSendSVC`, `ReceiveHigherSVC`,
+  `ForfeitViewChange` and `CrashRestart` all reset `rep_recv_dvc[r]` to `{}` in the same step in
+  which they put (or keep) a replica in `"ViewChange"`.
+- **The filter is no longer inert, though.** Re-running the same adversarial weakening against the
+  *current* spec — regenerate it with
+
+  ```bash
+  cd spec/tla
+  sed -e 's/^---- MODULE VSR ----/---- MODULE VSR_NoFilter ----/' \
+      -e 's/^ValidDvc(r, m) == m.v = View(r)$/ValidDvc(r, m) == TRUE/' VSR.tla > VSR_NoFilter.tla
+  grep -v 'INVARIANT RecvDvcValidWhenViewChange' VSR.cfg > VSR_NoFilter.cfg   # trivially true once ValidDvc is TRUE
+  cd ../.. && scripts/tlc VSR_NoFilter
+  ```
+
+  (not committed — it is a two-line derivation of the real module, and a committed copy would rot
+  the moment `VSR.tla` changed, which is precisely the failure this experiment exists to detect) —
+  gives
+  `12153929 states generated, 4787391 distinct states found, 0 states left on queue` — **not** the
+  same state graph as the unweakened `3678650`. Removing the filter now makes ~30% more states
+  reachable, because `ValidDvcs` feeds five readers in this module (`HasDvcQuorum`, `NackCount`,
+  `EntrySources`, `WinningDVC`, `HighestCommitNumber`) and unfiltered stale DVCs enable `SendSV`
+  and `ForfeitViewChange` in states where they were not enabled.
+
+  Stated precisely, because the honest version is weaker than "the filter is now proven necessary":
+  no safety violation was found in those 4,787,391 states either. So the filter is demonstrably
+  doing *work* on the state space now, where against the core spec it provably did none — but this
+  bound still provides no evidence that the work it does is *safety*-relevant. It stays in the spec
+  for the same reason as before, now with a better one: the margin it defends has visibly narrowed.
 
 **Why — and the reason is more interesting than "stale DVCs can never accumulate".** That simpler
 explanation is false, and TLC says so. A temporary invariant asserting that `rep_recv_dvc[r]` only
@@ -240,45 +315,64 @@ RecvDvcValidWhenViewChange ==
         rep_status[r] = "ViewChange" => \A m \in rep_recv_dvc[r] : ValidDvc(r, m)
 ```
 
-— **holds on all 264,376 reachable states, exhaustively, 0 left on queue.** The contamination
-`ReceiveSV` creates exists only while `rep_status[r] = "Normal"` (`ReceiveSV` always sets exactly
-that), and the only two actions that can put a replica back into `"ViewChange"` — `TimerSendSVC`
-and `ReceiveHigherSVC` — both unconditionally reset `rep_recv_dvc[r]` to `{}` in the same step.
-`SendSV` is guarded on `rep_status[r] = "ViewChange"`, and it is the only reader of
-`rep_recv_dvc[r]` (`WinningDVC` and `HighestCommitNumber` are evaluated only inside it). So every
-element `SendSV` ever sees is already valid, and the filter has nothing left to remove.
+— **held on all 264,376 of the core spec's reachable states, and holds on all 3,678,650 of the
+current spec's, exhaustively, 0 left on queue.** The contamination `ReceiveSV` creates exists only
+while `rep_status[r] = "Normal"` (`ReceiveSV` always sets exactly that), and every action that can
+put a replica into — or keep it in — `"ViewChange"` resets `rep_recv_dvc[r]` to `{}` in the same
+step. That was two actions in the core spec (`TimerSendSVC`, `ReceiveHigherSVC`) and is **four**
+now (`ForfeitViewChange` and `CrashRestart` added by this plan; `CrashRestart` is the interesting
+one, since it *reconstructs* `"ViewChange"` status from durable `view > log_view` rather than being
+told to enter it). Every reader of `rep_recv_dvc[r]` — `SendSV` and `ForfeitViewChange`, both via
+`HasDvcQuorum` — is guarded on `rep_status[r] = "ViewChange"`.
+
+**Why this matters more than it did, and why there is deliberately no separate nack accumulator.**
+Task 4's draft extension kept nack evidence in its own `rep_recv_nacks` variable, which would have
+reproduced exactly this stale-across-a-view-bump hazard for a *second* kind of evidence, needing a
+second reset discipline and a second regression invariant to defend it. This spec folds nacks into
+the `DOVIEWCHANGE` record instead (`SendDVC`'s `nacks` and `entries` fields), so every reader
+reaches nack evidence through `ValidDvcs(r)` and therefore through the same filter and the same
+reset discipline that already guard log selection. `RecvDvcValidWhenViewChange` covers nack
+evidence for free as a result. That is a structural removal of the hazard, not a defence against
+it, and it is the main reason the piggyback is preferred here over a separate accumulator.
 
 **What this does and does not mean.** It does **not** mean the historical bug is fake — it is real,
-published, and the filter is the correct fix for it. It means that *in this model*, the
-reset-on-every-new-view-change-episode discipline already prevents the accumulation pattern that
-bug needs, by a different mechanism than the filter. This scope's model-checking therefore provides
-no independent evidence that the filter is load-bearing, because at this bound it provably is not.
-
-**The filter stays in the spec anyway**, deliberately. Its redundancy is a property of the current
-reset discipline, not of the protocol: `ReceiveSV` already fails to reset `rep_recv_dvc`, and a
-follow-up plan that adds state transfer, recovery, or multi-step view-change completion (all of
-which add new ways to change a replica's view or status) could easily open a path where a stale DVC
-does reach `SendSV`. Removing a correct, defensive, currently-inert filter to save an intersection
-would be trading a real safety property for nothing. Whoever touches the view-transition actions
-next should re-run `RecvDvcValidWhenViewChange` as a regression check before assuming the filter is
-still inert.
+published, and the filter is the correct fix for it. Against the core spec it meant that the
+reset-on-every-new-view-change-episode discipline already prevented the accumulation pattern that
+bug needs, by a different mechanism than the filter. Against the current spec, per the measurement
+above, the filter has stopped being state-graph-inert but has still not been shown
+safety-load-bearing at this bound.
 
 **Explicitly out of scope, for a follow-up plan (not this one):**
 - **State-transfer** (`GETSTATE`/`NEWSTATE`) — the paper's own version has a documented, real
   data-loss defect (research §5.7 Part 3), and TigerBeetle's fix replaces the mechanism entirely
   with `get_view`/`view` (research §4.11) — building the textbook version now would be discarded.
-- **Storage-fault-aware recovery** — nacks, nack quorums, the `nack_bitset`/`present_bitset` on
-  `join_view`, the "never nack a corrupt entry" rule (research §4.2, §4.8-§4.10). This is the part
-  of Task 3 (per `docs/superpowers/specs/2026-09-16-distributed-consensus-design.md`'s Decision 1)
-  that most directly delivers on "storage-fault-aware" — it is real, substantial, separate work,
-  not owed by this plan.
-- **Crash/restart modeling and reconfiguration** — research §5's own finding: reconfiguration has
-  zero public formal treatment anywhere (Vanlightly's own Part 7 was announced and never published;
-  TigerBeetle's own docs mark it "TODO (Unimplemented)"). Anything Riptide does here is original
-  work, not transcription from prior art.
+- **Reconfiguration** — research §5's own finding: it has zero public formal treatment anywhere
+  (Vanlightly's own Part 7 was announced and never published; TigerBeetle's own docs mark it
+  "TODO (Unimplemented)"). Anything Riptide does here is original work, not transcription from
+  prior art.
+- **General crash modeling beyond `CrashRestart`** — this spec models one crash/restart shape: a
+  replica loses its volatile view-change bookkeeping, keeps its durable state, and may discover up
+  to `CorruptLimit` slots corrupt. It does not model a replica being down for a stretch of the
+  behaviour, partial writes in flight at the moment of the crash, or a corrupted *superblock* (only
+  corrupted WAL slots). The superblock gap is the most consequential of the three and is called out
+  again in the storage-fault section's own disclosed-gaps list below.
 
-**Four decisions a follow-up storage-fault-aware plan must make explicitly** (research §7.3 — none
-of these are settled by prior art, and none are needed by this plan's own scope):
+**The four decisions this file asked a follow-up storage-fault-aware plan to make have now been
+made** (research §7.3), by
+`docs/superpowers/specs/2026-09-23-storage-fault-tolerant-recovery-design.md`'s Decisions 4 and 5,
+and are implemented in `VSR.tla` as described in the next section. For the record, each was decided
+as this file recommended:
+1. Storage-fault abstraction level — **per-op tri-state** `{present, absent, corrupt}`, not a
+   faithful two-ring WAL model (research §4.13).
+2. Keep VSR's textbook Recovery sub-protocol, or follow TigerBeetle and persist `view`/`log_view`
+   to a durable, checksummed state — **persist** (`rep_view_number`/`rep_last_normal_view` survive
+   `CrashRestart`; `rep_status` is reconstructed from them rather than stored).
+3. Atomic vs. multi-step view-change completion — **multi-step**, with the forfeit escape.
+4. Flexible vs. uniform quorums — **uniform `f+1`** everywhere (`Quorum == f + 1`, one definition,
+   used by `HasDvcQuorum`, `ProvenAbsent` and both `AcknowledgedWrites*` invariants).
+
+The original wording of those four, kept because the reasoning behind the recommendations is still
+the reasoning behind the decisions:
 1. Storage-fault abstraction level — a per-op tri-state `{present, absent, corrupt}` (recommended
    starting point: simpler, still expresses the core "don't nack corrupt" rule) vs. a faithful
    two-ring WAL model (research §4.13; much more faithful, probably not exhaustively checkable).
@@ -293,6 +387,142 @@ of these are settled by prior art, and none are needed by this plan's own scope)
    (recommended starting point: uniform — flexible quorums are a real latency win but triple the
    number of quorum constants and every intersection argument; this spec's `f`-based thresholds
    already assume uniform quorums throughout and would need generalizing).
+
+## Storage-fault-aware recovery: what is modeled, and the evidence for it
+
+This is the section that used to be a bullet under "explicitly out of scope". The mechanism, in the
+order a reader of `VSR.tla` meets it:
+
+1. **Per-op tri-state storage.** `rep_storage[r][o] \in {"present", "absent", "corrupt"}`.
+   The load-bearing modelling decision, stated in the module and asserted as the invariant
+   `StorageWellFormed`, is that a slot a replica has already durably written can fault only to
+   `"corrupt"` — never to `"absent"`. `"absent"` means "I can prove I never wrote here", and holds
+   precisely for `o > Len(rep_log[r])`. This is the spec-level statement of design Decision 6's
+   redundant, physically-separate checksum header: a checksum mismatch means *corrupted*, never
+   conflated with *legitimately absent*. A storage layer that could let a durably-acknowledged
+   entry read back as a valid-but-empty slot would defeat **any** nack-based recovery protocol —
+   two replicas could then jointly "prove" a committed op was never held.
+2. **`CanNack(r, o) == rep_storage[r][o] = "absent"`** — research §4.2's "never nack a corrupt
+   entry" rule. A corrupt slot is exactly the case where a replica *cannot* prove it never held the
+   entry. `NeverNackCorruptOrHeld` is the regression guard.
+3. **Evidence piggybacked on `DOVIEWCHANGE`, not a separate round trip.** `SendDVC` carries
+   `entries` (a *partial* function, defined exactly on the ops the sender can actually read — a
+   replica cannot send bytes it cannot read), `nacks`, and the op-number/`log_view` it still knows
+   from durable superblock state even when entry bodies are unreadable. See the `ValidDvc` section
+   above for why this placement is a safety property and not just an economy.
+4. **Multi-step, interruptible completion.** `SendSV` is gated on `CanComplete(r)`: a completion at
+   length `L` is admissible only if every op it keeps can be reconstructed from canonical evidence
+   (`CanFill`), every op it drops was proven absent by an `f+1` nack quorum (`ProvenAbsent`), and
+   `L` never falls below the highest commit-number any quorum member reported. An op in neither
+   category is **contested** and blocks completion — the coordinator stays in `"ViewChange"`, keeps
+   accepting DVCs, and can be interrupted at any point by a higher view. `CompletionPoint` takes
+   the *longest* admissible log: truncation is a last resort taken only where a nack quorum forces
+   it.
+5. **The forfeit escape.** `ForfeitViewChange` is enabled precisely when a coordinator has
+   everything the storage-fault-*unaware* protocol needed to complete — primary of its view, in
+   `ViewChange`, holding a valid `f+1` DVC quorum — and still cannot, because an op is contested.
+   It abandons the attempt at `view+1` so a replica with different storage gets to coordinate. It
+   is deliberately **not** enabled short of a quorum: more DVCs can only add evidence, never remove
+   it, so forfeiting early would abandon an attempt that was still making progress.
+6. **Durable `view`/`log_view`.** `CrashRestart` keeps `rep_log`, `rep_op_number`,
+   `rep_commit_number`, `rep_view_number` and `rep_last_normal_view`; it loses `rep_peer_op_number`,
+   `rep_recv_svc`, `rep_recv_dvc` and `rep_sent_dvc`; and it *reconstructs* `rep_status` from
+   `view > log_view`. That reconstruction is the whole point of persisting the pair: a replica that
+   crashed mid-view-change resumes there instead of re-entering the old view as if nothing had
+   happened.
+
+### The defect this found, which is the main reason to trust the exercise at all
+
+The nack-quorum truncation argument is: a committed op is durably held by `f+1` replicas, any two
+`f+1` subsets of `2f+1` intersect, and a replica that durably held an entry can never nack it (a
+lost write reads back corrupt, and a corrupt slot is never nacked) — so an `f+1` nack quorum
+*proves* the op was never committed. Every word of that is about `f+1` **distinct replicas**.
+
+`HasDvcQuorum` originally tested `Cardinality(ValidDvcs(r)) >= Quorum` — the number of DVC
+*messages*. That is inherited, unremarkable-looking code, and against the core spec it was
+harmless: a replica sent at most one `DOVIEWCHANGE` per view-change episode, so messages and
+senders coincided. **This plan broke that coincidence**, and did so correctly: `CrashRestart` clears
+`rep_sent_dvc`, because it is volatile in-memory state, so a replica that restarts mid-view-change
+re-sends its `DOVIEWCHANGE` — and its second one differs from its first, because its `entries`
+field shrank when a slot faulted to corrupt. Two distinct records, one replica, counted as a quorum
+of two.
+
+TLC found it at the widened bound (`scripts/tlc VSR_Wide`, below) as a violation of
+`AcknowledgedWritesExistOnMajority` at depth 19: a coordinator formed a "quorum" out of two DVCs
+from the same restarted replica, neither of which knew about op 2, and completed a view change that
+truncated an op a third replica had already committed and acknowledged to a client.
+
+**Why the shipped bound is blind to it, exactly.** At `MaxOp = 1` the defect is still *reachable*
+(the fix removes real states: `3728294` distinct before, `3678650` after) but cannot produce a
+violation. To lose data you need the fake quorum's own op-number to be *shorter* than a committed
+op elsewhere. At `MaxOp = 1` the only way a duplicate-sending replica reports a short log is to
+report an empty one — but a replica with an empty log has written nothing, so a restart has nothing
+to corrupt, so its two `DOVIEWCHANGE`s are *identical records*, and `rep_recv_dvc` is a set, so they
+collapse to one. The second value is what breaks the symmetry. This is the most concrete answer
+this branch has to "how much does widening `Values` actually buy" — it bought a real safety defect
+that 3.7 million exhaustively-checked states at the narrow bound did not.
+
+### Non-vacuity: every part of the machinery is measured as reachable, not argued to be
+
+A safety invariant that holds because the state which would test it is unreachable is worth
+nothing, and this file already applies that scepticism to `NoLogDivergence`. `spec/tla/VSR_Probe.tla`
+applies it to the recovery machinery: each probe is written to be **false** on some reachable
+state, so an `Invariant ... is violated` result is the *success* case. Run them with
+`scripts/probe-vacuity` (one at a time — TLC stops at the first violation). All seven are reachable
+at the shipped bound:
+
+| Probe | Asks | Result |
+| --- | --- | --- |
+| `NoCorruptionEver` | is a storage fault ever actually discovered? | reachable, depth 4 |
+| `NoRestartEver` | does a crash/restart ever happen? | reachable, depth 3 |
+| `NoContestedCompletion` | is a coordinator ever stuck holding a full `f+1` DVC quorum and still unable to complete? | reachable, depth 10 |
+| `NoForfeitEver` | does the forfeit escape ever fire? | reachable, depth 11 |
+| `NoNackQuorumInRange` | does an `f+1` nack quorum ever form for an op in the candidate range? | reachable, depth 13 |
+| `NoNackOfACommittedOp` | is `NoCommittedOpProvablyAbsent`'s antecedent reachable at all? | reachable, depth 5 |
+| `NoStartViewShortensALog` | does a completed view change ever actually *truncate*? | reachable, depth 10 |
+
+`NoContestedCompletion` is the one that matters most: it is the direct test of whether
+storage-fault-awareness genuinely forces a multi-step sequence at this bound, or whether completion
+is still effectively atomic and the whole design is untested decoration. It is reachable, so the
+multi-step shape is exercised for real. `NoNackOfACommittedOp` is the second most important: it
+proves `NoCommittedOpProvablyAbsent` is guarding a situation that actually arises.
+
+### Widening `Values`: what it cost and what it is worth
+
+`spec/tla/VSR_Wide.tla`/`.cfg` is `VSR.tla` unmodified (by `EXTENDS`) at `Values = {v1, v2},
+MaxOp = 2`, with the shipped invariant set verbatim. `Values` and `MaxOp` move in lockstep because
+`VSR.tla`'s own `ASSUME MaxOp >= Cardinality(Values)` requires it: op-numbers are bounded by the
+number of distinct values (`ReceiveClientRequest` refuses a value already in the primary's log) and
+`rep_storage` is indexed by `1..MaxOp`, so widening `Values` alone would silently under-cover the
+fault model and widening it past `MaxOp` would index out of domain. That `ASSUME` did not exist
+before this plan; it was added because this exact coupling is easy to break with a one-line config
+edit.
+
+It is worth keeping and running despite the cost below, because it is what found the
+`HasDvcQuorum` defect.
+
+### Disclosed gaps in this scope, beyond the four liveness simplifications above
+
+- **The superblock itself never faults.** `CrashRestart` corrupts WAL slots only. `rep_view_number`,
+  `rep_last_normal_view`, `rep_op_number` and `rep_commit_number` always survive intact — which is
+  exactly the assumption design Decision 6's 3-copy superblock with flexible read/write quorums
+  exists to earn, but this spec assumes it rather than modelling it. A corrupted-superblock model is
+  separate work.
+- **Repair is wholesale, not incremental.** `SendSV`/`ReceiveSV` reset `rep_storage` to
+  `FreshStorage(n)`: adopting the new view's canonical log means durably writing and verifying it,
+  so corruption heals. `STARTVIEW` carries the complete log in this spec. A real implementation
+  repairs incrementally and would need its own treatment.
+- **`rep_peer_op_number` is not reset when a replica becomes primary.** A replica that was primary
+  in an earlier view and becomes primary again can count `PREPAREOK`s from that earlier view toward
+  `IsCommitted` in the new one. Textbook VSR starts a new primary's ack tracking fresh. This is
+  pre-existing (it is not introduced by this plan) and no run has produced a violation from it, at
+  either bound — but no run has *cleared* it either, and it was noticed rather than tested, so it
+  is recorded here rather than left implicit.
+- **`NoUnboundedGrowth` is a finiteness tripwire shipped in `VSR.cfg`, not a safety property.**
+  Nothing in the protocol requires a message-bag count to stay below 4. A breach means "some action
+  is growing the bag monotonically" — the `SendDVC`/`SendNack` self-loop defect class — not "the
+  protocol is unsafe". It is kept in the shipped config because that defect class is the single
+  most expensive mistake to misdiagnose in this spec; see the next two sections.
 
 ## A lesson for whoever plans the follow-up: check that the model is finite before blaming the bound
 
@@ -321,6 +551,11 @@ Two things follow:
   spec class at these bounds; the follow-up plan should default to it and fall back to simulation
   only when a *measured* run says otherwise. Widening `Values` to 2 — which is what
   `NoLogDivergence` needs to stop being vacuous — is now a cheap experiment worth trying first.
+  (Follow-up, measured: it was tried, it is **not** cheap against the storage-fault-aware model,
+  and it was worth doing anyway because it found a real safety defect. See "Widening `Values`"
+  above. The `default to exhaustive, fall back only on a measured run` advice held up exactly as
+  written: the shipped bound exhausts, and the widened one is reported with its real numbers rather
+  than with a guess.)
 - **Add a finiteness check to the follow-up plan's first task.** An unbounded-state-space defect is
   cheap to detect and expensive to misdiagnose: add a throwaway invariant like
   `\A m \in DOMAIN messages : messages[m] < 3` and run it. Against the broken spec here, that probe
@@ -346,7 +581,11 @@ sketch of the tri-state storage abstraction (decision 1 above) and nack accumula
 `DOVIEWCHANGE` (decision 3's multi-step shape). It is deliberately *not* the real extension — it
 accumulates nacks and never uses them, has no new safety invariants, and should be deleted rather
 than grown into the real thing. It is a **copy** specifically so `VSR.tla` stays byte-identical and
-the `264,376`-state result quoted at the top of this file stays literally reproducible.
+the `264,376`-state result then quoted at the top of this file stays literally reproducible.
+
+*(Written during Task 4, kept in the present tense it was written in. The file has since been
+deleted and the top of this file now quotes the storage-fault-aware spec's own numbers instead —
+see the subsection at the end of this section for both changes and why.)*
 
 **Finding 1 — the predicted defect, confirmed.** `SendNack` was drafted the natural way: guarded on
 `rep_status[r] = "ViewChange"` and "this op is provably absent," effect = send a NACK. Neither guard
@@ -403,8 +642,51 @@ invariants. Every one of those additions is still to come. Three concrete conseq
    consumes from the bag. Treat "does this action's own effect falsify any of its own guards?" as a
    checklist item for each new action, not as something to discover from a non-terminating run.
 
-Reproduce all of the above with `scripts/tlc VSR_RecoveryDraft`. One honest caveat on the headline
-run: TLC's own fingerprint-collision estimate for it is `3.6E-5` (based on actual fingerprints),
-versus `4.4E-9` for the core spec's much smaller run — still small, but four orders of magnitude
-larger, and worth re-checking with a second `fp` seed if this number is ever load-bearing for a real
-safety claim rather than, as here, a finiteness measurement.
+One honest caveat on the headline run: TLC's own fingerprint-collision estimate for it is `3.6E-5`
+(based on actual fingerprints), versus `4.4E-9` for the core spec's much smaller run — still small,
+but four orders of magnitude larger, and worth re-checking with a second `fp` seed if this number is
+ever load-bearing for a real safety claim rather than, as here, a finiteness measurement.
+
+### `VSR_RecoveryDraft.tla` has been deleted, and the budget above turned out to be pessimistic
+
+The draft is gone from the tree. Its own module header and Task 4's report both said it should be
+deleted rather than grown into the real extension once that existed, and it now does — the real
+extension lives in `VSR.tla`, as described in the storage-fault section above. The numbers quoted in
+this section remain reproducible at commit `169a4d3`, which is the last commit that contains the
+file; nothing here is unverifiable, it is just historical. `scripts/tlc VSR_RecoveryDraft` no longer
+works on `main`-line checkouts of this branch, by design.
+
+The draft was written as a copy specifically to keep `VSR.tla`'s own quoted numbers reproducible
+while the churn happened elsewhere. That was the right call for Task 4, and the reason it no longer
+applies is that Task 5 changed `VSR.tla` itself, so the numbers at the top of this file moved
+anyway — deliberately, and with the new run quoted in their place.
+
+**The measured outcome, against the budget this section set.** The prediction was that the real
+extension — nack quorums, truncation, forfeit, durable view state, new invariants — would cost
+"substantially more" than the minimal draft's `8,670,448` distinct states. It cost **less than
+half**:
+
+| | distinct states | depth |
+| --- | --- | --- |
+| core spec (pre-recovery, commit `169a4d3`) | 264,376 | 40 |
+| Task 4's minimal draft | 8,670,448 | 46 |
+| the real extension (`VSR.tla` today) | 3,678,650 | 45 |
+
+Compare the state counts, not the wall-clocks: `scripts/tlc` now defaults to `-workers auto`, and
+the draft's `15min 48s` was a single-worker figure, so the clocks are not comparable while the
+graphs are.
+
+The reason is finding 2 of this section, applied harder than the draft applied it. The draft turned
+its always-enabled `InjectStorageFault` action into **7 initial fault configurations** — which
+removed the interleaving blowup but multiplied the entire base graph by 7 unconditionally, paying
+for fault configurations on behaviours that never reach a view change at all. `VSR.tla` instead
+folds fault discovery into `CrashRestart` (they are the same event in reality — a replica discovers
+a slot no longer verifies when it re-reads its WAL after a restart) and then *narrows enablement to
+restarts that can matter*: a restart that corrupts nothing **and** happens while the replica is not
+mid-view-change is a pure volatile-state reset with no bearing on any property here, and is not
+modelled. That guard is where the factor of two-and-a-bit comes from.
+
+The generalisable form of finding 2 is therefore stronger than the draft's version of it. It is not
+"model faults as configuration rather than as events" — configuration has its own multiplier. It is:
+**a fault must be able to reach the states where it matters, and must not be paid for anywhere
+else.** Ask which behaviours the fault can actually change the outcome of, and guard on that.

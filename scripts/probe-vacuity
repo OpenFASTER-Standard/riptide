@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Runs spec/tla/VSR_Probe.tla's vacuity probes one at a time against the SHIPPED bound.
+#
+# Each probe is written to be FALSE on some reachable state, so "Invariant ... is violated" is
+# the SUCCESS case: it proves the corresponding piece of VSR.tla's storage-fault-aware recovery
+# machinery is genuinely exercised at spec/tla/VSR.cfg's bound, rather than a safety invariant
+# holding because the state that would test it is unreachable. A probe that instead reports
+# "No error has been found" is a real finding: that machinery is dead at this bound, and any
+# safety invariant depending on it is vacuous.
+#
+# Usage: scripts/probe-vacuity [probe-name ...]   (default: all of them)
+# Results land in .tlc-runs/probe-<name>.log; a one-line verdict per probe goes to stdout.
+set -uo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TLA_DIR="$REPO_ROOT/spec/tla"
+OUT_DIR="$REPO_ROOT/.tlc-runs"
+mkdir -p "$OUT_DIR"
+
+ALL_PROBES=(NoCorruptionEver NoRestartEver NoContestedCompletion NoForfeitEver \
+            NoNackQuorumInRange NoNackOfACommittedOp NoStartViewShortensALog)
+PROBES=("$@")
+[ ${#PROBES[@]} -eq 0 ] && PROBES=("${ALL_PROBES[@]}")
+
+for p in "${PROBES[@]}"; do
+  sed -i -E "s/^INVARIANT .*/INVARIANT $p/" "$TLA_DIR/VSR_Probe.cfg"
+  log="$OUT_DIR/probe-$p.log"
+  start=$(date +%s)
+  TLC_HEAP="${TLC_HEAP:-16g}" "$REPO_ROOT/scripts/tlc" VSR_Probe > "$log" 2>&1
+  elapsed=$(( $(date +%s) - start ))
+  if grep -q "Invariant $p is violated" "$log"; then
+    depth=$(grep -oE "The depth of the complete state graph search is [0-9]+" "$log" | grep -oE "[0-9]+$")
+    echo "REACHABLE (probe violated, good): $p  -- depth ${depth:-?}, ${elapsed}s  [$log]"
+  elif grep -q "Model checking completed. No error has been found." "$log"; then
+    echo "VACUOUS   (probe held, BAD):      $p  -- exhausted, ${elapsed}s  [$log]"
+  else
+    echo "INCONCLUSIVE:                     $p  -- ${elapsed}s, see $log"
+  fi
+done

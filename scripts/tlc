@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
-# Runs TLC against a TLA+ module. Usage: scripts/tlc <module-basename>
+# Runs TLC against a TLA+ module. Usage: scripts/tlc <module-basename> [extra TLC args...]
 # (looks for spec/tla/<module-basename>.tla and spec/tla/<module-basename>.cfg)
+#
+# Defaults, both chosen for the storage-fault-aware VSR.tla whose state space is ~2 orders of
+# magnitude larger than the pre-recovery spec's:
+#   -workers auto  -- TLC defaults to a SINGLE worker. Multi-worker changes wall-clock only;
+#                     the state graph, and therefore every state/distinct/depth number TLC
+#                     reports, is unaffected.
+#   -Xmx           -- TLC's default heap (1/4 of RAM) is not enough for a run of this size.
+# Override either with TLC_WORKERS / TLC_HEAP. Extra args are appended verbatim, e.g.
+#   scripts/tlc VSR -fp 7          (second fingerprint-function seed; see spec/tla/README.md)
+#   scripts/tlc VSR -simulate num=100000
 set -euo pipefail
-if [ $# -ne 1 ]; then
-  echo "usage: scripts/tlc <module-basename>" >&2
+if [ $# -lt 1 ]; then
+  echo "usage: scripts/tlc <module-basename> [extra TLC args...]" >&2
   exit 1
 fi
 MODULE="$1"
+shift
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TLA_DIR="$REPO_ROOT/spec/tla"
 TLA2TOOLS="/work/toolchain/tla/tla2tools.jar"
+TLC_WORKERS="${TLC_WORKERS:-auto}"
+TLC_HEAP="${TLC_HEAP:-16g}"
 if [ ! -f "$TLA2TOOLS" ]; then
   echo "error: $TLA2TOOLS not found. Install per cloud-admin-box's own CLAUDE.md TLA+ toolchain note (mirrors the OCaml toolchain durability pattern)." >&2
   exit 1
 fi
 cd "$TLA_DIR"
-exec java -jar "$TLA2TOOLS" -config "${MODULE}.cfg" "${MODULE}.tla"
+exec java -Xmx"$TLC_HEAP" -jar "$TLA2TOOLS" -workers "$TLC_WORKERS" \
+  -config "${MODULE}.cfg" "${MODULE}.tla" "$@"
