@@ -367,6 +367,76 @@ let test_ring_capacity_boundary () =
       Alcotest.(check bool) "views kept climbing as each attempt forfeited" true
         (List.exists (fun v -> v >= 3) views))
 
+
+(* ---------------------------------------------------------------------------------------------
+   Test 5: on-the-wire payload corruption breaks cross-replica agreement. A running reproduction of
+   a real, currently-unfixed gap, pinned rather than fixed -- see the long note below for why.
+   --------------------------------------------------------------------------------------------- *)
+
+(* WHAT THIS PINS, and why it is reported rather than fixed here.
+
+   Until Task 11, Network.fault_config's corrupt_probability was INERT for every cluster in this
+   repo: Sim_transport hard-coded Fun.id as Network.send's corruption function, so a "corrupted"
+   delivery was byte-identical to a clean one and the knob could be set to any value in any test
+   and change nothing. Sim_transport now takes the transformation as a parameter (still defaulting
+   to Fun.id), and Cluster supplies a deterministic one-byte flip -- so this is the first time any
+   cluster in this repo has ever been handed a genuinely corrupted message.
+
+   The result, at 3 replicas with NO other fault of any kind (no drops, no duplicates, no delays,
+   no storage faults): replica 1 and replica 3 end up reporting DIFFERENT values committed at
+   op_number 1 -- "o0-15" against "op-15", one flipped byte inside the proposal payload. That is
+   the exact property this entire plan exists to protect, broken, permanently, by a single bit.
+
+   WHY: Message.encode is Value.canonical_encode with no integrity field of any kind, so a flipped
+   payload byte produces a perfectly well-formed Prepare carrying a different value. replica.ml
+   validates every INTEGER field off the wire with real care -- its own doc comments cite "a
+   corrupted/forged network delivery" as the reason each guard exists -- but the value payload is
+   the one field that cannot be range-checked, and it is the one whose corruption directly
+   diverges committed state. So this is not outside the codebase's stated threat model; it is a
+   hole inside it. It also directly contradicts sim_transport.mli's own claim that code working
+   against the shared Transport_intf.S contract is fine with "corrupted payload bytes": the VSR
+   layer is not.
+
+   NOT FIXED HERE, deliberately. Any real fix must let a receiver DETECT the corruption, which
+   means adding redundancy to the message encoding -- a wire-format change to the consensus
+   protocol, i.e. Layer 0, which this repo's own CLAUDE.md says is decided by a small group of
+   people who have implemented against the change, not unilaterally by whoever finds the problem.
+   It is also not obvious that a checksum is the right answer rather than stating outright that
+   VSR requires an integrity-preserving transport (Riptide_transport.Tcp already is one), since a
+   checksum only defends against random corruption, which is what this injector models and what a
+   real transport already handles. That choice is the task report's top recommendation.
+
+   This test therefore asserts the CURRENT, broken behaviour, so the gap is a CI-visible fact
+   rather than folklore: if it ever starts passing without a divergence, something real changed and
+   this test should be turned into the positive assertion. *)
+let test_wire_corruption_diverges_committed_state () =
+  let seed = 4 and replica_count = 3 in
+  let c = make_checker ~seed ~replica_count in
+  Riptide_dst.Cluster.run ~seed ~replica_count
+    ~net_fault_config:
+      Riptide_sim.Network.
+        {
+          drop_probability = 0.0;
+          duplicate_probability = 0.0;
+          corrupt_probability = 0.2;
+          min_delay = 0.0;
+          max_delay = 0.0;
+        }
+    (fun ~replicas ~settle ->
+      scenario ~c ~rounds:8 ~ops_per_round:3 ~timeout_prob:0.5 ~replicas ~settle);
+  let is_divergence s =
+    let needle = "DIVERGENCE" in
+    let n = String.length needle and m = String.length s in
+    let rec at i = i + n <= m && (String.sub s i n = needle || at (i + 1)) in
+    at 0
+  in
+  let divergences = List.filter is_divergence c.violations in
+  Alcotest.(check bool)
+    "seed 4, 3 replicas, one flipped payload byte and nothing else: two replicas report different \
+     values committed at the same op_number (see this test's own comment -- pinned, not endorsed)"
+    true
+    (divergences <> [])
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -377,4 +447,6 @@ let tests =
       test_file_storage_cluster_committed_entries_are_durable);
     ("ring capacity boundary: past it, no view change can complete", `Quick,
       test_ring_capacity_boundary);
+    ("wire payload corruption diverges committed state (pinned, unfixed)", `Quick,
+      test_wire_corruption_diverges_committed_state);
   ]

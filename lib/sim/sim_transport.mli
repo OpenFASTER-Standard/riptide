@@ -24,12 +24,19 @@
 
     {2 What this adapter does NOT do}
 
-    It does not re-implement or re-test fault injection: {!send} always uses [Fun.id] as
-    {!Network.send}'s corruption function, so any drop/duplicate/corrupt/delay behavior comes
-    entirely from whatever {!Network.fault_config} the underlying {!Network.t} was created with --
-    already covered by {!Network}'s own existing tests. This module's whole purpose is to prove
-    that {!Network} and a real transport are genuinely swappable behind {!Riptide_transport.Transport_intf.S}, not
-    to add a second, redundant fault-injection surface.
+    It does not re-implement or re-test fault injection: all drop/duplicate/corrupt/delay behavior
+    comes entirely from whatever {!Network.fault_config} the underlying {!Network.t} was created
+    with -- already covered by {!Network}'s own existing tests. This module's whole purpose is to
+    prove that {!Network} and a real transport are genuinely swappable behind
+    {!Riptide_transport.Transport_intf.S}, not to add a second, redundant fault-injection surface.
+
+    {b One correction, Task 11}: {!send} used to pass [Fun.id] as {!Network.send}'s corruption
+    function unconditionally, which meant more than "this module adds no faults of its own" -- it
+    meant {!Network.fault_config}'s own [corrupt_probability] was INERT for every consumer of this
+    adapter (a "corrupted" delivery was byte-identical to a clean one), so the knob could be set to
+    any value, in any test, and change nothing. {!create}'s [?corrupt] is how a caller supplies the
+    transformation that probability selects; it still defaults to [Fun.id], so nothing that does
+    not pass it behaves differently.
 
     It does not drive delivery on its own: {!Network}'s sends are only scheduled, not delivered,
     until something calls {!Network.pump_one}/{!Network.pump_all} -- see [network.mli]. {!send}
@@ -57,7 +64,7 @@
 
 type t
 
-val create : string Network.t -> int -> t
+val create : ?corrupt:(string -> string) -> string Network.t -> int -> t
 (** [create net me] is a handle onto [net], acting as peer [me]. [me] must already be registered
     on [net] (i.e. [Network.register net (string_of_int me)] must have already been called) --
     {!receive}/{!receive_nonblocking} below raise [Invalid_argument] (via {!Network}'s own check)

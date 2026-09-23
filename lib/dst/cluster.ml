@@ -38,6 +38,25 @@ let default_ring_capacity = 4096
    still-huge range instead. *)
 let sub_seed_bound = 0x3FFFFFFF
 
+(* The transformation {!Riptide_sim.Network}'s own [corrupt_probability] selects, supplied to
+   {!Riptide_sim.Sim_transport.create} (Task 11 -- before that this adapter hard-coded [Fun.id],
+   which made that probability inert for every cluster ever built on it, so nothing in this repo
+   had exercised [Replica.handle_message]'s field-validation guards against corrupted wire input in
+   a real cluster). Deliberately a PURE function of the bytes: [Network] applies it at delivery
+   time, not at send time, while the decision to apply it is the seeded one -- so the corruption
+   must not consume PRNG draws of its own, or it would reorder the fault stream depending on
+   delivery scheduling and break reproducibility from the seed alone. Flipping bit 0x40 of one
+   content-derived byte position is enough to make a message either fail to decode or decode to
+   different field values, which is exactly the input those guards exist for. *)
+let flip_one_byte s =
+  if String.length s = 0 then s
+  else begin
+    let i = Hashtbl.hash s mod String.length s in
+    let b = Bytes.of_string s in
+    Bytes.set b i (Char.chr (Char.code (Bytes.get b i) lxor 0x40));
+    Bytes.to_string b
+  end
+
 let split_seed seed ~replica_count =
   let root = Riptide_sim.Prng.create seed in
   let net_seed = Riptide_sim.Prng.int root sub_seed_bound in
@@ -75,7 +94,10 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
   for id = 1 to replica_count do
     Riptide_sim.Network.register net (string_of_int id)
   done;
-  let handles = Array.init replica_count (fun i -> Riptide_sim.Sim_transport.create net (i + 1)) in
+  let handles =
+    Array.init replica_count (fun i ->
+        Riptide_sim.Sim_transport.create ~corrupt:flip_one_byte net (i + 1))
+  in
   (* VSR's own replication quorum, f + 1 (VSR.tla:140's [f = (ReplicaCount-1) \div 2]) -- see
      [Fault_injecting_storage.create]'s own doc comment for what this bounds. *)
   let replication_quorum = ((replica_count - 1) / 2) + 1 in
