@@ -226,11 +226,14 @@ let join a b =
 ```
 `lib/lattice/last_write_wins.mli`:
 ```ocaml
-include Riptide_lattice.Lattice_intf.S with type t = { value : Riptide.Value.value; timestamp : int64 }
+type t = { value : Riptide.Value.value; timestamp : int64 }
+include Riptide_lattice.Lattice_intf.S with type t := t
 ```
-(If OCaml rejects exposing a record type directly through `include ... with type t = <record>` this
-way, expose the fields via ordinary `type t = { value : Riptide.Value.value; timestamp : int64 }`
-plus a separate `include Lattice_intf.S with type t := t` — a mechanical fix, not a design change.)
+(Destructive substitution (`:=`), not `=` — this makes `Lattice_intf.S`'s abstract `type t` refer to
+the concrete record above without re-abstracting it, so `Last_write_wins.{ value = ...; timestamp =
+... }` record-construction syntax works at every call site — **required**, not optional: Task 3's
+own test code constructs `Last_write_wins.t` values via this exact record-literal syntax, so the
+fields must be genuinely exposed, not hidden behind an abstract `t`.)
 
 `lib/lattice/dune`:
 ```
