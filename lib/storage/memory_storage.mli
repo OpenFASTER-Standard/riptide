@@ -50,3 +50,22 @@ val for_test_corrupt : t -> op_number:int -> unit
     Out-of-range [op_number] (below 1, or above {!wal_highest_op_number}) is a no-op. A later
     {!wal_append} at the same op-number (only reachable after a {!wal_truncate_after}) clears the
     corruption, since it writes genuinely new, verifiable bytes. *)
+
+val for_test_lose_superblock : t -> unit
+(** [for_test_lose_superblock t] makes {!superblock_read} return [None] again, as if this backend
+    had never had a superblock written to it — {b without touching the WAL}, which keeps every
+    entry it already held.
+
+    {b That combination is a real, frequently-reachable crash state, not a contrived one}, which
+    is why it gets a test hook of its own. {!File_storage}'s superblock is 3 independent copies
+    written by 3 sequential, non-atomic header-then-data write pairs, and its [superblock_read]
+    returns [None] (honestly, by design) whenever fewer than 2 of them verify and agree — so an
+    ordinary crash partway through {!superblock_write}, with no storage fault injected anywhere,
+    lands exactly here: superblock unreadable, WAL fully intact.
+
+    Deliberately NOT symmetric with {!for_test_corrupt}'s own careful refusal to make a written
+    WAL slot read back absent. That rule (VSR.tla:111-150) is about WAL slots, whose absence is
+    protocol EVIDENCE other replicas act on; the superblock is this replica's own private durable
+    state and its loss is simply a fact a restart has to cope with. What a restart must not do is
+    cope with it by inventing [op_number = 0] — see {!Riptide_vsr.Replica.restart}'s own doc
+    comment for the fail-stop guard this hook is the regression test for. *)

@@ -48,3 +48,15 @@ let superblock_read t = t.superblock
 
 let for_test_corrupt t ~op_number =
   if op_number >= 1 && op_number <= t.highest then Hashtbl.replace t.corrupt op_number ()
+
+(* Deliberately asymmetric with [for_test_corrupt] above, and the asymmetry is the point.
+   A WAL slot must never fault from "written" to "provably absent" -- that is VSR.tla's own
+   load-bearing modelling decision (VSR.tla:111-150). The SUPERBLOCK has no such rule: it is a
+   single record written by three independent, non-atomic copy writes, and
+   [File_storage.superblock_read] genuinely and routinely returns [None] whenever fewer than 2 of
+   those 3 copies verify and agree -- which a crash between any copy's header write and its data
+   write produces on its own, with no injected fault at all. So "the superblock is simply gone"
+   is a real, reachable state this module must be able to express, and it is exactly the state
+   [Riptide_vsr.Replica.restart]'s fail-stop guard exists for. The WAL is left completely
+   untouched: the dangerous shape is precisely a LOST SUPERBLOCK over an INTACT WAL. *)
+let for_test_lose_superblock t = t.superblock <- None

@@ -617,12 +617,59 @@ let adopt_durable_log t (values : Value.value list) ~committed =
       [op_number] is a field rather than [Replica_log.length]: the replica still knows what it
       owes ([n] on its DoViewChange), it just cannot read all of it. Until a StartView repairs it,
       such a replica declines new Prepares (see [handle_prepare]) -- state transfer is out of
-      scope for this spec, disclosed in spec/tla/README.md. *)
+      scope for this spec, disclosed in spec/tla/README.md.
+
+   FAIL-STOP, NOT FAIL-SILENT, WHEN THE SUPERBLOCK IS UNUSABLE OVER A NON-EMPTY WAL (final-review
+   finding C1). This is the one place [restart] refuses to construct a replica at all, and the
+   reasoning is the whole nack-soundness argument, so it is stated here in full rather than left
+   to the guard's own message:
+
+   An unusable superblock is not rare and needs no injected fault. [superblock_write] is 3
+   SEQUENTIAL, NON-ATOMIC copy writes (each itself a header write then a data write), and
+   [superblock_read] returns [None] -- correctly, by its own flexible-quorum design -- whenever
+   fewer than 2 of those 3 copies verify and agree. An ordinary crash partway through that
+   sequence lands exactly there, with the WAL completely untouched and fully readable.
+
+   The previous behaviour was to fall back to [(0, 0, 0, 0)] and then truncate the WAL down to
+   match [op_number = 0]. That is not a conservative default; it is the single most dangerous
+   state this protocol has. [sender_proves_absent] (:1091) treats EVERY op above a sender's own
+   [n] as PROVABLY ABSENT -- that disjunct is sound only because [StorageWellFormed]
+   (VSR.tla:742-745) guarantees a durably-written slot can never read back absent. A replica that
+   comes back claiming [n = 0] over a WAL that still holds its entries breaks precisely that
+   guarantee: it proves absent every op it ever durably held. Combined with one honest nack from a
+   replica that genuinely never saw the op, that is a nack quorum, and [completion_point]
+   truncates a committed, client-acknowledged value cluster-wide.
+
+   spec/tla/VSR.tla:111-150 records TLC refuting exactly this mutation -- one word, "corrupt" to
+   "absent", violating [NoCommittedOpProvablyAbsent] at depth 6. The fallback WAS that mutation,
+   in OCaml. So [restart] refuses instead: [Invalid_argument], matching [create]'s own convention
+   for its own precondition violations (a constructor whose preconditions do not hold does not
+   return a half-usable value), and leaving every byte of durable state untouched so whatever
+   rebuilds the superblock still has the log to rebuild it from. A loud refusal to start one
+   replica is recoverable by operator action; silent cluster-wide loss of committed data is not.
+   It is the same failure shape this branch already accepts, deliberately, for the pinned
+   ring-capacity finding: stop rather than destroy.
+
+   The guard is conditioned on the WAL, not on the superblock alone, and that is load-bearing:
+   an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
+   still yield exactly [create]'s [Init] state -- otherwise [restart] stops being usable as a
+   general entry point at all. *)
 let restart ~my_id ~replica_count ~svc_limit ~send ~storage =
   validate_create_args ~fn:"Replica.restart" ~my_id ~replica_count ~svc_limit;
+  let durable = Option.bind (storage.superblock_read ()) superblock_decode in
+  if durable = None && storage.wal_highest_op_number () > 0 then
+    invalid_arg
+      "Replica.restart: this backend's superblock is unreadable while its WAL is NOT empty -- \
+       refusing to start. Coming up with op_number = 0 over a WAL that still holds entries would \
+       make this replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack \
+       quorum turns into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is \
+       intact and untouched; recovering this replica needs the superblock rebuilt or the backend \
+       discarded wholesale, neither of which restart can decide on its own.";
   let view_number, last_normal_view, op_number, commit_number =
-    match Option.bind (storage.superblock_read ()) superblock_decode with
+    match durable with
     | Some (v, lnv, n, k) -> (v, lnv, n, k)
+    (* Reachable ONLY for a genuinely empty backend now -- the guard above has already refused
+       every other route here. This is [create]'s own [Init] (VSR.tla:79), i.e. first boot. *)
     | None -> (0, 0, 0, 0)
   in
   let t =

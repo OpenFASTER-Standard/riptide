@@ -451,6 +451,104 @@ let test_restart_discards_wal_entries_the_superblock_never_saw () =
     (Replica.for_test_wal_read t' ~op_number:2 = Some (v "b"))
 
 (* ============================================================================================
+   FINAL-REVIEW FINDING C1: a lost superblock over a NON-EMPTY WAL must be FAIL-STOP.
+
+   THE DEFECT THESE PIN. [restart] used to fall back to [(view, last_normal_view, op_number,
+   commit_number) = (0, 0, 0, 0)] whenever the superblock did not read back, and then truncate the
+   WAL down to match [op_number = 0] -- even with the WAL itself fully intact on disk. The replica
+   came back reporting [n = 0] in its DoViewChange, and [sender_proves_absent] treats every op above
+   a sender's own [n] as PROVABLY ABSENT (replica.ml:1091), so that replica proceeded to prove
+   absent every op it had ever durably held. Two such replicas (or one plus one honest nack) are a
+   nack quorum, which truncates a committed, client-acknowledged value cluster-wide.
+
+   That is not a hypothetical: it is exactly the mutation spec/tla/VSR.tla:111-150 records TLC
+   refuting -- one word, "corrupt" to "absent", so a restart may discover a durably-written slot
+   provably empty, violating [NoCommittedOpProvablyAbsent] at depth 6. The fallback was that
+   mutation, in OCaml, reachable from an ORDINARY crash with no injected fault: [superblock_write]
+   is 3 sequential, non-atomic copy writes, and a crash between any copy's header and data write
+   leaves fewer than 2 copies agreeing, which is precisely when [superblock_read] returns [None].
+
+   THE FIX these three tests pin, from both sides: [restart] REFUSES (fail-stop, [Invalid_argument],
+   matching [create]'s own convention for its own precondition violations) when the superblock is
+   unusable while the WAL is non-empty -- and STILL accepts the genuinely empty backend, which is
+   the legitimate first-boot case and must keep working. *)
+
+let restart_refusal_message =
+  "Replica.restart: this backend's superblock is unreadable while its WAL is NOT empty -- refusing \
+   to start. Coming up with op_number = 0 over a WAL that still holds entries would make this \
+   replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack quorum turns \
+   into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is intact and \
+   untouched; recovering this replica needs the superblock rebuilt or the backend discarded \
+   wholesale, neither of which restart can decide on its own."
+
+(* A replica with two durable entries, one of them committed, whose superblock then goes missing
+   entirely -- [superblock_read] returning [None], the exact shape [File_storage] produces when
+   fewer than 2 of its 3 copies verify and agree. *)
+let test_restart_refuses_a_lost_superblock_over_a_non_empty_wal () =
+  let send, _sent = capturing_send () in
+  let backend, storage = fresh_storage () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "precondition: op 1 is committed and durable" 1 (Replica.commit_number t);
+  Riptide_storage.Memory_storage.for_test_lose_superblock backend;
+  Alcotest.(check bool) "precondition: the superblock really is gone" true
+    (Riptide_storage.Memory_storage.superblock_read backend = None);
+  Alcotest.(check bool) "precondition: the WAL really is intact" true
+    (Riptide_storage.Memory_storage.wal_highest_op_number backend = 2);
+  let send2, _sent2 = capturing_send () in
+  let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
+  Alcotest.check_raises "restart refuses rather than coming up at op_number = 0"
+    (Invalid_argument restart_refusal_message) (fun () ->
+      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2));
+  (* THE REFUSAL IS A TOTAL NO-OP on durable state, which is what makes it a recoverable failure
+     rather than a differently-shaped data loss: the WAL is not truncated, and the committed entry
+     is still there to be recovered by whatever rebuilds the superblock. *)
+  Alcotest.(check int) "the WAL was NOT truncated by the refused restart" 2
+    (Riptide_storage.Memory_storage.wal_highest_op_number backend);
+  Alcotest.(check bool) "and the committed entry is still durably readable" true
+    (Riptide_storage.Memory_storage.wal_read backend ~op_number:1
+    = Some (Value.canonical_encode (v "a")))
+
+(* The second shape of "unusable superblock", and it must be treated identically: the record reads
+   back fine at the storage layer but does not decode as this module's own superblock record
+   ([superblock_decode] returns [None]). A partially-decodable superblock is no more trustworthy
+   than a missing one -- that is already [superblock_decode]'s own documented stance -- so it must
+   reach the same fail-stop, not the same silent zero-fallback. *)
+let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
+  let send, _sent = capturing_send () in
+  let backend, storage = fresh_storage () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Riptide_storage.Memory_storage.superblock_write backend "not a superblock record at all";
+  Alcotest.(check bool) "precondition: storage hands back bytes, they just are not usable" true
+    (Riptide_storage.Memory_storage.superblock_read backend <> None);
+  let send2, _sent2 = capturing_send () in
+  let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
+  Alcotest.check_raises "an undecodable superblock is refused exactly like a missing one"
+    (Invalid_argument restart_refusal_message) (fun () ->
+      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2))
+
+(* THE OTHER SIDE OF THE GUARD, and the reason it is conditioned on the WAL rather than on the
+   superblock alone: first boot. A genuinely empty backend -- no superblock, no WAL -- is not a
+   lost superblock, it is a replica that has never run, and it must still come up as [Init]
+   exactly as {!Replica.create} would. A guard that refused on "no superblock" alone would make
+   [restart] unusable as a general entry point. *)
+let test_restart_still_accepts_a_genuinely_empty_backend () =
+  let send, _sent = capturing_send () in
+  let _backend, storage = fresh_storage () in
+  let t = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Alcotest.(check int) "Init: view_number" 0 (Replica.view_number t);
+  Alcotest.(check int) "Init: last_normal_view" 0 (Replica.last_normal_view t);
+  Alcotest.(check int) "Init: op_number" 0 (Replica.op_number t);
+  Alcotest.(check int) "Init: commit_number" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "Init: status" true (Replica.status t = Replica.Normal);
+  Alcotest.(check bool) "Init: empty log" true (Replica.entries t = []);
+  (* And it is a WORKING replica, not merely a constructed one. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Alcotest.(check int) "it accepts a Prepare like any freshly created replica" 1 (Replica.op_number t)
+
+(* ============================================================================================
    TASK 8: the CLUSTER-level half -- recovery under REAL injected storage faults.
 
    Everything above this line drives ONE replica with hand-built messages. That proves each action
@@ -814,6 +912,15 @@ let tests =
     ( "a lower-log_view DVC is not an admissible entry source",
       `Quick,
       test_a_lower_log_view_dvc_is_not_an_admissible_entry_source );
+    ( "C1: restart REFUSES a lost superblock over a non-empty WAL (fail-stop, not op_number = 0)",
+      `Quick,
+      test_restart_refuses_a_lost_superblock_over_a_non_empty_wal );
+    ( "C1: an undecodable superblock over a non-empty WAL is refused identically",
+      `Quick,
+      test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal );
+    ( "C1: a genuinely empty backend still restarts cleanly as Init (first boot keeps working)",
+      `Quick,
+      test_restart_still_accepts_a_genuinely_empty_backend );
     ( "CLUSTER: a committed entry survives real injected corruption of one replica's copy",
       `Quick,
       test_cluster_recovers_a_committed_entry_from_one_replicas_corrupted_storage );

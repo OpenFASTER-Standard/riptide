@@ -169,8 +169,34 @@ val restart :
     (VSR.tla:671-690): a replica coming back up on top of storage that already holds its durable
     state. Same argument validation as {!create}, and the same [Invalid_argument] cases for
     [my_id]/[replica_count]/[svc_limit] — but no emptiness requirement, since recovering existing
-    durable state is the point. An empty backend is accepted and yields exactly {!create}'s
-    [Init] state.
+    durable state is the point. An empty backend (no superblock AND an empty WAL) is accepted and
+    yields exactly {!create}'s [Init] state — that is first boot, and it keeps working.
+
+    {b Raises [Invalid_argument] — fail-stop — if the superblock is unusable while the WAL is NOT
+    empty}, i.e. if [superblock_read] returns [None] (fewer than a majority of copies verify and
+    agree) OR returns bytes that do not decode as this module's own superblock record, while
+    [wal_highest_op_number > 0]. {b This is an ordinary crash state, not an exotic one}:
+    {!Riptide_storage.Storage_intf.S.superblock_write} is implemented by
+    {!Riptide_storage.File_storage} as 3 sequential, non-atomic copy writes, so a crash partway
+    through leaves fewer than 2 copies agreeing while the WAL is fully intact.
+
+    The alternative — silently starting at [(view_number, last_normal_view, op_number,
+    commit_number) = (0, 0, 0, 0)] and truncating the WAL to match, which is what this function
+    used to do — is the single most dangerous state this protocol has, and it destroys committed
+    data CLUSTER-WIDE rather than merely losing this replica. {!handle_message}'s [Do_view_change]
+    dispatch treats every op-number above a sender's own [n] as PROVABLY ABSENT (VSR.tla's
+    [CanNack]), which is sound only because a durably-written slot can never read back absent
+    (VSR.tla:742-745's [StorageWellFormed]). A replica reporting [n = 0] over a WAL that still
+    holds its entries breaks exactly that: it proves absent every op it durably held, and one such
+    replica plus one honest nack is a nack quorum that truncates a committed, client-acknowledged
+    value everywhere. `spec/tla/VSR.tla`:111-150 records TLC refuting precisely this mutation
+    ([NoCommittedOpProvablyAbsent] violated at depth 6).
+
+    {b The refusal is a total no-op on durable state} — nothing is written, nothing is truncated,
+    the log is left exactly as it was found — so whatever rebuilds the superblock (or replaces the
+    backend wholesale and lets a [StartView] refill it) still has everything to work from.
+    Choosing between those is an operator/deployment decision this constructor deliberately does
+    not make on its caller's behalf.
 
     {b DURABLE, recovered here} (VSR.tla:592-596): the log (from the WAL), [op_number],
     [commit_number], [view_number], [last_normal_view]. The last two are Decision 4's whole point
