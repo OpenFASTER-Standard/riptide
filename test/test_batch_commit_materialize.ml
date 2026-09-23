@@ -134,8 +134,87 @@ let test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal () 
               (Printf.sprintf "v%d" ops_past_ring) s
           | _ -> Alcotest.fail "unexpected converged value shape")))
 
+(* Crash-then-retry regression test (review finding on the first cut of this task): a batch
+   proposed WITHOUT a materialize sink still commits (durable_append + commit_number update
+   inside Replica.propose happen regardless of ~materialize) but is never folded into the
+   materializer -- exactly the state a process would be in if it crashed between
+   Replica.propose's durable commit and a materialize step, on a retry that supplies
+   ~materialize for the first time. A correct [propose] must not let its own
+   "idempotency_key already committed, skip re-proposing" optimization also skip re-attempting
+   materialization: the SAME idempotency_key, re-proposed with a sink this time, must still
+   materialize the write, because the sink was never given the chance to run before. *)
+let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun wal_dir ->
+      with_tmp_dir (fun kv_dir ->
+          Eio.Switch.run @@ fun sw ->
+          let file_storage =
+            File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity wal_dir
+          in
+          let replica =
+            Replica.create
+              ~storage:(Replica.storage_of_module (module File_storage) file_storage)
+              ~my_id:1 ~replica_count:1 ~svc_limit:3
+              ~send:(fun ~to_:_ (_ : string) -> ())
+          in
+          let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) kv_dir in
+          let materializer =
+            M.create ~kv
+              ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
+              ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
+          in
+          let sink : Batch_commit.materialize_sink =
+            { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+          in
+          let merge_key = "retry-merge-key" in
+          let idempotency_key = "retry-key-1" in
+          let actor = "actor-1" in
+          let payload =
+            lww_to_value
+              { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String "only-value");
+                timestamp = 1L
+              }
+          in
+          let write =
+            {
+              Batch_commit.actor;
+              causation = fake_event_id "c1";
+              correlation = fake_event_id "r1";
+              payload;
+              merge_key = Some merge_key;
+            }
+          in
+
+          (* First call: no materialize sink at all -- simulates the state right after a crash
+             between Replica.propose's durable commit and a materialize step that never got to
+             run. The batch commits (solo replica, so Replica.propose commits synchronously,
+             confirmed via committed_envelopes below since already_committed itself isn't
+             exposed by this module's .mli) but nothing is materialized yet (confirmed via
+             M.read returning Last_write_wins.bottom, its documented "never written" sentinel). *)
+          Batch_commit.propose replica ~idempotency_key [ write ];
+          Alcotest.(check int) "batch committed on the first (sink-less) call" 1
+            (List.length (Batch_commit.committed_envelopes replica));
+          Alcotest.(check int64) "nothing materialized yet for merge_key (still Last_write_wins.bottom)"
+            Last_write_wins.bottom.timestamp (M.read materializer ~merge_key).timestamp;
+
+          (* Second call: SAME idempotency_key and writes, now WITH a sink -- the crash-then-retry
+             case. The "already committed" check makes this call skip re-proposing to VSR, but
+             materialization must still fire, because this is the first call that ever supplied a
+             sink for a batch that was already committed. *)
+          Batch_commit.propose replica ~idempotency_key ~materialize:sink [ write ];
+          Alcotest.(check int) "still exactly one committed batch -- the retry did not double-propose"
+            1 (List.length (Batch_commit.committed_envelopes replica));
+          let converged = M.read materializer ~merge_key in
+          Alcotest.(check bool) "materialize fired on the retry call for an already-committed batch"
+            true
+            (converged.timestamp <> Last_write_wins.bottom.timestamp);
+          Alcotest.(check int64) "converged to the retried write's timestamp" 1L converged.timestamp))
+
 let tests =
   [
     ( "a write's own merge_key survives WAL ring eviction that genuinely destroys the raw entry",
       `Quick, test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal );
+    ( "materialize fires on a later retry that supplies a sink for an already-committed batch \
+       (crash-then-retry)",
+      `Quick, test_materialize_fires_on_a_later_retry_for_an_already_committed_batch );
   ]

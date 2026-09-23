@@ -110,22 +110,27 @@ type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 
 let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materialize : materialize_sink option)
     (writes : write list) : unit =
-  if already_committed t ~idempotency_key then ()
-  else begin
+  if not (already_committed t ~idempotency_key) then
     Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes);
-    match materialize with
-    | None -> ()
-    | Some sink ->
-      (* Reuses the SAME commit-confirmation mechanism [already_committed] above already is --
-         see batch_commit.mli's own [propose] doc comment for why this, rather than a new,
-         separate notification path. Only fires for a commit this same call itself observes (the
-         degenerate replica_count = 1 case) -- see that doc comment's own "Scope" paragraph. *)
-      if already_committed t ~idempotency_key then
-        List.iter
-          (fun (w : write) ->
-            match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
-          writes
-  end
+  (* Deliberately NOT gated behind "did THIS call perform the durable commit" -- a batch
+     committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
+     above) is materialized here just the same. This makes materialization safe to retry: if a
+     process crashes between Replica.propose's durable commit and the materialize step below,
+     the very next propose call for the SAME idempotency_key -- even though already_committed
+     above makes it skip re-proposing -- still reaches this point and re-attempts the
+     materialize. That re-attempt is safe because Materializer.write is a read-join-put over a
+     lattice: joining the same value into an already-converged accumulator is a no-op by the
+     lattice laws (idempotent), so re-materializing an already-materialized write changes
+     nothing. See batch_commit.mli's own [propose] doc comment for the corrected, full account
+     of this behavior. *)
+  match materialize with
+  | None -> ()
+  | Some sink ->
+    if already_committed t ~idempotency_key then
+      List.iter
+        (fun (w : write) ->
+          match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
+        writes
 
 let committed_envelopes (t : Riptide_vsr.Replica.t) : Envelope.envelope list =
   let seen_keys = Hashtbl.create 16 in

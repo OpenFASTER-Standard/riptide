@@ -22,10 +22,13 @@ type write = {
     them for a locally-appended entry.
 
     [merge_key] (task-master subtask 3.7's own closing mechanism, for writes that opt in): when
-    [Some k] and this write commits via {!propose}'s own [~materialize] argument, [payload] is
-    durably folded into a {!Riptide_materialize.Materializer}'s accumulator at key [k],
-    SYNCHRONOUSLY, as part of the very {!propose} call that commits it -- see {!materialize_sink}
-    and {!propose}'s own doc comment for the exact mechanism and its scope. [None] (the only
+    [Some k] and this write's batch is committed, [payload] is durably folded into a
+    {!Riptide_materialize.Materializer}'s accumulator at key [k], SYNCHRONOUSLY within a
+    {!propose} call supplying [~materialize] -- not necessarily the exact call whose own
+    {!Riptide_vsr.Replica.propose} performed the commit; any later {!propose} call for the same
+    [idempotency_key] that supplies [~materialize] re-checks commit status and materializes too,
+    idempotently -- see {!materialize_sink} and {!propose}'s own doc comment for the exact
+    mechanism and its scope. [None] (the only
     option before this field existed) leaves a write exactly as vulnerable to
     {!Riptide_storage.File_storage}'s bounded ring WAL evicting it as before -- a disclosed,
     intentional scope boundary, not a bug. On the wire ({!write_of_value}, not exposed by this
@@ -106,22 +109,43 @@ val propose :
     safety.
 
     {b Materialization} (task-master subtask 3.7's own closing mechanism -- see {!write}'s own
-    [merge_key] doc comment): when [?materialize] is given, this function calls the underlying
-    {!Riptide_vsr.Replica.propose} and then immediately re-runs the SAME [idempotency_key]
-    commit-membership check {!committed_envelopes}'s own decode already performs (i.e., is this
-    exact batch now among [t]'s committed batches?) -- reusing that existing commit-confirmation
-    mechanism rather than adding a new, separate one. If and only if the batch is now committed,
-    every one of [writes] carrying [merge_key = Some k] has its [payload] handed to
-    [materialize.write ~merge_key:k] -- synchronously, before this call returns, and therefore
-    strictly before any LATER call on this replica could ever evict the WAL slot(s) this batch
-    just occupied.
+    [merge_key] doc comment): when [?materialize] is given, this function re-runs the SAME
+    [idempotency_key] commit-membership check {!committed_envelopes}'s own decode already
+    performs (i.e., is this batch now among [t]'s committed batches, whether committed by THIS
+    call or an earlier one?) -- reusing that existing commit-confirmation mechanism rather than
+    adding a new, separate one. If and only if the batch is committed, every one of [writes]
+    carrying [merge_key = Some k] has its [payload] handed to [materialize.write ~merge_key:k] --
+    synchronously, before this call returns.
+
+    Crucially, this check and materialize attempt happen on EVERY call, not only the call that
+    itself performs the durable commit -- deliberately decoupled from the
+    "already committed, skip re-proposing" optimization above. This means a batch proposed once
+    without [?materialize] and later re-proposed (same [idempotency_key]) WITH [?materialize] is
+    still materialized on that later call, even though the underlying VSR commit already
+    happened during the first call. This is what makes materialization robust to a crash between
+    {!Riptide_vsr.Replica.propose}'s durable commit and the materialize step: the next retried
+    call for the same key reaches the materialize step again and it fires, strictly before any
+    LATER call on this replica could ever evict the WAL slot(s) this batch occupies. Re-running
+    [materialize.write] for an already-materialized write is always safe: it is a read-join-put
+    over a lattice, and joining the same value into an already-converged accumulator is a no-op
+    by the lattice laws.
 
     {b Scope, stated precisely because it does not cover every commit path}: this hook only fires
-    for a commit this SAME [propose] call itself observes. Per {!Riptide_vsr.Replica.propose}'s
-    own doc comment, that happens unconditionally only for the degenerate [replica_count = 1]
-    ([f = 0]) cluster -- a normal [replica_count >= 3] cluster's primary never sees its own
-    proposal committed inside the [propose] call that made it (an acking quorum is required first,
-    arriving later via {!Riptide_vsr.Replica.handle_message}), so this specific hook does not
-    materialize writes committed that way. Closing that broader case is out of scope for this
-    function; see this task's own report for the full justification of why [propose]-time
-    threading was chosen over a broader hook. *)
+    synchronously inside SOME [propose] call that supplies [?materialize] and observes the batch
+    as committed at the moment [already_committed] is checked -- there is no background process
+    or automatic trigger that materializes a write purely because it became committed; a
+    [propose] call (this one, or a later one for the same [idempotency_key]) actually has to
+    happen, with [?materialize] supplied, at or after the moment the commit lands. In the
+    degenerate [replica_count = 1] ([f = 0]) cluster, {!Riptide_vsr.Replica.propose} commits
+    synchronously (per that function's own doc comment), so supplying [?materialize] on the very
+    first [propose] call for a batch is sufficient by itself -- and, per the paragraph above, even
+    a crash between that commit and materializing is recovered by any later retry call, whether or
+    not it re-proposes. In a normal [replica_count >= 3] cluster, {!Riptide_vsr.Replica.propose}
+    never commits synchronously -- the primary only sees its own proposal committed later,
+    asynchronously, via {!Riptide_vsr.Replica.handle_message} processing a quorum of replies -- so
+    materializing a write committed that way still requires SOME later [propose] call (e.g. a
+    client-driven retry) to run, with [?materialize] supplied, after that async commit has
+    happened; nothing in this module causes such a call to happen on its own. Closing that broader
+    case (materializing without depending on a later [propose] call ever occurring) is out of
+    scope for this function; see this task's own report for the full justification of why
+    [propose]-time threading was chosen over a broader hook. *)
