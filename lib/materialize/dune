@@ -1,0 +1,3 @@
+(library
+ (name riptide_materialize)
+ (libraries riptide riptide_lattice riptide_storage))
