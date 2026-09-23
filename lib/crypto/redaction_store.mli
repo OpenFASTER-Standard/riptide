@@ -73,10 +73,44 @@ val decrypt : t -> event_id:string -> string -> Riptide.Value.value option
     was would be learning something about a payload that is supposed to be gone. *)
 
 val redact : t -> event_id:string -> unit
-(** [redact t ~event_id] durably deletes [event_id]'s wrapped DEK. This is the whole of redaction:
-    the ciphertext, the envelope, and every content hash in the chain are left untouched, and the
-    payload becomes unrecoverable because the only key that could ever have opened it no longer
-    exists. A no-op if [event_id] was never stored or was already redacted. *)
+(** [redact t ~event_id] deletes [event_id]'s wrapped DEK from the keystore. This is the whole of
+    redaction: the ciphertext, the envelope, and every content hash in the chain are left
+    untouched, and the payload becomes unrecoverable through this module because the only key that
+    could ever have opened it is gone. A no-op if [event_id] was never stored or was already
+    redacted.
+
+    {b Exactly how strong "unrecoverable" is here, stated honestly rather than absolutely} (review
+    finding, 2026-09-23 -- this module previously claimed unqualified durable unrecoverability,
+    which overclaimed on two real points):
+
+    - {b Durability of the deletion itself is as strong as
+      {!Riptide_storage.File_kv_store.delete}'s, and no stronger.} That backend unlinks the key's
+      own file and then fsyncs the containing directory, so the removal survives a crash
+      immediately after this function returns. Against a {e different}
+      {!Riptide_storage.Kv_store_intf.S} backend, redaction inherits whatever durability that
+      backend's own [delete] provides -- an in-memory store's [delete], for instance, survives
+      nothing.
+    - {b No scrub: the DEK's bytes are not overwritten before the unlink.} Unlinking releases the
+      file's blocks without erasing them, so the wrapped DEK may remain forensically recoverable
+      from unallocated disk blocks (and from any filesystem journal, snapshot, or backup that
+      captured it) until those blocks are reused. Such a recovered blob is still wrapped, so it is
+      useless without the KEK -- redaction is therefore robust against an adversary who can read
+      raw disk but not against one who holds the KEK {e and} can read raw disk. Destroying the KEK
+      (which destroys every record's recoverability at once) or storing the keystore on an
+      encrypted volume are the mitigations available today; a real scrub-on-delete is a larger
+      change, deliberately out of scope, not something this function quietly does.
+
+    {b The keystore is unreplicated, while the log it protects is replicated.} A [t] holds its
+    wrapped DEKs in one ordinary local {!Riptide_storage.File_kv_store.t} directory on one
+    machine, whereas the ciphertext those DEKs open is replicated byte-identically to every
+    replica by VSR. Losing that single directory therefore makes every record it covers
+    unrecoverable cluster-wide -- strictly weaker durability than the log itself has. This cuts
+    both ways for redaction: it is what makes a redaction cheap and complete (one deletion, one
+    place), and it is also a real single point of failure that an encrypted deployment must
+    address out of band, by backing up or replicating the keystore directory with the same care
+    the KEK file gets. See {!Riptide_batch_commit.Batch_commit.propose}'s own doc comment for how
+    this plays out across a view change. Replicating the keystore -- including what redaction
+    would then have to mean -- is out of scope here and tracked as its own future task. *)
 
 val payload_of_ciphertext : string -> Riptide.Value.value
 (** [payload_of_ciphertext ct] is the canonical way this codebase carries ciphertext inside a

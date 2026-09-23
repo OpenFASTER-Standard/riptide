@@ -169,14 +169,18 @@ val propose :
     error) unless [t] is currently the primary in [Normal] status -- see that function's own doc
     comment for the exact guard.
 
-    Checks first whether [idempotency_key] already appears among [t]'s own currently-committed
-    batches (reusing the same batch decode {!committed_envelopes} uses) and is a no-op if so --
-    purely to avoid unboundedly bloating the replicated log with duplicate no-op entries from a
-    client that retries many times. This check is NOT what makes a duplicate safe to retry: that
-    guarantee comes entirely from {!committed_envelopes}'s own first-wins-per-key dedup on the
-    READ side, and holds regardless of how many times [propose] is called with the same key --
-    this check is an optimization on top of an already-safe operation, not a precondition for
-    safety.
+    Checks first whether [idempotency_key] already appears among the batches in [t]'s own log --
+    the WHOLE log as {!Riptide_vsr.Replica.entries} reports it, including the
+    replicated-but-not-yet-committed tail, not merely the committed prefix -- reusing the same
+    batch decode {!committed_envelopes} uses, and is a no-op if so. For an unencrypted batch this
+    is purely an optimization, avoiding unboundedly bloating the replicated log with duplicate
+    no-op entries from a client that retries many times: what makes an unencrypted duplicate
+    {e safe} is {!committed_envelopes}'s own first-wins-per-key dedup on the READ side, which holds
+    regardless of how many times [propose] is called with the same key.
+
+    {b For an encrypted batch ([?encryption]) the same check is load-bearing for correctness, not
+    an optimization}, and that is why it spans the uncommitted tail rather than only the committed
+    prefix. See the Encryption section below.
 
     {b Materialization} (task-master subtask 3.7's own closing mechanism -- see {!write}'s own
     [merge_key] doc comment): when [?materialize] is given, this function re-runs the SAME
@@ -233,16 +237,47 @@ val propose :
 
     Two behaviours of this path are load-bearing rather than incidental:
 
-    - {b Encryption happens only on a call that actually proposes} (i.e. inside the same
-      "[idempotency_key] not already committed" guard as {!Riptide_vsr.Replica.propose} itself).
-      Encrypting on a retry of an already-committed batch would mint a fresh DEK and overwrite the
-      keystore entry for a ciphertext already immutably in the log -- permanently destroying a
-      record nobody asked to redact. Note the converse residual risk, disclosed rather than
-      fixed: [already_committed] reads only this replica's own committed prefix, so calling this
-      function with [?encryption] against a replica that has not yet learned of a commit its
-      cluster already has would re-encrypt and orphan that record's DEK. Propose encrypted batches
-      only through the primary, the same constraint {!Riptide_vsr.Replica.propose} already imposes
-      for the proposal itself to have any effect at all.
+    - {b Encryption happens only on a call that actually proposes}, i.e. only when
+      [idempotency_key] appears nowhere in this replica's log at all -- neither in the committed
+      prefix nor in the replicated-but-not-yet-committed tail. Encrypting a batch whose key is
+      already in the log would mint a fresh DEK and overwrite the keystore entry for a ciphertext
+      that is already (or is about to become) immutably committed -- permanently destroying a
+      record nobody asked to redact.
+
+      {b The uncommitted tail is deliberately included in that guard, and this is the correctness-
+      critical part} (review finding, 2026-09-23). In a [replica_count >= 3] cluster
+      {!Riptide_vsr.Replica.propose} never commits synchronously, so every proposal spends a real
+      window appended-but-uncommitted, and a client retry inside that window is the only kind of
+      retry this layer's own fire-and-forget contract permits at all. Unencrypted, such a retry is
+      absorbed by {!Riptide_vsr.Replica.propose}'s own byte-identical-value suppression.
+      Encryption defeats that suppression -- a fresh DEK and nonce make the retry's bytes
+      different, so a SECOND entry would be appended while the keystore entry for the FIRST one
+      had already been overwritten; both would commit, {!committed_envelopes} would keep the first
+      (first-wins per key), and its ciphertext would be unopenable by the only surviving DEK. That
+      is silent, permanent data loss with no fault injected and the hash chain still verifying,
+      which is why the guard spans the whole log.
+
+      Note the residual risk that remains, disclosed rather than fixed: this check reads only
+      {e this replica's own} log, so calling this function with [?encryption] against a replica
+      that has not yet learned of a batch its cluster already has would still re-encrypt and
+      orphan that record's DEK. Propose encrypted batches only through the primary, the same
+      constraint {!Riptide_vsr.Replica.propose} already imposes for the proposal itself to have
+      any effect at all.
+    - {b The keystore is not replicated, while the log it protects is} -- a real, disclosed
+      durability asymmetry, not an oversight (review finding, 2026-09-23). Only the replica this
+      function is called on runs [encryption.encrypt], and a
+      {!Riptide_crypto.Redaction_store.t}'s own keystore is an ordinary local
+      {!Riptide_storage.File_kv_store.t} directory on that one machine. VSR gives every replica a
+      byte-identical copy of the ciphertext; exactly one machine's unreplicated directory holds
+      the only means of ever reading any of it. Losing that directory makes every encrypted record
+      unrecoverable {e cluster-wide}, which is strictly weaker durability than the replicated log
+      itself provides -- and a view change that moves the primary elsewhere leaves later encrypted
+      writes' DEKs on the new primary while the old ones stay behind, so the DEKs for one log can
+      end up split across machines. Operating an encrypted deployment therefore requires backing
+      up (or otherwise replicating) the keystore directory out of band, with the same care the KEK
+      file itself gets. Replicating the keystore properly -- including what redaction means once a
+      DEK exists in more than one place -- is out of scope here and tracked as its own future
+      task.
     - {b A write carrying [merge_key = Some _] cannot be encrypted}: the combination raises
       [Invalid_argument] and nothing is proposed. A materializer's accumulator holds joined
       {e plaintext}, in its own KV store, structurally outside the redaction keystore -- so

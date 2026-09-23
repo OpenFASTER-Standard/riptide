@@ -256,8 +256,30 @@ let create ~sw ~fs dir_path =
 let get t ~key = durable_read t (path_for t ~key)
 let put t ~key data = durable_write t (path_for t ~key) data
 
+(* [delete]'s own durability step, and the reason it is not just the [unlink] above: POSIX leaves
+   an [unlink] unsynced, so the directory entry removal can sit in the page cache indefinitely --
+   a crash immediately after [delete] returns can bring the file back on the next open. That is
+   exactly the "deleted key must never be resurrected" bug [Kv_store_intf.S.delete]'s own contract
+   forbids, and for this store's first real consumer
+   ([Riptide_crypto.Redaction_store.redact]) it would mean a redacted record's wrapped DEK
+   returning from the dead. Making the removal durable requires fsyncing the DIRECTORY (fsyncing
+   the unlinked file itself would say nothing about its name being gone), which is why this opens
+   [dir_path] rather than any key's own path.
+
+   Plain blocking [Unix] calls rather than [Eio_linux.Low_level]: [openat2] is a file-oriented
+   helper here (this module's own [open_file_handle_read]/[open_file_handle_write] both set
+   [~seekable:true] and read/write records) and the installed Eio 0.12 exposes no fsync at all, on
+   a path or an fd. Blocking briefly in a fiber is already this module's established practice --
+   [alloc_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously on every
+   single read and write. Errors deliberately propagate rather than being swallowed, matching the
+   narrow catch below: a caller must be able to trust that [delete] returning means the key is
+   really, durably gone. *)
+let fsync_dir t =
+  let fd = Unix.openfile t.dir_path [ Unix.O_RDONLY ] 0 in
+  Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
+
 let delete t ~key =
-  try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key)
-  with
+  (try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key) with
   | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
-    () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *)
+    () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *));
+  fsync_dir t

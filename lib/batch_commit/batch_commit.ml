@@ -101,10 +101,41 @@ let committed_batch_values (t : Riptide_vsr.Replica.t) : Value.value list =
   let committed_count = Riptide_vsr.Replica.commit_number t in
   List.filteri (fun i _ -> i < committed_count) all
 
+let has_key ~(idempotency_key : string) (v : Value.value) : bool =
+  match batch_of_value v with Some (key, _) -> String.equal key idempotency_key | None -> false
+
 let already_committed (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : bool =
-  List.exists
-    (fun v -> match batch_of_value v with Some (key, _) -> String.equal key idempotency_key | None -> false)
-    (committed_batch_values t)
+  List.exists (has_key ~idempotency_key) (committed_batch_values t)
+
+(* The same membership question as [already_committed], asked over the WHOLE log rather than its
+   committed prefix -- i.e. "has a batch under this idempotency key ever been APPENDED here",
+   committed or not. Uses [Replica.entries] directly (the raw log, including the
+   replicated-but-not-yet-agreed tail) rather than [committed_batch_values].
+
+   Why this exists, and why [propose] gates on it rather than on [already_committed] (review
+   finding, 2026-09-23 -- a real fault-free data-destruction path, not a hypothetical one): in any
+   real [replica_count >= 3] cluster [Riptide_vsr.Replica.propose] never commits synchronously, so
+   there is a genuine window in which a batch is appended to the log but [already_committed] is
+   still false. A client retry inside that window is not a fault -- this layer provides no
+   acknowledgment mechanism at all (see batch_commit.mli's own [propose]), so it is the ONLY kind
+   of retry a client can issue, and it is expected.
+
+   Unencrypted, such a retry is harmless: [Riptide_vsr.Replica.propose]'s own duplicate-value
+   suppression ([List.exists (value_equal ...) (entries t)], replica.ml) sees a byte-identical
+   value and does nothing. ENCRYPTION DEFEATS THAT SUPPRESSION: encrypting mints a fresh DEK and a
+   fresh nonce, so the retry's batch value is byte-DIFFERENT, [value_equal] never matches, and a
+   SECOND entry is appended -- while the keystore [put] for the same derived event_id has already
+   overwritten the first entry's DEK in place. Both entries then commit;
+   [committed_envelopes_keyed] keeps the first (first-wins per key), whose ciphertext the surviving
+   DEK cannot open. The record is permanently unrecoverable, with no fault injected and the hash
+   chain still verifying -- nothing surfaces the loss.
+
+   Gating on log membership instead closes that window: a key already present ANYWHERE in the log
+   is never re-encrypted and never re-proposed. This deliberately does not change
+   [Riptide_vsr.Replica.propose]'s own [value_equal] suppression, which still covers the
+   unencrypted identical-retry case exactly as before. *)
+let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : bool =
+  List.exists (has_key ~idempotency_key) (Riptide_vsr.Replica.entries t)
 
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
@@ -138,11 +169,15 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
         "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
          (~encryption): the materialized accumulator is outside the redaction keystore, so \
          deleting the DEK would not erase it");
-  if not (already_committed t ~idempotency_key) then begin
-    (* Encryption happens HERE, inside the "not already committed" guard, and not a line earlier:
-       encrypting mints a fresh DEK and overwrites the keystore entry for this event_id. Doing
-       that on a retry of an ALREADY-committed batch would orphan the DEK for the ciphertext
-       already immutably in the log, permanently destroying a record nobody asked to redact. *)
+  if not (already_in_log t ~idempotency_key) then begin
+    (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,
+       and not a line earlier: encrypting mints a fresh DEK and overwrites the keystore entry for
+       this event_id. Doing that on a retry of a batch already in the log -- committed OR merely
+       appended-and-awaiting-quorum -- would orphan the DEK for a ciphertext that is (or is about
+       to become) immutably committed, permanently destroying a record nobody asked to redact.
+       [already_in_log], not [already_committed], is the guard precisely because the
+       appended-but-uncommitted window is the normal state of every multi-replica propose; see
+       [already_in_log]'s own comment for the full failure mode this closes. *)
     let writes_to_propose =
       match encryption with
       | None -> writes
@@ -158,9 +193,12 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
      committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
      above) is materialized here just the same. This makes materialization safe to retry: if a
      process crashes between Replica.propose's durable commit and the materialize step below,
-     the very next propose call for the SAME idempotency_key -- even though already_committed
+     the very next propose call for the SAME idempotency_key -- even though already_in_log
      above makes it skip re-proposing -- still reaches this point and re-attempts the
-     materialize. That re-attempt is safe because Materializer.write is a read-join-put over a
+     materialize. Note the two guards are deliberately DIFFERENT questions and must stay so:
+     re-proposing is gated on "is this key anywhere in the log at all" (see already_in_log), while
+     materializing is gated on "is it COMMITTED", since materializing an entry that has not yet
+     reached quorum would publish state the cluster has not agreed on. That re-attempt is safe because Materializer.write is a read-join-put over a
      lattice: joining the same value into an already-converged accumulator is a no-op by the
      lattice laws (idempotent), so re-materializing an already-materialized write changes
      nothing. See batch_commit.mli's own [propose] doc comment for the corrected, full account

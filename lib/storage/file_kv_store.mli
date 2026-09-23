@@ -7,7 +7,18 @@
     deliberately use different, non-[O_DIRECT], non-creating open flags than writes; and why
     [delete] is a real [Eio.Path.unlink] rather than a header zero-out (unlike
     {!Riptide_storage.File_storage.wal_truncate_after}, which cannot unlink because its ring
-    file holds many other still-live entries). *)
+    file holds many other still-live entries).
+
+    {b Two properties of [delete] worth stating here, since {!Kv_store_intf.S}'s own contract
+    cannot state them for every backend.} First, the removal is durable against a crash, not
+    merely against a reopen: the [unlink] is followed by an fsync of the containing {e directory},
+    without which POSIX leaves the directory-entry removal unsynced and a crash right after
+    [delete] returns could resurrect the key. Second, [delete] does {b not} scrub: the value's
+    bytes are not overwritten before the [unlink], so they may remain forensically recoverable
+    from unallocated blocks (or a filesystem journal/snapshot/backup) until those blocks are
+    reused. That is a deliberate, disclosed limitation rather than an oversight -- see
+    {!Riptide_crypto.Redaction_store.redact}, this store's first real consumer, for what it does
+    and does not imply for redaction. *)
 
 include Kv_store_intf.S
 

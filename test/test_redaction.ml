@@ -92,13 +92,51 @@ let test_redaction_is_per_record () =
 
 (* The wrapped DEK is bound to its own event_id as GCM additional authenticated data, so an
    attacker with write access to the keystore cannot swap one record's wrapped DEK onto another
-   record's slot and have it silently authenticate. *)
+   record's slot and have it silently authenticate.
+
+   This test needs the keystore itself, not just a store handle: the previous version of it merely
+   called [decrypt ~event_id:"e2"] on a ciphertext encrypted under "e1", which returns None from
+   the keystore MISS alone -- the GCM/AAD path was never reached, and a reviewer confirmed by
+   mutation that deleting [~adata] from both Kek.wrap and Kek.unwrap left the whole suite green.
+   The real attack is a swap, so the test performs the swap: copy e1's wrapped-DEK blob verbatim
+   onto e2's slot, so the lookup genuinely SUCCEEDS and only the AAD binding can reject it. *)
 let test_wrapped_dek_is_bound_to_its_event_id () =
-  with_store (fun store ->
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let store = Redaction_store.create ~kv ~kek in
       let v = Riptide.Value.Scalar (Riptide.Value.String "sensitive") in
       let ct = Redaction_store.encrypt_for_storage store ~event_id:"e1" v in
-      Alcotest.(check bool) "decrypting under the wrong event_id fails" true
-        (Redaction_store.decrypt store ~event_id:"e2" ct = None))
+      (* Sanity: the blob really is there, and really does open its own record -- otherwise the
+         assertion below could pass for the trivial reason the old test did. *)
+      let wrapped_e1 =
+        match Riptide_storage.File_kv_store.get kv ~key:"e1" with
+        | Some w -> w
+        | None -> Alcotest.fail "e1's wrapped DEK should be in the keystore"
+      in
+      Alcotest.(check bool) "e1 decrypts under its own event_id before the swap" true
+        (Redaction_store.decrypt store ~event_id:"e1" ct = Some v);
+      (* The attack: the attacker has keystore write access and moves a wrapped DEK to another
+         record's slot, hoping it silently authenticates there. *)
+      Riptide_storage.File_kv_store.put kv ~key:"e2" wrapped_e1;
+      Alcotest.(check bool) "the swapped-in blob is genuinely present at e2 -- the keystore lookup \
+                             now SUCCEEDS, so only the AAD binding can reject it"
+        true
+        (Riptide_storage.File_kv_store.get kv ~key:"e2" = Some wrapped_e1);
+      Alcotest.(check bool) "a wrapped DEK moved onto another record's slot fails to unwrap there" true
+        (Redaction_store.decrypt store ~event_id:"e2" ct = None);
+      (* Pin WHERE that rejection happens: at the KEK unwrap itself, because of the AAD, and not
+         at some later ciphertext/decode step that happens to also yield None. Asserted against
+         Kek directly, on the very same blob, so dropping [~adata] from Kek.wrap/unwrap fails here
+         loudly instead of silently leaving the suite green. *)
+      Alcotest.(check bool) "the same blob unwraps under its own AAD" true
+        (Kek.unwrap kek ~aad:"e1" wrapped_e1 <> None);
+      Alcotest.(check (option string)) "but not under another record's AAD" None
+        (Kek.unwrap kek ~aad:"e2" wrapped_e1);
+      Alcotest.(check bool) "e1 is untouched by the attack and still opens normally" true
+        (Redaction_store.decrypt store ~event_id:"e1" ct = Some v))
 
 let test_decrypt_of_tampered_ciphertext_is_none () =
   with_store (fun store ->
@@ -314,6 +352,111 @@ let test_retrying_an_already_committed_batch_does_not_orphan_its_dek () =
       Alcotest.(check bool) "the committed ciphertext still decrypts after the retry" true
         (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = Some secret))
 
+(* ---- the propose-but-not-yet-committed window, over a real multi-replica cluster ----
+
+   Every encryption test above runs against [create_solo ()] (replica_count = 1), where
+   Replica.propose commits SYNCHRONOUSLY -- so the window this section is about does not exist
+   there at all, which is exactly why the bug it pins was missed in the first round.
+
+   Why this harness and not test_batch_commit_cluster.ml's own [with_cluster]: that one (like
+   Riptide_dst.Cluster.run) drives its replicas' dispatch fibers under [Eio_mock.Backend.run],
+   which provides no real filesystem -- and [Riptide_storage.File_kv_store] (the keystore every
+   encryption test needs) is built on [Eio_linux.Low_level]/io_uring and therefore needs
+   [Eio_main.run]'s real backend. The two cannot nest. So the cluster below keeps the parts that
+   matter for THIS bug -- three real Replica.t instances at replica_count = 3, real encoded
+   Prepare/PrepareOk bytes, a real f + 1 = 2 quorum, commit strictly asynchronous -- and replaces
+   only the fiber-based transport with a synchronous in-process queue drained by [deliver_all].
+   Nothing is hand-forged: every message delivered is bytes a real replica actually sent. This
+   matches test_vsr_replica.ml's own established "drive handle_message directly" convention,
+   applied to messages the cluster generated itself. *)
+let with_store_and_cluster ~replica_count f =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let store = Redaction_store.create ~kv ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32)) in
+      let inflight : (int * string) Queue.t = Queue.create () in
+      let replicas =
+        Array.init replica_count (fun i ->
+            Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:(i + 1) ~replica_count
+              ~svc_limit:3 ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight))
+      in
+      (* Same reason every cluster harness in this repo does this (see test_batch_commit_cluster.ml
+         and Riptide_dst.Cluster): a fresh replica starts at view 0, where Primary(0) =
+         replica_count, so replicas.(0) would NOT be the primary and every propose against it
+         would be a silent no-op. Primary(1) = 1 for any replica_count. All replicas must be
+         pinned to the same view or they reject each other's messages outright. *)
+      Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
+      let deliver_all () =
+        while not (Queue.is_empty inflight) do
+          let to_, bytes = Queue.pop inflight in
+          Replica.handle_message replicas.(to_ - 1) bytes
+        done
+      in
+      f ~store ~replicas ~deliver_all)
+
+(* THE regression test for the review's Critical finding (2026-09-23). A client retry issued in
+   the propose-but-not-yet-committed window is not a fault: this layer has no acknowledgment
+   mechanism at all (batch_commit.mli's propose is explicitly fire-and-forget), so it is the only
+   kind of retry a client can issue, and in a replica_count >= 3 cluster that window is the normal
+   state of every proposal.
+
+   Pre-fix, [Batch_commit.propose] gated encryption on [already_committed] (the committed prefix
+   only), so the retry re-encrypted: a fresh DEK overwrote the first one in the keystore under the
+   same derived event_id, and because the fresh nonce made the batch bytes DIFFERENT,
+   Replica.propose's own byte-identical-value suppression did not catch it and a second entry was
+   appended. Both entries commit; committed_envelopes_keyed keeps the first; its ciphertext is
+   unopenable by the only surviving DEK. Silent, permanent loss, no fault injected, hash chain
+   still verifying. *)
+let test_retrying_an_uncommitted_batch_in_a_cluster_keeps_it_decryptable () =
+  with_store_and_cluster ~replica_count:3 (fun ~store ~replicas ~deliver_all ->
+      let primary = replicas.(0) in
+      Batch_commit.propose primary ~idempotency_key:"k1" ~encryption:(sink_of store) [ write_of secret ];
+      (* The window itself, asserted rather than assumed -- if commit were synchronous here (as it
+         is for replica_count = 1) this test would be testing nothing. *)
+      Alcotest.(check int) "the batch is in the primary's own log" 1 (List.length (Replica.entries primary));
+      Alcotest.(check int) "but nothing has committed yet -- this is the window under test" 0
+        (Replica.commit_number primary);
+      (* The retry, inside that window, with the same key and the same writes. *)
+      Batch_commit.propose primary ~idempotency_key:"k1" ~encryption:(sink_of store) [ write_of secret ];
+      Alcotest.(check int)
+        "the retry appended NO second entry -- it must not re-encrypt to different bytes and slip \
+         past Replica.propose's own identical-value suppression"
+        1
+        (List.length (Replica.entries primary));
+      (* Now let the cluster actually reach quorum and commit, the ordinary asynchronous way. *)
+      deliver_all ();
+      Alcotest.(check int) "the batch committed via a real f + 1 = 2 PrepareOk quorum" 1
+        (Replica.commit_number primary);
+      let keyed = Batch_commit.committed_envelopes_keyed primary in
+      Alcotest.(check int) "exactly one committed envelope" 1 (List.length keyed);
+      let event_id, envelope = List.hd keyed in
+      (* The whole point: the record that actually committed is still readable. Pre-fix this is
+         None -- the keystore holds the retry's DEK, the log holds the first attempt's
+         ciphertext. *)
+      Alcotest.(check bool)
+        "the committed record is still decryptable after a retry in the uncommitted window" true
+        (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = Some secret);
+      Alcotest.(check bool) "and the chain verifies" true
+        (Riptide.Log.verify_chain_list (Batch_commit.committed_envelopes primary)))
+
+(* The same window, but for the property the fix must NOT break: an unencrypted retry of an
+   identical batch was always a safe no-op via Replica.propose's own value_equal suppression, and
+   still is. Guards against "fixed the encrypted case by changing the underlying suppression". *)
+let test_unencrypted_retry_in_the_uncommitted_window_is_still_a_no_op () =
+  with_store_and_cluster ~replica_count:3 (fun ~store:_ ~replicas ~deliver_all ->
+      let primary = replicas.(0) in
+      Batch_commit.propose primary ~idempotency_key:"k1" [ write_of secret ];
+      Alcotest.(check int) "appended, not committed" 0 (Replica.commit_number primary);
+      Batch_commit.propose primary ~idempotency_key:"k1" [ write_of secret ];
+      Alcotest.(check int) "the unencrypted retry appended no second entry either" 1
+        (List.length (Replica.entries primary));
+      deliver_all ();
+      let envelopes = Batch_commit.committed_envelopes primary in
+      Alcotest.(check int) "one committed envelope" 1 (List.length envelopes);
+      Alcotest.(check bool) "payload is the plaintext value, untouched" true
+        ((List.hd envelopes).Riptide.Envelope.payload = secret))
+
 (* Encrypted payloads and materialization are, today, mutually exclusive: the materializer's
    accumulator holds joined PLAINTEXT derived from the payload and lives entirely outside the
    keystore, so deleting a DEK would not erase the record's contribution to it -- a redaction that
@@ -369,6 +512,13 @@ let tests =
     ( "retrying an already-committed batch does not orphan its DEK",
       `Quick,
       test_retrying_an_already_committed_batch_does_not_orphan_its_dek );
+    ( "a retry in the propose-but-uncommitted window keeps the committed record decryptable \
+       (3-replica cluster)",
+      `Quick,
+      test_retrying_an_uncommitted_batch_in_a_cluster_keeps_it_decryptable );
+    ( "an unencrypted retry in that same window is still a no-op",
+      `Quick,
+      test_unencrypted_retry_in_the_uncommitted_window_is_still_a_no_op );
     ("encryption with merge_key is rejected", `Quick, test_encryption_with_merge_key_is_rejected);
     ("without encryption payloads are unchanged", `Quick, test_without_encryption_payloads_are_unchanged);
   ]
