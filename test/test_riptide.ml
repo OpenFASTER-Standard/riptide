@@ -114,4 +114,5 @@ let () =
          ("vsr_replica_recovery", Test_vsr_replica_recovery.tests);
          ("dst_cluster", Test_dst_cluster.tests);
          ("dst_scenarios", Test_dst_scenarios.tests);
+         ("lattice_materialize_crypto_scenarios", Test_lattice_materialize_crypto_scenarios.tests);
        ]

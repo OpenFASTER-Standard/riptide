@@ -22,6 +22,21 @@
 
 include Kv_store_intf.S
 
+val max_value_size : int
+(** The hard upper bound, in bytes, on a single value this backend can store: one aligned data
+    slot. {!Kv_store_intf.S.put} raises [Invalid_argument] naming this limit for anything larger,
+    and nothing is written.
+
+    {b Exposed because a caller genuinely cannot infer it and one was already hurt by that} (Task
+    9's end-to-end proof, 2026-09-23). {!Kv_store_intf.S.put}'s own contract states no bound at all
+    -- it cannot, since it covers every backend -- so a consumer whose values grow over time has no
+    way to ask how much room it has. {!Riptide_materialize.Materializer}'s accumulator is exactly
+    such a consumer: it is the join of every value ever written to a [merge_key], which for a
+    grow-only lattice grows without bound, and it reaches this limit in the ordinary course of
+    working rather than through any misuse. See that module's own [write] doc comment for what
+    happens when it does, and test_lattice_materialize_crypto_scenarios.ml for the running
+    reproduction. *)
+
 val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> string -> t
 (** [create ~sw ~fs dir_path] opens (creating if necessary) a key-value store directory at
     [dir_path]. Every key already durably [put] on a previous [create] of the same [dir_path]

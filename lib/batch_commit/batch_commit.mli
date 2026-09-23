@@ -187,9 +187,35 @@ val propose :
     [idempotency_key] commit-membership check {!committed_envelopes}'s own decode already
     performs (i.e., is this batch now among [t]'s committed batches, whether committed by THIS
     call or an earlier one?) -- reusing that existing commit-confirmation mechanism rather than
-    adding a new, separate one. If and only if the batch is committed, every one of [writes]
-    carrying [merge_key = Some k] has its [payload] handed to [materialize.write ~merge_key:k] --
-    synchronously, before this call returns.
+    adding a new, separate one. If and only if the batch is committed, every write of that
+    {b committed} batch carrying [merge_key = Some k] has its [payload] handed to
+    [materialize.write ~merge_key:k] -- synchronously, before this call returns.
+
+    {b What is materialized is decoded from the committed bytes, never from the [writes] argument
+    of this call}, and that distinction is load-bearing for correctness rather than cosmetic (Task
+    9's end-to-end adversarial proof, 2026-09-23). The batch materialized is the FIRST well-formed
+    committed batch carrying [idempotency_key] -- bit-for-bit the same batch, under the same
+    first-wins-per-key rule, that {!committed_envelopes_keyed} publishes envelopes for. Before
+    this was so, the two halves of this module disagreed: a client retry under an already-committed
+    key carrying different writes (the only kind of retry this fire-and-forget layer lets a client
+    issue, and one the read half above already defends against) had its payloads folded durably
+    into the accumulator even though they appear in no committed entry on any replica -- permanent,
+    unauditable divergence a lattice join can never undo -- and, worse, it let the
+    [merge_key]-with-[?encryption] rejection below be split across two calls sharing one key, so a
+    record committed as ciphertext could have its PLAINTEXT materialized by a second call that
+    supplies no [?encryption] at all, leaving {!Riptide_crypto.Redaction_store.redact} destroying
+    a ciphertext nobody can read while the plaintext stays on disk forever. Both are reproduced,
+    pre-fix and post-fix, in [test/test_lattice_materialize_crypto_scenarios.ml].
+
+    Two consequences worth stating explicitly:
+    - The accumulator is a function of the committed log alone -- the one input every replica
+      agrees on -- so any replica holding a committed batch can materialize it, and replicas that
+      have materialized the same committed batches hold the same accumulator, whatever order or
+      how many times each did so (join is commutative, associative and idempotent).
+    - Materializing therefore does not need the writes in hand at all: calling this function with
+      an [idempotency_key] already in [t]'s log and an EMPTY [writes] list materializes that
+      batch's committed writes and proposes nothing. That is the supported way for a replica to
+      drive its own commit stream into its own materializer.
 
     Crucially, this check and materialize attempt happen on EVERY call, not only the call that
     itself performs the durable commit -- deliberately decoupled from the
@@ -283,4 +309,12 @@ val propose :
       {e plaintext}, in its own KV store, structurally outside the redaction keystore -- so
       deleting a record's DEK would leave that record's contribution to the accumulator fully
       readable. Rejecting the combination loudly is the conservative call; supporting it needs a
-      redaction story for materialized state that this task does not have. *)
+      redaction story for materialized state that this task does not have.
+
+      This check is per-call, and on its own that is not enough to make the property hold: what
+      actually enforces it is that the check runs at the only moment encryption can happen (before
+      the payload enters the log), so a committed encrypted batch's writes all carry
+      [merge_key = None] {e in the log} -- and materialization reads the log, not the caller's
+      argument (see the Materialization section above). The two together are what make "an
+      encrypted payload's plaintext can never reach an accumulator" structural rather than a rule
+      each call site has to keep. *)

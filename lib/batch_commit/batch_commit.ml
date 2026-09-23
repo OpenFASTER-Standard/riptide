@@ -104,8 +104,23 @@ let committed_batch_values (t : Riptide_vsr.Replica.t) : Value.value list =
 let has_key ~(idempotency_key : string) (v : Value.value) : bool =
   match batch_of_value v with Some (key, _) -> String.equal key idempotency_key | None -> false
 
-let already_committed (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : bool =
-  List.exists (has_key ~idempotency_key) (committed_batch_values t)
+(* The writes of the batch that actually COMMITTED under [idempotency_key], decoded from the
+   committed bytes themselves -- [None] if no well-formed committed batch carries that key.
+
+   First-wins per key, deliberately identical to [committed_envelopes_keyed]'s own dedup rule (a
+   malformed batch never claims a key, since it contributes no envelopes to skip in favour of), so
+   the writes this returns are exactly the writes whose envelopes that function publishes. That
+   agreement is the point of this function; see [propose]'s own materialize step for the defect
+   its absence caused. *)
+let committed_writes_for (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : write list option =
+  let rec find = function
+    | [] -> None
+    | v :: rest -> (
+      match batch_of_value v with
+      | Some (key, writes) when String.equal key idempotency_key -> Some writes
+      | _ -> find rest)
+  in
+  find (committed_batch_values t)
 
 (* The same membership question as [already_committed], asked over the WHOLE log rather than its
    committed prefix -- i.e. "has a batch under this idempotency key ever been APPENDED here",
@@ -205,12 +220,57 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
      of this behavior. *)
   match materialize with
   | None -> ()
-  | Some sink ->
-    if already_committed t ~idempotency_key then
+  | Some sink -> (
+    (* Materialize the writes that are actually COMMITTED under this key, read back out of the
+       committed bytes -- never the [writes] argument this call happened to be handed (Task 9's
+       end-to-end adversarial proof, 2026-09-23; see that task's report and
+       test_lattice_materialize_crypto_scenarios.ml).
+
+       Why this is the root fix and not a hardening: the two halves of this module disagreed about
+       what "the batch under key K" means. The READ half ([committed_envelopes_keyed]) says: the
+       FIRST well-formed committed batch carrying K, every later one skipped. This write half used
+       to say: whatever the most recent caller passed. Any difference between the two went straight
+       into a durable lattice accumulator, and a lattice join can never take it back out.
+
+       Two real consequences, both reproduced before the fix:
+
+       - {b Permanent, unauditable divergence.} A client retry under an already-committed key
+         carrying different writes (the only kind of retry this fire-and-forget layer permits a
+         client to issue at all, and one the read half above explicitly defends against) folded a
+         payload that appears in NO committed entry on ANY replica into one replica's accumulator.
+         Two replicas driven from the same committed log then hold different accumulators forever
+         -- the divergence is not something a later join repairs, because no other replica will
+         ever see the value.
+       - {b A redaction that does not redact.} [propose] rejects [merge_key] together with
+         [~encryption] precisely because a materialized accumulator lives outside the redaction
+         keystore. That guard is per-call, and this step read the caller's argument, so the two
+         could be split across two calls sharing one idempotency key: call one commits the payload
+         as ciphertext under [~encryption], call two (same key, no [~encryption], so nothing is
+         re-proposed and the guard never fires) hands the PLAINTEXT to a [merge_key] write and this
+         step folds it durably into the accumulator. [Redaction_store.redact] then genuinely
+         destroys the ciphertext's recoverability while the plaintext stays readable on disk
+         forever.
+
+       Reading the committed bytes closes both structurally rather than case by case: a committed
+       batch's own [merge_key]s and payloads are the only thing that can ever be materialized, so
+       the accumulator is a function of the committed log alone -- the same input every replica
+       agrees on -- and an encrypted batch (whose committed writes all carry [merge_key = None],
+       enforced by the guard above at the only moment encryption can happen) can contribute
+       nothing to it no matter what a later caller passes.
+
+       [None] here is exactly the old [already_committed t = false] case: not yet committed,
+       nothing to materialize, try again on a later call. Note the consequence that makes this
+       strictly more capable rather than merely safer: because the payloads come from the log
+       rather than the argument, ANY replica holding the committed batch can materialize its own
+       commit stream -- including with an empty [writes] list -- which is what lets each replica
+       feed its own materializer and converge. *)
+    match committed_writes_for t ~idempotency_key with
+    | None -> ()
+    | Some committed_writes ->
       List.iter
         (fun (w : write) ->
           match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
-        writes
+        committed_writes)
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =
   let seen_keys = Hashtbl.create 16 in

@@ -24,7 +24,24 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       If multiple fibers must write the same [merge_key] concurrently, the caller must
       serialize those writes itself (e.g., by using one fiber/serial queue per [merge_key]).
       This limitation is inherited from {!Kv_store_intf.S}, which does not promise atomicity
-      across separate [get] + [put] calls. *)
+      across separate [get] + [put] calls.
+
+      WARNING, and it is reached by ordinary use rather than misuse: an accumulator is the join of
+      every value ever written to its [merge_key], so for a grow-only lattice it grows without
+      bound -- while a real [KV] backend's single value is bounded
+      ({!Riptide_storage.File_kv_store.max_value_size}, 4096 bytes, is the only backend this repo
+      ships). Once [encode]'s output for the merged accumulator exceeds that, [KV.put] raises
+      [Invalid_argument] and nothing is stored, so THIS write is silently absent from the
+      accumulator while remaining wherever the caller put it -- in
+      {!Riptide_batch_commit.Batch_commit.propose}'s case, durably committed to the replicated log,
+      since the fold deliberately runs only after commit. The accumulator is left at its last good
+      value, so a subsequent SMALLER write to the same [merge_key] succeeds and nothing surfaces
+      the gap again. Found and measured by Task 9's end-to-end proof
+      (test_lattice_materialize_crypto_scenarios.ml, which pins the exact behaviour); no fix is
+      attempted here, because both candidate fixes -- spilling a large value across slots in the
+      backend, or giving {!Kv_store_intf.S} a declared bound this module checks before folding --
+      are real design decisions rather than an oversight to patch. A caller whose lattice can grow
+      unboundedly must either bound it itself or choose a backend that can hold it. *)
 
   val read : t -> merge_key:string -> L.t
   (** [read t ~merge_key] returns the current accumulated value at [merge_key], or [L.bottom]

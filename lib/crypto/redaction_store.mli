@@ -43,7 +43,18 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     need to be a secret store. It does need real, durable per-key deletion, which is precisely why
     Task 2 introduced {!Riptide_storage.Kv_store_intf.S} rather than reusing
     {!Riptide_storage.Storage_intf.S}'s bounded-ring WAL shape: a redaction that leaves the DEK
-    recoverable on disk is not a redaction. *)
+    recoverable on disk is not a redaction.
+
+    {b [kv] must be this keystore's alone} -- a directory no other {!Riptide_storage.File_kv_store}
+    consumer also writes to. That store's key space is flat and untyped (one file per key, named by
+    the key's own hash), so a second consumer sharing the directory and choosing a key equal to one
+    of this store's [event_id]s overwrites that record's wrapped DEK, destroying the record with no
+    error anywhere. It is reachable in practice, not merely in principle: a
+    {!Riptide_materialize.Materializer} is the other consumer this plan creates, its keys are
+    caller-chosen [merge_key]s, and this store's own keys are the plain strings
+    {!Riptide_batch_commit.Batch_commit.redaction_event_id} derives -- so one [merge_key] shaped
+    like [\{length\}:\{idempotency_key\}#\{index\}] is all it takes. Noted by Task 9's end-to-end
+    proof, which confirmed the collision live. *)
 
 val encrypt_for_storage : t -> event_id:string -> Riptide.Value.value -> string
 (** [encrypt_for_storage t ~event_id v] generates a fresh DEK, encrypts
