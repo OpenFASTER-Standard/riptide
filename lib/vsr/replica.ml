@@ -89,6 +89,67 @@ let volatile_storage () = storage_of_module (module Riptide_storage.Memory_stora
    [NoCommittedOpProvablyAbsent] on at depth 6. *)
 type slot_state = Present of Value.value | Corrupt | Absent
 
+(* ---- I2: the genuinely different reasons a durable append can be refused ----
+   [durable_append] used to catch EVERY [Invalid_argument] and report one undifferentiated
+   "the backend refused this entry" to the protocol layer. Three unrelated conditions were
+   arriving through that one arm, and the conflation was invisible because nothing counted them.
+   It is not hypothetical: instrumenting the existing suite before this change recorded 317
+   refusals across one `dune test --force`, of two different kinds (308 + 9), none of them
+   observable anywhere.
+
+     [Fault_injection_cap] -- {!Riptide_storage.Fault_injecting_storage}'s own deliberate
+       ["faults_max exceeded"] guard (Task 6). This is not a storage failure at all: it is the
+       fault INJECTOR refusing to inject more simultaneous corruption than the configured
+       replication quorum could tolerate. Measured: 308 of the 317. Rounding it down to "the
+       backend refused this entry" silently makes a sweep's EFFECTIVE fault rate lower than its
+       configured one, with nothing anywhere to say so.
+     [Entry_rejected] -- a backend that cannot store an entry of this size at all
+       ({!Riptide_storage.File_storage} raises for anything larger than one aligned data slot).
+       This is the only shape the original blanket catch actually documented, and the only one
+       that genuinely means "this entry can never be durable here".
+     [Out_of_sequence] -- the backend's own [wal_highest_op_number] is not [op_number - 1].
+       Measured: 9 of the 317, and REACHABLE BY DESIGN rather than a programming error: when
+       [adopt_durable_log] is refused partway through, it has already truncated and partially
+       re-appended, so the durable log sits BELOW this replica's own [op_number] until a
+       [StartView] repairs it, and every append until then is out of sequence. That degradation
+       is safe (the gap reads back [Corrupt], never [Absent] -- see [slot_state] above), which is
+       exactly why it must be visible rather than silently equated with the case above.
+
+   All three still mean "not durable" to the protocol, and the protocol still behaves identically
+   -- the replica declines to acknowledge. What changes is that they are told apart and COUNTED
+   (see [for_test_append_refusals]), so a harness can assert on them, and that an Invalid_argument
+   matching NONE of them now propagates instead of being swallowed: an unrecognized exception out
+   of a backend is not a documented storage refusal, and treating it as one is the very
+   conflation this finding names. *)
+type append_refusal = Fault_injection_cap | Entry_rejected | Out_of_sequence
+
+let append_refusal_kinds = [ Fault_injection_cap; Entry_rejected; Out_of_sequence ]
+
+let append_refusal_index = function
+  | Fault_injection_cap -> 0
+  | Entry_rejected -> 1
+  | Out_of_sequence -> 2
+
+let append_refusal_name = function
+  | Fault_injection_cap -> "fault_injection_cap"
+  | Entry_rejected -> "entry_rejected"
+  | Out_of_sequence -> "out_of_sequence"
+
+(* Matched on the message, because [Storage_intf.S] has no dedicated exception for any of these
+   and giving it one is a contract change to every backend and every conformance test -- out of
+   scope for this fix. The two [wal_append: ] prefixes are raised verbatim, from one shared format
+   string each, by BOTH {!Riptide_storage.Memory_storage} and {!Riptide_storage.File_storage};
+   ["faults_max exceeded"] is raised verbatim from two sites in
+   {!Riptide_storage.Fault_injecting_storage}. All three are pinned by
+   [test_vsr_replica_recovery.ml]'s own discrimination test, which asserts the real exceptions
+   those modules raise land in the intended buckets -- so a message reworded on either side fails
+   a test rather than silently falling through to the propagating arm. *)
+let classify_append_refusal msg =
+  if String.equal msg "faults_max exceeded" then Some Fault_injection_cap
+  else if String.starts_with ~prefix:"wal_append: entry of " msg then Some Entry_rejected
+  else if String.starts_with ~prefix:"wal_append: op_number " msg then Some Out_of_sequence
+  else None
+
 (* One received DOVIEWCHANGE, as an element of VSR.tla's own [rep_recv_dvc[r]] (VSR.tla:34, typed
    [SUBSET [message]] -- a set of message RECORDS). Exactly the six fields [SendDVC]'s own record
    literal carries (VSR.tla:222-224), minus [type]/[dest] (constant/implied here -- see
@@ -239,6 +300,11 @@ type t = {
      added to prevent. *)
   peer_op_number : (int, int) Hashtbl.t;
   send : to_:int -> string -> unit;
+  append_refusals : int array;
+      (* I2: one counter per {!append_refusal}, indexed by [append_refusal_index]. Pure
+         diagnostics -- nothing in the protocol ever reads it -- but it is what makes the three
+         refusal shapes told apart above OBSERVABLE rather than merely distinguished in a comment.
+         See [for_test_append_refusals]. *)
 }
 
 (* ---- the superblock record: VSR.tla's DURABLE per-replica state ----
@@ -338,6 +404,7 @@ let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_norm
     svc_count = 0;
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
     send;
+    append_refusals = Array.make (List.length append_refusal_kinds) 0;
   }
 
 let create ~my_id ~replica_count ~svc_limit ~send ~storage =
@@ -549,11 +616,29 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
    not go on to acknowledge it. VSR.tla:243-245's own note is that appending and replying
    PREPAREOK are one step precisely because the entry is durable before it is acknowledged; this
    is that coupling, made real. Returning [false] keeps [handle_message] total on adversarial
-   input (an oversized value on the wire must drop the message, never escape as an exception). *)
+   input (an oversized value on the wire must drop the message, never escape as an exception).
+
+   I2: WHICH refusal is now classified and counted rather than flattened -- see [append_refusal]'s
+   own comment above for the three shapes, the measurement behind them, and why an Invalid_argument
+   matching none of them PROPAGATES instead. That propagation does not weaken the totality
+   guarantee above: every refusal a real backend in this repo raises for a real entry is one of the
+   three classified shapes (pinned by a test), so what escapes here is a backend contract violation,
+   which is precisely the thing that must not be laundered into "the protocol declined an op".
+
+   [Value.canonical_encode] is evaluated OUTSIDE the handler on purpose: it has its own
+   [Invalid_argument] failure modes, and catching those here would put an encoding bug in the
+   value layer into a storage-refusal bucket -- the same conflation at one remove. *)
 let durable_append t ~op_number (v : Value.value) =
-  match t.storage.wal_append ~op_number (Value.canonical_encode v) with
+  let bytes = Value.canonical_encode v in
+  match t.storage.wal_append ~op_number bytes with
   | () -> true
-  | exception Invalid_argument _ -> false
+  | exception Invalid_argument msg -> (
+    match classify_append_refusal msg with
+    | Some refusal ->
+      let i = append_refusal_index refusal in
+      t.append_refusals.(i) <- t.append_refusals.(i) + 1;
+      false
+    | None -> invalid_arg msg)
 
 (* The durable half of [SendSV]/[ReceiveSV]'s wholesale log replacement, and of VSR.tla's
    [rep_storage' = FreshStorage(L)] (VSR.tla:509, :573): after this returns [true], op-numbers
@@ -1679,3 +1764,11 @@ let for_test_truncate_wal t ~op_number =
 
 let for_test_wal_read t ~op_number =
   match slot_state t ~op_number with Present v -> Some v | Corrupt | Absent -> None
+
+(* I2. Diagnostics, not protocol: how many durable appends this replica has had refused, per
+   refusal shape (see [append_refusal]'s own comment for what each one means and why flattening
+   them into one "not durable" was the finding). Returned as (name, count) pairs in a fixed order
+   so a test can assert on exact values. *)
+let for_test_append_refusals t =
+  List.map (fun r -> (append_refusal_name r, t.append_refusals.(append_refusal_index r)))
+    append_refusal_kinds

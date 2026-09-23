@@ -549,6 +549,124 @@ let test_restart_still_accepts_a_genuinely_empty_backend () =
   Alcotest.(check int) "it accepts a Prepare like any freshly created replica" 1 (Replica.op_number t)
 
 (* ============================================================================================
+   FINAL-REVIEW FINDING I2: the three refusal shapes [durable_append] used to flatten into one.
+
+   [durable_append] caught EVERY [Invalid_argument] as "the backend refused this entry". Three
+   unrelated conditions arrived through that one arm, and nothing counted them, so the conflation
+   was invisible: instrumenting the suite before the fix recorded 317 refusals in a single
+   [dune test --force], 308 of one kind and 9 of another.
+
+   These tests drive each shape through a REAL backend raising its own REAL exception, rather than
+   asserting against a hand-written message string -- which is what makes them a guard against the
+   classifier silently rotting if any of those modules rewords its message. The protocol effect is
+   identical in all three cases (the entry is not durable, so it is not acknowledged); what is
+   pinned here is that they are told apart, and that an UNRECOGNIZED exception propagates instead
+   of joining them. *)
+
+let refusals t = Replica.for_test_append_refusals t
+
+(* [fault_injection_cap]: Fault_injecting_storage's own "faults_max exceeded" (Task 6, Decision 7).
+   [replication_quorum = 1] makes [faults_max = 0], so the very first corrupting append is refused
+   outright -- the injector declining to inject, not a storage failure. *)
+let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
+  let send, sent = capturing_send () in
+  let backend =
+    Riptide_storage.Fault_injecting_storage.create
+      ~prng:(Riptide_sim.Prng.create 1)
+      ~fault_config:{ Riptide_storage.Fault_injecting_storage.corrupt_probability = 1.0; drop_probability = 0.0 }
+      ~replication_quorum:1
+      ~underlying:(module Riptide_storage.Memory_storage)
+      (Riptide_storage.Memory_storage.create ())
+  in
+  let storage = Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) backend in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Alcotest.(check (list (pair string int)))
+    "counted as fault_injection_cap, and as nothing else"
+    [ ("fault_injection_cap", 1); ("entry_rejected", 0); ("out_of_sequence", 0) ]
+    (refusals t);
+  (* The protocol effect is unchanged by the classification: not durable, so not acknowledged. *)
+  Alcotest.(check int) "the op was NOT taken on" 0 (Replica.op_number t);
+  Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = [])
+
+(* [out_of_sequence]: the backend's own [wal_highest_op_number] is not [op_number - 1]. Reachable
+   by design rather than by programming error -- an adoption refused partway through leaves the
+   durable log below this replica's own op_number -- and simulated here directly by truncating the
+   backend behind the replica's back, which is the same shape that leaves. *)
+let test_refusal_out_of_sequence_is_counted_as_its_own_shape () =
+  let send, _sent = capturing_send () in
+  let backend, storage = fresh_storage () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Riptide_storage.Memory_storage.wal_truncate_after backend ~op_number:0;
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 1 }));
+  Alcotest.(check (list (pair string int)))
+    "counted as out_of_sequence, and as nothing else"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 1) ]
+    (refusals t);
+  Alcotest.(check int) "the op was NOT taken on" 2 (Replica.op_number t)
+
+(* [entry_rejected]: a real {!Riptide_storage.File_storage}, refusing a real entry larger than one
+   aligned data slot. This is the one shape the original blanket catch actually documented, and the
+   only one that means "this entry can never be durable here" -- so it is driven end to end through
+   a replica over a real on-disk backend rather than simulated. *)
+let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
+  Eio_main.run @@ fun env ->
+  let dir = Filename.temp_file "riptide_i2_entry_rejected" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () ->
+      Eio.Switch.run @@ fun sw ->
+      let backend =
+        Riptide_storage.File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 dir
+      in
+      let send, sent = capturing_send () in
+      let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
+      let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+      (* Comfortably past one 4096-byte data slot once canonically encoded. *)
+      let oversized = v (String.make 5000 'x') in
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = oversized; k = 0 }));
+      Alcotest.(check (list (pair string int)))
+        "counted as entry_rejected, and as nothing else"
+        [ ("fault_injection_cap", 0); ("entry_rejected", 1); ("out_of_sequence", 0) ]
+        (refusals t);
+      Alcotest.(check int) "the oversized op was NOT taken on" 0 (Replica.op_number t);
+      Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = []);
+      (* Still a working replica: the refusal is per-entry, not terminal. *)
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+      Alcotest.(check int) "a normal-sized op right afterwards is accepted" 1 (Replica.op_number t))
+
+(* THE PROPAGATING ARM, which is the half of this fix that is not merely bookkeeping: an
+   [Invalid_argument] matching NONE of the three known shapes is a backend contract violation, not
+   a documented storage refusal, and swallowing it as "the protocol declined this op" is exactly
+   the conflation I2 names. It escapes to the caller instead. *)
+module Unhelpful_backend : Riptide_storage.Storage_intf.S with type t = unit = struct
+  type t = unit
+
+  let wal_append () ~op_number:_ _ = invalid_arg "something else entirely"
+  let wal_read () ~op_number:_ = None
+  let wal_truncate_after () ~op_number:_ = ()
+  let wal_highest_op_number () = 0
+  let superblock_write () _ = ()
+  let superblock_read () = None
+end
+
+let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed () =
+  let send, _sent = capturing_send () in
+  let storage = Replica.storage_of_module (module Unhelpful_backend) () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  Alcotest.check_raises "an unclassifiable backend exception is not laundered into 'not durable'"
+    (Invalid_argument "something else entirely") (fun () ->
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 })));
+  Alcotest.(check (list (pair string int)))
+    "and it is not counted as any known refusal shape either"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0) ]
+    (refusals t)
+
+(* ============================================================================================
    TASK 8: the CLUSTER-level half -- recovery under REAL injected storage faults.
 
    Everything above this line drives ONE replica with hand-built messages. That proves each action
@@ -921,6 +1039,18 @@ let tests =
     ( "C1: a genuinely empty backend still restarts cleanly as Init (first boot keeps working)",
       `Quick,
       test_restart_still_accepts_a_genuinely_empty_backend );
+    ( "I2: a faults_max-exceeded refusal is counted as its own shape",
+      `Quick,
+      test_refusal_fault_injection_cap_is_counted_as_its_own_shape );
+    ( "I2: an out-of-sequence refusal is counted as its own shape",
+      `Quick,
+      test_refusal_out_of_sequence_is_counted_as_its_own_shape );
+    ( "I2: File_storage's oversized-entry refusal is counted as its own shape",
+      `Quick,
+      test_refusal_entry_rejected_is_counted_as_its_own_shape );
+    ( "I2: an unrecognized backend refusal propagates rather than being swallowed",
+      `Quick,
+      test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed );
     ( "CLUSTER: a committed entry survives real injected corruption of one replica's copy",
       `Quick,
       test_cluster_recovers_a_committed_entry_from_one_replicas_corrupted_storage );
