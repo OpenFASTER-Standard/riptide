@@ -33,9 +33,9 @@ out-of-tree scratch directory:
 
 ```
 Model checking completed. No error has been found.
-9341066 states generated, 3728294 distinct states found, 0 states left on queue.
+9226786 states generated, 3678650 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 45.
-Finished in 02min 41s
+Finished in 02min 35s
 ```
 
 `0 states left on queue` is the part that matters: the entire reachable state space at this bound
@@ -47,14 +47,15 @@ Two notes on reproducing this exact block, both of which are differences from th
 earlier numbers rather than anything about the protocol:
 
 - **Wall-clock is not comparable across runs with different worker counts; state counts are.**
-  `scripts/tlc` now passes `-workers auto` (TLC defaults to a single worker), so `02min 41s` is a
-  16-core figure. The state counts — `9341066` / `3728294` / depth `45` — are properties of the
-  state graph and are unaffected by worker count. Compare those, not the clock.
-- **The fingerprint-collision estimate is `1.7E-6`**, three orders of magnitude larger than the
+  `scripts/tlc` now passes `-workers auto` (TLC defaults to a single worker), so `02min 35s` is a
+  16-core figure. The state counts — `9226786` / `3678650` / depth `45` — are properties of the
+  state graph and are unaffected by worker count. Compare those, not the clock. (Re-run on the
+  committed tree at 12:40 to confirm: same three numbers, `Finished in 02min 36s`.)
+- **The fingerprint-collision estimate is `1.6E-6`**, three orders of magnitude larger than the
   core spec's `4.4E-9`, because the run is 14x bigger. This file's own earlier advice was to
   re-check with a second `fp` seed whenever that number is load-bearing for a real safety claim,
   which it now is, so that was done: `scripts/tlc VSR -fp 7` returns
-  `9341066 states generated, 3728294 distinct states found, 0 states left on queue`, depth `45` —
+  `9226786 states generated, 3678650 distinct states found, 0 states left on queue`, depth `45` —
   byte-identical counts under an independent fingerprint function, and no error.
 
 Every documented defect in the original VSR paper (Liskov & Cowling, 2012) that this scope touches
@@ -498,8 +499,41 @@ fault model and widening it past `MaxOp` would index out of domain. That `ASSUME
 before this plan; it was added because this exact coupling is easy to break with a one-line config
 edit.
 
-It is worth keeping and running despite the cost below, because it is what found the
-`HasDvcQuorum` defect.
+**It does not terminate, and that is the reportable result.** `scripts/tlc VSR_Wide` was run to a
+34-minute budget decided before the run started, on 16 cores with a 20G heap. It was still
+expanding, with a queue that grew monotonically for the entire run:
+
+| elapsed | distinct states | states left on queue | depth |
+| --- | --- | --- | --- |
+| 1 min | 6,017,885 | 1,893,678 | 20 |
+| 5 min | 9,948,909 | 2,846,367 | 21 |
+| 12 min | 21,920,289 | 5,556,676 | 24 |
+| 20 min | 36,584,832 | 7,947,110 | 26 |
+| 34 min | 53,282,218 | 9,526,285 | 27 |
+
+Depth 27 of a graph whose narrow-bound analogue completes at 45, with the frontier still widening
+after 53 million distinct states — this is not a run that was nearly done. It was stopped
+deliberately rather than left to run: at the measured ~115 MB of TLC scratch per million distinct
+states, the disk headroom on this box runs out before the state space does, so waiting longer
+changes the failure mode, not the answer. **Exhaustive checking at `Values = {v1, v2}, MaxOp = 2`
+is not feasible on this hardware.**
+
+**The fallback, run rather than recommended.** TLC's simulation mode at the same widened bound,
+`scripts/tlc VSR_Wide -simulate -depth 60`, checks randomly-sampled behaviours instead of the whole
+graph:
+
+```
+Progress: 61197752 states checked.
+```
+
+No invariant violation in ~61.2 million simulated states (14 minutes, then stopped). This is real evidence and it is weaker
+evidence than exhaustion — simulation cannot prove absence, and a defect reachable only through a
+narrow interleaving can be missed by any amount of sampling. It is reported as what it is.
+
+**So the widened bound is kept in the tree as an experiment module, not as a second shipped bar.**
+`scripts/tlc VSR` remains the claim this branch makes. Widening earned its place anyway: it is what
+found the `HasDvcQuorum` defect, which 3.7 million exhaustively-checked states at the narrow bound
+could not, and it is the obvious first thing to re-run on hardware with more memory and disk.
 
 ### Disclosed gaps in this scope, beyond the four liveness simplifications above
 
