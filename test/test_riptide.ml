@@ -70,4 +70,5 @@ let () =
       ("vsr_replica_cluster", Test_vsr_replica_cluster.tests);
       ("vsr_replica_view_change", Test_vsr_replica_view_change.tests);
       ("vsr_replica_recovery", Test_vsr_replica_recovery.tests);
+      ("dst_cluster", Test_dst_cluster.tests);
     ]
