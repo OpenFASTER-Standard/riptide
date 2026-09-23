@@ -19,14 +19,21 @@
     and never repeats within one {!t}'s lifetime. This is a deliberate rejection of a randomly
     generated nonce: GCM's 96-bit nonce space only gives a birthday-bound safety margin of roughly
     2^32 encryptions before random collisions become a real risk, which a monotonic counter avoids
-    entirely -- collision is impossible as long as the counter itself never repeats, which it
-    can't within a 64-bit range short of ~1.8 * 10^19 encryptions under one key.
+    entirely -- collision is impossible as long as the counter itself never repeats. Note this
+    deterministic construction is itself capped at 2^32 invocations per key by NIST SP 800-38D
+    §8.3 ("Requirements and Guidelines for Deterministic Construction of Nonces") -- the same
+    standard cited above for the construction itself -- so {!t} should not be used to encrypt more
+    than 2^32 payloads under one key regardless of how much headroom the 64-bit counter field
+    itself has.
 
-    {b [t] is mutable.} Every {!encrypt} call advances an internal counter ref as a side effect --
-    calling {!encrypt} on the same [t] twice never reuses a nonce, but this also means a [t] is
-    not safe to encrypt with concurrently from two fibers/threads without external
-    synchronization (the read-then-increment of the counter is not atomic), the same caveat
-    {!Riptide_materialize.Materializer}'s own [write] documents for its read-join-put pattern. *)
+    {b [t] is mutable.} Every {!encrypt} call advances an internal atomic counter as a side effect
+    -- calling {!encrypt} on the same [t] twice never reuses a nonce. The counter's
+    read-then-increment itself ({!Stdlib.Atomic.fetch_and_add}) is safe to call concurrently on the
+    same [t] from two OCaml 5 domains -- no two concurrent {!encrypt} calls can ever be handed the
+    same nonce. This does *not* make [t] fully safe for unsynchronized concurrent use in general:
+    it only guarantees nonce uniqueness, not e.g. any particular interleaving or ordering of which
+    plaintext gets which counter value, the same caveat {!Riptide_materialize.Materializer}'s own
+    [write] documents for its read-join-put pattern. *)
 
 type t
 (** An unwrapped DEK: AES-256 key material plus the private nonce-prefix and counter state
@@ -68,13 +75,18 @@ val of_raw : string -> t
     brand-new random nonce prefix and a counter reset to zero; it does {b not} resume whatever
     nonce state the original [t] (the one {!raw} was called on) had reached.
 
-    {b Concern for Task 6:} because the counter resets to zero, two live [t] values reconstructed
-    from the very same raw key bytes -- e.g. via two separate {!of_raw} calls, or one {!of_raw}
-    call alongside the original [t] the bytes came from -- do {b not} pick up where the other left
-    off. Each gets an independently random 4-byte nonce prefix, so a nonce collision between them
-    requires both an (unlikely, ~1-in-2^32) prefix collision {b and} overlapping counter values --
-    which is exactly the same birthday-bound risk the deterministic-counter design above exists to
-    avoid, just reintroduced at the reconstruction boundary instead of eliminated by it. Under
+    @raise Invalid_argument if [raw_bytes] is not exactly 32 bytes (256 bits) -- this module is
+    AES-256 only, unconditionally; a 16- or 24-byte input is never silently accepted as a weaker
+    AES-128/192 key.
+
+    {b Concern for Task 6:} because the counter {b always} resets to zero, a prefix collision
+    between two reconstructions is {b immediately} a nonce collision on their very first
+    subsequent {!encrypt} call -- both would encrypt with nonce [prefix || 0], not merely
+    "eventually, once their counters happen to overlap." That makes the birthday bound here the
+    bound on the 4-byte (32-bit) prefix space alone, not the combined 96-bit nonce space the
+    deterministic-counter design above gets to rely on: roughly {b 2^16 (~65,000)}
+    reconstructions-that-subsequently-encrypt, from the same raw key bytes, before 50% collision
+    odds -- far worse than the 2^32-scale margins elsewhere in this module. Under
     Decision 4's intended usage (one fresh [t] per payload from {!generate}, encrypted exactly
     once, wrapped, and from then on only ever reconstructed via {!of_raw} for {!decrypt} -- never
     to {!encrypt} again) this is not a live hazard, since {!decrypt} never consults the nonce

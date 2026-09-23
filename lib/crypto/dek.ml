@@ -11,7 +11,17 @@ type t = {
                           the KEK. *)
   key : Mirage_crypto.AES.GCM.key;
   nonce_prefix : string;
-  counter : int64 ref;
+  counter : int Atomic.t;
+  (* A native OCaml [int] (63-bit on 64-bit platforms), not [int64]: this
+     lets [nonce_of] use [Atomic.fetch_and_add] for a lock-free,
+     race-free read-then-increment (an [int64 ref] can't participate in
+     [Atomic] -- OCaml 5's atomics are only over the native, unboxed
+     [int]/immediate-value width). 2^62 nonces is still far past the 2^32
+     NIST SP 800-38D §8.3 bound this construction is limited to anyway
+     (see the .mli), so the narrower range costs nothing in practice. The
+     8-byte big-endian counter field in the nonce is still encoded via
+     [Int64.of_int], which is exact for any non-negative value this
+     counter will ever hold. *)
 }
 
 (* GCM's nonce is 12 bytes: a fixed 4-byte prefix (random, chosen once per
@@ -19,15 +29,15 @@ type t = {
    even if both started their counters at 0) plus an 8-byte big-endian
    monotonic counter. *)
 let nonce_of t =
-  let n = !(t.counter) in
-  t.counter := Int64.add n 1L;
+  let n = Atomic.fetch_and_add t.counter 1 in
   let buf = Bytes.create 12 in
   Bytes.blit_string t.nonce_prefix 0 buf 0 4;
-  Bytes.set_int64_be buf 4 n;
+  Bytes.set_int64_be buf 4 (Int64.of_int n);
   Bytes.unsafe_to_string buf
 
 let of_key_bytes key_bytes =
-  { key_bytes; key = Mirage_crypto.AES.GCM.of_secret key_bytes; nonce_prefix = Mirage_crypto_rng.generate 4; counter = ref 0L }
+  if String.length key_bytes <> 32 then invalid_arg "Dek.of_raw: expected 32-byte key";
+  { key_bytes; key = Mirage_crypto.AES.GCM.of_secret key_bytes; nonce_prefix = Mirage_crypto_rng.generate 4; counter = Atomic.make 0 }
 
 let generate () = of_key_bytes (Mirage_crypto_rng.generate 32)
 let of_raw raw_bytes = of_key_bytes raw_bytes
