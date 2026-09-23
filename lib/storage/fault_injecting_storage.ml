@@ -144,9 +144,15 @@ let wal_highest_op_number (T r) =
 let for_test_corrupt_entry (T r) ~op_number =
   let module U = (val r.module_) in
   let highest = U.wal_highest_op_number r.value in
+  (* Readability is judged by THIS module's own [wal_read] semantics, not the wrapped backend's:
+     a slot already corrupted by this wrapper still reads back as [Some] from [U] (the flipped
+     bytes are self-consistent down there -- see [wal_read]'s own comment), so consulting [U]
+     alone would let an already-faulted slot be "corrupted" a second time. It has no intact entry
+     left to destroy, which is exactly the shape of a test that has lost track of which faults it
+     already injected, so it takes the same [Invalid_argument] as an out-of-range op_number. *)
   let original =
     if op_number < 1 || op_number > highest then None
-    else if Int_set.mem op_number r.dropped_slots then None
+    else if Int_set.mem op_number r.corrupted_slots || Int_set.mem op_number r.dropped_slots then None
     else U.wal_read r.value ~op_number
   in
   match original with

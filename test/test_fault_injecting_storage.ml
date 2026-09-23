@@ -227,7 +227,16 @@ let test_for_test_corrupt_entry_raises_out_of_range_rather_than_silently_doing_n
         (fun () -> Fault_injecting_storage.for_test_corrupt_entry t ~op_number:0);
       Alcotest.(check (option string)) "and the real entry was left completely alone"
         (Some "only entry")
-        (Fault_injecting_storage.wal_read t ~op_number:1))
+        (Fault_injecting_storage.wal_read t ~op_number:1);
+      (* The same rule applied to an ALREADY-corrupted slot, which is the non-obvious case: the
+         wrapped backend still hands those bytes back happily (they are self-consistent down
+         there -- only this wrapper's own bookkeeping makes them [None]), so judging readability
+         by the wrapped backend alone would silently "corrupt" a slot with no intact entry left to
+         destroy -- and, at replication_quorum 3, would do so without even tripping faults_max. *)
+      Fault_injecting_storage.for_test_corrupt_entry t ~op_number:1;
+      Alcotest.check_raises "a slot this wrapper has already corrupted"
+        (Invalid_argument "for_test_corrupt_entry: no readable durable entry at that op_number")
+        (fun () -> Fault_injecting_storage.for_test_corrupt_entry t ~op_number:1))
 
 (* [wal_truncate_after] must free a [for_test_corrupt_entry]-corrupted slot's bookkeeping exactly
    the way it frees a probabilistically-corrupted one -- the property the cluster tests' durable
