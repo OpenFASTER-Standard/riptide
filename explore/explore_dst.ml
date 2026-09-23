@@ -31,15 +31,27 @@ let run_scenario ~seed ~replica_count ~rounds ~ops_per_round ~timeout_prob ~net 
      committed slot is the violation this whole plan exists to prevent. *)
   let committed : (int, string * int) Hashtbl.t = Hashtbl.create 64 in
   let last_commit = Array.make replica_count 0 in
+  (* TASK 11 FOLLOW-UP instrumentation. The permanent test used to excuse a commit_number
+     regression at [is_primary && status = Normal && last_normal_view = view_number]. That
+     condition is vacuous: [last_normal_view = view_number] is implied by [status = Normal] (every
+     path to Normal sets both together), so it reduces to "any primary in its ordinary steady
+     state". What actually distinguishes "just completed SendSV" from steady state is observable
+     only as a TRANSITION, so record each replica's view at the previous check and report whether
+     the view had just advanced. *)
+  let prev_view = Array.make replica_count (-1) in
   let check replicas phase =
     Array.iteri
       (fun i r ->
         let cn = Replica.commit_number r in
         if cn < last_commit.(i) then
-          note "[%s] replica %d commit_number REGRESSED %d -> %d (is_primary=%b status=%s view=%d lnv=%d)"
+          note
+            "[%s] replica %d commit_number REGRESSED %d -> %d (is_primary=%b status=%s view=%d \
+             lnv=%d prev_view=%d view_advanced=%b)"
             phase (i + 1) last_commit.(i) cn (Replica.is_primary r)
             (match Replica.status r with Replica.Normal -> "N" | _ -> "VC")
-            (Replica.view_number r) (Replica.last_normal_view r);
+            (Replica.view_number r) (Replica.last_normal_view r) prev_view.(i)
+            (Replica.view_number r > prev_view.(i));
+        prev_view.(i) <- Replica.view_number r;
         last_commit.(i) <- max last_commit.(i) cn;
         let entries = Array.of_list (Replica.entries r) in
         if cn > Array.length entries then
