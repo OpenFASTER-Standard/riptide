@@ -333,3 +333,78 @@ Storage-fault recovery — nack bitsets, present bitsets, the multi-step interru
 completion (open decision 3 above) — will still grow the state space, possibly a lot. The point is
 that this branch has no evidence about how much, and neither does anything written here before the
 `SendDVC` fix. Measure it; do not inherit this plan's earlier guess.
+
+## The finiteness check was run. Here is what it measured (`VSR_RecoveryDraft.tla`)
+
+The section above asked the follow-up plan's first task to run a throwaway finiteness probe before
+any real storage-fault design effort. That has now been done, and it earned its place twice — it
+caught one genuine infinite-state-space defect and one severe (but finite) state-space blowup, both
+in the first draft, both cheaply.
+
+`spec/tla/VSR_RecoveryDraft.tla` is that draft: a **throwaway copy** of `VSR.tla` plus a minimal
+sketch of the tri-state storage abstraction (decision 1 above) and nack accumulation piggybacked on
+`DOVIEWCHANGE` (decision 3's multi-step shape). It is deliberately *not* the real extension — it
+accumulates nacks and never uses them, has no new safety invariants, and should be deleted rather
+than grown into the real thing. It is a **copy** specifically so `VSR.tla` stays byte-identical and
+the `264,376`-state result quoted at the top of this file stays literally reproducible.
+
+**Finding 1 — the predicted defect, confirmed.** `SendNack` was drafted the natural way: guarded on
+`rep_status[r] = "ViewChange"` and "this op is provably absent," effect = send a NACK. Neither guard
+is falsified by the action's own effect, and the only state change is a message-bag increment — the
+`SendDVC` defect exactly, in exactly the action class this file predicted would reproduce it. The
+probe caught it **at depth 6, in under a second**:
+
+```
+Error: Invariant NoUnboundedGrowth is violated.
+...
+3003 states generated, 1333 distinct states found, 879 states left on queue.
+The depth of the complete state graph search is 6.
+```
+
+Fixed with a `rep_sent_nack` one-shot flag mirroring `rep_sent_dvc` verbatim. **This is a modeling
+device, not protocol logic** — a real implementation retransmits, so the follow-up must bound
+retransmission explicitly rather than inherit the flag as though it were a design.
+
+**Finding 2 — not everything that fails to terminate is infinite.** With the self-loop fixed, the
+draft modeled storage faults as an interleaved `InjectStorageFault` action. That never tripped the
+finiteness tripwire, but it did not converge either: **still expanding at 8,016,933 distinct states
+and 1,027,038 states queued after 12 minutes**, at depth 28 of a graph whose unfaulted baseline
+completes at depth 40. The cause is structural and worth naming, because it is the *dual* of the
+`SendDVC` lesson: an action enabled in **every** reachable state does not add states, it multiplies
+the entire base state graph by every distinct point at which it could first fire. Nothing about the
+safety question depends on a fault interleaving with consensus steps at a particular moment — only
+on a replica *having* a faulted op while it participates in a view change — so the fault became a
+one-time initial-state choice (`FaultConfigs`, 7 initial states at this bound) instead of an action.
+
+**Result after both fixes — terminates, exhaustively.** `scripts/tlc VSR_RecoveryDraft` at
+`ReplicaCount=3, Values={v1}, StartViewOnTimerLimit=1, MaxOp=1, FaultLimit=1`, quoted verbatim:
+
+```
+Model checking completed. No error has been found.
+20404014 states generated, 8670448 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 46.
+Finished in 15min 48s
+```
+
+**What this means for the real extension, stated as a budget rather than a reassurance.** Exhaustive
+checking of a storage-fault-aware model is realistic — `0 states left on queue` — but it costs
+roughly **33x the distinct states and 41x the wall-clock** of the core spec (`8,670,448` vs
+`264,376`; `15min 48s` vs `23s`) for the *most minimal possible* sketch: one op, one fault, no
+nack-quorum logic, no truncation, no forfeit escape, no durable `view`/`log_view`, and no new safety
+invariants. Every one of those additions is still to come. Three concrete consequences:
+
+1. **Budget before widening anything.** The earlier suggestion in this file that widening `Values`
+   to 2 is "a cheap experiment worth trying first" was measured against the *core* spec. Against a
+   storage-fault-aware model it is not obviously cheap, and should be measured, not assumed.
+2. **Model faults as configuration, not as events**, unless a specific property genuinely needs
+   fault timing to interleave — and if one does, expect to pay for it and say so explicitly.
+3. **Bound every new sending action at the moment it is written.** Two of this draft's three new
+   actions needed an explicit bound; the one that did not (`ReceiveNack`) is a receive action that
+   consumes from the bag. Treat "does this action's own effect falsify any of its own guards?" as a
+   checklist item for each new action, not as something to discover from a non-terminating run.
+
+Reproduce all of the above with `scripts/tlc VSR_RecoveryDraft`. One honest caveat on the headline
+run: TLC's own fingerprint-collision estimate for it is `3.6E-5` (based on actual fingerprints),
+versus `4.4E-9` for the core spec's much smaller run — still small, but four orders of magnitude
+larger, and worth re-checking with a second `fp` seed if this number is ever load-bearing for a real
+safety claim rather than, as here, a finiteness measurement.

@@ -28,3 +28,6 @@ node_modules/
 _build/
 *.install
 .merlin
+
+# TLC model-checker scratch output (spec/tla)
+spec/tla/states/
