@@ -66,16 +66,25 @@ let test_sign_leaf_produces_a_cert_the_root_validates () =
   | Ok _ -> ()
   | Error e -> Alcotest.fail (Fmt.to_to_string X509.Validation.pp_validation_error e)
 
+(* Both CAs deliberately share a common name, so anchor-filtering by DN alone (which
+   [verify_chain_of_trust]'s [issuer_matches_subject] step performs before any signature check
+   runs -- traced in `validation.ml` of the `x509.1.2.0` source) cannot be what rejects this
+   leaf: [ca1] is a genuine, DN-matching candidate anchor. Rejection can only come from
+   [validate_signature]/[ext_authority_matches_subject] finding that the leaf was not actually
+   signed by [ca1]'s key -- the cryptographic property that matters against an attacker who
+   could spoof an issuer DN but not forge a signature. *)
 let test_leaf_signed_by_unrelated_ca_is_rejected () =
-  let ca1 = Ca.generate_root ~common_name:"ca-one" in
-  let ca2 = Ca.generate_root ~common_name:"ca-two" in
+  let ca1 = Ca.generate_root ~common_name:"riptide-test-ca" in
+  let ca2 = Ca.generate_root ~common_name:"riptide-test-ca" in
   let leaf_cert, _ = Ca.sign_leaf ca2 ~common_name:"replica-x" ~valid_days:365 in
   match
     X509.Validation.verify_chain_of_trust ~host:None ~time:time_thunk ~anchors:[ ca1.Ca.cert ]
       [ leaf_cert ]
   with
   | Ok _ ->
-    Alcotest.fail "a leaf signed by an unrelated CA must not validate against a different anchor"
+    Alcotest.fail
+      "a leaf signed by an unrelated CA's key must not validate, even against an anchor whose \
+       DN happens to match the true issuer"
   | Error _ -> ()
 
 (* Task 8's mTLS peer verification identifies a replica by name, which only works if the leaf
@@ -115,6 +124,34 @@ let test_leaf_is_not_itself_a_ca () =
   match X509.Validation.valid_ca ~time:(now ()) leaf_cert with
   | Ok () -> Alcotest.fail "a leaf certificate must not pass as a valid CA"
   | Error _ -> ()
+
+(* [x509]'s own `.mli` states plainly that [Key_usage]/[Ext_key_usage] are *not* checked by the
+   library itself -- "they need to be checked by the client of the API" -- so nothing in
+   [verify_chain_of_trust] or [valid_ca] would ever fail if these extensions were silently
+   dropped from [sign_leaf]. Confirmed live: removing either extension from `ca.ml` does not
+   fail any other test in this file. Task 8's mTLS role-checking is the actual client that will
+   read them, so this test reads the minted leaf's extensions directly, the same way
+   [test_leaf_is_not_itself_a_ca] and [test_root_is_a_pathlen_zero_ca] already do for
+   [Basic_constraints], rather than going through the validator. *)
+let test_leaf_has_the_expected_key_usage_extensions () =
+  let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+  let leaf_cert, _ = Ca.sign_leaf ca ~common_name:"replica-1" ~valid_days:365 in
+  let extensions = X509.Certificate.extensions leaf_cert in
+  (match X509.Extension.find X509.Extension.Key_usage extensions with
+   | Some (_, usages) ->
+     Alcotest.(check bool)
+       "leaf Key_usage contains Digital_signature" true
+       (List.mem `Digital_signature usages)
+   | None -> Alcotest.fail "leaf must carry an explicit Key_usage extension");
+  match X509.Extension.find X509.Extension.Ext_key_usage extensions with
+  | Some (_, usages) ->
+    Alcotest.(check bool)
+      "leaf Ext_key_usage contains Server_auth" true
+      (List.mem `Server_auth usages);
+    Alcotest.(check bool)
+      "leaf Ext_key_usage contains Client_auth" true
+      (List.mem `Client_auth usages)
+  | None -> Alcotest.fail "leaf must carry an explicit Ext_key_usage extension"
 
 let test_root_is_a_pathlen_zero_ca () =
   let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
@@ -198,6 +235,9 @@ let tests =
     ("leaf is valid for its own hostname", `Quick, test_leaf_is_valid_for_its_own_hostname);
     ("leaf is rejected for a different hostname", `Quick, test_leaf_is_rejected_for_a_different_hostname);
     ("leaf is not itself a CA", `Quick, test_leaf_is_not_itself_a_ca);
+    ( "leaf has the expected Key_usage/Ext_key_usage extensions",
+      `Quick,
+      test_leaf_has_the_expected_key_usage_extensions );
     ("leaf validity honours valid_days", `Quick, test_leaf_validity_honours_valid_days);
     ("leaf is rejected once expired", `Quick, test_leaf_is_rejected_once_expired);
     ( "each leaf gets a fresh key and a distinct serial",
