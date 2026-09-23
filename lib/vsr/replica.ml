@@ -486,13 +486,28 @@ let readable_entries t =
    infinite set, exactly. [nack_proves_absent] below is where the receiving side spends it.
 
    What this function therefore computes is the remainder: an explicitly-proven-absent op-number
-   at or below the sender's own op-number. Under the current storage layer that set is always
-   EMPTY (a slot within the durable range reads back present or corrupt, never absent -- that is
-   [slot_state]'s own construction, and it is the property the whole nack-soundness argument
-   rests on). It is computed for real, rather than hard-coded to [[]], so that a storage layer or
-   partial-repair path that can one day report a genuine in-range hole starts producing real
-   evidence here without a second edit -- and because the receiving side already accepts and
-   counts such evidence (with a test). *)
+   at or below the sender's own op-number. Under the current storage layer that set is EMPTY BY
+   CONSTRUCTION -- provably, for every reachable state, and not as a coverage gap: a slot within
+   the durable range reads back [Present] or [Corrupt], NEVER [Absent]. That is [slot_state]'s own
+   construction (:451-463), and it is the property the whole nack-soundness argument rests on. So
+   this function returns [[]] today, always. It is written as a real scan rather than hard-coded
+   to [[]] so the structural reason stays legible next to the code that depends on it.
+
+   DO NOT read that as "a drop-in extension point the receiver already supports". It is not. The
+   receiving side REJECTS in-range nack evidence: [nacks_wellformed] (:1405) drops any DVC
+   carrying a nack at or below the sender's own [n] WHOLESALE -- the entire message is discarded
+   as malformed, not partially honoured, not specially handled (pinned by
+   [test_out_of_range_nack_is_a_total_no_op] in test_vsr_replica_recovery.ml and by a
+   field-validation case in test_vsr_replica.ml). That rejection is correct and load-bearing, not
+   merely tolerated: it is the right strengthening under [StorageWellFormed] (VSR.tla:742-745),
+   and it is what keeps [sender_proves_absent] monotone in [op_number], which is in turn what
+   makes [completion_point]'s downward-scan bound exact rather than heuristic (an ACCEPTED nack
+   must satisfy [o > n], so it is fully subsumed by that disjunct and adds nothing).
+
+   Consequently, if a future storage layer or partial-repair path ever needs to report a genuine
+   in-range hole, it must RELAX [nacks_wellformed] in the same change that widens this function.
+   Widening the sender alone would make every DoViewChange from such a replica malformed to every
+   peer, permanently wedging every view change that replica takes part in. *)
 let provable_nacks t =
   let horizon = max t.op_number (t.storage.wal_highest_op_number ()) in
   let rec loop o acc =
@@ -1056,10 +1071,23 @@ let fill_value (dvcs : dvc list) ~winner ~op_number =
    [StorageWellFormed] (VSR.tla:742-745) and [LogLengthMatchesOpNumber] (:728-729) is PRECISELY
    the condition [CanNack] tests). The second disjunct is not an extra liberty taken on top of the
    spec -- it is the spec's own [CanNack], restated in the only form a real, unbounded op-number
-   space can carry it in. The first is kept because the wire field is real and a future storage
-   layer able to report an in-range hole must be honoured without a second edit; arrivals are
-   validated (see [handle_do_view_change]) so an explicit nack can never CONTRADICT the sender's
-   own [n], only refine it. *)
+   space can carry it in. Today it is also the ONLY disjunct that ever fires.
+
+   The [List.mem] disjunct is, as of today, STRUCTURALLY REDUNDANT rather than a second source of
+   evidence -- it refines nothing. [nacks_wellformed] (:1405, reached via [handle_do_view_change])
+   drops any DVC carrying a nack at or below the sender's own [n] wholesale, so every nack that
+   survives validation already satisfies [op_number > d.dvc_n], which is precisely the first
+   disjunct. An accepted nack therefore cannot contradict [n], cannot refine it, and cannot add
+   anything to it. It is kept because the wire field is real and the membership test costs
+   nothing, NOT because it extends what [n] already carries, and NOT as a hook a future storage
+   layer could light up on its own.
+
+   That redundancy is load-bearing in two places: it makes [sender_proves_absent] monotone in
+   [op_number] (what makes [completion_point]'s downward-scan bound exact, not a heuristic cap),
+   and it is what lets [provable_nacks] (:496) be provably empty on the sender side with no
+   receiver losing any evidence. Reporting genuine in-range holes means relaxing
+   [nacks_wellformed] in the same change that widens [provable_nacks] -- see that function's own
+   comment for why the sender-only version would wedge the protocol. *)
 let sender_proves_absent (d : dvc) ~op_number = op_number > d.dvc_n || List.mem op_number d.dvc_nacks
 
 let nack_count (dvcs : dvc list) ~op_number =
