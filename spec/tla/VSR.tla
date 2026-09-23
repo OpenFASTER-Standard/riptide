@@ -116,7 +116,24 @@ IsNormalBackup(r)   == /\ rep_status[r] = "Normal" /\ Primary(View(r)) # r
    'corrupted,' never conflated with 'legitimately absent.'" A storage layer that could let a
    durably-acknowledged entry read back as a valid-but-empty slot would defeat ANY nack-based
    recovery protocol: two replicas could then jointly "prove" a committed op was never held.
-   Task 5's report records the deliberate mutation run that demonstrates exactly that failure.
+
+   THAT IS MEASURED, NOT ARGUED. A deliberate mutation of CrashRestart -- one word, "corrupt"
+   to "absent", so a restart may discover a durably-written slot provably empty -- violates
+   NoCommittedOpProvablyAbsent at depth 6 in under a second (595 states generated, 328
+   distinct, single-worker). TLC's trace is exactly the two-replica false proof above: op 1 is
+   committed and client-acked, replica 2 legitimately nacks it (it never received the PREPARE,
+   so its slot is honestly "absent"), and the mutated restart makes replica 1's WRITTEN slot
+   read back "absent" too -- 2 of 3 replicas, a quorum, jointly "proving" a committed op was
+   never held. Reproduce it (the derived module is deliberately not committed, so it cannot
+   rot out of sync with this one) from spec/tla:
+     sed -e 's/^---- MODULE VSR ----/---- MODULE VSR_AbsentFault ----/' \
+         -e 's/IF o \in corrupted THEN "corrupt"/IF o \in corrupted THEN "absent"/' \
+         VSR.tla > VSR_AbsentFault.tla
+     grep -v 'INVARIANT StorageWellFormed' VSR.cfg > VSR_AbsentFault.cfg
+     cd ../.. && scripts/tlc VSR_AbsentFault
+   StorageWellFormed is dropped from the derived config on purpose: it is the direct restatement
+   of the contract being mutated, so leaving it in would report the mutation itself rather than
+   the SAFETY CONSEQUENCE of the mutation, which is the whole point of the exercise.
 
    Consequently "absent" holds precisely for o > Len(rep_log[r]) -- StorageWellFormed asserts
    that as a checkable invariant rather than leaving it as prose. *)
@@ -573,12 +590,59 @@ ReceiveSV ==
    transition preserves the reset discipline RecvDvcValidWhenViewChange checks.
 
    STORAGE: the restart may discover up to CorruptLimit slots corrupt. It may NOT discover a
-   written slot "absent" -- see the storage model note; that is the storage layer's contract,
-   and the mutation that breaks it is recorded in task 5's report.
+   written slot "absent" -- see the storage model note above, which also records the run that
+   mutates this one word and watches NoCommittedOpProvablyAbsent fall at depth 6.
 
-   Enablement is narrowed to restarts that can matter: one that corrupts nothing AND happens
-   while the replica is not mid-view-change is a pure volatile-state reset with no bearing on
-   any property here, and paying the full graph multiplier for it buys nothing. *)
+   ================ the enablement narrowing, and what actually makes it sound ================
+   Enablement is narrowed to restarts that can MATTER: a restart that corrupts nothing AND
+   happens while the replica is not mid-view-change (rep_view_number[r] = rep_last_normal_view[r])
+   is not modelled, which is where roughly a factor of two in the state graph comes from.
+
+   This is a state-space REDUCTION, so the bar it has to clear is not "the excluded transitions
+   look uninteresting" -- an earlier version of this comment said only that they are "a pure
+   volatile-state reset with no bearing on any property here", which is too weak to license
+   anything. The property that actually makes the reduction sound is:
+
+     THE EXCLUDED TRANSITIONS ENABLE NO ACTION THAT WAS NOT ALREADY ENABLED, AND FALSIFY NO
+     INVARIANT THAT WAS NOT ALREADY FALSE.
+
+   An excluded transition changes exactly four variables (rep_status' = "Normal" = its own
+   prior value, since status "ViewChange" is only ever established together with view > log_view,
+   which this branch excludes by construction). Walking each of the four, against this module's
+   own readers -- the walk is the argument, and it must be REDONE if any reader is added:
+
+     - rep_peer_op_number -> 0. Read in exactly one place: IsCommitted, which is used only by
+       PrimaryExecuteOp's guard, monotonically (it counts peers whose ack'd op-number is >=
+       some op). Zeroing it can only shrink that count, so it only ever DISABLES
+       PrimaryExecuteOp.
+     - rep_recv_svc -> {}. Read in exactly one guard: SendDVC's Cardinality(rep_recv_svc[r]) >= f
+       (f >= 1 by ASSUME ReplicaCount % 2 = 1 with ReplicaCount >= 3). Emptying it only ever
+       DISABLES SendDVC. ReceiveMatchingSVC writes it (@ \cup {m.i}) but does not read it in a
+       guard, so it cannot change ReceiveMatchingSVC's enablement -- and because that write is
+       monotone in the set, the emptied branch stays pointwise <= the un-emptied one forever
+       after, which is what makes the argument survive induction rather than hold one step.
+     - rep_recv_dvc -> {}. Read only through ValidDvcs(r), whose only guard-level consumer is
+       HasDvcQuorum (SendSV, ForfeitViewChange); emptying it makes that Cardinality 0, so both
+       are DISABLED. ReceiveDVC writes it monotonically (@ \cup {m}) without reading it in a
+       guard, same induction as above. The two invariants that read it --
+       RecvDvcValidWhenViewChange and DvcEntriesAgreeWithinLogView -- are universally quantified
+       over its members, so {} satisfies both VACUOUSLY: the excluded transition cannot create a
+       violation either.
+     - rep_sent_dvc -> FALSE. This is the only one that can ENABLE anything: SendDVC guards on
+       ~rep_sent_dvc[r]. It is safe for a different reason -- SendDVC also guards on
+       rep_status[r] = "ViewChange", and every excluded transition lands in "Normal" by
+       construction (the excluded case is precisely ~(view > log_view), which is exactly what
+       makes the status reconstruction produce "Normal"). So SendDVC is disabled in the excluded
+       post-state regardless of the flag. Separately, every path INTO "ViewChange"
+       (TimerSendSVC, ReceiveHigherSVC, ForfeitViewChange, CrashRestart) already sets this flag
+       FALSE itself, so the reset is not what makes a later SendDVC possible in any case.
+
+   This is an argument, not a machine-checked reduction: TLC never sees the excluded
+   transitions, so nothing here would FAIL if the argument stopped holding. A future edit that
+   adds a reader of any of those four variables -- especially a non-monotone one, or a guard
+   that fires on a variable being EMPTY -- can silently invalidate it with no failing run to
+   say so. If you add such a reader, either redo this walk or delete the narrowing (the cost is
+   roughly 2x the state graph, which is affordable at the shipped bound). *)
 CrashRestart ==
     \E r \in replicas : \E corrupted \in SUBSET (1..Len(rep_log[r])) :
         /\ aux_restart_count < RestartLimit

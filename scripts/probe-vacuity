@@ -8,6 +8,11 @@
 # "No error has been found" is a real finding: that machinery is dead at this bound, and any
 # safety invariant depending on it is vacuous.
 #
+# NoAckedValueEverCorrupt and NoStartViewWithCommitPoint (P8/P9) are deliberately WEAKER than
+# the other seven and must not be quoted as if they were equivalent: they show only that the
+# situation their invariant describes arises at this bound, not that the invariant could fail.
+# See VSR_Probe.tla's own note above P8 and README.md's structural-guards list.
+#
 # Usage: scripts/probe-vacuity [probe-name ...]   (default: all of them)
 # Results land in .tlc-runs/probe-<name>.log; a one-line verdict per probe goes to stdout.
 set -uo pipefail
@@ -17,7 +22,8 @@ OUT_DIR="$REPO_ROOT/.tlc-runs"
 mkdir -p "$OUT_DIR"
 
 ALL_PROBES=(NoCorruptionEver NoRestartEver NoContestedCompletion NoForfeitEver \
-            NoNackQuorumInRange NoNackOfACommittedOp NoStartViewShortensALog)
+            NoNackQuorumInRange NoNackOfACommittedOp NoStartViewShortensALog \
+            NoAckedValueEverCorrupt NoStartViewWithCommitPoint)
 PROBES=("$@")
 [ ${#PROBES[@]} -eq 0 ] && PROBES=("${ALL_PROBES[@]}")
 

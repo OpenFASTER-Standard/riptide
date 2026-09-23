@@ -50,9 +50,21 @@ earlier numbers rather than anything about the protocol:
   `scripts/tlc` now passes `-workers auto` (TLC defaults to a single worker), so `02min 35s` is a
   16-core figure. The state counts — `9226786` / `3678650` / depth `45` — are properties of the
   state graph and are unaffected by worker count. Compare those, not the clock. (Re-run on the
-  committed tree at 12:40 to confirm: same three numbers, `Finished in 02min 36s`.)
-- **The fingerprint-collision estimate is `1.6E-6`**, three orders of magnitude larger than the
-  core spec's `4.4E-9`, because the run is 14x bigger. This file's own earlier advice was to
+  committed tree at 12:40 to confirm: same three numbers, `Finished in 02min 36s`. Re-run a third
+  time after the review-fix commit, to confirm nothing in it regressed: same three numbers again,
+  `0 states left on queue`, no error, `Finished in 01min 55s` — a 25% faster clock for a
+  byte-identical state graph, which is the clearest available illustration of why this file says to
+  compare state counts and not wall-clock.)
+- **The fingerprint-collision estimate is of order `1E-6`**, three orders of magnitude larger than
+  the core spec's `4.4E-9`, because the run is 14x bigger. Quoted as an order of magnitude and not
+  as a single figure on purpose: TLC prints two of these, and unlike the state counts they are
+  **not** stable across runs of the identical spec. A fresh re-run of this exact tree reports
+  `calculated (optimistic): 1.1E-6` and `based on the actual fingerprints: 4.9E-6`, where an
+  earlier run of the same tree reported `1.6E-6`. The optimistic figure is a function of the state
+  count alone, so it reproduces; the actual-fingerprints figure is derived from the observed
+  spacing of fingerprints and therefore moves with worker interleaving. Compare it as an order of
+  magnitude, the same way this file already says to compare wall-clock as an order of magnitude and
+  state counts exactly. This file's own earlier advice was to
   re-check with a second `fp` seed whenever that number is load-bearing for a real safety claim,
   which it now is, so that was done: `scripts/tlc VSR -fp 7` returns
   `9226786 states generated, 3678650 distinct states found, 0 states left on queue`, depth `45` —
@@ -203,14 +215,49 @@ them:
 - `CommitNumberNeverHigherThanOpNumber` — the invariant that actually catches the `WinningDVC`
   mutation (in 9s), and the one that catches a `ReceiveSV` truncating below its own destination's
   commit point.
-- `NoCommittedOpProvablyAbsent`, `AcknowledgedWritesReadableSomewhere`,
-  `StartViewNeverDropsACommittedOp`, `StartViewCoversItsOwnCommitPoint` — the four new
-  storage-fault-aware ones. All four are non-vacuous at this bound by *measurement*, not by
-  argument; see the probe table in the storage-fault section below.
+- `NoCommittedOpProvablyAbsent` — the strongest of the four new storage-fault-aware invariants,
+  and the only one in this whole file backed by a **mutation run** rather than only by a
+  reachability probe: weakening `CrashRestart` by one word so a durably-written slot may fault to
+  `"absent"` instead of `"corrupt"` violates it at depth 6 in under a second. So it is not merely
+  reachable-antecedent non-vacuous (probe `NoNackOfACommittedOp`, depth 5) — it is demonstrably
+  *falsifiable*, and it is what catches the failure of the single load-bearing modelling
+  assumption this whole extension rests on. Reproduction command in `VSR.tla`'s own storage-model
+  comment.
+- `StartViewNeverDropsACommittedOp` — non-vacuous at this bound by measurement: probe
+  `NoStartViewShortensALog` (depth 10) shows completions really do truncate, which is exactly the
+  situation this invariant polices. Two earlier formulations of it were *violated* by TLC (both
+  false positives, both recorded in `VSR.tla`'s own comment), which is its own kind of evidence
+  that the invariant is sensitive to what the completion logic actually does.
 - `DvcEntriesAgreeWithinLogView` — the premise that licenses repairing a corrupt slot from a
   same-`log_view` peer. Falsifiable and load-bearing.
 
+An earlier version of this list also claimed `AcknowledgedWritesReadableSomewhere` and
+`StartViewCoversItsOwnCommitPoint` were "non-vacuous by measurement, not by argument; see the probe
+table" — for both, there was no probe in the table, and for the first, `VSR.tla`'s own comment
+argued the *opposite*. Both have been moved down to the structural guards, where the caveat is
+stated instead of implied.
+
 *Structural / regression guards (keep them, don't count them as safety evidence):*
+- `AcknowledgedWritesReadableSomewhere` — **unfalsifiable at the shipped fault budget, by
+  argument, exactly like `NoLogDivergence` is at `Values = {v1}`.** With
+  `CorruptLimit = RestartLimit = 1` at most one copy of anything is ever unreadable, and an
+  acknowledged write exists on a quorum's worth of replicas, so at least one readable copy always
+  remains no matter what the protocol does. `VSR.tla`'s own comment on the invariant has always
+  said this; this list previously contradicted it. What *is* measured is strictly weaker and is
+  reported as such: probe `NoAckedValueEverCorrupt` asks whether a copy of an acknowledged write
+  ever becomes unreadable at all (it does — see the probe table), so the invariant at least
+  describes a situation that arises, rather than one that never occurs. It becomes a real
+  discriminator only at `CorruptLimit > f` or `RestartLimit > 1`, which no run in this tree has
+  attempted; widening the fault budget, not the value domain, is what would buy that.
+- `StartViewCoversItsOwnCommitPoint` — well-formedness of the emitted completion artifact
+  (`Len(m.log) = m.n /\ m.k <= m.n`), not a safety discriminator. `VSR.tla`'s own comment calls it
+  "the tripwire" for dropping `ValidCompletion`'s `L >= HighestCommitNumber(r)` clause, which is
+  what it is: it would catch that specific edit, and it is not evidence about the protocol
+  otherwise. Probe `NoStartViewWithCommitPoint` measures the one non-trivial thing available —
+  that completions carrying a *non-zero* commit point are emitted at all, so the `m.k <= m.n`
+  clause is at least checked against something — and that is reachability of an antecedent, not
+  falsifiability of the invariant. The two are not the same, and this list no longer treats them
+  as if they were.
 - `NoLogDivergence` — still structurally unfalsifiable at `Values = {v1}`, as described above. The
   storage-fault extension makes this gap matter *more* than it did for the core spec, because
   nack-quorum-driven truncation is a brand-new way for two logs to end up disagreeing. This is
@@ -469,8 +516,8 @@ A safety invariant that holds because the state which would test it is unreachab
 nothing, and this file already applies that scepticism to `NoLogDivergence`. `spec/tla/VSR_Probe.tla`
 applies it to the recovery machinery: each probe is written to be **false** on some reachable
 state, so an `Invariant ... is violated` result is the *success* case. Run them with
-`scripts/probe-vacuity` (one at a time — TLC stops at the first violation). All seven are reachable
-at the shipped bound:
+`scripts/probe-vacuity` (one at a time — TLC stops at the first violation). All seven of the
+primary probes are reachable at the shipped bound:
 
 | Probe | Asks | Result |
 | --- | --- | --- |
@@ -481,6 +528,18 @@ at the shipped bound:
 | `NoNackQuorumInRange` | does an `f+1` nack quorum ever form for an op in the candidate range? | reachable, depth 13 |
 | `NoNackOfACommittedOp` | is `NoCommittedOpProvablyAbsent`'s antecedent reachable at all? | reachable, depth 5 |
 | `NoStartViewShortensALog` | does a completed view change ever actually *truncate*? | reachable, depth 10 |
+
+Two further probes, `NoAckedValueEverCorrupt` and `NoStartViewWithCommitPoint`, are deliberately
+**weaker** and are listed separately so they are not read as equivalent to the seven above. Those
+seven each show that a mechanism the shipped invariants depend on is genuinely exercised. These two
+show only that the *situation* a given invariant describes arises at all — which is necessary for
+the invariant to be worth keeping, but is not evidence that it could fail. See the structural-guards
+list above for what each one's invariant is and is not:
+
+| Probe | Asks | Result |
+| --- | --- | --- |
+| `NoAckedValueEverCorrupt` | does a copy of a client-*acknowledged* write ever actually become unreadable? | reachable, depth 6 |
+| `NoStartViewWithCommitPoint` | is a completion ever emitted carrying a *non-zero* commit point? | reachable, depth 13 |
 
 `NoContestedCompletion` is the one that matters most: it is the direct test of whether
 storage-fault-awareness genuinely forces a multi-step sequence at this bound, or whether completion
@@ -529,6 +588,80 @@ Progress: 61197752 states checked.
 No invariant violation in ~61.2 million simulated states (14 minutes, then stopped). This is real evidence and it is weaker
 evidence than exhaustion — simulation cannot prove absence, and a defect reachable only through a
 narrow interleaving can be missed by any amount of sampling. It is reported as what it is.
+
+**Four ways to get an exhaustive widened-bound result, one tried, three not — so the next person
+does not have to rediscover the list.** All four narrow the search rather than buying hardware,
+which is the axis this box cannot move:
+
+1. **Disable the forfeit escape (`ForfeitLimit = 0`).** TRIED — `spec/tla/VSR_WideNoForfeit.tla`/
+   `.cfg`, result below. The counterexample trace that found the `HasDvcQuorum` defect uses no
+   `ForfeitViewChange` action at all, so removing that action's branching factor keeps the defect
+   class reachable while cutting the graph. Cheapest of the four to try, which is why it was the
+   one tried.
+2. **A TLC `CONSTRAINT` bounding the view number.** Not tried. `VSR.tla` already bounds view
+   changes indirectly (`StartViewOnTimerLimit`, `ForfeitLimit`) but nothing caps `View(r)` itself,
+   and a state constraint is the standard TLC lever for exactly this. Note what it costs: a
+   `CONSTRAINT` silently prunes successor states, so any "no error found" result under one is a
+   claim about the constrained graph only — strictly weaker than an unconstrained exhaustion, and
+   it must be reported that way.
+3. **Depth-bounded exhaustive search (`-dfid <n>`).** Not tried. Iterative-deepening DFS gives a
+   *complete* answer up to depth `n` rather than a random sample, which is strictly stronger than
+   simulation mode for the same budget. The `HasDvcQuorum` violation was found at depth 19, so a
+   `-dfid` run to ~20-25 would cover the region where this spec's known defect class actually
+   lives, and would say so exhaustively for that region.
+4. **Widen one dimension at a time.** Not tried. `VSR_Wide` moves `Values` and `MaxOp` together
+   (forced by `ASSUME MaxOp >= Cardinality(Values)`), and leaves the fault budget alone. Nothing
+   has measured `ReplicaCount = 5` at the narrow value domain, or `CorruptLimit = 2` — and per the
+   structural-guards list above, the fault budget is the dimension that would make
+   `AcknowledgedWritesReadableSomewhere` falsifiable, which widening `Values` never will.
+
+### `ForfeitLimit = 0` at the widened bound: it does not terminate either
+
+`scripts/tlc VSR_WideNoForfeit`, 16 cores, 16G heap, run to a **45-minute budget decided before the
+run started** (it was stopped at 46 minutes, by the disk guard rather than the clock — see below).
+The hypothesis was that removing `ForfeitViewChange`'s branching factor might let the widened bound
+exhaust. **It does not.** Side by side with `VSR_Wide`'s own run at matched elapsed times:
+
+| elapsed | `VSR_Wide` distinct | `VSR_Wide` queue | `VSR_WideNoForfeit` distinct | `VSR_WideNoForfeit` queue | depth (no-forfeit) |
+| --- | --- | --- | --- | --- | --- |
+| 1 min | 6,017,885 | 1,893,678 | 2,942,031 | 1,016,352 | 18 |
+| 5 min | 9,948,909 | 2,846,367 | 11,157,995 | 3,037,331 | 22 |
+| 12 min | 21,920,289 | 5,556,676 | 25,166,609 | 6,029,095 | 25 |
+| 20 min | 36,584,832 | 7,947,110 | 40,930,513 | 8,183,152 | 27 |
+| 34 min | 53,282,218 | 9,526,285 | 65,575,663 | 9,660,855 | 29 |
+| 46 min | (not run this long) | — | 84,140,894 | 9,582,887 | 31 |
+
+**The honest reading, including the part that argues against the hypothesis.** Disabling the
+forfeit escape did not shrink this state space — after the first minute it is consistently *ahead*
+of `VSR_Wide` on distinct states at matched wall-clock, which is what you would expect if TLC is
+simply exploring a comparably-sized graph slightly faster per state with one action gone. So the
+reviewer's reasoning was sound (the action is a real branching factor, and the defect class does
+not need it) but the premise it rests on — that forfeit is a *large enough* share of the branching
+to matter — is measured false. The blowup lives elsewhere, almost certainly in the `Values`/`MaxOp`
+widening itself: two distinct values roughly square the log-content space, and `rep_storage` is
+indexed over `1..MaxOp` on top of that.
+
+**One thing genuinely did change, and it is the most interesting number here.** `VSR_Wide`'s queue
+grew monotonically for its entire run. This one's peaked at **9,808,597 at 39 minutes** and then
+*declined* — 9,660,855 at 34 min, 9,808,597 at 39 min, 9,582,887 at 46 min. A queue that has
+stopped growing is the first sign of a frontier closing rather than widening, which is weak
+evidence that this variant is *finite and might actually terminate* given enough time, where
+`VSR_Wide` showed no such sign at all. It is not evidence that it would terminate *soon*: 9.6M
+states still queued at depth 31, against a narrow-bound analogue that completes at depth 45.
+
+**Why it stopped at 46 minutes rather than running longer.** Disk, not the clock, and this is the
+binding constraint on this box for any further attempt: TLC's scratch directory reached **18 GB**
+and `/work` fell to **5.2 GB free (98% full)** — this volume is shared with every other project on
+this box, so running it dry is not a local failure. At the measured ~215 MB of scratch per million
+distinct states (higher than `VSR_Wide`'s ~115 MB/M, since this run's states are reached at greater
+depth), the remaining headroom was ~25 further minutes and the queue was not draining anywhere near
+fast enough to finish in it. Scratch was deleted afterwards and the 18 GB returned.
+
+**So option 1 of the four above is now TRIED and NEGATIVE, and options 2-4 are the remaining
+candidates** — with option 3 (`-dfid`, depth-bounded *exhaustive* search) now looking like the best
+of them: this run reached depth 31 and the known defect class lives at depth 19, so a `-dfid 25`
+run would give a complete answer over exactly the region that matters, rather than an incomplete
+answer over a region that cannot be finished.
 
 **So the widened bound is kept in the tree as an experiment module, not as a second shipped bar.**
 `scripts/tlc VSR` remains the claim this branch makes. Widening earned its place anyway: it is what

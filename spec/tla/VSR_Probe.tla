@@ -54,4 +54,33 @@ NoStartViewShortensALog ==
     \A m \in DOMAIN messages :
         (messages[m] > 0 /\ m.type = "StartView") =>
             (m.v >= rep_view_number[m.dest] => rep_op_number[m.dest] <= m.n)
+
+(* P8 and P9 are a WEAKER KIND OF PROBE than P1-P7, and are labelled as such in
+   spec/tla/README.md rather than quietly listed alongside them. P1-P7 each show that a
+   mechanism the shipped invariants depend on is genuinely exercised. P8 and P9 instead show
+   only that the SITUATION two specific invariants describe actually arises at this bound --
+   which is necessary for those invariants to be worth anything, but is NOT the same as
+   showing they could fail. Both invariants remain, by argument, unfalsifiable at the shipped
+   fault budget; see README.md's structural-guards list. Reachability of an antecedent is not
+   falsifiability of an invariant, and conflating the two is exactly the overstatement these
+   probes exist to stop this file from making. *)
+
+(* P8: AcknowledgedWritesReadableSomewhere asserts that a client-acknowledged write is readable
+   on SOME replica. At CorruptLimit = RestartLimit = 1 that cannot fail (at most one copy is
+   ever unreadable, and an acknowledged write exists on a quorum). So the falsifiable question
+   is the weaker one: does a copy of an ACKNOWLEDGED write ever actually become unreadable at
+   all? If not, the invariant is not merely unfalsifiable but describes a situation that never
+   arises, and CorruptLimit > 1 would be measuring nothing new either. *)
+NoAckedValueEverCorrupt ==
+    \A v \in Values : \A r \in replicas : \A i \in DOMAIN rep_log[r] :
+        ~(aux_client_acked[v] /\ rep_log[r][i] = v /\ IsCorrupt(r, i))
+
+(* P9: StartViewCoversItsOwnCommitPoint's second clause (m.k <= m.n) is trivially true of any
+   StartView carrying commit-number 0. Is a completion ever emitted with a NON-ZERO commit
+   point -- i.e. is that clause ever checked against a completion that had a real commit point
+   to cover? (Its first clause, Len(m.log) = m.n, is well-formedness and has no comparable
+   "interesting antecedent" to probe for.) *)
+NoStartViewWithCommitPoint ==
+    \A m \in DOMAIN messages :
+        ~(messages[m] > 0 /\ m.type = "StartView" /\ m.k > 0)
 ====
