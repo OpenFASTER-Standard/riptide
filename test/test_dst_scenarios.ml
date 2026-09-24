@@ -680,22 +680,46 @@ let test_ring_capacity_boundary () =
    ring-capacity/view-change mechanism itself, running the identical scenario N times in one
    process each against a fresh real [File_storage] directory, catching any nondeterministic
    flakes that may emerge from that path's interaction with File_storage timing or wall-clock
-   budget behavior. *)
+   budget behavior.
+
+   ITERATION COUNT AND SPEED, both reduced from this test's first form after it was measured
+   rather than guessed. It first ran 20 iterations and was registered [`Quick]. At 20 it cost
+   ~6.3s of the suite's ~20s idle wall-clock -- roughly a third of the whole suite for one test --
+   against test_riptide.ml's own 15s PER-TEST watchdog, which is far less headroom than that ratio
+   makes it sound: the cost here is real [Eio.Time.sleep]-based I/O waiting, so it stretches under
+   CPU contention rather than staying put, and a review reproduced 4 watchdog failures out of 4
+   runs under induced load (against 0/5 for [test_ring_capacity_boundary], the single-iteration
+   test it soaks). Worse, the watchdog's own message blames "a busy-poll livelock," which is
+   exactly the wrong diagnosis for a test that is legitimately waiting on I/O -- the failure mode
+   test_riptide.ml's own TASK 11 CORRECTION note already calls the worst possible one for a
+   watchdog, since it discredits the suite instead of finding a bug.
+
+   So: 5 iterations, and [`Slow], following this repo's existing convention for adversarial/soak-
+   shaped tests (test_lattice_materialize_crypto_scenarios.ml registers its multi-seed sweeps and
+   its real-TLS test that way). 5 still soaks -- it is 5 independent real-[File_storage]
+   directories and 5 independent full view-change storms, i.e. still 5x the coverage of the
+   single-iteration test next to it, which is the actual regression-catching property this test
+   exists for -- while costing ~1.6s instead of ~6.3s and leaving an order-of-magnitude margin
+   under the watchdog rather than a 2.4x one. A genuine nondeterministic flake in this path is
+   caught by repetition across RUNS as much as within one; buying the last few iterations at the
+   price of being the suite's most load-fragile test was not a good trade. *)
+let soak_iterations = 5
+
 let test_ring_capacity_boundary_soak () =
-  for iteration = 1 to 20 do
+  for iteration = 1 to soak_iterations do
     Eio_main.run @@ fun env ->
     with_tmp_dir (fun dir ->
         let ok, views = run_until_view_change ~env ~dir ~ring_capacity:small_ring in
         Alcotest.(check bool)
           (Printf.sprintf
-             "soak iteration %d/20: with a log of %d ops in a ring of %d, no view change can ever \
+             "soak iteration %d/%d: with a log of %d ops in a ring of %d, no view change can ever \
               complete -- the cluster is permanently in View_change (views reached: %s)"
-             iteration ops_past_ring small_ring
+             iteration soak_iterations ops_past_ring small_ring
              (String.concat "," (List.map string_of_int views)))
           false ok;
         Alcotest.(check bool)
-          (Printf.sprintf "soak iteration %d/20: views kept climbing as each attempt forfeited"
-             iteration)
+          (Printf.sprintf "soak iteration %d/%d: views kept climbing as each attempt forfeited"
+             iteration soak_iterations)
           true
           (List.exists (fun v -> v >= 3) views))
   done
@@ -988,6 +1012,7 @@ let tests =
     (* Appended, not inserted earlier in this list, so every other test's index (several of which
        are cited by number in doc comments and shell commands elsewhere in this file) stays
        stable. *)
-    ("ring capacity boundary soak (subtask 3.8 regression coverage, 20 iterations)", `Quick,
-      test_ring_capacity_boundary_soak);
+    (Printf.sprintf "ring capacity boundary soak (subtask 3.8 regression coverage, %d iterations)"
+       soak_iterations,
+      `Slow, test_ring_capacity_boundary_soak);
   ]

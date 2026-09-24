@@ -177,7 +177,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
      anywhere. This is checked FIRST, before the pre-existing merge_key+encryption rejection below,
      so a caller who somehow triggers both sees the more fundamental policy violation
      (require_encryption with no sink at all) rather than a check that presupposes a sink exists. *)
-  if require_encryption && encryption = None then
+  if require_encryption && Option.is_none encryption then
     invalid_arg "Batch_commit.propose: require_encryption is true but no ~encryption sink was supplied";
   (* An EMPTY batch is never proposed -- not here, not in any log state (review finding,
      2026-09-23). This is a real data-destruction path, previously pinned as a known behaviour by

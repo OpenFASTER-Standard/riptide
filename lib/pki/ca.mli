@@ -65,8 +65,16 @@ val generate_root : common_name:string -> t
 val sign_leaf : t -> common_name:string -> valid_days:int -> X509.Certificate.t * X509.Private_key.t
 
 (** [save ca ~dir] writes [ca] to two PEM files in the existing directory [dir]:
-    [ca-cert.pem] (the certificate) and [ca-key.pem] (the private key). Both are truncated and
-    overwritten if they already exist.
+    [ca-cert.pem] (the certificate) and [ca-key.pem] (the private key). Neither is ever
+    truncated: an existing file is [unlink]-ed and the replacement created fresh with [O_EXCL]
+    (see the symlink paragraph below for why).
+
+    [ca-cert.pem] is written with mode [0644] deliberately, not as a relaxed version of the key's
+    mode: a root CA certificate is public, distributable material -- every replica and client that
+    must validate a leaf needs to read it -- so it is forced world-readable regardless of the
+    caller's umask, exactly as unconditionally as the private key is forced [0600]. The two modes
+    are set by the same [fchmod]-on-the-open-descriptor mechanism described next; only the
+    constant differs.
 
     [ca-key.pem] ends up at mode [0600] unconditionally -- whether or not it already existed, and
     whatever mode it previously had. This takes two steps, because neither alone is sufficient:

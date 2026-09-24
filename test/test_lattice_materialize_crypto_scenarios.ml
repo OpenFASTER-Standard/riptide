@@ -138,10 +138,32 @@ let enc_sink store : Batch_commit.encryption_sink =
 let mat_sink materializer : Batch_commit.materialize_sink =
   { write = (fun ~merge_key payload -> M.write materializer ~merge_key (G_set.of_value payload)) }
 
+(* THE materializer constructor for this file -- every materializer below is built through it, and
+   it is the shape any real caller would follow, since {!Riptide_materialize.Materializer.create}
+   takes its [kv] already built and materializer.mli's own doc tells the caller building that [kv]
+   to pass [~owner:"materializer"]. It is tagged here rather than at each call site precisely so
+   the collision test below can exercise the guard against the REAL construction path instead of a
+   bare, test-only [File_kv_store.create ~owner:"materializer"] written just to make the guard
+   fire (which is what it did before: an artificial call that proved the guard existed but not
+   that anything in this repo actually opted into it). *)
 let make_materializer ~sw ~fs dir =
   M.create
-    ~kv:(File_kv_store.create ~sw ~fs dir)
+    ~kv:(File_kv_store.create ~sw ~fs ~owner:"materializer" dir)
     ~decode:(fun s -> G_set.of_value (Riptide.Value.canonical_decode s))
+    ~encode:(fun g -> Riptide.Value.canonical_encode (G_set.to_value g))
+
+(* The deliberately UNPROTECTED counterpart, used by exactly one test below
+   ([test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek]) and nothing else. It exists
+   to keep file_kv_store.mli's own honest disclosure -- "if EITHER side of a real collision omits
+   [owner] ... the pair is exactly as unprotected as before this task existed" -- backed by running
+   code rather than prose alone. Its [decode] is TOTAL (unparseable bytes decode as [bottom] rather
+   than raising), which is a legitimate, even defensive, caller choice and is what makes the
+   collision below silent rather than loud. *)
+let make_unowned_lenient_materializer ~sw ~fs dir =
+  M.create
+    ~kv:(File_kv_store.create ~sw ~fs dir)
+    ~decode:(fun s ->
+      try G_set.of_value (Riptide.Value.canonical_decode s) with Invalid_argument _ -> G_set.bottom)
     ~encode:(fun g -> Riptide.Value.canonical_encode (G_set.to_value g))
 
 (* The "raw disk read" half of property (d): every byte of every regular file the real durable
@@ -1154,24 +1176,37 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
    derivation is public and documented, so the colliding shape was not even hard to produce by
    accident.
 
-   {!Riptide_storage.File_kv_store.create}'s new [?owner] (subtask 4.6) closes it: this test now
-   builds the keystore's [kv] with [~owner:"redaction-keystore"] and then attempts to build a
-   second, materializer-shaped [kv] with a DIFFERENT owner tag pointed at the exact same directory,
-   and asserts that the second [File_kv_store.create] call itself raises [Invalid_argument] --
-   before any [Materializer.create], any [M.write], or any decode strategy ever enters the picture.
+   {!Riptide_storage.File_kv_store.create}'s new [?owner] (subtask 4.6) closes it, FOR CALLERS WHO
+   PASS IT: this test builds the keystore's [kv] with [~owner:"redaction-keystore"] and then
+   attempts to build a real materializer -- through this file's own [make_materializer], the same
+   constructor every other materializer here is built with -- pointed at the exact same directory,
+   and asserts that the [File_kv_store.create] inside that helper raises [Invalid_argument] before
+   [Materializer.create], any [M.write], or any decode strategy ever enters the picture.
 
-   {b This is strictly stronger than what this test proved before}, in the ways that mattered most
-   about the original finding: previously the test had to run the full exploit to observe the
-   damage (three separate directions, one of them silent for a lenient/TOTAL [decode] and only loud
-   -- in the wrong place, from the caller's own decode -- for a strict/PARTIAL one), and in the
-   silent case nothing short of noticing an unopenable record after the fact would ever reveal the
-   corruption. Now the two consumers can never both come into existence pointed at the same
-   directory at all: construction fails immediately, synchronously, with a message naming exactly
-   which owner already holds the directory, regardless of decode strategy -- there is no longer a
-   "silent" direction to distinguish from a "loud" one, because neither materializer variant can be
-   built in the first place. The keystore itself, and the record already stored in it, are provably
-   untouched by the rejected attempt (checked below) -- not merely presumed safe because nothing
-   crashed. *)
+   Going through [make_materializer] rather than a bare, inline [File_kv_store.create
+   ~owner:"materializer"] is deliberate and was a review finding against this test's first form.
+   An inline, correctly-tagged call proves the guard fires when someone passes the tag; it proves
+   nothing about whether any materializer this repo actually constructs passes it -- and at the
+   time, none did, on any of the four real materializer-side call sites, so the guard was inert
+   everywhere it mattered while this test still passed. Routing through the real helper ties the
+   assertion to the production-shaped call path, so it fails the moment that path stops opting in.
+
+   The protection is strictly opt-in and this file proves BOTH halves of that: see
+   [test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek] at the end of this file for the
+   running negative control showing the original hazard is entirely undiminished for a pair that
+   omits [~owner], exactly as file_kv_store.mli's own [?owner] doc discloses.
+
+   {b What the guard buys, stated against what this hazard used to cost} -- and note this is an
+   improvement ON TOP OF the reproduction, not a replacement for it: an opted-in pair can never
+   both come into existence pointed at the same directory at all. Construction fails immediately,
+   synchronously, with a message naming exactly which owner already holds the directory, regardless
+   of decode strategy -- so for such a pair there is no longer a "silent" corruption direction to
+   distinguish from a "loud" one, because no materializer variant can be built in the first place
+   to produce either. Previously the only recourse was to run the full exploit and observe the
+   damage after the fact, and in the silent direction nothing short of noticing an unopenable
+   record much later would ever reveal it. The keystore itself, and the record already stored in
+   it, are provably untouched by the rejected attempt (checked below) -- not merely presumed safe
+   because nothing crashed. *)
 
 let test_a_shared_kv_directory_is_rejected_at_construction () =
   Eio_main.run @@ fun env ->
@@ -1193,15 +1228,23 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
   Alcotest.(check bool) "the record really is recoverable while its wrapped DEK is intact" true
     (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload
     = Some (canonical payload));
-  (* The exploit attempt: a materializer whose [merge_key] would have equalled [event_id] can no
-     longer even be constructed, because its own [kv] -- built with a different owner tag, pointed
-     at the same [shared_dir] -- is rejected before [Materializer.create] is ever reached. *)
-  Alcotest.check_raises "a second, different owner sharing the keystore's directory is rejected"
+  (* The exploit attempt, made THROUGH THIS FILE'S REAL MATERIALIZER CONSTRUCTOR rather than
+     through a bare [File_kv_store.create ~owner:"materializer"] written inline here. That
+     distinction is the whole point and was the substance of a review finding against this test's
+     first form: a hand-written, correctly-tagged [create] proves only that the guard fires when
+     someone passes the tag, not that any materializer this repo actually builds passes it. Going
+     through [make_materializer] means this assertion fails the moment that helper -- the shape a
+     real caller follows -- stops opting in, which is exactly the regression worth catching.
+     Note also that the raise comes from strictly inside [make_materializer]: the [kv] argument is
+     evaluated before [Materializer.create] is entered, so no materializer, no decode strategy and
+     no [M.write] ever exists to do damage. *)
+  Alcotest.check_raises
+    "building a real materializer over the keystore's own directory is rejected at construction"
     (Invalid_argument
        (Printf.sprintf "File_kv_store.create: %s is owned by \"redaction-keystore\", not \
                          \"materializer\""
           shared_dir))
-    (fun () -> ignore (File_kv_store.create ~sw ~fs ~owner:"materializer" shared_dir));
+    (fun () -> ignore (make_materializer ~sw ~fs shared_dir));
   (* Non-vacuity: the keystore and the record it already holds are completely untouched by the
      rejected attempt -- construction failed strictly before either consumer could touch the shared
      directory's data at all, not merely before the materialized write that used to do the damage. *)
@@ -1211,6 +1254,84 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
     = Some (canonical payload));
   Alcotest.(check int) "the committed log still holds exactly the one record" 1
     (List.length (Batch_commit.committed_envelopes replica))
+
+(* ---------------------------------------------------------------------------------------------
+   THE SAME HAZARD, STILL FULLY LIVE FOR ANYONE WHO OPTS OUT -- a running proof of the limitation
+   file_kv_store.mli's [?owner] doc states in prose: "if EITHER side of a real collision omits
+   [owner] -- not just both -- the pair is exactly as unprotected as before this task existed."
+
+   This test exists because that sentence is a real, load-bearing disclosure about the shape of
+   subtask 4.6's fix, not a caveat: the guard is a marker file compared between two CLAIMING
+   callers, so it cannot possibly protect a directory nobody claims. An earlier fix round deleted
+   this file's original three-direction reproduction of the hazard on the grounds that construction
+   now fails first -- which is true only on the opted-in path, and left the documented opted-out
+   path asserted in prose with nothing running behind it. This is the reduced restoration: two of
+   the original three directions, enough to show the destruction is real and bidirectional, without
+   re-litigating the partial-vs-total [decode] distinction the opted-in test above already makes
+   moot for every protected caller.
+
+   Read it as the negative control for
+   [test_a_shared_kv_directory_is_rejected_at_construction] above: same directory-sharing setup,
+   same collision, the only difference being that neither side passes [~owner] -- and the outcome
+   flips from "rejected at construction, data provably intact" back to "silent, total destruction
+   with nothing raising anywhere." That contrast is what shows the guard's protection comes from
+   the tags themselves and not from something incidental about the scenario.
+   --------------------------------------------------------------------------------------------- *)
+
+let test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir @@ fun shared_dir ->
+  Eio.Switch.run @@ fun sw ->
+  let fs = Eio.Stdenv.fs env in
+  (* Neither side claims the directory: the keystore's [kv] is built with NO [~owner] (unlike
+     every other keystore in this file), and the materializer below goes through the deliberately
+     untagged [make_unowned_lenient_materializer]. Nothing here is protected, by construction. *)
+  let store =
+    Redaction_store.create
+      ~kv:(File_kv_store.create ~sw ~fs shared_dir)
+      ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
+  in
+  let replica = create_solo () in
+  let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
+  Batch_commit.propose replica ~idempotency_key:"k1" ~encryption:(enc_sink store) [ write_of payload ];
+  let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
+  Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0" event_id;
+  Alcotest.(check bool) "the record really is recoverable before the collision" true
+    (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload
+    = Some (canonical payload));
+  (* The unowned materializer constructs FINE -- this is the first half of the finding: no marker
+     was ever written, so there is nothing for [create] to compare against and nothing to reject. *)
+  let mat = make_unowned_lenient_materializer ~sw ~fs shared_dir in
+  (* DIRECTION 1, the silent one: an ordinary materialized write whose [merge_key] happens to equal
+     that [event_id]. Not a redaction, not a fault, not an error -- and with a total [decode], not
+     even a raise. *)
+  M.write mat ~merge_key:event_id (G_set.of_list [ "innocent-accumulator-value" ]);
+  Alcotest.(check bool)
+    "the encrypted record is now permanently unreadable, and nothing raised to say so" true
+    (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = None);
+  (* Non-vacuity, and the reason this is silent rather than merely destructive: everything else
+     looks perfectly healthy afterwards. The accumulator holds exactly what it was asked to hold,
+     and the committed log is untouched -- the loss is indistinguishable from a deliberate
+     redaction of that one record. *)
+  Alcotest.(check (list string)) "while the accumulator write itself succeeded normally"
+    [ "innocent-accumulator-value" ]
+    (G_set.elements (M.read mat ~merge_key:event_id));
+  Alcotest.(check int) "and the committed log still holds the (now unopenable) record" 1
+    (List.length (Batch_commit.committed_envelopes replica));
+  (* DIRECTION 2, silent in the other direction and true for ANY [decode]: the keystore's own [put]
+     never reads first, so encrypting a record whose derived [event_id] collides with an EXISTING
+     [merge_key] overwrites that accumulator with wrapped-DEK bytes, with no error and no read. *)
+  M.write mat ~merge_key:"2:k2#0" (G_set.of_list [ "accumulated-before-the-collision" ]);
+  Batch_commit.propose replica ~idempotency_key:"k2" ~encryption:(enc_sink store)
+    [ write_of (secret_payload_with "RIPTIDE-COLLISION-VICTIM-2") ];
+  Alcotest.(check (list string))
+    "the accumulator's value is silently gone, replaced by a wrapped DEK" []
+    (G_set.elements (M.read mat ~merge_key:"2:k2#0"));
+  Alcotest.(check bool) "...while that record itself decrypts perfectly well" true
+    (Redaction_store.decrypt_value store ~event_id:"2:k2#0"
+       (List.assoc "2:k2#0" (Batch_commit.committed_envelopes_keyed replica))
+         .Riptide.Envelope.payload
+    <> None)
 
 let tests =
   Lattice_conformance.tests (module G_set) g_set_arb "G_set"
@@ -1234,4 +1355,7 @@ let tests =
       ("sharing one KV directory between a keystore and a materializer is now rejected at \
         construction (subtask 4.6)", `Quick,
        test_a_shared_kv_directory_is_rejected_at_construction);
+      ("...but opting out of ?owner on both sides still silently destroys a wrapped DEK, exactly \
+        as file_kv_store.mli documents (negative control)", `Quick,
+       test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek);
     ]

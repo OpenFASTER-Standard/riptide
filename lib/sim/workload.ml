@@ -108,7 +108,16 @@ let random_payload prng =
 let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create seed in
-  let net = Network.create ~faults ~seed () in
+  (* The network's own stream is DERIVED from [prng], not handed the same raw [seed] the workload
+     generator itself runs on. Passing [~seed] directly would give [Network.create] a PRNG whose
+     state sequence is identical to this function's own, so every fault decision would be locked
+     in lockstep with the sender/receiver/payload draws made against [prng] rather than being
+     statistically independent of them. Same derivation shape as this repo's other two
+     [Network.create] call sites -- [Riptide_dst.Cluster]'s own [split_seed] and
+     [explore/file_cluster.ml]'s [net_seed] -- both of which draw a sub-seed from a root [Prng]
+     for exactly this reason. Determinism is unaffected: the draw happens before any other, so a
+     given [seed] still reproduces a byte-identical run. *)
+  let net = Network.create ~faults ~seed:(Prng.int prng 0x3FFFFFFF) () in
   let peers = List.init peer_count peer_name in
   List.iter (Network.register net) peers;
   let trace = ref [] in

@@ -85,7 +85,7 @@ let test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal () 
               ~my_id:1 ~replica_count:1 ~svc_limit:3
               ~send:(fun ~to_:_ (_ : string) -> ())
           in
-          let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) kv_dir in
+          let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
           let materializer =
             M.create ~kv
               ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
@@ -157,7 +157,7 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
               ~my_id:1 ~replica_count:1 ~svc_limit:3
               ~send:(fun ~to_:_ (_ : string) -> ())
           in
-          let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) kv_dir in
+          let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
           let materializer =
             M.create ~kv
               ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))

@@ -10,7 +10,10 @@ let with_materializer f =
   Fun.protect ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
     (fun () ->
       Eio.Switch.run @@ fun sw ->
-      let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      (* [~owner:"materializer"] on every real materializer-backing store in this repo, per
+         materializer.mli's own instruction to the caller building the [kv]: the guard added in
+         subtask 4.6 only protects a directory that its consumers actually claim. *)
+      let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir in
       (* Real codec: Last_write_wins.t round-tripped through Value.value
          (a record of its two fields), then Value.canonical_encode/decode --
          the same wire-encoding primitive this codebase already uses for
