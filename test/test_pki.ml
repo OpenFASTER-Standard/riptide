@@ -223,6 +223,132 @@ let test_common_name_that_is_not_a_hostname_is_refused () =
       | _ -> Alcotest.failf "sign_leaf must refuse the non-hostname common name %S" bad)
     [ "replica 1"; "replica_1"; ""; "replica-1..x" ]
 
+(* ---- [Ca.save]/[Ca.load]: real PEM persistence (subtask 4.7) ----
+
+   Closes the gap this module's own header documented as open: until now every key and
+   certificate here existed only in memory, so the mesh could not cross a process boundary or
+   survive a restart.
+
+   {b On running as root.} [test_file_kv_store.ml]'s header records that this suite's environment
+   runs as root, and that [CAP_DAC_OVERRIDE] therefore makes it impossible to test a failure that
+   depends on the {i OS} denying access. That limitation does {i not} apply to
+   [test_load_rejects_a_world_readable_key_file] below, for the same reason it does not apply to
+   [Test_redaction]'s already-passing [test_kek_load_rejects_a_world_readable_file]: the check
+   under test inspects the mode bits itself ([Unix.fstat], [st_perm land 0o077]) and refuses, so
+   it is the {i program}, not the kernel, that rejects the file. Root reads the loose file
+   perfectly well -- and [Ca.load] still raises. Confirmed live, not assumed: this test passes
+   under [uid=0]. *)
+
+let with_tmp_dir f =
+  let dir = Filename.temp_file "riptide_ca_persist_test" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () -> f dir)
+
+let cert_path dir = Filename.concat dir "ca-cert.pem"
+let key_path dir = Filename.concat dir "ca-key.pem"
+
+(* The round trip that actually matters. Comparing the re-encoded certificate proves the cert
+   file survived intact, but says nothing about the private key -- a [Ca.t] carrying a corrupt or
+   unrelated key would compare equal here. So the key is proven the only way that counts: the
+   {i loaded} CA signs a fresh leaf, and that leaf is validated against the {i original},
+   in-memory root as trust anchor. That can only succeed if the bytes read back off disk are
+   genuinely the same signing key. *)
+let test_save_load_roundtrips_and_the_loaded_ca_still_signs_valid_leaves () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      Ca.save ca ~dir;
+      let loaded = Ca.load ~dir in
+      Alcotest.(check string)
+        "the loaded certificate is the certificate that was saved"
+        (X509.Certificate.encode_pem ca.Ca.cert)
+        (X509.Certificate.encode_pem loaded.Ca.cert);
+      let leaf_cert, _leaf_key = Ca.sign_leaf loaded ~common_name:"replica-1" ~valid_days:365 in
+      match
+        X509.Validation.verify_chain_of_trust ~host:None ~time:time_thunk ~anchors:[ ca.Ca.cert ]
+          [ leaf_cert ]
+      with
+      | Ok _ -> ()
+      | Error e -> Alcotest.fail (Fmt.to_to_string X509.Validation.pp_validation_error e))
+
+(* [save] must create the private-key file restrictively from the start, not chmod it down
+   afterwards -- between an [open] at 0644 and a later [chmod 0600] there is a real window in
+   which any local account can open the CA key and keep the descriptor. *)
+let test_save_creates_the_key_file_with_no_group_or_other_access () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      Ca.save ca ~dir;
+      let mode = (Unix.stat (key_path dir)).Unix.st_perm in
+      Alcotest.(check int) "saved CA key file grants nothing to group or other" 0
+        (mode land 0o077))
+
+(* Mirrors [Test_redaction.test_kek_load_rejects_a_world_readable_file] exactly, one layer up: a
+   CA private key readable by group or other is not a secret, and a compromised CA key is
+   strictly worse than any leaf's -- it mints arbitrary trusted identities for the whole
+   cluster. *)
+let test_load_rejects_a_world_readable_key_file () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      Ca.save ca ~dir;
+      Unix.chmod (key_path dir) 0o644;
+      Alcotest.check_raises "a group/other-readable CA key file is rejected on load"
+        (Invalid_argument
+           (Printf.sprintf
+              "Ca.load: %s has mode 0644, which grants access to group or other; a CA private key \
+               file must be 0600 or stricter"
+              (key_path dir)))
+        (fun () -> ignore (Ca.load ~dir)))
+
+(* [generate_root]/[sign_leaf] guarantee by construction that a [Ca.t]'s key and certificate
+   belong together; nothing guarantees that for two files an operator put in a directory. The
+   shape this catches is mundane and real -- a half-finished restore, or a backup that mixed two
+   generations of root -- and the consequence of not catching it is a CA that loads cleanly and
+   then fails at every signing attempt, far from the cause. *)
+let test_load_rejects_a_key_that_does_not_match_the_certificate () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      let unrelated = Ca.generate_root ~common_name:"riptide-test-ca" in
+      Ca.save ca ~dir;
+      (* Overwrite only the key file, leaving [ca]'s certificate in place. O_TRUNC on the
+         existing 0600 file leaves its mode alone, so this isolates the mismatch from the
+         permission check above. *)
+      let fd = Unix.openfile (key_path dir) [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+      let oc = Unix.out_channel_of_descr fd in
+      Fun.protect
+        ~finally:(fun () -> close_out_noerr oc)
+        (fun () -> output_string oc (X509.Private_key.encode_pem unrelated.Ca.key));
+      Alcotest.check_raises "a key that is not the certificate's key is rejected on load"
+        (Failure
+           (Printf.sprintf "Ca.load: %s: private key does not match certificate %s" (key_path dir)
+              (cert_path dir)))
+        (fun () -> ignore (Ca.load ~dir)))
+
+let test_load_of_a_malformed_pem_fails_loudly () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      Ca.save ca ~dir;
+      let oc = open_out_bin (cert_path dir) in
+      output_string oc "-----BEGIN CERTIFICATE-----\nnot base64 at all\n-----END CERTIFICATE-----\n";
+      close_out oc;
+      match Ca.load ~dir with
+      | exception Failure _ -> ()
+      | exception e ->
+        Alcotest.failf "a malformed certificate PEM must raise Failure, got %s"
+          (Printexc.to_string e)
+      | _ -> Alcotest.fail "a malformed certificate PEM must not load")
+
+let test_load_of_a_missing_directory_raises_sys_error () =
+  with_tmp_dir (fun dir ->
+      let absent = Filename.concat dir "not-created" in
+      match Ca.load ~dir:absent with
+      | exception Sys_error _ -> ()
+      | exception e ->
+        Alcotest.failf "loading from a missing directory must raise Sys_error, got %s"
+          (Printexc.to_string e)
+      | _ -> Alcotest.fail "loading from a missing directory must not succeed")
+
 let tests =
   [
     ("root is a genuine self-signed CA", `Quick, test_root_is_a_genuine_self_signed_ca);
@@ -248,4 +374,20 @@ let tests =
     ( "a common name that is not a hostname is refused",
       `Quick,
       test_common_name_that_is_not_a_hostname_is_refused );
+    ( "save/load round-trips and the loaded CA still signs valid leaves",
+      `Quick,
+      test_save_load_roundtrips_and_the_loaded_ca_still_signs_valid_leaves );
+    ( "save creates the key file with no group or other access",
+      `Quick,
+      test_save_creates_the_key_file_with_no_group_or_other_access );
+    ( "load rejects a world-readable key file",
+      `Quick,
+      test_load_rejects_a_world_readable_key_file );
+    ( "load rejects a key that does not match the certificate",
+      `Quick,
+      test_load_rejects_a_key_that_does_not_match_the_certificate );
+    ("load of a malformed PEM fails loudly", `Quick, test_load_of_a_malformed_pem_fails_loudly);
+    ( "load of a missing directory raises Sys_error",
+      `Quick,
+      test_load_of_a_missing_directory_raises_sys_error );
   ]

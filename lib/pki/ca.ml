@@ -176,3 +176,147 @@ let sign_leaf t ~common_name ~valid_days =
   | Error e ->
     fail "signing the leaf certificate for %S failed: %s" common_name
       (Fmt.to_to_string X509.Validation.pp_signature_error e)
+
+(* ---- Persistence (subtask 4.7) ----------------------------------------------------------
+
+   Closes the "no persistence story" gap this file's own header and [ca.mli] documented as open:
+   until now the root's key and certificate lived only in the process that called
+   [generate_root], so the mesh could not cross a process boundary or survive a restart.
+
+   {b API verification.} Same discipline as the rest of this file. All four calls used below
+   were re-checked against the real installed library before use, not assumed:
+   [X509.Private_key.encode_pem : t -> string] and
+   [X509.Private_key.decode_pem : string -> (t, [> `Msg of string]) result]
+   (`x509.mli` lines 234-239), and [X509.Certificate.encode_pem]/[decode_pem] with the same
+   shapes (lines 641-649). [Certificate.decode_pem] -- singular -- is the right one here: a CA
+   directory holds exactly one root certificate, and [decode_pem_multiple] would silently accept
+   a file containing several, leaving which one is the trust anchor ambiguous.
+
+   {b Exception discipline.} Unlike the generation/signing functions above, which raise
+   {!Pki_error}, [save] and [load] below mirror {!Riptide_crypto.Kek.load}'s already-established
+   convention for loading key material off disk -- [Sys_error] for an absent/unopenable file
+   (propagated from [open_in_bin], deliberately: a process that cannot load its CA must fail to
+   start rather than continue with anything else), [Invalid_argument] for unsafe permissions, and
+   [Failure] for content that is present and readable but not what it claims to be. That
+   convention is what this repo's other on-disk secret loader already raises, and [ca.mli]
+   documents it per function. *)
+
+let cert_filename = "ca-cert.pem"
+let key_filename = "ca-key.pem"
+
+(* Written through an explicit descriptor with an explicit [perm], and flushed all the way to
+   the device before the descriptor is closed.
+
+   [perm] rather than [open_out_bin]'s umask default because the key file must be 0600 from the
+   moment it exists: [open] at the default (commonly 0644) followed by a [Unix.chmod] leaves a
+   real window in which any local account can open the CA private key and hold the descriptor
+   open past the chmod. O_TRUNC so overwriting a previous CA leaves no tail of a longer old file
+   behind; note that O_TRUNC on an {i existing} file does {i not} reset its mode, which is
+   exactly why [load] re-checks permissions rather than trusting what [save] wrote.
+
+   The [fsync] is this repo's existing durability discipline applied here: [file_storage.ml]
+   opens its WAL with O_DSYNC precisely so an acknowledged write is on the device and not just in
+   the page cache. A root CA is if anything less forgiving -- it is written once and then relied
+   on indefinitely, and a crash between [save] returning and the kernel flushing would lose the
+   trust anchor every certificate in the cluster chains to, with no way to reconstruct it. *)
+let write_file_durably ~path ~perm contents =
+  let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] perm in
+  let oc = Unix.out_channel_of_descr fd in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr oc)
+    (fun () ->
+      output_string oc contents;
+      flush oc;
+      Unix.fsync fd)
+
+let save t ~dir =
+  write_file_durably
+    ~path:(Filename.concat dir cert_filename)
+    ~perm:0o644
+    (X509.Certificate.encode_pem t.cert);
+  write_file_durably
+    ~path:(Filename.concat dir key_filename)
+    ~perm:0o600
+    (X509.Private_key.encode_pem t.key);
+  (* Fsyncing the files is not enough on its own: on a crash the directory entries themselves
+     can be missing, leaving a durable file nothing names. Opening the directory read-only and
+     fsyncing it is the standard way to make the two [creat]s above durable too. *)
+  let dfd = Unix.openfile dir [ Unix.O_RDONLY ] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close dfd) (fun () -> Unix.fsync dfd)
+
+(* Mirrors [Riptide_crypto.Kek.check_permissions] (lib/crypto/kek.ml) exactly, including its
+   reasoning: checked via the already-open descriptor ([Unix.fstat]), never the path
+   ([Unix.stat]), so nothing can swap the file between the check and the read. 0o077 is every
+   group and other bit. The stake is strictly higher here than for a KEK: a leaked CA private key
+   mints arbitrary certificates every replica in the cluster will trust. *)
+let check_key_permissions ~path fd =
+  let st = Unix.fstat fd in
+  if st.Unix.st_perm land 0o077 <> 0 then
+    invalid_arg
+      (Printf.sprintf
+         "Ca.load: %s has mode %04o, which grants access to group or other; a CA private key file \
+          must be 0600 or stricter"
+         path st.Unix.st_perm)
+
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () -> really_input_string ic (in_channel_length ic))
+
+let read_key_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      check_key_permissions ~path (Unix.descr_of_in_channel ic);
+      really_input_string ic (in_channel_length ic))
+
+(* Deliberately a local four-line duplicate of {!Riptide_transport.Tls_identity}'s
+   [check_key_matches_cert], not a call to it.
+
+   Calling it would compile today -- checked, rather than assumed from the plan, which asserted a
+   dependency cycle: [lib/transport/dune] does {i not} list [riptide_pki], and
+   [tls_identity.mli] states the non-dependency as a deliberate design property ("It does not
+   depend on {!Riptide_pki.Ca} ... so the transport layer stays independent of how the operator's
+   certificates were produced"). There is therefore no cycle to break. It is still the wrong
+   thing to do, for three reasons that outlive the cycle question:
+
+   - It inverts the layering. [riptide_pki] is the lower library; depending on [riptide_transport]
+     would drag [eio], [tls], [tls-eio] and [mirage-crypto-rng.unix] into every consumer of the
+     CA, to reuse one fingerprint comparison.
+   - It would turn the natural {i future} direction -- transport, or a replica binary, depending
+     on pki -- into a genuine cycle. Today's absence of one is a reason to keep the arrow
+     pointing the way it already does, not a licence to add the opposite arrow.
+   - Its failure is a [Tls_config_error] whose message is hardcoded to say
+     "Tls_identity.create: ...", which is simply untrue when the caller is [Ca.load].
+
+   So the {i logic} is mirrored, not the name: compare the certificate's public key and the
+   private key's derived public key by [X509.Public_key.fingerprint], rather than by structural
+   equality, so this does not depend on how [x509] happens to represent a given key type. *)
+let check_key_matches_cert ~cert_path ~key_path ~cert ~key =
+  let of_cert = X509.Public_key.fingerprint (X509.Certificate.public_key cert) in
+  let of_key = X509.Public_key.fingerprint (X509.Private_key.public key) in
+  if not (String.equal of_cert of_key) then
+    failwith
+      (Printf.sprintf "Ca.load: %s: private key does not match certificate %s" key_path cert_path)
+
+let load ~dir =
+  let cert_path = Filename.concat dir cert_filename in
+  let cert =
+    match X509.Certificate.decode_pem (read_file cert_path) with
+    | Ok cert -> cert
+    | Error (`Msg m) -> failwith (Printf.sprintf "Ca.load: %s: %s" cert_path m)
+  in
+  let key_path = Filename.concat dir key_filename in
+  let key =
+    match X509.Private_key.decode_pem (read_key_file key_path) with
+    | Ok key -> key
+    | Error (`Msg m) -> failwith (Printf.sprintf "Ca.load: %s: %s" key_path m)
+  in
+  (* [generate_root] and [sign_leaf] guarantee by construction that a [t]'s key and certificate
+     belong together. Two files in a directory guarantee nothing, so the invariant is re-checked
+     on the way back in -- otherwise a mixed-up restore yields a [t] that loads cleanly and then
+     fails at every [sign_leaf], far from the cause. *)
+  check_key_matches_cert ~cert_path ~key_path ~cert ~key;
+  { key; cert }

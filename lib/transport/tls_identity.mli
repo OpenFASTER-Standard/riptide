@@ -27,21 +27,24 @@
     {!X509.Certificate.t}/{!X509.Private_key.t} values. Certificate {e sourcing} (files, secrets
     manager, rotation) is a separate concern and is not modelled here.
 
-    {2 Open gap: nothing else models that sourcing either}
+    {2 Where that sourcing {e is} modelled, and where it still is not}
 
     "A separate concern, not modelled here" is accurate about this module's boundary but would be
-    misleading if read as "handled elsewhere", so it is spelled out (final-review finding,
-    2026-09-23): as of this branch, {e no} module in this repo can encode or decode certificate or
-    private-key material. {!Riptide_pki.Ca} mints it in memory and this module consumes it in
-    memory; there is no PEM (or other) serialisation anywhere, and no non-test caller of either.
+    misleading if read as "handled nowhere", so it is spelled out. This paragraph previously
+    recorded (final-review finding, 2026-09-23) that {e no} module in this repo could encode or
+    decode certificate or private-key material at all. That is no longer true:
+    {!Riptide_pki.Ca.save} and {!Riptide_pki.Ca.load} are real PEM persistence for the root CA's
+    own key and certificate, including the permission discipline a private-key file needs
+    (subtask 4.7).
 
-    So the mesh cannot currently cross a process boundary or survive a restart: both ends of every
-    connection have to have been handed the same in-memory values, which today only happens because
-    the only callers are tests running both ends in one process. The design spec's Decision 6
-    ("certs are static and long-lived") presupposes a persistence mechanism that does not exist
-    yet. This is a real, currently-open gap rather than a settled design position -- it is simply
-    not yet load-bearing, because this repo has no replica server binary for it to block. {b
-    Tracked as future work}, alongside the same note in {!Riptide_pki.Ca}'s own header. *)
+    What is still not modelled anywhere is {e leaf} sourcing -- how a given replica obtains its
+    own long-lived certificate and key at startup. The root can now be generated once, persisted,
+    and loaded by separate processes, so the trust anchor is no longer confined to one process's
+    memory; but the identity this module is handed still is. Closing that is a deployment
+    question ({!Riptide_pki.Ca.sign_leaf} at startup from a loaded root, an orchestrator, a
+    secrets manager), and it is not yet load-bearing because this repo has no replica server
+    binary for it to block. {b Tracked as future work}, alongside the same note in
+    {!Riptide_pki.Ca}'s own header. *)
 
 exception Tls_config_error of string
 (** Raised by {!create} when the supplied material is internally inconsistent, or when the

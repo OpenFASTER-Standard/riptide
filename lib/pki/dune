@@ -1,3 +1,7 @@
 (library
  (name riptide_pki)
- (libraries x509 ptime ptime.clock.os domain-name fmt))
+ ;; [unix] is for [Ca.save]/[Ca.load] only: creating the CA private-key file at 0600 from the
+ ;; start needs [Unix.openfile]'s mode argument (OCaml's [open_out_bin] has none), and checking
+ ;; it on load needs [Unix.fstat] on the already-open descriptor rather than [Unix.stat] on the
+ ;; path -- the same TOCTOU-free discipline [Riptide_crypto.Kek.load] already uses.
+ (libraries x509 ptime ptime.clock.os domain-name unix fmt))
