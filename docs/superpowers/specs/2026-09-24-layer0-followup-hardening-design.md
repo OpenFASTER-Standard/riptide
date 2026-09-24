@@ -179,12 +179,29 @@ with existing callers/tests that don't care). When supplied: on first creation o
 directory, write a marker file (e.g. `.riptide-kv-owner`) recording the tag; on every subsequent
 `create` against an existing directory, read the marker and compare — a mismatch raises
 `Invalid_argument` immediately, at construction time, naming both the expected and actual owner
-tags. `Redaction_store.create` and `Materializer.create` are updated to require (not merely accept)
-a real, purpose-specific owner tag from their own callers.
+tags.
+
+**What actually shipped, corrected after implementation (was: "`Redaction_store.create` and
+`Materializer.create` are updated to require (not merely accept) a real, purpose-specific owner
+tag from their own callers"):** neither constructor requires a tag at the type level.
+`Materializer.create` takes its `kv` already built, through the deliberately backend-agnostic
+`Kv_store_intf.S`, which carries no ownership concept — requiring a tag there is a real interface
+change to that module type, not a call-site addition. `Redaction_store.create` similarly takes an
+already-built `File_kv_store.t` (`~kv ~kek`) and does not itself validate or require a tag, even
+though (unlike the materializer) it could — `File_kv_store.t` is concrete there, so exposing and
+checking its owner tag is feasible without touching `Kv_store_intf.S`. What shipped instead: every
+real construction site in this repo (all keystore and materializer callers) passes `~owner`, so
+the protection is real end-to-end today, backed by a running negative control proving the
+documented opt-out failure mode (both sides omitting `~owner`) still reproduces the original
+hazard. Requiring the tag at the constructor level for either module remains open, tracked
+separately (task-master, not this spec) rather than closed here.
 
 **Testing:** the existing pinned collision-reproduction test (added by the just-merged plan's own
-Task 9) is updated to prove construction-time rejection with a clear error, replacing its current
-role of merely documenting three ways the collision silently corrupts data.
+Task 9) is updated to prove construction-time rejection with a clear error, going through the real
+`Materializer`-constructing call path rather than an inline `File_kv_store.create` built only to
+demonstrate the guard — replacing its prior role of documenting three ways the collision silently
+corrupts data. A second, restored test proves the still-open opt-out case (both sides omitting
+`~owner`) still reproduces two of those three original corruption directions.
 
 ## Decision 5 (subtask 3.8): Deterministic `dst_scenarios` fix
 
