@@ -284,6 +284,80 @@ let test_save_creates_the_key_file_with_no_group_or_other_access () =
       Alcotest.(check int) "saved CA key file grants nothing to group or other" 0
         (mode land 0o077))
 
+(* The test above only covers the {i fresh-file} case, which [Unix.openfile]'s [perm] argument
+   already handled on its own. This covers the case it does not: [perm] applies only when the
+   file is actually created, so overwriting a [ca-key.pem] that {i already exists} at a loose mode
+   left that mode exactly as it was -- [save] would write the CA private key into a 0644 file and
+   return success, with no error and no warning, and nothing in this repo calls [load] straight
+   after [save] to catch it via the re-check. The exposure was silent and unbounded. The fix is
+   [Unix.fchmod] on the already-open descriptor; this asserts the mode {i after} [save], not
+   merely that [save] succeeded. *)
+let test_save_tightens_permissions_on_a_pre_existing_loose_key_file () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      (* Plant a world-readable file at exactly the path [save] is about to write the key to. *)
+      let oc = open_out_bin (key_path dir) in
+      output_string oc "stale contents from an earlier, careless write\n";
+      close_out oc;
+      Unix.chmod (key_path dir) 0o644;
+      Alcotest.(check int)
+        "precondition: the pre-existing file really is group/other-readable" 0o044
+        ((Unix.stat (key_path dir)).Unix.st_perm land 0o077);
+      Ca.save ca ~dir;
+      Alcotest.(check int)
+        "save tightens a pre-existing loose key file to 0600 rather than inheriting its mode" 0
+        ((Unix.stat (key_path dir)).Unix.st_perm land 0o077);
+      (* And the tightening must not have come at the cost of the write itself. *)
+      let loaded = Ca.load ~dir in
+      Alcotest.(check string)
+        "the key written over the loose file is still the real one"
+        (X509.Certificate.encode_pem ca.Ca.cert)
+        (X509.Certificate.encode_pem loaded.Ca.cert))
+
+(* The other half of the same gap: an [O_CREAT|O_TRUNC] open {i follows symlinks}, so a
+   [ca-key.pem] replaced by a symlink pointing anywhere else would deposit the CA private key at
+   that target, at the target's own mode. [save] now unlinks the path first (removing the symlink
+   itself, not its target) and creates with [O_EXCL]. The assertion that matters is about the
+   {i target}: it must be untouched. *)
+let test_save_does_not_follow_a_symlink_planted_at_the_key_path () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      let target = Filename.concat dir "attacker-chosen-target" in
+      let sentinel = "this file must not receive the CA private key\n" in
+      let oc = open_out_bin target in
+      output_string oc sentinel;
+      close_out oc;
+      Unix.symlink target (key_path dir);
+      Ca.save ca ~dir;
+      let read_whole path =
+        let ic = open_in_bin path in
+        Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () -> really_input_string ic (in_channel_length ic))
+      in
+      Alcotest.(check string) "the symlink's target was not written through" sentinel
+        (read_whole target);
+      Alcotest.(check bool) "the key path is now a real file, not still a symlink" false
+        ((Unix.lstat (key_path dir)).Unix.st_kind = Unix.S_LNK);
+      Alcotest.(check int)
+        "and that real file is 0600" 0
+        ((Unix.stat (key_path dir)).Unix.st_perm land 0o077))
+
+(* Mirrors [test_load_of_a_missing_directory_raises_sys_error] below, for [save]'s own side --
+   and deliberately asserts a {i different} exception, because that is what [save] genuinely
+   raises. [load] opens with [open_in_bin] (stdlib, [Sys_error]); [save] opens with
+   [Unix.openfile] ([Unix.Unix_error]). [ca.mli] documented [Sys_error] for both, which was
+   simply wrong for [save]: a caller following that contract would have caught nothing. This
+   test is what stops the documented contract drifting away from the real one again. *)
+let test_save_into_a_missing_directory_raises_unix_error () =
+  with_tmp_dir (fun dir ->
+      let ca = Ca.generate_root ~common_name:"riptide-test-ca" in
+      let absent = Filename.concat dir "not-created" in
+      match Ca.save ca ~dir:absent with
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+      | exception e ->
+        Alcotest.failf "saving into a missing directory must raise Unix_error (ENOENT, _, _), got %s"
+          (Printexc.to_string e)
+      | () -> Alcotest.fail "saving into a missing directory must not succeed")
+
 (* Mirrors [Test_redaction.test_kek_load_rejects_a_world_readable_file] exactly, one layer up: a
    CA private key readable by group or other is not a secret, and a compromised CA key is
    strictly worse than any leaf's -- it mints arbitrary trusted identities for the whole
@@ -380,6 +454,15 @@ let tests =
     ( "save creates the key file with no group or other access",
       `Quick,
       test_save_creates_the_key_file_with_no_group_or_other_access );
+    ( "save tightens permissions on a pre-existing loose key file",
+      `Quick,
+      test_save_tightens_permissions_on_a_pre_existing_loose_key_file );
+    ( "save does not follow a symlink planted at the key path",
+      `Quick,
+      test_save_does_not_follow_a_symlink_planted_at_the_key_path );
+    ( "save into a missing directory raises Unix_error",
+      `Quick,
+      test_save_into_a_missing_directory_raises_unix_error );
     ( "load rejects a world-readable key file",
       `Quick,
       test_load_rejects_a_world_readable_key_file );

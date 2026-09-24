@@ -199,7 +199,14 @@ let sign_leaf t ~common_name ~valid_days =
    start rather than continue with anything else), [Invalid_argument] for unsafe permissions, and
    [Failure] for content that is present and readable but not what it claims to be. That
    convention is what this repo's other on-disk secret loader already raises, and [ca.mli]
-   documents it per function. *)
+   documents it per function.
+
+   The one asymmetry, documented as such in [ca.mli] rather than papered over: [save] reaches the
+   filesystem through [Unix.openfile]/[Unix.fchmod]/[Unix.fsync], which raise [Unix.Unix_error],
+   {i not} [Sys_error] -- so a missing [dir] fails [save] with [Unix_error (ENOENT, "open", _)]
+   while it fails [load] with [Sys_error]. Both are propagated verbatim; neither is translated
+   into the other, because rewrapping would discard the errno a caller diagnosing a real
+   deployment problem actually needs. *)
 
 let cert_filename = "ca-cert.pem"
 let key_filename = "ca-key.pem"
@@ -210,9 +217,35 @@ let key_filename = "ca-key.pem"
    [perm] rather than [open_out_bin]'s umask default because the key file must be 0600 from the
    moment it exists: [open] at the default (commonly 0644) followed by a [Unix.chmod] leaves a
    real window in which any local account can open the CA private key and hold the descriptor
-   open past the chmod. O_TRUNC so overwriting a previous CA leaves no tail of a longer old file
-   behind; note that O_TRUNC on an {i existing} file does {i not} reset its mode, which is
-   exactly why [load] re-checks permissions rather than trusting what [save] wrote.
+   open past the chmod.
+
+   {b Why unlink-then-O_EXCL rather than O_CREAT|O_TRUNC.} [openfile]'s [perm] argument applies
+   only when the file is actually {i created}. An earlier version of this function opened with
+   O_CREAT|O_TRUNC, which meant that overwriting a {i pre-existing} [ca-key.pem] left whatever
+   mode it already had untouched: a file sitting at 0644 would silently receive the CA private
+   key and stay 0644, with no error and no warning. Worse, an O_CREAT|O_TRUNC open {i follows
+   symlinks}, so a [ca-key.pem] that had been replaced with a symlink to an attacker-chosen path
+   would deposit the key at that target, at the target's own mode. Unlinking first (ignoring
+   ENOENT) removes the symlink itself rather than its target, and O_EXCL then refuses to create
+   through any symlink raced back in between the two calls -- the open fails with EEXIST instead
+   of writing the secret somewhere else.
+
+   {b And why [fchmod] on top of that.} O_EXCL guarantees a fresh file, but [perm] is still
+   subject to the process umask, so [perm] alone does not {i guarantee} the resulting mode.
+   [Unix.fchmod fd perm] immediately after the open settles it unconditionally, and does so on
+   the descriptor this function already holds rather than on the path -- the same
+   fstat-on-descriptor discipline [check_key_permissions] below uses, so there is no window in
+   which the path could be swapped for something else and chmod-ed instead. It runs before any
+   content is written, so the key bytes never exist on disk under a wider mode than the final one.
+
+   [load] still re-checks permissions rather than trusting any of this: the file can be chmod-ed
+   by anything at all in the arbitrarily long interval between [save] and a later [load], so what
+   [save] guarantees at write time is not what a reader needs to know at read time.
+
+   Note that this is deliberately {i not} an atomic replacement -- there is a window after the
+   unlink in which no CA file exists, exactly as there was a window after the O_TRUNC in which a
+   truncated one did. Making the overwrite atomic (write to a temporary name, fsync, rename)
+   is a real improvement but a larger change than this one, and is tracked separately.
 
    The [fsync] is this repo's existing durability discipline applied here: [file_storage.ml]
    opens its WAL with O_DSYNC precisely so an acknowledged write is on the device and not just in
@@ -220,11 +253,13 @@ let key_filename = "ca-key.pem"
    on indefinitely, and a crash between [save] returning and the kernel flushing would lose the
    trust anchor every certificate in the cluster chains to, with no way to reconstruct it. *)
 let write_file_durably ~path ~perm contents =
-  let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] perm in
+  (try Unix.unlink path with Unix.Unix_error (Unix.ENOENT, _, _) -> ());
+  let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL ] perm in
   let oc = Unix.out_channel_of_descr fd in
   Fun.protect
     ~finally:(fun () -> close_out_noerr oc)
     (fun () ->
+      Unix.fchmod fd perm;
       output_string oc contents;
       flush oc;
       Unix.fsync fd)

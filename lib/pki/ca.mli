@@ -68,12 +68,24 @@ val sign_leaf : t -> common_name:string -> valid_days:int -> X509.Certificate.t 
     [ca-cert.pem] (the certificate) and [ca-key.pem] (the private key). Both are truncated and
     overwritten if they already exist.
 
-    [ca-key.pem] is created with mode [0600] at open time, not chmod-ed down afterwards: between
-    a default-mode create and a later tightening there is a real window in which another local
-    account can open the CA private key and keep the descriptor. Note that this applies to
-    {e creation} -- overwriting a file that already exists with looser permissions leaves those
-    permissions as they were, which is one reason {!load} re-checks rather than trusting what
-    [save] wrote.
+    [ca-key.pem] ends up at mode [0600] unconditionally -- whether or not it already existed, and
+    whatever mode it previously had. This takes two steps, because neither alone is sufficient:
+    the file is created with [0600] at open time rather than chmod-ed down from a default-mode
+    create (which would leave a real window in which another local account could open the CA
+    private key and keep the descriptor), and the mode is then also set with [Unix.fchmod] on
+    that same descriptor before any content is written. The [fchmod] is what makes the guarantee
+    hold for a {e pre-existing} file: [Unix.openfile]'s permission argument applies only when the
+    file is actually created, so without it, overwriting a [ca-key.pem] already sitting at, say,
+    [0644] would silently leave it world-readable with the new CA key inside.
+
+    Any existing [ca-key.pem]/[ca-cert.pem] is [unlink]-ed before the new one is created with
+    [O_EXCL], so a path that has been replaced by a symlink cannot redirect the write: the
+    [unlink] removes the symlink itself rather than following it to its target, and [O_EXCL]
+    refuses to create through any symlink planted in between. The cost of this, stated plainly,
+    is that the replacement is not atomic -- there is a window in which no CA file exists.
+
+    {!load} nonetheless re-checks the mode rather than trusting any of the above, since the file
+    can be chmod-ed by anything else in the arbitrarily long interval between the two calls.
 
     Both files, and the directory entries naming them, are [fsync]-ed before this returns: a root
     CA is written once and relied on indefinitely, and a crash that lost it would take every
@@ -83,9 +95,15 @@ val sign_leaf : t -> common_name:string -> valid_days:int -> X509.Certificate.t 
 
     [dir] must already exist; this function does not create it.
 
-    @raise Sys_error
+    @raise Unix.Unix_error
       if [dir] does not exist, or either file cannot be created, written or synced (propagated
-      verbatim from the underlying [open]/[write]/[fsync]). *)
+      verbatim from the underlying [Unix.openfile]/[Unix.fchmod]/[Unix.fsync]). Note the
+      asymmetry with {!load}, which raises [Sys_error] for its own missing-file case: that is not
+      an inconsistency to be relied on away, it is what the two actually raise -- [load] opens
+      with [open_in_bin] (stdlib, [Sys_error]) while [save] opens with [Unix.openfile]
+      ([Unix_error]). A caller wrapping both must catch both; a caller wrapping only [save] and
+      matching on [Sys_error] would catch nothing at all. In particular a missing [dir] surfaces
+      here as [Unix_error (ENOENT, "open", _)]. *)
 val save : t -> dir:string -> unit
 
 (** [load ~dir] is the CA previously written to [dir] by {!save}, read back from
