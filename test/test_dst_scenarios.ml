@@ -761,15 +761,34 @@ let clean_encodings =
 
 let is_clean enc = Hashtbl.mem clean_encodings enc
 
-let test_wire_corruption_diverges_committed_state () =
-  (* [seed] re-picked (was 4) after subtask 3.8's fix keyed Network.send's fault decisions
+let test_wire_corruption_is_detected_and_dropped_not_accepted () =
+  (* Formerly [test_wire_corruption_diverges_committed_state], pinned-failing-by-design: this
+     header used to document a real, then-open gap ("NOT FIXED HERE, deliberately") where
+     [Message.encode]/[decode] carried no integrity field at all, so a corrupted wire byte could
+     make the cluster retroactively accept a corrupted value as if it had been legitimately
+     proposed, and it said explicitly that if this test ever started passing without a divergence,
+     something real had changed and it should be turned into the positive assertion.
+
+     2026-09-24, layer0-followup-hardening Task 2 (subtask 3.6) is exactly that change:
+     [Message.encode] now appends an 8-byte wire-integrity checksum (see message.mli's own
+     "Wire-integrity checksum" section) and [Message.decode] verifies it before accepting the
+     bytes, raising [Malformed_message] on a mismatch -- which [Replica.handle_message] already
+     catches unconditionally and silently drops (VSR's own retry/timeout machinery recovers from
+     there, the same as any other malformed/dropped message). The two assertions below are now
+     flipped from asserting the bug's presence to asserting its absence: a corrupted [Prepare] must
+     be dropped, never accepted as a legitimately different committed value.
+
+     [seed] re-picked (was 4) after subtask 3.8's fix keyed Network.send's fault decisions
      per-sender instead of drawing them from one send-order-consumed stream (lib/sim/network.ml):
      that changed which seed happens to land a corrupting flip on the one decisive message this
      test's assertions need, since it is a genuinely different derivation from the same integer,
      not a compatible re-seeding. Re-searched by sweeping seeds 1-160 for one that still reproduces
      both pinned facts (a divergence AND a cluster-wide erasure) under the new derivation; this
      scenario runs on Eio_mock.Backend (no real I/O), so it was never the source of the flake this
-     fix closes and is fully deterministic for a fixed seed both before and after. *)
+     fix closes and is fully deterministic for a fixed seed both before and after. This seed was
+     chosen to reproduce the PRE-fix bug; it is kept as-is post-fix specifically because the same
+     seed now demonstrating a clean run (no divergence, no erasure) IS the evidence the fix works,
+     rather than picking a new seed that never exercised the bug in the first place. *)
   let seed = 71 and replica_count = 3 in
   let c = make_checker ~seed ~replica_count in
   (* Final state, captured inside the run because [replicas] does not outlive it: per replica, for
@@ -851,24 +870,27 @@ let test_wire_corruption_diverges_committed_state () =
   print_newline ();
   Alcotest.(check bool)
     (Printf.sprintf
-       "seed %d, 3 replicas, one flipped payload byte and nothing else: replicas report \
-        different values committed at the same op_number (see this test's own comment -- \
-        pinned, not endorsed)"
+       "seed %d, 3 replicas, one flipped payload byte and nothing else: the wire-integrity \
+        checksum (subtask 3.6) catches it, so replicas never report different values committed \
+        at the same op_number"
        seed)
     true
-    (divergences <> []);
-  (* THE SEVERITY, pinned separately and deliberately: this is not merely disagreement between
-     replicas. An acknowledged, committed clean value ends up held by no replica in memory and
-     readable off no replica's disk -- erased cluster-wide, with the corrupted value in its place.
-     If a fix ever makes THIS assertion fail while the divergence one still passes, the failure
-     mode has genuinely changed character and both assertions need revisiting together. *)
+    (divergences = []);
+  (* THE SEVERITY, checked separately and deliberately: this is not merely "no disagreement
+     between replicas". No acknowledged, committed clean value may end up erased cluster-wide
+     (held by no replica in memory and readable off no replica's disk) either -- a corrupted
+     [Prepare] must be dropped outright by the receiving replica, the same as any other
+     malformed/dropped message, never accepted as a legitimately different committed value. If a
+     fix ever makes THIS assertion fail while the divergence one still passes, the failure mode
+     has genuinely changed character and both assertions need revisiting together. *)
   Alcotest.(check bool)
     (Printf.sprintf
-       "at least one acknowledged write is destroyed cluster-wide -- held by no replica in memory \
-        AND durably readable on no replica (count = %d)"
+       "no acknowledged write is destroyed cluster-wide -- every committed value remains held by \
+        at least one replica in memory or durably readable on at least one replica (count of \
+        erased = %d)"
        (List.length erased))
     true
-    (erased <> [])
+    (erased = [])
 
 (* ---------------------------------------------------------------------------------------------
    Test 8: the DETERMINISTIC counterpart of the sweep's statistical coverage of finding C1.
@@ -962,8 +984,8 @@ let tests =
       test_file_storage_cluster_committed_entries_are_durable);
     ("ring capacity boundary: past it, no view change can complete", `Quick,
       test_ring_capacity_boundary);
-    ("wire payload corruption diverges committed state (pinned, unfixed)", `Quick,
-      test_wire_corruption_diverges_committed_state);
+    ("wire payload corruption is detected and dropped, not accepted (subtask 3.6)", `Quick,
+      test_wire_corruption_is_detected_and_dropped_not_accepted);
     ( "C1/I1: a crash with a torn superblock refuses to come back, and the data survives", `Quick,
       test_a_crash_with_a_torn_superblock_refuses_to_come_back );
     (* Appended, not inserted earlier in this list, so every other test's index (several of which

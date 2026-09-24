@@ -25,7 +25,29 @@
     string tag per constructor (documented below, next to each constructor), matching the
     domain-separation style already used by {!Riptide.Envelope.content_hash}. These tag
     strings, and each constructor's field names, are this module's actual wire format —
-    changing either is a wire-format-breaking change, not a cosmetic rename. *)
+    changing either is a wire-format-breaking change, not a cosmetic rename.
+
+    {2 Wire-integrity checksum (subtask 3.6)}
+
+    The encoding produced by {!encode} is [Value.canonical_encode (to_value t)] followed by
+    an 8-byte trailing checksum (the first 8 bytes of {!Riptide.Value.content_hash} of the
+    encoded value); {!decode} recomputes and checks it before accepting the bytes.
+
+    This is accidental-corruption detection, {b not authentication and not a security
+    boundary}: VSR is a crash-fault-tolerant protocol, not a Byzantine one, and the
+    network-corruption case this would originally have guarded against is already closed
+    for every real deployment by {!Riptide_transport.Tcp}'s own mandatory mutual TLS
+    (AES-GCM authenticated encryption fails closed on a tampered record before VSR ever
+    sees the bytes). What this checksum catches instead is corruption introduced somewhere
+    other than the network — a local encoding bug, or bytes already corrupted before
+    retransmission — which keeps the DST test harness's own wire-corruption fault injection
+    meaningful rather than silently accepted as a legitimately different value.
+
+    A checksum failure raises {!Malformed_message}, the same exception every other
+    malformed-input case here already raises. {!Riptide_vsr.Replica.handle_message} already
+    catches {!Malformed_message} unconditionally and silently drops the message (relying on
+    VSR's own retry/timeout machinery to recover) — this checksum required zero changes to
+    that call site. *)
 
 type t =
   | Prepare of { view : int; n : int; v : Riptide.Value.value; k : int }

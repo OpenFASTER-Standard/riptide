@@ -71,7 +71,28 @@ let to_value (t : t) : Value.value =
     Value.Sum
       (tag_start_view, Value.Record [ int_field "v" v; log_field log; int_field "n" n; int_field "k" k ])
 
-let encode (t : t) : string = Value.canonical_encode (to_value t)
+(* ---- wire-integrity checksum (subtask 3.6) ----
+   Accidental-corruption detection only, not a security boundary: VSR is a crash-fault-tolerant
+   protocol (not Byzantine), and the network-corruption case this originally guarded against is
+   already closed for every real deployment by Riptide_transport.Tcp's own mandatory mutual TLS
+   (AES-GCM authenticated encryption fails closed on a tampered record before VSR ever sees the
+   bytes). What this catches instead: corruption introduced somewhere other than the network --
+   a local encoding bug, or bytes that were already corrupted before retransmission. 8 bytes
+   (64 bits) is far more collision resistance than this threat model needs.
+
+   Computed via {!Riptide.Value.content_hash}, not a direct [Digestif] call -- this module's own
+   library ([riptide_vsr]) does not depend on [digestif] at all, and [lib/value.ml] is the only
+   module in this codebase that touches [Digestif] directly (confirmed by grepping the whole
+   tree); every other consumer of hashing, including {!Riptide.Envelope.content_hash}, goes
+   through that one wrapper. Reusing it here keeps that convention intact instead of introducing
+   a second, parallel hashing entry point. *)
+let checksum_length = 8
+
+let checksum (v : Value.value) : string = String.sub (Value.content_hash v) 0 checksum_length
+
+let encode (t : t) : string =
+  let v = to_value t in
+  Value.canonical_encode v ^ checksum v
 
 (* ---- Value.value -> t ---- *)
 
@@ -158,5 +179,13 @@ let of_value (v : Value.value) : t =
   | _ -> raise (Malformed_message "expected a Sum value at the top level")
 
 let decode (s : string) : t =
-  let v = try Value.canonical_decode s with Invalid_argument msg -> raise (Malformed_message msg) in
+  let total_len = String.length s in
+  if total_len < checksum_length then
+    raise (Malformed_message (Printf.sprintf "message too short to carry a checksum (%d bytes)" total_len));
+  let body_len = total_len - checksum_length in
+  let body = String.sub s 0 body_len in
+  let claimed_checksum = String.sub s body_len checksum_length in
+  let v = try Value.canonical_decode body with Invalid_argument msg -> raise (Malformed_message msg) in
+  if not (String.equal claimed_checksum (checksum v)) then
+    raise (Malformed_message "checksum mismatch -- message corrupted in transit or at rest");
   of_value v

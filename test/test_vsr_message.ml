@@ -51,6 +51,36 @@ let test_round_trip_start_view () =
   let m = Message.Start_view { v = 4; log = sample_log (); n = 7; k = 5 } in
   Alcotest.(check bool) "Start_view round-trips" true (Message.decode (Message.encode m) = m)
 
+(* ---- wire-integrity checksum (subtask 3.6): decode must reject a corrupted encoding rather than
+   silently accept it as a different, well-formed message. Defense-in-depth only -- the real
+   network-corruption case is already closed for production by Riptide_transport.Tcp's mandatory
+   mutual TLS; this catches corruption from other sources (a local encoding bug, bytes already
+   corrupted before retransmission) and keeps DST's own fault-injection testing meaningful. ---- *)
+
+let test_decode_rejects_a_corrupted_encoding () =
+  let msg = Message.Prepare { view = 1; n = 1; v = Value.Scalar (Value.String "x"); k = 0 } in
+  let encoded = Message.encode msg in
+  (* Flip one byte roughly in the middle of the encoding -- avoids the length-prefix bytes at the
+     very start most canonical encodings carry, so this is a real content-corruption test, not a
+     length-field corruption test (a different failure mode). *)
+  let corrupted = Bytes.of_string encoded in
+  let mid = Bytes.length corrupted / 2 in
+  Bytes.set corrupted mid (Char.chr (Char.code (Bytes.get corrupted mid) lxor 0xFF));
+  let corrupted = Bytes.to_string corrupted in
+  (* This codebase's own established convention for asserting on an exception carrying a payload
+     (see test_redaction.ml's test_encryption_with_merge_key_is_rejected) is to assert the real,
+     exact message via Alcotest.check_raises -- NOT a placeholder payload. Alcotest 1.9.1's
+     check_raises compares the raised exception for structural equality (`e <> exn`), so a
+     placeholder string would not match and this test would fail for the wrong reason. *)
+  Alcotest.check_raises "a corrupted encoding is rejected as malformed"
+    (Message.Malformed_message "checksum mismatch -- message corrupted in transit or at rest")
+    (fun () -> ignore (Message.decode corrupted))
+
+let test_encode_decode_roundtrips_with_the_new_checksum () =
+  let msg = Message.Prepare_ok { view = 2; n = 5; i = 1 } in
+  Alcotest.(check bool) "a clean encoding still decodes to the same message" true
+    (Message.decode (Message.encode msg) = msg)
+
 (* ---- malformed-input tests: decode must raise Message.Malformed_message, never crash or
    succeed on garbage. ---- *)
 
@@ -177,5 +207,9 @@ let tests =
       test_round_trip_do_view_change_with_empty_evidence );
     ("round-trip Start_view", `Quick, test_round_trip_start_view);
     QCheck_alcotest.to_alcotest round_trip_prop;
+    ("decode rejects a corrupted encoding", `Quick, test_decode_rejects_a_corrupted_encoding);
+    ( "encode/decode round-trips with the new checksum",
+      `Quick,
+      test_encode_decode_roundtrips_with_the_new_checksum );
   ]
   @ malformed_input_tests
