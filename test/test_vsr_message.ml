@@ -93,19 +93,33 @@ let expect_malformed name (f : unit -> Message.t) =
       | exception Message.Malformed_message _ -> ()
       | exception exn -> Alcotest.failf "%s: expected Malformed_message, got %s" name (Printexc.to_string exn) )
 
+(* [decode] strips the LAST 8 bytes of whatever it is given as a claimed checksum before doing
+   anything else (see message.mli's "Wire-integrity checksum" section). A bare
+   [Value.canonical_encode v] therefore has 8 real content bytes stripped off its end by [decode],
+   so the truncated remainder dies inside [Value.canonical_decode] with a generic truncation
+   error -- BEFORE ever reaching [of_value]'s own shape-validation code. [expect_malformed] only
+   checks for [Malformed_message _] generically, so a case built with a bare [canonical_encode]
+   still "passes", just for the wrong reason (truncation, not the shape defect the test name
+   claims to cover). [enc] appends a real checksum, exactly as [Message.encode] does, so decode's
+   checksum-stripping step consumes real checksum bytes and the (still-malformed) body actually
+   reaches [of_value]'s shape validation as each of these tests intends. *)
+let enc v = Value.canonical_encode v ^ String.sub (Value.content_hash v) 0 8
+
 let malformed_input_tests =
   [
+    (* These two are genuinely testing the "too short to carry a checksum" / immediate-garbage
+       path, not [of_value]'s shape validation -- kept as raw, un-checksummed input on purpose. *)
     expect_malformed "not a value at all (garbage bytes)" (fun () -> Message.decode "\xff\xff\xff");
     expect_malformed "empty input" (fun () -> Message.decode "");
     expect_malformed "unknown Sum tag" (fun () ->
-        Message.decode (Value.canonical_encode (Value.Sum ("NotAVsrMessage", Value.Record []))));
+        Message.decode (enc (Value.Sum ("NotAVsrMessage", Value.Record []))));
     expect_malformed "top-level value is not a Sum at all" (fun () ->
-        Message.decode (Value.canonical_encode (Value.Record [ ("view", Value.Scalar (Value.Int 1L)) ])));
+        Message.decode (enc (Value.Record [ ("view", Value.Scalar (Value.Int 1L)) ])));
     expect_malformed "Sum body is not a Record" (fun () ->
-        Message.decode (Value.canonical_encode (Value.Sum ("Prepare", Value.Scalar (Value.Int 1L)))));
+        Message.decode (enc (Value.Sum ("Prepare", Value.Scalar (Value.Int 1L)))));
     expect_malformed "Prepare missing the 'k' field" (fun () ->
         Message.decode
-          (Value.canonical_encode
+          (enc
              (Value.Sum
                 ( "Prepare",
                   Value.Record
@@ -116,7 +130,7 @@ let malformed_input_tests =
                     ] ))));
     expect_malformed "Prepare 'view' field has the wrong shape (String instead of Int)" (fun () ->
         Message.decode
-          (Value.canonical_encode
+          (enc
              (Value.Sum
                 ( "Prepare",
                   Value.Record
@@ -128,7 +142,7 @@ let malformed_input_tests =
                     ] ))));
     expect_malformed "Do_view_change 'entries' field has the wrong shape (Int instead of Sequence)" (fun () ->
         Message.decode
-          (Value.canonical_encode
+          (enc
              (Value.Sum
                 ( "DoViewChange",
                   Value.Record
@@ -142,8 +156,7 @@ let malformed_input_tests =
                       ("i", Value.Scalar (Value.Int 1L));
                     ] ))));
     expect_malformed "Start_view_change missing the 'i' field" (fun () ->
-        Message.decode
-          (Value.canonical_encode (Value.Sum ("StartViewChange", Value.Record [ ("v", Value.Scalar (Value.Int 4L)) ]))));
+        Message.decode (enc (Value.Sum ("StartViewChange", Value.Record [ ("v", Value.Scalar (Value.Int 4L)) ]))));
   ]
 
 (* ---- QCheck2 round-trip property, one generator per constructor, matching Task 1's own

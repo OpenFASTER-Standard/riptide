@@ -701,54 +701,11 @@ let test_ring_capacity_boundary_soak () =
   done
 
 (* ---------------------------------------------------------------------------------------------
-   Test 5: on-the-wire payload corruption breaks cross-replica agreement. A running reproduction of
-   a real, currently-unfixed gap, pinned rather than fixed -- see the long note below for why.
+   Test 5: on-the-wire payload corruption must be detected and dropped, not silently accepted as
+   a legitimately different committed value. See the long note on the test function itself for
+   the full history (this used to be a pinned reproduction of a real, then-open gap; it is now a
+   positive assertion that subtask 3.6's fix closes it).
    --------------------------------------------------------------------------------------------- *)
-
-(* WHAT THIS PINS, and why it is reported rather than fixed here.
-
-   Until Task 11, Network.fault_config's corrupt_probability was INERT for every cluster in this
-   repo: Sim_transport hard-coded Fun.id as Network.send's corruption function, so a "corrupted"
-   delivery was byte-identical to a clean one and the knob could be set to any value in any test
-   and change nothing. Sim_transport now takes the transformation as a parameter (still defaulting
-   to Fun.id), and Cluster supplies a deterministic one-byte flip -- so this is the first time any
-   cluster in this repo has ever been handed a genuinely corrupted message.
-
-   The result, at 3 replicas with NO other fault of any kind (no drops, no duplicates, no delays,
-   no storage faults), is worse than disagreement between replicas, and the test prints its own
-   evidence for that claim rather than asking anyone to take it on trust (see [print_evidence]
-   below; run it with `dune exec test/test_riptide.exe -- test dst_scenarios 6 -v`).
-
-   What actually happens is that the corrupted value wins EVERYWHERE. An already-committed,
-   already-acknowledged clean value is reported committed at some op_number, and by the end of the
-   run that value is held by NO replica in memory and is durably readable on NO replica -- while
-   all three replicas hold the corrupted value in its place, in memory and on disk. This is not
-   "two replicas disagree"; it is silent, total, retroactive destruction of an acknowledged write,
-   cluster-wide, from a single flipped bit. Both facts are asserted below: the divergence, and the
-   erasure.
-
-   WHY: Message.encode is Value.canonical_encode with no integrity field of any kind, so a flipped
-   payload byte produces a perfectly well-formed Prepare carrying a different value. replica.ml
-   validates every INTEGER field off the wire with real care -- its own doc comments cite "a
-   corrupted/forged network delivery" as the reason each guard exists -- but the value payload is
-   the one field that cannot be range-checked, and it is the one whose corruption directly
-   diverges committed state. So this is not outside the codebase's stated threat model; it is a
-   hole inside it. It also directly contradicts sim_transport.mli's own claim that code working
-   against the shared Transport_intf.S contract is fine with "corrupted payload bytes": the VSR
-   layer is not.
-
-   NOT FIXED HERE, deliberately. Any real fix must let a receiver DETECT the corruption, which
-   means adding redundancy to the message encoding -- a wire-format change to the consensus
-   protocol, i.e. Layer 0, which this repo's own CLAUDE.md says is decided by a small group of
-   people who have implemented against the change, not unilaterally by whoever finds the problem.
-   It is also not obvious that a checksum is the right answer rather than stating outright that
-   VSR requires an integrity-preserving transport (Riptide_transport.Tcp already is one), since a
-   checksum only defends against random corruption, which is what this injector models and what a
-   real transport already handles. That choice is the task report's top recommendation.
-
-   This test therefore asserts the CURRENT, broken behaviour, so the gap is a CI-visible fact
-   rather than folklore: if it ever starts passing without a divergence, something real changed and
-   this test should be turned into the positive assertion. *)
 (* Every value this scenario ever proposes is [v "op-<k>"], so "clean" is decidable exactly, with
    no decoding and no guessing: an encoding is clean iff it is one of those. Anything else a
    replica reports committed was manufactured by the one-byte flip. *)
@@ -763,11 +720,39 @@ let is_clean enc = Hashtbl.mem clean_encodings enc
 
 let test_wire_corruption_is_detected_and_dropped_not_accepted () =
   (* Formerly [test_wire_corruption_diverges_committed_state], pinned-failing-by-design: this
-     header used to document a real, then-open gap ("NOT FIXED HERE, deliberately") where
-     [Message.encode]/[decode] carried no integrity field at all, so a corrupted wire byte could
-     make the cluster retroactively accept a corrupted value as if it had been legitimately
-     proposed, and it said explicitly that if this test ever started passing without a divergence,
-     something real had changed and it should be turned into the positive assertion.
+     note used to document a real, then-open gap where [Message.encode]/[decode] carried no
+     integrity field at all, so a corrupted wire byte could make the cluster retroactively accept
+     a corrupted value as if it had been legitimately proposed. It said explicitly that if this
+     test ever started passing without a divergence, something real had changed and it should be
+     turned into the positive assertion below -- this is that change.
+
+     WHAT THE GAP WAS AND HOW IT WAS FOUND. Until Task 11, Network.fault_config's
+     corrupt_probability was INERT for every cluster in this repo: Sim_transport hard-coded
+     Fun.id as Network.send's corruption function, so a "corrupted" delivery was byte-identical
+     to a clean one and the knob could be set to any value in any test and change nothing.
+     Sim_transport was changed to take the transformation as a parameter (still defaulting to
+     Fun.id), with Cluster supplying a deterministic one-byte flip -- the first time any cluster
+     in this repo was ever handed a genuinely corrupted message. Before this task's fix, at 3
+     replicas with NO other fault of any kind (no drops, no duplicates, no delays, no storage
+     faults), the result was worse than disagreement between replicas: the corrupted value won
+     EVERYWHERE. An already-committed, already-acknowledged clean value was reported committed at
+     some op_number, and by the end of the run that value was held by NO replica in memory and
+     was durably readable on NO replica -- while all three replicas held the corrupted value in
+     its place, in memory and on disk. This was not "two replicas disagree"; it was silent,
+     total, retroactive destruction of an acknowledged write, cluster-wide, from a single flipped
+     bit.
+
+     WHY IT MATTERED. [Message.encode] was [Value.canonical_encode] with no integrity field of
+     any kind, so a flipped payload byte produced a perfectly well-formed [Prepare] carrying a
+     different value. [replica.ml] validates every INTEGER field off the wire with real care --
+     its own doc comments cite "a corrupted/forged network delivery" as the reason each guard
+     exists -- but the value payload was the one field that could not be range-checked, and it
+     was the one whose corruption directly diverged committed state. This was not outside the
+     codebase's stated threat model; it was a hole inside it. It also directly contradicted
+     sim_transport.mli's own claim that code working against the shared Transport_intf.S contract
+     is fine with "corrupted payload bytes": the VSR layer was not. (Fixing it required adding
+     redundancy to the message encoding -- a wire-format change to the consensus protocol, i.e.
+     Layer 0, hence deferred to its own task rather than patched in unilaterally where found.)
 
      2026-09-24, layer0-followup-hardening Task 2 (subtask 3.6) is exactly that change:
      [Message.encode] now appends an 8-byte wire-integrity checksum (see message.mli's own
@@ -868,6 +853,18 @@ let test_wire_corruption_is_detected_and_dropped_not_accepted () =
         final)
     erased;
   print_newline ();
+  (* Guard against a vacuous pass: [divergences = []] and [erased = []] both hold trivially if
+     the cluster never committed anything at all -- e.g. if [decode] regressed to rejecting EVERY
+     message (not just corrupted ones), if [corrupt_probability] got silently zeroed somewhere, or
+     if Sim_transport's corruption function regressed to the inert [Fun.id] default this same test
+     already lived through once (see the history note above). Proving real work happened closes
+     that path directly; it does not prove corruption specifically fired (that would need a
+     "corruption genuinely fired N times" counter threaded through Cluster/Network, which is
+     outside this task's file scope -- named here as a known, accepted limitation, not fixed). *)
+  Alcotest.(check bool)
+    (Printf.sprintf "seed %d: the run actually committed real ops (not a vacuous pass)" seed)
+    true
+    (Hashtbl.length c.committed > 0);
   Alcotest.(check bool)
     (Printf.sprintf
        "seed %d, 3 replicas, one flipped payload byte and nothing else: the wire-integrity \
