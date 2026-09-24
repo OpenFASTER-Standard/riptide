@@ -25,7 +25,23 @@
 
     It also does not read or write files, PEM or otherwise: everything is in-memory
     {!X509.Certificate.t}/{!X509.Private_key.t} values. Certificate {e sourcing} (files, secrets
-    manager, rotation) is a separate concern and is not modelled here. *)
+    manager, rotation) is a separate concern and is not modelled here.
+
+    {2 Open gap: nothing else models that sourcing either}
+
+    "A separate concern, not modelled here" is accurate about this module's boundary but would be
+    misleading if read as "handled elsewhere", so it is spelled out (final-review finding,
+    2026-09-23): as of this branch, {e no} module in this repo can encode or decode certificate or
+    private-key material. {!Riptide_pki.Ca} mints it in memory and this module consumes it in
+    memory; there is no PEM (or other) serialisation anywhere, and no non-test caller of either.
+
+    So the mesh cannot currently cross a process boundary or survive a restart: both ends of every
+    connection have to have been handed the same in-memory values, which today only happens because
+    the only callers are tests running both ends in one process. The design spec's Decision 6
+    ("certs are static and long-lived") presupposes a persistence mechanism that does not exist
+    yet. This is a real, currently-open gap rather than a settled design position -- it is simply
+    not yet load-bearing, because this repo has no replica server binary for it to block. {b
+    Tracked as future work}, alongside the same note in {!Riptide_pki.Ca}'s own header. *)
 
 exception Tls_config_error of string
 (** Raised by {!create} when the supplied material is internally inconsistent, or when the

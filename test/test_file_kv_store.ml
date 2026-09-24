@@ -119,6 +119,113 @@ let test_interrupted_overwrite_leaves_old_value_intact () =
       Alcotest.(check (option string)) "subsequent put still succeeds" (Some "new")
         (File_kv_store.get t ~key:"k"))
 
+(* -- Final-review Finding 1: [put] must make the renamed directory ENTRY durable, not just the
+   temp file's content, by fsyncing the containing directory after the rename -- exactly as
+   [delete] already does after its [unlink].
+
+   {b What is and is not observable here, stated plainly, because it determines the shape of these
+   two tests.} A directory fsync has no userspace-visible effect on a machine that does not actually
+   lose power: the page cache serves the same bytes either way, so no amount of reopening,
+   restatting, or re-reading can distinguish "synced" from "not synced". Confirmed on this box that
+   none of the usual escape hatches exist either: no [strace]/[ltrace]/[gdb] installed,
+   [/proc/sys/kernel/yama/ptrace_scope] is [1] (so a self-attaching tracer is out), and the process
+   lacks [CAP_SYS_ADMIN], which [fanotify]'s open-event reporting would need; there is no [inotify]
+   binding in this switch, and an [LD_PRELOAD] interposition shim would mean adding C stubs to this
+   test suite (a real risk in this environment, where [CC] is globally an [sccache] wrapper that
+   breaks naive C compilation -- see the box's own notes). [atime] is no help either: opening a
+   directory without reading it does not update it.
+
+   So the coverage is deliberately two-part, and the second part is the one that actually fails if
+   the fix is reverted:
+
+   1. [test_put_is_durable_across_reopen] mirrors [test_delete_is_durable_across_reopen] above --
+      which is, on inspection, exactly and only how [delete]'s own [fsync_dir] is covered today.
+      It proves the value survives a real close-and-reopen; it does NOT prove the sync happened.
+   2. [test_put_and_delete_both_fsync_the_directory] is a source-level guard on the two call sites
+      themselves, and is honest about being one. It fails loudly if the [fsync_dir] call after
+      [durable_write]'s [Eio.Path.rename] (or [delete]'s, for symmetry) is ever removed or
+      reordered -- which is the actual regression to prevent, since the bug being fixed was a
+      missing call, not a subtly wrong one. [test_golden.ml] already establishes the
+      read-a-source-file-declared-as-a-dune-dep pattern used here. *)
+let test_put_is_durable_across_reopen () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       File_kv_store.put t ~key:"wrapped-dek" "ciphertext-key-material");
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      Alcotest.(check (option string))
+        "put value is still there after a full close and reopen"
+        (Some "ciphertext-key-material")
+        (File_kv_store.get t2 ~key:"wrapped-dek"))
+
+(* Relative to this test's own working directory (_build/default/test/), declared in test/dune's
+   own [(deps ...)] so dune both copies it into a sandbox and reruns this test when it changes --
+   the same arrangement, and the same reasoning, as [test_golden.ml]'s [golden_file_path]. *)
+let file_kv_store_source_path = "../lib/storage/file_kv_store.ml"
+
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () -> really_input_string ic (in_channel_length ic))
+
+(* The body of a top-level [let <name> ...] binding: everything from that binding up to the next
+   line starting in column 0, which in this file is always either the next top-level [let] or the
+   next top-level comment. *)
+let top_level_binding_body source name =
+  let lines = String.split_on_char '\n' source in
+  let starts_binding line = String.length line > 4 && String.sub line 0 4 = "let " in
+  let rec find = function
+    | [] -> Alcotest.failf "no top-level binding %S found in %s" name file_kv_store_source_path
+    | line :: rest ->
+      if starts_binding line && String.length line >= 4 + String.length name
+         && String.sub line 4 (String.length name) = name then
+        let rec take acc = function
+          | [] -> List.rev acc
+          | l :: tl ->
+            if l <> "" && l.[0] <> ' ' && l.[0] <> ')' then List.rev acc else take (l :: acc) tl
+        in
+        String.concat "\n" (line :: take [] rest)
+      else find rest
+  in
+  find lines
+
+let contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+let index_of ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i =
+    if i + nl > hl then None else if String.sub haystack i nl = needle then Some i else go (i + 1)
+  in
+  go 0
+
+let test_put_and_delete_both_fsync_the_directory () =
+  let source = read_file file_kv_store_source_path in
+  let durable_write = top_level_binding_body source "durable_write" in
+  Alcotest.(check bool)
+    "durable_write still publishes via Eio.Path.rename" true
+    (contains ~needle:"Eio.Path.rename" durable_write);
+  Alcotest.(check bool)
+    "durable_write fsyncs the containing directory (Finding 1 regression guard)" true
+    (contains ~needle:"fsync_dir t" durable_write);
+  (* Ordering matters, not just presence: syncing the directory before the rename would sync a
+     state that does not yet contain the new entry, which is no guarantee at all. *)
+  (match
+     (index_of ~needle:"Eio.Path.rename" durable_write, index_of ~needle:"fsync_dir t" durable_write)
+   with
+  | Some rename_at, Some fsync_at ->
+    Alcotest.(check bool) "the fsync_dir comes AFTER the rename, not before" true (fsync_at > rename_at)
+  | _ -> Alcotest.fail "expected both Eio.Path.rename and fsync_dir t in durable_write's body");
+  let delete_body = top_level_binding_body source "delete" in
+  Alcotest.(check bool)
+    "delete still fsyncs the containing directory too" true
+    (contains ~needle:"fsync_dir t" delete_body)
+
 let tests =
   [
     ("put then get", `Quick, test_put_then_get);
@@ -129,4 +236,7 @@ let tests =
       test_put_overwrite_leaves_no_leftover_tmp_file);
     ("interrupted overwrite leaves old value intact", `Quick,
       test_interrupted_overwrite_leaves_old_value_intact);
+    ("put is durable across reopen", `Quick, test_put_is_durable_across_reopen);
+    ("put and delete both fsync the directory", `Quick,
+      test_put_and_delete_both_fsync_the_directory);
   ]

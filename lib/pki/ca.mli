@@ -1,6 +1,34 @@
 (** A minimal, real, self-managed PKI: a self-signed Ed25519 root CA plus leaf-certificate
     issuance for cluster replicas. See [ca.ml]'s header for the design rationale and for the
-    record of which [x509] APIs were verified against the real library. *)
+    record of which [x509] APIs were verified against the real library.
+
+    {2 Open gap: there is no persistence story for this material}
+
+    Stated plainly rather than assumed away (final-review finding, 2026-09-23). Everything this
+    module produces -- the root CA's own private key and certificate, and every leaf keypair and
+    certificate [sign_leaf] mints -- exists only as in-memory [X509.Private_key.t] /
+    [X509.Certificate.t] values, for the lifetime of the process that called [generate_root].
+    There is no PEM (or DER, or any other) encode/decode anywhere in this module, nothing writes
+    any of it to disk or to a secrets manager, and nothing loads it back.
+
+    The direct consequence: the PKI + mTLS mesh this composes with
+    ([Riptide_transport.Tls_identity], [Riptide_transport.Tcp]) cannot currently span two
+    separate OS processes, and cannot survive a restart. Every participant that is to trust the
+    same root has to be handed that root's [t] value in-memory, which in practice means
+    being in the same process -- which is exactly the shape of this repo's own transport tests,
+    the only callers that exist today. A real deployment would instead generate the root once,
+    persist it, and have each replica load its own long-lived leaf at startup.
+
+    This is in tension with the design spec's Decision 6 framing that "certs are static and
+    long-lived": that framing presupposes persistence, and persistence is not built. It is a real,
+    currently-open gap, not a deliberate design position, and it is only tolerable at this stage
+    because no replica server binary exists in this repo yet for it to block. {b Tracked as future
+    work}: certificate/key serialisation and sourcing (PEM encode/decode, on-disk or
+    secrets-manager loading, and whatever validation that needs) is its own task, deliberately not
+    smuggled into the task that built the CA itself.
+
+    See [Riptide_transport.Tls_identity]'s own header for the same gap stated from the consuming
+    side. *)
 
 (** Raised by every function here when certificate generation or signing cannot succeed. The
     message always carries the underlying [x509] error, never a generic one. *)

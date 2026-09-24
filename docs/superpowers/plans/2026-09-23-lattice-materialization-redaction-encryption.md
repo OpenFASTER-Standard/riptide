@@ -4,14 +4,44 @@
 
 **Goal:** Give Layer 0 a generic (domain-agnostic) join-semilattice contract and incremental
 materialization engine (closing subtask 3.7's ring-capacity data-loss finding for materialized
-writes), real crypto-shredding redaction, and real mTLS between replicas.
+writes, in the scope stated under "Subtask 3.7: what is and is not closed" below — **not**
+generally), real crypto-shredding redaction, and real mTLS between replicas.
+
+> **Amended 2026-09-23, after the final whole-branch review.** This plan originally read as though
+> subtask 3.7 were closed unconditionally for any write carrying a `merge_key`. It is not, and the
+> design spec's Decision 3 has been amended in the same pass. Every claim about ring-eviction
+> safety in this document is now qualified by the section immediately below; where a later section
+> still says "closes subtask 3.7", read it as "closes subtask 3.7 within that scope".
+
+### Subtask 3.7: what is and is not closed
+
+- **Built:** materialization happens **synchronously with commit**, inside the same
+  `Batch_commit.propose` call that observes the batch as committed. No background trigger exists.
+- **Genuinely safe by construction:** the `replica_count = 1` (`f = 0`) case, where
+  `Riptide_vsr.Replica.propose` commits synchronously so the first call both commits and
+  materializes; and the case where a caller explicitly drives `propose ~materialize:sink [...]` (or
+  the empty-writes idiom `propose ~materialize:sink []`) against a replica that has since learned of
+  the commit.
+- **Not built, and open:** the **watermark/eviction interlock** the design spec's Decision 3
+  originally promised — the materializer publishing a watermark and `File_storage`'s ring refusing
+  to evict past it. `lib/storage/file_storage.ml` is not touched anywhere in this plan. In a real
+  `replica_count >= 3` cluster nothing automatically materializes an asynchronously-committed write:
+  a follower on which `propose ~materialize` is never called never materializes anything, and its
+  ring can evict entries no accumulator ever absorbed.
+- **Tracked as future work:** the general interlock is real new production scope in
+  `File_storage`, and belongs in its own task-master subtask rather than being back-filled into
+  this plan's tasks.
+- **Authoritative, code-adjacent statement:** `lib/batch_commit/batch_commit.mli`'s own
+  `{b Scope, stated precisely because it does not cover every commit path}` paragraph. This plan
+  and the design spec are written to agree with it.
 
 **Architecture:** `lib/lattice/` defines the law (a module signature plus a reusable QCheck
 conformance harness). `lib/storage/` gains a new `Kv_store.S` primitive (durable, keyed,
 real-delete storage — distinct from `Storage.S`'s WAL/superblock shape) that both the materializer
 and the redaction keystore build on. `lib/materialize/` is the generic incremental-projection
 engine, folding writes into per-`merge_key` accumulators synchronously with commit — which is what
-makes ring eviction safe. `lib/crypto/` holds real AES-256-GCM envelope encryption (fresh DEK per
+makes ring eviction safe *in the scope stated above*, i.e. wherever the `propose` call that
+materializes is one that observes the commit. `lib/crypto/` holds real AES-256-GCM envelope encryption (fresh DEK per
 record, deterministic counter nonces) and the redaction keystore. `lib/pki/` builds a minimal,
 real, self-signed CA; `lib/transport/tcp.ml` gets real mutual TLS via `tls-eio`.
 
@@ -32,10 +62,13 @@ own research verified.
   pattern (Decision 1).
 - `merge_key : string` is opaque and caller-supplied — Layer 0 never inspects it (Decision 2).
 - The materializer folds a merge-keyed write into its accumulator **synchronously**, in the same
-  call that durably appends the write — this is what makes ring eviction safe by construction, not
-  a runtime watermark check (Decision 3). Writes with no `merge_key` are unaffected by this plan;
-  they remain exactly as subject to ring eviction as before this plan (a disclosed scope boundary,
-  not a regression — Decision 2's "opt-in" framing already implies this).
+  call that observes the write as committed — and there is deliberately no runtime watermark check
+  (Decision 3). This makes ring eviction safe by construction only for the cases enumerated under
+  "Subtask 3.7: what is and is not closed" above (`replica_count = 1`, or a caller explicitly
+  driving `propose ~materialize`); the general `replica_count >= 3` follower case is **open**, and
+  the watermark/eviction interlock that would close it was not built. Writes with no `merge_key` are
+  unaffected by this plan; they remain exactly as subject to ring eviction as before this plan (a
+  disclosed scope boundary, not a regression — Decision 2's "opt-in" framing already implies this).
 - Redaction is **per-record**, via a genuinely independent, randomly-generated DEK per record —
   never HKDF-derived from the KEK (derivation defeats independent deletability; Decision 4).
 - AEAD cipher is **AES-256-GCM with a deterministic, counter-based nonce per DEK**, never a randomly
@@ -588,7 +621,7 @@ git commit -m "materialize: generic incremental-projection engine over any Latti
 
 ---
 
-## Task 4: Wire materialization into the commit path — close subtask 3.7 for materialized writes
+## Task 4: Wire materialization into the commit path — close subtask 3.7 for materialized writes, in the scope stated above
 
 **Files:**
 - Modify: `lib/batch_commit/batch_commit.ml`/`.mli`
@@ -600,11 +633,18 @@ git commit -m "materialize: generic incremental-projection engine over any Latti
 
 **Context**: read the current, real `lib/batch_commit/batch_commit.ml`/`.mli` on disk first (this
 plan does not re-derive its existing `write`/`propose`/`committed_envelopes` shape — it extends it).
-This is the task that actually closes subtask 3.7: a write proposed with a `merge_key` gets folded
-into its materializer accumulator **synchronously**, as part of the same call that commits it — so
-the accumulator can never lag behind what the WAL ring is about to evict, by construction, not by a
-runtime check. A write with `merge_key = None` is unaffected — exactly as vulnerable to ring
-eviction as before this plan (a disclosed scope boundary, per this plan's own Global Constraints).
+This is the task that closes subtask 3.7 for materialized writes, in the scope this plan states up
+front (see "Subtask 3.7: what is and is not closed"): a write proposed with a `merge_key` gets folded
+into its materializer accumulator **synchronously**, as part of the same call that observes it as
+committed — so the accumulator can never lag behind what the WAL ring is about to evict, by
+construction, not by a runtime check. **That "by construction" holds only where such a call actually
+happens:** `replica_count = 1`, where `propose` commits synchronously, or a caller explicitly driving
+`propose ~materialize` on a replica that has since learned of the commit. It does **not** hold
+generally for a `replica_count >= 3` cluster, where commits land asynchronously and nothing here
+triggers materialization off them; no watermark/eviction interlock was built, and that case stays
+open as tracked future work. A write with `merge_key = None` is unaffected — exactly as vulnerable to
+ring eviction as before this plan (a disclosed scope boundary, per this plan's own Global
+Constraints).
 
 - [ ] **Step 1: Write the failing reproduction test**
 

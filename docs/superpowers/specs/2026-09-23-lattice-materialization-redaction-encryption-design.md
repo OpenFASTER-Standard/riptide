@@ -65,7 +65,7 @@ picks, not something Layer 0 derives from payload structure or existing envelope
 already means something specific — causal link — and overloading it as "merge grouping" would
 conflate two different concepts to avoid adding one new field).
 
-## Decision 3: Incremental projection — the generic engine, and how it closes subtask 3.7
+## Decision 3: Incremental projection — the generic engine, and how far it closes subtask 3.7
 
 A **materializer** is built by supplying a concrete `Lattice.S` module (satisfying Decision 1's
 contract) plus a codec (`Value.value <-> 'a`). As each write for a given `merge_key` commits, the
@@ -77,14 +77,57 @@ domain semantics. This resolves the apparent tension in Decision 1's own framing
 conformance harness; a concrete lattice module is supplied by whoever sets up a materializer,
 Layer 2 or otherwise.
 
-**This is subtask 3.7's real fix.** Once a write is folded into its key's accumulator, the raw WAL
-entry behind it is safe to evict — its content survives, compacted, in the materialized state. The
-materializer tracks a **watermark**: the highest op-number it has folded into some accumulator.
-`File_storage`'s ring is only permitted to evict an entry once the watermark has passed its
-op-number — turning a silent, undetected data-loss bug into a real, enforced checkpointing
-discipline. (Exact wiring — whether the watermark check lives in `File_storage` itself or in a
-caller-side guard analogous to the existing `wal_truncate_after`-below-`commit_number` guard — is
-an implementation-plan decision, not fixed here.)
+**This is subtask 3.7's fix for merge-keyed writes, within the scope stated below — not a general
+closure of 3.7.** Once a write is folded into its key's accumulator, the raw WAL entry behind it is
+safe to evict: its content survives, compacted, in the materialized state.
+
+> **Amended 2026-09-23, after the final whole-branch review, to say what was actually built.**
+> This section originally specified a *watermark/eviction interlock*: the materializer would track
+> the highest op-number it had folded, and `File_storage`'s ring would only be permitted to evict an
+> entry once the watermark had passed that op-number. **That interlock was never implemented.**
+> `lib/storage/file_storage.ml` is not touched anywhere in this work, and no watermark exists in
+> the shipped code. The original wording is preserved here only as the record of what was
+> envisioned; everything below describes the delivered mechanism and its real limits. Leaving the
+> unbuilt design in place as if it were the shipped one would be exactly the "spec ahead of running
+> code" failure this repo's own `CLAUDE.md` forbids, and would make a `done` status unprovable.
+
+**What was actually delivered.** Materialization is **synchronous with commit, at the point of the
+`Batch_commit.propose` call that observes the batch as committed**. A write carrying a `merge_key`
+is folded into its accumulator inside that same call, strictly before any later call on that replica
+could evict the WAL slot it occupies. There is no runtime watermark check, and no background
+process: *some* `propose` call supplied with `?materialize` has to actually run, at or after the
+moment the commit lands, for anything to be materialized at all.
+
+**The scope that makes ring eviction genuinely safe by construction is therefore narrower than
+"always", and is exactly this:**
+
+- **`replica_count = 1` (`f = 0`)**: `Riptide_vsr.Replica.propose` commits synchronously, so the
+  very first `propose` call for a batch both commits it and materializes it. Safe by construction,
+  with no further action by anyone.
+- **A caller explicitly driving materialization on a replica that has since learned of the
+  commit**: e.g. an operator or client re-proposing under the same `idempotency_key`, or calling
+  `propose ~materialize:sink []` (the empty-writes idiom) against a replica that is merely behind.
+  Also safe — but it depends on that call actually being made.
+
+**What is *not* covered, stated as a real limitation rather than an implementation detail:** in a
+normal `replica_count >= 3` cluster, `propose` never commits synchronously — the primary learns of
+its own commit later, asynchronously, via `handle_message` processing a quorum of replies. Nothing
+in the shipped code triggers materialization off that asynchronous commit. A follower that never has
+`propose ~materialize` called on it never materializes anything, and its ring can evict entries
+whose content was never absorbed into any accumulator. Closing that case is what the original
+watermark/eviction interlock above was for, and it remains open.
+
+**Tracked as future work**, deliberately not smuggled into this plan: a general
+watermark/eviction interlock — the materializer publishing a durable watermark, and `File_storage`
+(or a caller-side guard analogous to the existing `wal_truncate_after`-below-`commit_number` guard)
+refusing to evict past it — belongs in its own task-master subtask, because it is real new
+production scope in `lib/storage/file_storage.ml`, a file this entire plan otherwise never touches.
+
+Writes with no `merge_key` are unaffected by any of this: they remain exactly as subject to ring
+eviction as before, a disclosed scope boundary that Decision 2's opt-in framing already implies.
+`lib/batch_commit/batch_commit.mli`'s own `{b Scope, ...}` paragraph is the authoritative,
+code-adjacent statement of all of the above, and this section is written to agree with it rather
+than to overstate it.
 
 ## Decision 4: Redaction — real envelope encryption, not a derived key
 
@@ -176,10 +219,16 @@ mechanism; deferring avoids that.
   proof, matching this project's established non-vacuity discipline).
 - **Decision 3**: a materializer under real concurrent/interleaved commits converges to the same
   accumulator regardless of delivery order (this is what the lattice laws are *for* — prove it, not
-  just assert it). The watermark/eviction interaction gets a real test mirroring subtask 3.7's own
-  reproduction: propose enough writes to exceed `ring_capacity` with materialization keeping pace,
-  confirm no data loss, then (as a negative control) confirm the old, pre-Decision-3 failure mode
-  still reproduces if materialization is disabled/starved.
+  just assert it). The materialization/eviction interaction gets a real test mirroring subtask 3.7's
+  own reproduction: propose enough writes to exceed `ring_capacity` with materialization keeping
+  pace, confirm no data loss, then (as a negative control) confirm the old, pre-Decision-3 failure
+  mode still reproduces if materialization is disabled/starved. **Amended 2026-09-23 (final
+  review):** "watermark/eviction interaction" here originally named a mechanism that was never
+  built — see Decision 3's own amendment box. What is testable, and what this bullet now means, is
+  the *synchronous-with-commit* interaction, in the narrow scope Decision 3 now states: a
+  `replica_count = 1` cluster, or a caller explicitly driving `propose ~materialize`. There is no
+  watermark to test, and the general `replica_count >= 3` follower case is open, not covered by any
+  test, because the mechanism that would make it hold does not exist yet.
 - **Decision 4**: a redacted record's hash-chain integrity is unaffected (`Log.verify_chain_list`
   still passes) and the payload is genuinely unrecoverable after its keystore entry is deleted —
   proven by attempting decryption post-redaction and confirming failure, not merely that the

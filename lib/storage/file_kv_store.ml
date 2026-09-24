@@ -69,7 +69,11 @@
    and links it as new_t"). POSIX [rename(2)] within one directory is atomic, so [get] (which
    only ever opens the real key path, never the temp one) can only ever observe the fully-old
    record or the fully-new one, never a torn mix -- a crash at any point before the [rename]
-   leaves the real path, and therefore the previous value, completely untouched. *)
+   leaves the real path, and therefore the previous value, completely untouched. Publishing is
+   only finished once that new directory ENTRY is itself durable, which a [rename] alone does not
+   make it, so [durable_write] fsyncs the containing directory afterwards exactly as [delete]
+   does -- see [fsync_dir]'s own comment for the full hazard this closes on [put]'s path
+   (final-review finding, 2026-09-23). *)
 
 type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_capable : bool }
 
@@ -196,12 +200,56 @@ let path_for t ~key =
    during a single writer's own interrupted write, not race a second writer for the name. *)
 let tmp_suffix = ".put.tmp"
 
+(* The durability step BOTH [durable_write] and [delete] need, and the reason neither is finished
+   once its own file operation returns: POSIX leaves a directory's own metadata -- the list of
+   names it contains -- unsynced after a [rename] or an [unlink], even when the file data those
+   names point at is itself durable. The entry change can sit in the page cache, or in the
+   filesystem's journal ahead of the commit that makes it visible again after a power loss, for an
+   unbounded time. Making a change to a DIRECTORY durable requires fsyncing the directory (fsyncing
+   a file would say nothing about its name existing, or being gone), which is why this opens
+   [dir_path] rather than any key's own path.
+
+   For [delete] this closes the "deleted key must never be resurrected" bug
+   [Kv_store_intf.S.delete]'s own contract forbids: a crash right after [delete] returned could
+   otherwise bring the file back on the next open, which for this store's first real consumer
+   ([Riptide_crypto.Redaction_store.redact]) would mean a redacted record's wrapped DEK returning
+   from the dead.
+
+   For [put] it closes the mirror-image hazard, found by the final whole-branch review (2026-09-23)
+   after having been missed when [durable_write] was converted to write-temp-then-rename: the temp
+   file's own CONTENT is durable ([O_DIRECT]+[O_DSYNC] on every [perform_write]), and [rename] is
+   atomic, but the rename's own directory-entry update was never synced, so a power loss inside the
+   filesystem's journal-commit window could leave the new name unpersisted. That is not a
+   symmetrical "lose the last write" outcome, because callers above this layer commit on the
+   strength of [put] having returned: [Riptide_crypto.Redaction_store.encrypt_for_storage] stores a
+   record's wrapped DEK through [put] and documents in its own [.mli] that the wrapped DEK is
+   durably stored before it returns, then the ciphertext gets committed to a real WAL that IS
+   durable. Losing only the keystore entry therefore yields a committed ciphertext whose DEK is
+   gone: permanently unopenable, with the hash chain still verifying and nothing surfacing the
+   loss. Syncing the directory on [put]'s path is what makes that [.mli]'s guarantee true.
+
+   Plain blocking [Unix] calls rather than [Eio_linux.Low_level]: [openat2] is a file-oriented
+   helper here (this module's own [open_file_handle_read]/[open_file_handle_write] both set
+   [~seekable:true] and read/write records) and the installed Eio 0.12 exposes no fsync at all, on
+   a path or an fd. Blocking briefly in a fiber is already this module's established practice --
+   [alloc_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously on every
+   single read and write. Errors deliberately propagate rather than being swallowed, matching
+   [delete]'s narrow catch: a caller must be able to trust that a returning [put] or [delete] means
+   the key really, durably is (or is not) there. *)
+let fsync_dir t =
+  let fd = Unix.openfile t.dir_path [ Unix.O_RDONLY ] 0 in
+  Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
+
 (* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
    first, then data, into [path ^ tmp_suffix] -- the same "header always written first"
    ordering [File_storage.wal_append] uses, so a crash between the two *temp*-file writes
    leaves (at worst) a garbage temp file that the real [path] never points at -- then a single
    [Eio.Path.rename] of the temp file onto [path] publishes the whole record atomically. Opens
-   the temp file with [creat] so a first [put] for a key with no file yet succeeds. *)
+   the temp file with [creat] so a first [put] for a key with no file yet succeeds.
+
+   The [fsync_dir] after the rename is not optional bookkeeping -- see [fsync_dir]'s own comment
+   above for why a durable-content, atomically-renamed file is still not a durable KEY without it,
+   and what [Riptide_crypto.Redaction_store] loses if it is missing. *)
 let durable_write t path data =
   if String.length data > max_value_size then
     invalid_arg
@@ -221,7 +269,8 @@ let durable_write t path data =
       let data_buf = alloc_aligned_buffer data_slot_size in
       Cstruct.blit_from_string data 0 data_buf 0 (String.length data);
       perform_write ~sw:t.sw h ~offset:header_slot_size data_buf);
-  Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path)
+  Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path);
+  fsync_dir t
 
 (* [None] for every way this can fail to verify: the file doesn't exist (never put, or
    deleted -- caught as [Eio.Io] from the open itself), a short/missing header or data read, a
@@ -255,28 +304,6 @@ let create ~sw ~fs dir_path =
 
 let get t ~key = durable_read t (path_for t ~key)
 let put t ~key data = durable_write t (path_for t ~key) data
-
-(* [delete]'s own durability step, and the reason it is not just the [unlink] above: POSIX leaves
-   an [unlink] unsynced, so the directory entry removal can sit in the page cache indefinitely --
-   a crash immediately after [delete] returns can bring the file back on the next open. That is
-   exactly the "deleted key must never be resurrected" bug [Kv_store_intf.S.delete]'s own contract
-   forbids, and for this store's first real consumer
-   ([Riptide_crypto.Redaction_store.redact]) it would mean a redacted record's wrapped DEK
-   returning from the dead. Making the removal durable requires fsyncing the DIRECTORY (fsyncing
-   the unlinked file itself would say nothing about its name being gone), which is why this opens
-   [dir_path] rather than any key's own path.
-
-   Plain blocking [Unix] calls rather than [Eio_linux.Low_level]: [openat2] is a file-oriented
-   helper here (this module's own [open_file_handle_read]/[open_file_handle_write] both set
-   [~seekable:true] and read/write records) and the installed Eio 0.12 exposes no fsync at all, on
-   a path or an fd. Blocking briefly in a fiber is already this module's established practice --
-   [alloc_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously on every
-   single read and write. Errors deliberately propagate rather than being swallowed, matching the
-   narrow catch below: a caller must be able to trust that [delete] returning means the key is
-   really, durably gone. *)
-let fsync_dir t =
-  let fd = Unix.openfile t.dir_path [ Unix.O_RDONLY ] 0 in
-  Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
 
 let delete t ~key =
   (try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key) with
