@@ -114,36 +114,18 @@ count you get — this is your baseline.
 
 Read the real, current `lib/sim/network.ml` and `lib/sim/network.mli` in full before editing —
 this plan does not restate the whole file. The type `'msg t` (`network.ml`) currently holds one
-shared `prng : Prng.t`. Add a per-sender counter table and a per-message deterministic sub-PRNG:
-
-```ocaml
-(* In the type definition, alongside the existing prng field: *)
-send_counts : (peer_id, int) Hashtbl.t;
-
-(* In create: *)
-send_counts = Hashtbl.create 16;
-
-(* Replace the shared-prng fault draws in `send` with a per-(sender, count)-derived one: *)
-let fault_prng_for net ~from_ =
-  let count = Option.value (Hashtbl.find_opt net.send_counts from_) ~default:0 in
-  Hashtbl.replace net.send_counts from_ (count + 1);
-  (* Derive a fresh, deterministic sub-seed from the base seed, the sender id, and this
-     sender's own send count -- NOT from net.prng's shared, order-dependent stream. *)
-  Prng.create (Hashtbl.hash (Prng.int net.prng max_int, from_, count))
-```
-
-Wait — `Prng.int net.prng max_int` still consumes the shared stream in call order, reintroducing
-the exact problem. Do not do that. Instead derive the sub-seed purely from data already fixed at
-`Network.create` time (the base seed) plus `(from_, count)`, with no further draw from the shared
-`prng` inside `send` for the fault-decision purpose:
+shared `prng : Prng.t`, constructed from a caller-supplied `Prng.t` at `create` time. The fix
+derives each fault decision from data fixed once at `create` time (a base seed) plus
+`(sender, that sender's own send count)` — **never** from a further draw against the shared
+`prng`, since any such draw would reintroduce the exact order-dependence this task removes:
 
 ```ocaml
 (* In the type definition: *)
 base_seed : int;
 send_counts : (peer_id, int) Hashtbl.t;
 
-(* In create ~faults prng () -- Prng.t doesn't expose its own seed, so thread the base seed
-   through create's own argument list instead of trying to recover it from prng: *)
+(* In create -- Prng.t doesn't expose its own seed, so thread the base seed through create's
+   own argument list directly rather than trying to recover it from an already-built Prng.t: *)
 val create : faults:fault_config -> seed:int -> unit -> 'msg t
 
 let create ~faults ~seed () =
