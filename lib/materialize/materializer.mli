@@ -36,7 +36,22 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       {!Riptide_batch_commit.Batch_commit.propose}'s case, durably committed to the replicated log,
       since the fold deliberately runs only after commit. The accumulator is left at its last good
       value, so a subsequent SMALLER write to the same [merge_key] succeeds and nothing surfaces
-      the gap again. Found and measured by Task 9's end-to-end proof
+      the gap again.
+
+      {b The resulting divergence is PERMANENT and has no retry-recovery path at all}, and that is
+      stronger than "a documented limitation" -- it is worth stating exactly, because Task 9's fix
+      to {!Riptide_batch_commit.Batch_commit.propose} deliberately made it so. Materialization now
+      re-reads the batch's writes from the COMMITTED bytes (which is what makes the accumulator a
+      function of the agreed log alone), so retrying the failing key re-encodes the identical
+      payload, re-joins it into the identical accumulator, and hits the identical size cap, forever
+      -- on this replica and on every other one, since they all read the same committed bytes.
+      Before that fix a caller could at least retry the same [idempotency_key] with a smaller
+      regenerated batch and get {e something} folded in; that escape hatch is gone by design (it was
+      itself the divergence bug the fix closed). There is no in-band repair: the only ways out are
+      to reduce what the lattice holds at that [merge_key] (which a grow-only lattice cannot do) or
+      to move the store to a backend whose value bound is large enough. And because a later,
+      smaller write to the same [merge_key] still succeeds silently, a store carrying such a gap
+      goes on looking healthy indefinitely. Found and measured by Task 9's end-to-end proof
       (test_lattice_materialize_crypto_scenarios.ml, which pins the exact behaviour); no fix is
       attempted here, because both candidate fixes -- spilling a large value across slots in the
       backend, or giving {!Kv_store_intf.S} a declared bound this module checks before folding --

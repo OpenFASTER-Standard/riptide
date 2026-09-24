@@ -213,9 +213,29 @@ val propose :
       have materialized the same committed batches hold the same accumulator, whatever order or
       how many times each did so (join is commutative, associative and idempotent).
     - Materializing therefore does not need the writes in hand at all: calling this function with
-      an [idempotency_key] already in [t]'s log and an EMPTY [writes] list materializes that
-      batch's committed writes and proposes nothing. That is the supported way for a replica to
-      drive its own commit stream into its own materializer.
+      an EMPTY [writes] list materializes whatever is committed under [idempotency_key] and
+      proposes nothing. That is the supported way for a replica to drive its own commit stream into
+      its own materializer, and it is safe in every log state -- including on a replica that has
+      not yet learned of the batch at all, where it simply does nothing and can be retried later.
+      See {b An empty batch is never proposed} below for why that is now guaranteed rather than
+      merely typical.
+
+    {b An empty batch is never proposed}, in any log state, and [writes = \[\]] with no
+    [?materialize] raises [Invalid_argument] (review finding, 2026-09-23 -- a real silent
+    data-destruction path, previously pinned as known behaviour by [test_batch_commit.ml]'s own
+    [test_empty_batch_permanently_burns_its_key_via_propose] and closed here). {b WARNING, and this
+    is what the guard exists to prevent}: an empty batch is perfectly well-formed, so before this
+    guard, proposing one claimed [idempotency_key] permanently -- it entered
+    {!committed_envelopes_keyed}'s first-wins dedup set while contributing zero envelopes, and the
+    already-in-the-log check above then made every later [propose] under that key a silent no-op.
+    Any real batch proposed under that key afterwards was never committed, never materialized, and
+    nothing raised: silent, permanent data loss, reached by a single stray empty-list call. Since
+    an empty batch contributes zero envelopes and zero materialization, there is no state in which
+    writing one is useful, so suppressing the proposal costs nothing and the guard is
+    unconditional. The materialize step is deliberately NOT suppressed with it -- that is the
+    empty-[writes] idiom above, which must keep working on a replica that is merely behind, since
+    replication lag is a normal state rather than a caller error. A call with neither writes nor a
+    sink can have no effect at all, which is never what a caller meant, so it raises instead.
 
     Crucially, this check and materialize attempt happen on EVERY call, not only the call that
     itself performs the durable commit -- deliberately decoupled from the

@@ -697,7 +697,19 @@ let test_adversarial_sweep () =
    the bytes [File_storage] itself writes, not only [File_kv_store]'s. One seed rather than twelve:
    this is about the on-disk artifacts being real, and every other property is already swept above.
    [ring_capacity] is set well above this run's op count so WAL eviction (a known, separate
-   limitation with its own test in test_dst_scenarios.ml) is not what this test ends up measuring. *)
+   limitation with its own test in test_dst_scenarios.ml) is not what this test ends up measuring.
+
+   The seed is CHOSEN, not arbitrary, and re-chosen during this task's review round (2026-09-24):
+   one seed means one drawn workload, and the first seed used here (101) happened to draw no
+   regenerated retry against an already-committed key at all -- so it verified the fix's behaviour
+   against the real WAL without independently detecting the bug the way the memory-backed sweep
+   above does. Seed 102 draws two such retries and fails pre-fix with the bug's exact signature
+   ("replica 1's accumulator at mk-alpha is [REGENERATED-102-2-0,...] but its own committed log says
+   [...]", 8 violations across phases 2, 3, final and re-drain), while dominating seed 101 on every
+   non-vacuity count this test asserts (22 committed batches vs 21, 6 real storage faults vs 2, 21
+   marker decryptions vs 16). Every regression test in this file now discriminates the defect it is
+   about; if this one's seed is ever changed again, re-check that property against a reverted
+   [Batch_commit.propose] rather than assuming it. *)
 let test_sweep_against_real_file_storage () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -709,13 +721,13 @@ let test_sweep_against_real_file_storage () =
       ~underlying:(module File_storage)
       (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:256 dir)
   in
-  let r = run_scenario ~env ~sw ~seed:101 ~phases:3 ~make_fault_storage in
+  let r = run_scenario ~env ~sw ~seed:102 ~phases:3 ~make_fault_storage in
   Alcotest.(check bool) "the fault injector never had to decline a fault" true (r.fault_cap_hits = 0);
-  Alcotest.(check bool) "batches actually committed (measured: 21 replica-batch commits)" true
+  Alcotest.(check bool) "batches actually committed (measured: 22 replica-batch commits)" true
     (r.committed_batches > 12);
-  Alcotest.(check bool) "real storage faults fired against the real WAL (measured: 2)" true
+  Alcotest.(check bool) "real storage faults fired against the real WAL (measured: 6)" true
     (r.storage_faults_observed > 0);
-  Alcotest.(check bool) "the marker was genuinely recoverable by real decryption (measured: 16)" true
+  Alcotest.(check bool) "the marker was genuinely recoverable by real decryption (measured: 21)" true
     (r.marker_decryptions > 5);
   (* The check this test exists for: every byte the real ring WAL put on disk, grepped directly. *)
   Alcotest.(check bool) "the plaintext marker never reached the real on-disk WAL" false
@@ -1096,9 +1108,11 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
       [ write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ Printf.sprintf "element-%04d" n ])) ]
   in
   let failed_at = ref 0 in
+  (* The [Invalid_argument] escapes the whole loop, so there is no in-loop guard to write: the
+     [for] simply stops where the cap is hit. *)
   (try
      for n = 1 to 400 do
-       if !failed_at = 0 then propose n
+       propose n
      done
    with Invalid_argument msg ->
      failed_at := List.length (G_set.elements (M.read materializer ~merge_key:"mk")) + 1;
@@ -1125,6 +1139,109 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
   Alcotest.(check bool) "a later, smaller write to the same merge_key succeeds silently" true
     (List.mem "tiny" (G_set.elements (M.read materializer ~merge_key:"mk")))
 
+(* ---------------------------------------------------------------------------------------------
+   A THIRD FINDING, PINNED RATHER THAN FIXED, and the more severe of the two: one
+   {!Riptide_storage.File_kv_store} directory shared between a {!Riptide_crypto.Redaction_store}
+   keystore and a {!Riptide_materialize.Materializer} accumulator store lets an ORDINARY
+   materialized write destroy an encrypted record's wrapped DEK, with no error anywhere and nothing
+   about either store looking broken afterwards.
+
+   Why it is reachable rather than theoretical: [File_kv_store]'s key space is flat and untyped (one
+   file per key, named by the hash of the key), the keystore's keys are exactly the plain strings
+   {!Batch_commit.redaction_event_id} derives, and a materializer's keys are caller-chosen
+   [merge_key]s -- so a single [merge_key] shaped like "{length}:{idempotency_key}#{index}" is the
+   whole exploit. Nothing in either module's type or contract stops it, and the derivation is public
+   and documented, so the colliding shape is not even hard to produce by accident.
+
+   Strictly worse than the size-bound finding above, which is why it gets a running reproduction
+   too rather than only the paragraph redaction_store.mli now carries (this task's own change):
+   the size-bound case loses one write from a derived accumulator that the committed log can still
+   be re-read to rebuild by hand, while this one destroys the only copy of a key protecting data
+   that VSR replicated to every replica -- unrecoverable cluster-wide, and indistinguishable
+   afterwards from a deliberate redaction.
+
+   Pinned, not fixed, and for the same reason as the size bound: the fix is a real design decision
+   (namespacing/typing [Kv_store_intf.S]'s key space, or making a keystore directory
+   exclusively-owned and enforcing it), not an oversight to patch inside a test task.
+   --------------------------------------------------------------------------------------------- *)
+
+(* Same materializer, but with a TOTAL [decode]: bytes it cannot parse decode as [bottom] rather
+   than raising. [Materializer.create]'s [decode] is the caller's own function and nothing requires
+   it to be partial, so this is a legitimate -- even defensive -- choice, and it is what makes the
+   collision below silent rather than loud. Both variants are pinned. *)
+let make_lenient_materializer ~sw ~fs dir =
+  M.create
+    ~kv:(File_kv_store.create ~sw ~fs dir)
+    ~decode:(fun s ->
+      try G_set.of_value (Riptide.Value.canonical_decode s) with Invalid_argument _ -> G_set.bottom)
+    ~encode:(fun g -> Riptide.Value.canonical_encode (G_set.to_value g))
+
+let test_a_shared_kv_directory_silently_destroys_a_wrapped_dek () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir @@ fun shared_dir ->
+  Eio.Switch.run @@ fun sw ->
+  let fs = Eio.Stdenv.fs env in
+  (* ONE directory, two consumers -- exactly what redaction_store.mli now tells callers not to do. *)
+  let store =
+    Redaction_store.create
+      ~kv:(File_kv_store.create ~sw ~fs shared_dir)
+      ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
+  in
+  let replica = create_solo () in
+  let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
+  Batch_commit.propose replica ~idempotency_key:"k1" ~encryption:(enc_sink store) [ write_of payload ];
+  let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
+  Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0" event_id;
+  Alcotest.(check bool) "the record really is recoverable while its wrapped DEK is intact" true
+    (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload
+    = Some (canonical payload));
+  (* DIRECTION 1, the silent one: an ordinary materialized write whose [merge_key] happens to equal
+     that event_id. Not a redaction, not a fault, not an error -- and with a total [decode], not
+     even a raise. *)
+  let lenient = make_lenient_materializer ~sw ~fs shared_dir in
+  M.write lenient ~merge_key:event_id (G_set.of_list [ "innocent-accumulator-value" ]);
+  Alcotest.(check bool)
+    "the encrypted record is now permanently unreadable, and nothing raised to say so" true
+    (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = None);
+  (* Non-vacuity, and the reason this is silent rather than merely destructive: everything else
+     looks perfectly healthy afterwards. The accumulator holds exactly what it was asked to hold,
+     and the committed log and its hash chain are untouched -- the loss is indistinguishable from a
+     deliberate redaction of that one record. *)
+  Alcotest.(check (list string)) "while the accumulator write itself succeeded normally"
+    [ "innocent-accumulator-value" ]
+    (G_set.elements (M.read lenient ~merge_key:event_id));
+  Alcotest.(check int) "and the committed log still holds the (now unopenable) record" 1
+    (List.length (Batch_commit.committed_envelopes replica));
+  (* DIRECTION 1', with this file's own PARTIAL [decode] (the realistic alternative): the collision
+     is loud instead, but loud in the wrong place -- the read-join-put raises out of the CALLER's
+     decode, from the materialize path, about a value no materializer ever wrote. The DEK survives
+     this one, and every retry of that [merge_key] raises again forever. *)
+  Batch_commit.propose replica ~idempotency_key:"k2" ~encryption:(enc_sink store)
+    [ write_of (secret_payload_with "RIPTIDE-COLLISION-VICTIM-2") ];
+  let strict = make_materializer ~sw ~fs shared_dir in
+  Alcotest.(check bool) "a partial decode turns the same collision into a raise" true
+    (try
+       M.write strict ~merge_key:"2:k2#0" (G_set.of_list [ "x" ]);
+       false
+     with Invalid_argument _ -> true);
+  Alcotest.(check bool) "...and that record's DEK is still intact, because the put never ran" true
+    (Redaction_store.decrypt_value store ~event_id:"2:k2#0"
+       (List.assoc "2:k2#0" (Batch_commit.committed_envelopes_keyed replica)).Riptide.Envelope.payload
+    <> None);
+  (* DIRECTION 2, silent in the other direction and true for ANY [decode]: the keystore's own [put]
+     never reads first, so encrypting a record whose derived event_id collides with an EXISTING
+     [merge_key] overwrites that accumulator with wrapped-DEK bytes, with no error and no read. *)
+  M.write lenient ~merge_key:"2:k3#0" (G_set.of_list [ "accumulated-before-the-collision" ]);
+  Batch_commit.propose replica ~idempotency_key:"k3" ~encryption:(enc_sink store)
+    [ write_of (secret_payload_with "RIPTIDE-COLLISION-VICTIM-3") ];
+  Alcotest.(check (list string))
+    "the accumulator's value is silently gone, replaced by a wrapped DEK" []
+    (G_set.elements (M.read lenient ~merge_key:"2:k3#0"));
+  Alcotest.(check bool) "...while that record itself decrypts perfectly well" true
+    (Redaction_store.decrypt_value store ~event_id:"2:k3#0"
+       (List.assoc "2:k3#0" (Batch_commit.committed_envelopes_keyed replica)).Riptide.Envelope.payload
+    <> None)
+
 let tests =
   Lattice_conformance.tests (module G_set) g_set_arb "G_set"
   @ [
@@ -1144,4 +1261,7 @@ let tests =
       ("an accumulator outgrowing its KV backend's value limit diverges from the committed log \
         (known limitation, pinned)", `Quick,
        test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log);
+      ("sharing one KV directory between a keystore and a materializer silently destroys a wrapped \
+        DEK (known limitation, pinned)", `Quick,
+       test_a_shared_kv_directory_silently_destroys_a_wrapped_dek);
     ]

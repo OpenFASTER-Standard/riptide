@@ -48,13 +48,35 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     {b [kv] must be this keystore's alone} -- a directory no other {!Riptide_storage.File_kv_store}
     consumer also writes to. That store's key space is flat and untyped (one file per key, named by
     the key's own hash), so a second consumer sharing the directory and choosing a key equal to one
-    of this store's [event_id]s overwrites that record's wrapped DEK, destroying the record with no
-    error anywhere. It is reachable in practice, not merely in principle: a
-    {!Riptide_materialize.Materializer} is the other consumer this plan creates, its keys are
-    caller-chosen [merge_key]s, and this store's own keys are the plain strings
-    {!Riptide_batch_commit.Batch_commit.redaction_event_id} derives -- so one [merge_key] shaped
-    like [\{length\}:\{idempotency_key\}#\{index\}] is all it takes. Noted by Task 9's end-to-end
-    proof, which confirmed the collision live. *)
+    of this store's [event_id]s collides with it destructively. It is reachable in practice, not
+    merely in principle: a {!Riptide_materialize.Materializer} is the other consumer this plan
+    creates, its keys are caller-chosen [merge_key]s, and this store's own keys are the plain
+    strings {!Riptide_batch_commit.Batch_commit.redaction_event_id} derives -- so one [merge_key]
+    shaped like [\{length\}:\{idempotency_key\}#\{index\}] is all it takes.
+
+    All three consequences below were reproduced live, and are pinned by
+    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) rather than
+    reasoned about, because which one you get is not obvious:
+
+    - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
+      materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse
+      -- a legitimate, even defensive choice, and [Materializer.create] neither requires nor
+      forbids it). The accumulator's read-join-put simply overwrites the wrapped DEK; the record is
+      then permanently unreadable, nothing raises anywhere, the accumulator looks healthy, the log
+      and its hash chain are untouched, and the loss is indistinguishable from a deliberate
+      {!redact} of that one record.
+    - {b The same write raises instead, out of the materializer's caller's own [decode]}, if that
+      [decode] is partial (the more common shape). Less bad -- the DEK survives, since the [put]
+      never runs -- but it surfaces as an [Invalid_argument] from the materialize path about bytes
+      no materializer ever wrote, and it recurs on every retry of that [merge_key] forever. Via
+      {!Riptide_batch_commit.Batch_commit.propose} it raises AFTER the batch has committed, so it
+      also diverges the accumulator from the log exactly the way
+      {!Riptide_materialize.Materializer.Make.write}'s own size-bound WARNING describes.
+    - {b In the other direction it is silent for ANY [decode]}: this store's own [put] never reads
+      first, so encrypting a record whose derived [event_id] collides with an accumulator's
+      existing [merge_key] overwrites that accumulator with wrapped-DEK bytes, with no error and no
+      read. The record decrypts perfectly well afterwards; the accumulated lattice value is simply
+      gone. *)
 
 val encrypt_for_storage : t -> event_id:string -> Riptide.Value.value -> string
 (** [encrypt_for_storage t ~event_id v] generates a fresh DEK, encrypts

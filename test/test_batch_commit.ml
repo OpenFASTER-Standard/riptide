@@ -331,28 +331,43 @@ let test_propose_skips_a_key_already_committed () =
   Alcotest.(check int) "still exactly one committed envelope, from the first call" 1
     (List.length (Batch_commit.committed_envelopes t))
 
-let test_empty_batch_permanently_burns_its_key_via_propose () =
+(* This test used to pin the OPPOSITE behaviour, under the name
+   [test_empty_batch_permanently_burns_its_key_via_propose]: an empty batch was well-formed, so
+   [batch_of_value] decoded it, it claimed its key in [committed_envelopes]'s own first-wins dedup
+   set while contributing zero envelopes, and propose's already-in-the-log check then made every
+   later call under that key a silent no-op -- so a real batch proposed afterwards was never
+   committed, never materialized, and nothing raised. Task 9's review (2026-09-23) judged that a
+   silent, permanent data-loss path rather than a curiosity worth pinning, especially once
+   batch_commit.mli began recommending the empty-[writes] call shape as the way for a replica to
+   drive its own commit stream into its own materializer. [propose] now refuses to write an empty
+   batch at all, and this test pins the guard instead. *)
+let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
   let t = create_solo () in
   let key = "k-empty-burns-key" in
-  (* Unlike a malformed batch, an EMPTY batch (zero writes) is well-formed -- batch_of_value
-     decodes it fine, so committed_envelopes's own dedup set DOES gain this key. Worse: propose's
-     own already_committed guard runs BEFORE calling the underlying Replica.propose at all, so a
-     second propose call under the same key never even reaches the replicated log -- not merely
-     deduped on the read side, genuinely never sent. *)
-  Batch_commit.propose t ~idempotency_key:key [];
-  Alcotest.(check int) "the empty batch itself commits as zero envelopes" 0
-    (List.length (Batch_commit.committed_envelopes t));
+  (* No writes and no ~materialize sink: the call could not have had any effect even before the
+     guard, so it raises rather than silently doing nothing. *)
+  Alcotest.check_raises "an empty batch with no sink is a caller error"
+    (Invalid_argument
+       "Batch_commit.propose: an empty writes list with no ~materialize sink cannot do anything -- \
+        an empty batch is never proposed (it would permanently claim this idempotency key while \
+        contributing no envelopes, silently swallowing any later real batch under it), and with no \
+        sink there is nothing to materialize either. Pass the batch's writes, or pass ~materialize \
+        to drive an already-committed batch into a materializer.")
+    (fun () -> Batch_commit.propose t ~idempotency_key:key []);
+  Alcotest.(check int) "nothing reached the replicated log" 0 (List.length (Replica.entries t));
+  (* The same shape WITH a sink is the supported drain idiom, so it does not raise -- and it still
+     must not write an empty batch. Nothing is committed under this key yet, so it is simply
+     inert. *)
+  Batch_commit.propose t ~idempotency_key:key ~materialize:{ write = (fun ~merge_key:_ _ -> assert false) } [];
+  Alcotest.(check int) "the drain idiom against an unknown key proposes nothing either" 0
+    (List.length (Replica.entries t));
+  (* And the key is still free: a real batch under it lands normally. *)
   let actor = "actor-1" in
   Batch_commit.propose t ~idempotency_key:key
-    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "should-never-land") ];
-  Alcotest.(check int)
-    "a real, non-empty batch under the same key never materializes -- the empty batch already won \
-     this key"
-    0 (List.length (Batch_commit.committed_envelopes t));
-  Alcotest.(check int)
-    "the second propose call was genuinely skipped -- the underlying replicated log never grew \
-     past the first (empty) batch's own single entry"
-    1 (List.length (Replica.entries t))
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "lands-fine") ];
+  Alcotest.(check int) "a real batch under the same key is committed, not swallowed" 1
+    (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int) "and it is the log's first and only entry" 1 (List.length (Replica.entries t))
 
 let test_propose_with_different_keys_both_land () =
   let t = create_solo () in
@@ -383,7 +398,7 @@ let tests =
     ("an uncommitted tail entry is excluded", `Quick, test_uncommitted_tail_is_excluded);
     ("propose produces correct, chained envelopes", `Quick, test_propose_produces_correct_envelopes);
     ("propose skips re-proposing an already-committed key", `Quick, test_propose_skips_a_key_already_committed);
-    ("an empty batch permanently burns its key via propose's own duplicate check", `Quick,
-      test_empty_batch_permanently_burns_its_key_via_propose);
+    ("an empty batch is never proposed and never burns its key", `Quick,
+      test_an_empty_batch_is_never_proposed_and_never_burns_its_key);
     ("propose with two distinct keys: both land", `Quick, test_propose_with_different_keys_both_land);
   ]

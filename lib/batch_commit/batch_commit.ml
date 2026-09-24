@@ -122,9 +122,9 @@ let committed_writes_for (t : Riptide_vsr.Replica.t) ~(idempotency_key : string)
   in
   find (committed_batch_values t)
 
-(* The same membership question as [already_committed], asked over the WHOLE log rather than its
-   committed prefix -- i.e. "has a batch under this idempotency key ever been APPENDED here",
-   committed or not. Uses [Replica.entries] directly (the raw log, including the
+(* The membership question [committed_writes_for] above answers over the committed prefix, asked
+   over the WHOLE log instead -- i.e. "has a batch under this idempotency key ever been APPENDED
+   here", committed or not. Uses [Replica.entries] directly (the raw log, including the
    replicated-but-not-yet-agreed tail) rather than [committed_batch_values].
 
    Why this exists, and why [propose] gates on it rather than on [already_committed] (review
@@ -171,6 +171,36 @@ let redaction_event_id ~idempotency_key ~index =
 
 let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materialize : materialize_sink option)
     ?(encryption : encryption_sink option) (writes : write list) : unit =
+  (* An EMPTY batch is never proposed -- not here, not in any log state (review finding,
+     2026-09-23). This is a real data-destruction path, previously pinned as a known behaviour by
+     test_batch_commit.ml's own [test_empty_batch_permanently_burns_its_key_via_propose] and now
+     closed: an empty batch is perfectly well-formed, so [batch_of_value] decodes it, it claims
+     [idempotency_key] in [committed_envelopes_keyed]'s own first-wins dedup set, and
+     [already_in_log] below makes every LATER propose under that key a no-op. The key is poisoned
+     permanently: a real batch proposed under it afterwards is never committed, never materialized,
+     and nothing raises. What it buys in exchange is nothing at all -- an empty batch contributes
+     zero envelopes and zero materialization -- so there is no state in which writing one is the
+     right thing to do, and the guard is unconditional rather than "only when the key is new".
+
+     Only the PROPOSE half is suppressed; the materialize step below still runs, because
+     [propose t ~idempotency_key ~materialize []] is this module's own documented way for a replica
+     to drive its own committed batch into its own materializer (see batch_commit.mli), and that
+     idiom must stay safe on a replica that has not yet learned of the batch -- a normal, expected
+     state in any multi-replica cluster, not a caller error. Raising there instead would turn an
+     ordinary replication lag into an exception.
+
+     With NO [?materialize] either, the call can have no effect whatsoever -- nothing proposed,
+     nothing materialized -- which is never what a caller meant, so that shape raises rather than
+     silently doing nothing. *)
+  (match (writes, materialize) with
+  | [], None ->
+    invalid_arg
+      "Batch_commit.propose: an empty writes list with no ~materialize sink cannot do anything -- \
+       an empty batch is never proposed (it would permanently claim this idempotency key while \
+       contributing no envelopes, silently swallowing any later real batch under it), and with no \
+       sink there is nothing to materialize either. Pass the batch's writes, or pass ~materialize \
+       to drive an already-committed batch into a materializer."
+  | _ -> ());
   (* Encrypted and materialized are mutually exclusive, and this fails loudly rather than
      silently: the materializer's accumulator holds joined plaintext, lives in its own KV store,
      and is structurally outside the redaction keystore -- so deleting a record's DEK would leave
@@ -184,7 +214,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
         "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
          (~encryption): the materialized accumulator is outside the redaction keystore, so \
          deleting the DEK would not erase it");
-  if not (already_in_log t ~idempotency_key) then begin
+  if writes <> [] && not (already_in_log t ~idempotency_key) then begin
     (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,
        and not a line earlier: encrypting mints a fresh DEK and overwrites the keystore entry for
        this event_id. Doing that on a retry of a batch already in the log -- committed OR merely
@@ -258,8 +288,9 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materializ
        enforced by the guard above at the only moment encryption can happen) can contribute
        nothing to it no matter what a later caller passes.
 
-       [None] here is exactly the old [already_committed t = false] case: not yet committed,
-       nothing to materialize, try again on a later call. Note the consequence that makes this
+       [None] here is exactly the "not committed on this replica (yet)" case the old
+       [already_committed t = false] test covered before this function replaced it: nothing to
+       materialize, try again on a later call. Note the consequence that makes this
        strictly more capable rather than merely safer: because the payloads come from the log
        rather than the argument, ANY replica holding the committed batch can materialize its own
        commit stream -- including with an empty [writes] list -- which is what lets each replica
