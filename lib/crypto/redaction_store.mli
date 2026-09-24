@@ -54,9 +54,24 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     strings {!Riptide_batch_commit.Batch_commit.redaction_event_id} derives -- so one [merge_key]
     shaped like [\{length\}:\{idempotency_key\}#\{index\}] is all it takes.
 
-    All three consequences below were reproduced live, and are pinned by
-    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) rather than
-    reasoned about, because which one you get is not obvious:
+    {b Subtask 4.6 gave {!Riptide_storage.File_kv_store.create} a real, construction-time guard
+    against exactly this}: build the [kv] you pass here with [~owner:"redaction-keystore"] (any
+    fixed, project-wide-unique tag works; this is the one every {!Riptide_crypto} caller in this
+    codebase actually uses), and a second, differently-tagged {!Riptide_storage.File_kv_store.create}
+    aimed at the same directory now raises [Invalid_argument] immediately, before either consumer
+    can touch the shared directory's data at all -- turning the three silent outcomes below into a
+    loud rejection at construction. {b This function itself cannot enforce that}: [create] above
+    receives an already-built [kv], the same way {!Riptide_materialize.Materializer.Make.create}
+    does, so there is no [File_kv_store.create] call inside this module for an owner tag to attach
+    to -- the guard only works if the caller building [kv] opts in. Passing no [~owner] (or two
+    different, uncoordinated tags on the two sides of a real collision) leaves the hazard exactly as
+    unprotected as it was before subtask 4.6, and the three outcomes below still apply in full:
+
+    All three consequences below were reproduced live, and were pinned by
+    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) as the
+    ordinary, no-[~owner] case; that test now proves subtask 4.6's construction-time rejection
+    instead (both sides opting in), which is why what follows is a description of what still
+    happens if you skip [~owner], not something currently exercised end-to-end by that test:
 
     - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
       materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse

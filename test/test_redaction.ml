@@ -30,7 +30,10 @@ let with_store f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+          dir
+      in
       let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
       f (Redaction_store.create ~kv ~kek))
 
@@ -104,7 +107,10 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+          dir
+      in
       let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
       let store = Redaction_store.create ~kv ~kek in
       let v = Riptide.Value.Scalar (Riptide.Value.String "sensitive") in
@@ -373,7 +379,10 @@ let with_store_and_cluster ~replica_count f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+          dir
+      in
       let store = Redaction_store.create ~kv ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32)) in
       let inflight : (int * string) Queue.t = Queue.create () in
       let replicas =

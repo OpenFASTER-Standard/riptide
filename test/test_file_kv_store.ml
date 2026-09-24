@@ -226,6 +226,50 @@ let test_put_and_delete_both_fsync_the_directory () =
     "delete still fsyncs the containing directory too" true
     (contains ~needle:"fsync_dir t" delete_body)
 
+(* -- Subtask 4.6: [create]'s [?owner] closes a confirmed, real data-destruction bug -- sharing one
+   [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator silently
+   corrupts data (three distinct ways, pinned by
+   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test). These three
+   tests cover: a real mismatch is rejected loudly at construction, a matching owner reopens
+   exactly as before, and omitting [owner] entirely leaves every pre-existing caller unaffected. *)
+
+let test_owner_mismatch_is_rejected_at_construction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let (_ : File_kv_store.t) =
+        File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" dir
+      in
+      Alcotest.check_raises "a second, different owner is rejected"
+        (Invalid_argument
+           (Printf.sprintf "File_kv_store.create: %s is owned by \"redaction-keystore\", not \
+                             \"materializer\""
+              dir))
+        (fun () ->
+          ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)))
+
+let test_matching_owner_reopens_cleanly () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t1 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" dir in
+      File_kv_store.put t1 ~key:"k" "v";
+      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" dir in
+      Alcotest.(check (option string)) "the same-owner reopen sees the same data" (Some "v")
+        (File_kv_store.get t2 ~key:"k"))
+
+let test_no_owner_supplied_is_unaffected () =
+  (* Backward compatibility: every existing test/caller that omits [~owner] must see zero
+     behavior change -- this is just an ordinary put/get round trip with no [~owner] argument at
+     all, confirming [create] still works exactly as before this task. *)
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      File_kv_store.put t ~key:"k" "v";
+      Alcotest.(check (option string)) "put/get with no owner tag still works" (Some "v")
+        (File_kv_store.get t ~key:"k"))
+
 let tests =
   [
     ("put then get", `Quick, test_put_then_get);
@@ -239,4 +283,9 @@ let tests =
     ("put is durable across reopen", `Quick, test_put_is_durable_across_reopen);
     ("put and delete both fsync the directory", `Quick,
       test_put_and_delete_both_fsync_the_directory);
+    ("owner mismatch is rejected at construction", `Quick,
+      test_owner_mismatch_is_rejected_at_construction);
+    ("matching owner reopens cleanly", `Quick, test_matching_owner_reopens_cleanly);
+    ("no owner supplied is unaffected (backward compatibility)", `Quick,
+      test_no_owner_supplied_is_unaffected);
   ]

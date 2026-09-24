@@ -296,10 +296,52 @@ let durable_read t path =
               let data = Cstruct.to_string ~len:length data_buf in
               if checksum_of data = checksum then Some data else None))
 
+(* The marker file [check_or_write_owner_marker] reads/writes to enforce exclusive directory
+   ownership -- subtask 4.6's construction-time fix for a confirmed, real data-destruction bug:
+   sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
+   silently destroys data in three distinct ways (pinned, before this task, by
+   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test -- see that
+   test's current form, and [redaction_store.mli]'s own doc comment, for the full history). Named
+   with a leading dot so [Eio.Path.read_dir] callers (none exist on this store today, but the
+   convention is cheap) don't confuse it for a real key file -- real key files are always exactly
+   64 lowercase hex characters ([path_for]'s [hash_to_hex] output), which this name can never
+   collide with. *)
+let owner_marker_name = ".riptide-kv-owner"
+
+(* Enforces that at most one distinct [owner] tag ever claims [dir_path], across every [create] of
+   it for the lifetime of the directory. A no-op when [owner] is [None] -- deliberately: see this
+   file's [.mli] on [create]'s [?owner] for why an opt-out caller is not this function's
+   responsibility to protect from itself.
+
+   Same "try the operation, catch [Eio.Io]" discipline this file's own top comment already
+   documents for every other existence check, since the installed Eio 0.12's [Path] has no
+   [kind]/[stat] check to test first instead: [Eio.Path.load] on a marker that was never written
+   raises [Eio.Io] (confirmed against [path.ml]'s own [load], which opens via [open_in] --
+   the same backend open every other existence check in this file already relies on raising
+   [Eio.Io] for ENOENT), read here as "no owner has claimed this directory yet, this call is the
+   first". [Eio.Path.load]/[Eio.Path.save] themselves are both confirmed real, current functions
+   in the installed Eio 0.12 ([path.mli]) -- [save ~create:(`Exclusive perm)] confirmed via
+   [fs.ml]'s own [type create] variant. *)
+let check_or_write_owner_marker ~fs ~dir_path owner =
+  match owner with
+  | None -> ()
+  | Some tag -> (
+    let marker_path = Eio.Path.(fs / dir_path / owner_marker_name) in
+    match Eio.Path.load marker_path with
+    | existing ->
+      if not (String.equal existing tag) then
+        invalid_arg
+          (Printf.sprintf "File_kv_store.create: %s is owned by %S, not %S" dir_path existing tag)
+    | exception Eio.Io _ -> Eio.Path.save ~create:(`Exclusive 0o600) marker_path tag)
+
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
-   top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). *)
-let create ~sw ~fs dir_path =
+   top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
+   owner-marker check runs strictly after this, since it needs [dir_path] to already exist (an
+   [Eio.Path.save] into a nonexistent directory would itself raise [Eio.Io], indistinguishable
+   from this module's own "no marker yet" case, if the two were reordered). *)
+let create ~sw ~fs ?owner dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
+  check_or_write_owner_marker ~fs ~dir_path owner;
   { sw; fs; dir_path }
 
 let get t ~key = durable_read t (path_for t ~key)

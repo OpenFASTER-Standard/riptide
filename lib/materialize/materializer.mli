@@ -7,7 +7,18 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
   (** [create ~kv ~decode ~encode] creates a materializer backed by [kv], with [decode]/[encode]
       for round-tripping the lattice type [L.t] to/from the store's string value format.
       Durably folds all future [write] calls to the same [merge_key] into a single, live
-      accumulator — the join of all values ever seen, regardless of call order. *)
+      accumulator — the join of all values ever seen, regardless of call order.
+
+      {b [kv] is received already built, never constructed here.} This functor is generic over
+      {!Riptide_storage.Kv_store_intf.S}, which is deliberately backend-agnostic and carries no
+      notion of directory ownership at all (see that module type's own comment) -- so subtask
+      4.6's construction-time exclusive-ownership guard against a real, confirmed hazard (an
+      accumulator sharing its directory with a {!Riptide_crypto.Redaction_store} keystore
+      silently destroys the keystore's data; see that module's own [.mli] for the full account)
+      lives entirely in {!Riptide_storage.File_kv_store.create}'s [?owner], at the point where
+      the caller builds the [kv] passed in here, not in this function. A caller backing a
+      materializer with {!Riptide_storage.File_kv_store} should pass its own distinct
+      [~owner] tag (e.g. ["materializer"]) to that [create] call to get the protection. *)
 
   val write : t -> merge_key:string -> L.t -> unit
   (** [write t ~merge_key value] durably merges [value] into the accumulator at [merge_key]

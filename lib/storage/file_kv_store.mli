@@ -37,10 +37,34 @@ val max_value_size : int
     happens when it does, and test_lattice_materialize_crypto_scenarios.ml for the running
     reproduction. *)
 
-val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> string -> t
-(** [create ~sw ~fs dir_path] opens (creating if necessary) a key-value store directory at
+val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> ?owner:string -> string -> t
+(** [create ~sw ~fs ?owner dir_path] opens (creating if necessary) a key-value store directory at
     [dir_path]. Every key already durably [put] on a previous [create] of the same [dir_path]
     is visible again immediately -- there is no separate recovery scan needed (unlike
     {!Riptide_storage.File_storage.create}'s ring-highest-op-number reconstruction): each
     key's own file either exists with a valid record or doesn't, and {!get} re-derives that
-    per call directly from disk rather than from any in-memory state built at [create] time. *)
+    per call directly from disk rather than from any in-memory state built at [create] time.
+
+    {b [?owner], subtask 4.6's construction-time fix for a confirmed, real data-destruction bug}:
+    this store's key space is flat and untyped (one file per key, named by the key's own content
+    hash), so nothing stops two unrelated consumers from independently pointing [create] at the
+    same [dir_path] -- and when that happens, they silently corrupt each other's data (see
+    {!Riptide_crypto.Redaction_store}'s own [.mli] for the exact, previously-pinned three-way
+    reproduction: a keystore and a {!Riptide_materialize.Materializer} sharing one directory).
+
+    When [owner] is [Some tag], [create] writes a small marker file recording [tag] the first
+    time any caller claims [dir_path], and on every later [create] of the same [dir_path] with a
+    [Some] owner, compares the new [tag] against the marker: a mismatch raises [Invalid_argument]
+    immediately, before this call returns a usable [t] and before either consumer can touch the
+    shared directory's data at all. A matching [tag] (e.g. the same subsystem reopening its own
+    store) succeeds exactly as it always did.
+
+    [owner] is optional, and omitting it is a pure no-op with respect to this check -- for
+    backward compatibility, and because it cannot be otherwise: a directory with no marker at all
+    (every [dir_path] that predates this task, or whose callers simply never opt in) has nothing
+    to compare a later [Some tag] against, so the first [Some]-owner [create] of such a directory
+    always succeeds and starts the marker fresh from that point on. Concretely: if EITHER side of
+    a real collision omits [owner] -- not just both -- the pair is exactly as unprotected as
+    before this task existed. Opting a directory in requires every consumer of it to pass
+    [~owner], consistently, from that directory's very first [create] onward; this function has
+    no way to retroactively protect a caller who chooses not to. *)
