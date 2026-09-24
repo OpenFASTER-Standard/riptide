@@ -1,6 +1,9 @@
 open Riptide
 open Riptide_vsr
 open Riptide_batch_commit
+open Riptide_crypto
+
+let () = Mirage_crypto_rng_unix.use_default ()
 
 let record_value name = Value.Record [ ("name", Value.Scalar (Value.String name)) ]
 let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
@@ -15,6 +18,29 @@ let create_solo () =
 
 let w ~actor ~causation ~correlation ?(merge_key = None) payload : Batch_commit.write =
   { actor; causation; correlation; payload; merge_key }
+
+(* Real encryption_sink construction against a real Redaction_store, for the
+   require_encryption tests below -- reusing test_redaction.ml's own with_tmp_dir/with_store/
+   sink_of pattern rather than inventing a new one (this file has no other need for a real
+   keystore, so the helpers live here rather than being shared/exported). *)
+let with_tmp_dir f =
+  let dir = Filename.temp_file "riptide_batch_commit_test" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () -> f dir)
+
+let with_store f =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      f (Redaction_store.create ~kv ~kek))
+
+let sink_of store : Batch_commit.encryption_sink =
+  { encrypt = (fun ~event_id v -> Redaction_store.encrypt_value store ~event_id v) }
 
 let test_empty_batch_commits_as_zero_envelopes () =
   let t = create_solo () in
@@ -380,6 +406,52 @@ let test_propose_with_different_keys_both_land () =
   Alcotest.(check int) "two distinct keys both commit" 2 (List.length envelopes);
   Alcotest.(check bool) "the resulting chain verifies" true (Log.verify_chain_list envelopes)
 
+(* Deployment-level policy primitive (task-master subtask 4.5): a deployment that wants to
+   enforce "every write through this path must be encrypted" previously had no way to do so --
+   ~encryption was purely opt-in per call, so a caller that simply omitted it silently produced a
+   plaintext-in-the-log write with no error anywhere. *)
+let test_require_encryption_rejects_a_plaintext_propose () =
+  let t = create_solo () in
+  let actor = "actor-1" in
+  Alcotest.check_raises "require_encryption:true with no ~encryption sink raises"
+    (Invalid_argument
+       "Batch_commit.propose: require_encryption is true but no ~encryption sink was supplied")
+    (fun () ->
+      Batch_commit.propose t ~idempotency_key:"k1" ~require_encryption:true
+        [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ])
+
+let test_require_encryption_true_with_a_real_sink_succeeds () =
+  with_store (fun store ->
+      let t = create_solo () in
+      let actor = "actor-1" in
+      Batch_commit.propose t ~idempotency_key:"k2" ~require_encryption:true ~encryption:(sink_of store)
+        [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ];
+      Alcotest.(check int) "the batch committed" 1 (List.length (Batch_commit.committed_envelopes t)))
+
+(* Review Focus: require_encryption must not mask or confuse the pre-existing merge_key +
+   ~encryption rejection (from the just-merged plan's own Task 6) -- one clear failure, not two
+   competing ones. Here require_encryption's own check can't even fire (~encryption IS supplied),
+   so the ORIGINAL merge_key rejection must still be the one that raises, verbatim. *)
+let test_require_encryption_true_still_raises_for_the_pre_existing_merge_key_reason () =
+  with_store (fun store ->
+      let t = create_solo () in
+      let actor = "actor-1" in
+      let bad_write =
+        {
+          (w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello"))
+          with
+          merge_key = Some "mk";
+        }
+      in
+      Alcotest.check_raises "merge_key + encryption is still rejected, unchanged by require_encryption"
+        (Invalid_argument
+           "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
+            (~encryption): the materialized accumulator is outside the redaction keystore, so \
+            deleting the DEK would not erase it")
+        (fun () ->
+          Batch_commit.propose t ~idempotency_key:"k3" ~require_encryption:true ~encryption:(sink_of store)
+            [ bad_write ]))
+
 let tests =
   [
     ("empty batch commits as zero envelopes", `Quick, test_empty_batch_commits_as_zero_envelopes);
@@ -401,4 +473,10 @@ let tests =
     ("an empty batch is never proposed and never burns its key", `Quick,
       test_an_empty_batch_is_never_proposed_and_never_burns_its_key);
     ("propose with two distinct keys: both land", `Quick, test_propose_with_different_keys_both_land);
+    ("require_encryption:true rejects a plaintext propose", `Quick,
+      test_require_encryption_rejects_a_plaintext_propose);
+    ("require_encryption:true with a real ~encryption sink succeeds", `Quick,
+      test_require_encryption_true_with_a_real_sink_succeeds);
+    ("require_encryption:true still raises for the pre-existing merge_key + encryption reason", `Quick,
+      test_require_encryption_true_still_raises_for_the_pre_existing_merge_key_reason);
   ]

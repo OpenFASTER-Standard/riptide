@@ -169,8 +169,16 @@ type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value
 let redaction_event_id ~idempotency_key ~index =
   Printf.sprintf "%d:%s#%d" (String.length idempotency_key) idempotency_key index
 
-let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(materialize : materialize_sink option)
-    ?(encryption : encryption_sink option) (writes : write list) : unit =
+let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_encryption = false)
+    ?(materialize : materialize_sink option) ?(encryption : encryption_sink option) (writes : write list) : unit =
+  (* Deployment-level policy: a deployment that wants to enforce "every write through this path
+     must be encrypted" previously had no way to say so -- ~encryption was purely opt-in per call,
+     so an ordinary caller that simply forgot it produced a silent plaintext write with no error
+     anywhere. This is checked FIRST, before the pre-existing merge_key+encryption rejection below,
+     so a caller who somehow triggers both sees the more fundamental policy violation
+     (require_encryption with no sink at all) rather than a check that presupposes a sink exists. *)
+  if require_encryption && encryption = None then
+    invalid_arg "Batch_commit.propose: require_encryption is true but no ~encryption sink was supplied";
   (* An EMPTY batch is never proposed -- not here, not in any log state (review finding,
      2026-09-23). This is a real data-destruction path, previously pinned as a known behaviour by
      test_batch_commit.ml's own [test_empty_batch_permanently_burns_its_key_via_propose] and now

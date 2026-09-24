@@ -5,7 +5,15 @@
     Not safe for concurrent access from multiple OCaml 5 domains: [append]
     does an unsynchronized read-modify-write on the log's internal state,
     so two domains appending concurrently can race and assign a duplicate
-    [sequence], forking the chain. Single-domain only for now. *)
+    [sequence], forking the chain. Single-domain only for now.
+
+    A pre-VSR-consensus prototype module, superseded by {!Riptide_batch_commit.Batch_commit} plus
+    {!Riptide_vsr.Replica} for real replicated writes -- confirmed via a repo-wide grep to have no
+    production callers as of this writing ([append] is called only from this module's own tests).
+    Not a production write path, and therefore intentionally NOT covered by
+    {!Riptide_batch_commit.Batch_commit.propose}'s [?require_encryption] or any of that module's
+    other opt-in capabilities ([?materialize], [?encryption]) -- those are deployment-level policy
+    for the real write path, and this module isn't it. *)
 
 type log
 

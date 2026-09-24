@@ -155,12 +155,13 @@ type encryption_sink = {
 val propose :
   Riptide_vsr.Replica.t ->
   idempotency_key:string ->
+  ?require_encryption:bool ->
   ?materialize:materialize_sink ->
   ?encryption:encryption_sink ->
   write list ->
   unit
-(** [propose t ~idempotency_key ?materialize ?encryption writes] proposes [writes] as one atomic
-    batch through
+(** [propose t ~idempotency_key ?require_encryption ?materialize ?encryption writes] proposes
+    [writes] as one atomic batch through
     {!Riptide_vsr.Replica.propose} -- matching that function's own fire-and-forget convention: no
     return value, no client acknowledgment. Telling a caller whether/when their batch committed is
     explicitly out of scope here (task-master Task 9's job).
@@ -168,6 +169,17 @@ val propose :
     Like the underlying {!Riptide_vsr.Replica.propose} itself, this is a silent no-op (not an
     error) unless [t] is currently the primary in [Normal] status -- see that function's own doc
     comment for the exact guard.
+
+    {b [require_encryption]} (default [false]) is a deployment-level policy primitive, checked
+    first, before every other guard in this function: if [true] and no [?encryption] sink is
+    supplied, this raises [Invalid_argument] rather than silently proposing plaintext. {!encryption_sink}
+    above is deliberately opt-in per call -- policy for whether a given call site encrypts lives at
+    that call site, not inside this mechanism, matching {!materialize_sink}'s own framing -- but
+    that leaves a real gap for a deployment that wants "every write through this path is
+    encrypted, no exceptions" as an enforced invariant rather than a convention every call site has
+    to remember unaided. A real deployment choosing to run encrypted should always pass
+    [~require_encryption:true] from its own calling code, not merely pass [~encryption] and hope no
+    call site elsewhere in the same deployment forgets it.
 
     Checks first whether [idempotency_key] already appears among the batches in [t]'s own log --
     the WHOLE log as {!Riptide_vsr.Replica.entries} reports it, including the
