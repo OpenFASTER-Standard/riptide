@@ -671,6 +671,33 @@ let test_ring_capacity_boundary () =
       Alcotest.(check bool) "views kept climbing as each attempt forfeited" true
         (List.exists (fun v -> v >= 3) views))
 
+(* SOAK TEST, subtask 3.8: this exact scenario (same hardcoded seed:1 as [run_until_view_change]
+   above) was independently reproduced flaking at ~5% (2/40 isolated runs of
+   `dune exec test/test_riptide.exe -- test dst_scenarios 5`) before [lib/sim/network.ml]'s fault
+   decisions were keyed per-sender instead of drawn from one shared, send-order-consumed PRNG
+   stream -- a stream whose consumption order depended on real [File_storage] I/O completion
+   timing (which replica's fiber resumes first after a real io_uring completion), not on anything
+   seeded. Running the identical scenario N times in one process, each against a fresh real
+   [File_storage] directory, is the same reproduction technique the flake was originally isolated
+   with, kept here as permanent regression coverage rather than only a one-off shell loop. *)
+let test_ring_capacity_boundary_soak () =
+  for iteration = 1 to 20 do
+    Eio_main.run @@ fun env ->
+    with_tmp_dir (fun dir ->
+        let ok, views = run_until_view_change ~env ~dir ~ring_capacity:small_ring in
+        Alcotest.(check bool)
+          (Printf.sprintf
+             "soak iteration %d/20: with a log of %d ops in a ring of %d, no view change can ever \
+              complete -- the cluster is permanently in View_change (views reached: %s)"
+             iteration ops_past_ring small_ring
+             (String.concat "," (List.map string_of_int views)))
+          false ok;
+        Alcotest.(check bool)
+          (Printf.sprintf "soak iteration %d/20: views kept climbing as each attempt forfeited"
+             iteration)
+          true
+          (List.exists (fun v -> v >= 3) views))
+  done
 
 (* ---------------------------------------------------------------------------------------------
    Test 5: on-the-wire payload corruption breaks cross-replica agreement. A running reproduction of
@@ -734,7 +761,15 @@ let clean_encodings =
 let is_clean enc = Hashtbl.mem clean_encodings enc
 
 let test_wire_corruption_diverges_committed_state () =
-  let seed = 4 and replica_count = 3 in
+  (* [seed] re-picked (was 4) after subtask 3.8's fix keyed Network.send's fault decisions
+     per-sender instead of drawing them from one send-order-consumed stream (lib/sim/network.ml):
+     that changed which seed happens to land a corrupting flip on the one decisive message this
+     test's assertions need, since it is a genuinely different derivation from the same integer,
+     not a compatible re-seeding. Re-searched by sweeping seeds 1-160 for one that still reproduces
+     both pinned facts (a divergence AND a cluster-wide erasure) under the new derivation; this
+     scenario runs on Eio_mock.Backend (no real I/O), so it was never the source of the flake this
+     fix closes and is fully deterministic for a fixed seed both before and after. *)
+  let seed = 71 and replica_count = 3 in
   let c = make_checker ~seed ~replica_count in
   (* Final state, captured inside the run because [replicas] does not outlive it: per replica, for
      each op_number it holds, what it has in memory and what it can actually read back off its own
@@ -814,8 +849,11 @@ let test_wire_corruption_diverges_committed_state () =
     erased;
   print_newline ();
   Alcotest.(check bool)
-    "seed 4, 3 replicas, one flipped payload byte and nothing else: replicas report different \
-     values committed at the same op_number (see this test's own comment -- pinned, not endorsed)"
+    (Printf.sprintf
+       "seed %d, 3 replicas, one flipped payload byte and nothing else: replicas report \
+        different values committed at the same op_number (see this test's own comment -- \
+        pinned, not endorsed)"
+       seed)
     true
     (divergences <> []);
   (* THE SEVERITY, pinned separately and deliberately: this is not merely disagreement between
@@ -927,4 +965,9 @@ let tests =
       test_wire_corruption_diverges_committed_state);
     ( "C1/I1: a crash with a torn superblock refuses to come back, and the data survives", `Quick,
       test_a_crash_with_a_torn_superblock_refuses_to_come_back );
+    (* Appended, not inserted earlier in this list, so every other test's index (several of which
+       are cited by number in doc comments and shell commands elsewhere in this file) stays
+       stable. *)
+    ("ring capacity boundary soak (subtask 3.8 regression coverage, 20 iterations)", `Quick,
+      test_ring_capacity_boundary_soak);
   ]

@@ -51,7 +51,7 @@ let run_scenario ~env ~seed ~replica_count ~ring_capacity ~rounds ~ops_per_round
   let fs = Eio.Stdenv.fs env in
   (try
      Eio.Switch.run @@ fun sw ->
-     let n = Riptide_sim.Network.create ~faults:net (Riptide_sim.Prng.create net_seed) () in
+     let n = Riptide_sim.Network.create ~faults:net ~seed:net_seed () in
      for id = 1 to replica_count do
        Riptide_sim.Network.register n (string_of_int id)
      done;

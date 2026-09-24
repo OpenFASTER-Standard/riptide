@@ -16,8 +16,8 @@ type t = { net : string Network.t; me : int; corrupt : string -> string }
    it was, so this adds a fault surface rather than changing one. *)
 let create ?(corrupt = Fun.id) net me = { net; me; corrupt }
 
-let create_cluster ?faults prng peer_count =
-  let net = Network.create ?faults prng () in
+let create_cluster ?faults ~seed peer_count =
+  let net = Network.create ?faults ~seed () in
   Array.init peer_count (fun i ->
       Network.register net (string_of_int i);
       create net i)

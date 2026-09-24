@@ -3,8 +3,7 @@ open Riptide_sim
 
 let test_send_and_receive () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let net = Network.create ~seed:1 () in
   Network.register net "a";
   Network.register net "b";
   Network.send Fun.id net ~from_:"a" ~to_:"b" "hello";
@@ -13,8 +12,7 @@ let test_send_and_receive () =
 
 let test_deterministic_two_fiber_exchange () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let net = Network.create ~seed:1 () in
   Network.register net "a";
   Network.register net "b";
   let trace = ref [] in
@@ -50,9 +48,8 @@ let test_fiber_suspends_on_virtual_clock_and_wakes_via_pump () =
      running - verified live while developing this test: deleting that call from [pump_one]
      turns this exact test red. *)
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
   let faults = { Network.default_fault_config with min_delay = 6.0; max_delay = 6.0 } in
-  let net = Network.create ~faults prng () in
+  let net = Network.create ~faults ~seed:1 () in
   Network.register net "a";
   Network.register net "b";
   let events = ref [] in
@@ -99,8 +96,7 @@ let test_interleaving_with_active_fault_injection_is_deterministic () =
   let guaranteed_per_peer = message_count / List.length peers in
   let run seed =
     Eio_mock.Backend.run @@ fun () ->
-    let prng = Prng.create seed in
-    let net = Network.create ~faults prng () in
+    let net = Network.create ~faults ~seed () in
     List.iter (Network.register net) peers;
     let events = ref [] in
     let record ev = events := ev :: !events in
@@ -163,8 +159,7 @@ let test_interleaving_with_active_fault_injection_is_deterministic () =
 
 let test_receive_nonblocking_empty () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let net = Network.create ~seed:1 () in
   Network.register net "a";
   Alcotest.(check bool) "no message yet" true (Network.receive_nonblocking net "a" = None)
 

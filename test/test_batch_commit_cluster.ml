@@ -31,8 +31,7 @@ exception Replica_stopped
    isolate/reconnect -- this file has no need to construct divergent survivor logs. *)
 let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int -> unit) -> settle:(unit -> unit) -> unit) =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let net = Network.create ~seed:1 () in
   for id = 1 to replica_count do
     Network.register net (string_of_int id)
   done;

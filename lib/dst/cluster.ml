@@ -94,9 +94,7 @@ let check_storage_fault_config ~replica_count ~faults_max
 let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
     ~make_storage ~wait_io ~delivery_rounds body =
   let net_seed, storage_seeds = split_seed seed ~replica_count in
-  let net =
-    Riptide_sim.Network.create ~faults:net_fault_config (Riptide_sim.Prng.create net_seed) ()
-  in
+  let net = Riptide_sim.Network.create ~faults:net_fault_config ~seed:net_seed () in
   for id = 1 to replica_count do
     Riptide_sim.Network.register net (string_of_int id)
   done;

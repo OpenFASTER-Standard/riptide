@@ -3,8 +3,7 @@ open Riptide_sim
 
 let test_zero_faults_behaves_like_task_2 () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () in
+  let net = Network.create ~seed:1 () in
   Network.register net "a";
   Network.register net "b";
   Network.send Fun.id net ~from_:"a" ~to_:"b" "hello";
@@ -14,8 +13,7 @@ let test_zero_faults_behaves_like_task_2 () =
 
 let test_drop_probability_one_means_never_delivered () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 2 in
-  let net = Network.create ~faults:{ Network.default_fault_config with drop_probability = 1.0 } prng () in
+  let net = Network.create ~faults:{ Network.default_fault_config with drop_probability = 1.0 } ~seed:2 () in
   Network.register net "a";
   Network.register net "b";
   Network.send Fun.id net ~from_:"a" ~to_:"b" "hello";
@@ -24,8 +22,7 @@ let test_drop_probability_one_means_never_delivered () =
 
 let test_duplicate_probability_one_means_delivered_twice () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 3 in
-  let net = Network.create ~faults:{ Network.default_fault_config with duplicate_probability = 1.0 } prng () in
+  let net = Network.create ~faults:{ Network.default_fault_config with duplicate_probability = 1.0 } ~seed:3 () in
   Network.register net "a";
   Network.register net "b";
   Network.send Fun.id net ~from_:"a" ~to_:"b" "hello";
@@ -36,8 +33,7 @@ let test_duplicate_probability_one_means_delivered_twice () =
 
 let test_corrupt_probability_one_always_applies_corruption_fn () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 4 in
-  let net = Network.create ~faults:{ Network.default_fault_config with corrupt_probability = 1.0 } prng () in
+  let net = Network.create ~faults:{ Network.default_fault_config with corrupt_probability = 1.0 } ~seed:4 () in
   Network.register net "a";
   Network.register net "b";
   Network.send String.uppercase_ascii net ~from_:"a" ~to_:"b" "hello";
@@ -46,8 +42,7 @@ let test_corrupt_probability_one_always_applies_corruption_fn () =
 
 let test_corruption_applied_at_delivery_not_at_send () =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 6 in
-  let net = Network.create ~faults:{ Network.default_fault_config with corrupt_probability = 1.0 } prng () in
+  let net = Network.create ~faults:{ Network.default_fault_config with corrupt_probability = 1.0 } ~seed:6 () in
   Network.register net "a";
   Network.register net "b";
   let applied = ref false in
@@ -60,9 +55,8 @@ let test_corruption_applied_at_delivery_not_at_send () =
 let test_same_seed_same_fault_decisions () =
   let run seed =
     Eio_mock.Backend.run @@ fun () ->
-    let prng = Prng.create seed in
     let faults = { Network.default_fault_config with drop_probability = 0.5; duplicate_probability = 0.3 } in
-    let net = Network.create ~faults prng () in
+    let net = Network.create ~faults ~seed () in
     Network.register net "a";
     Network.register net "b";
     for i = 1 to 50 do
@@ -88,8 +82,7 @@ let test_delay_based_reordering () =
   let faults = { Network.default_fault_config with min_delay = 0.0; max_delay = 10.0 } in
   let run seed =
     Eio_mock.Backend.run @@ fun () ->
-    let prng = Prng.create seed in
-    let net = Network.create ~faults prng () in
+    let net = Network.create ~faults ~seed () in
     Network.register net "a";
     Network.register net "b";
     List.iter (fun payload -> Network.send Fun.id net ~from_:"a" ~to_:"b" payload) payloads;

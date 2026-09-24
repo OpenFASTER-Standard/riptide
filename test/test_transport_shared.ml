@@ -83,8 +83,7 @@ let test_sim_echo_between_peers () =
      ever sees a plain [unit -> unit] [run] and a plain [unit -> T.t array] [make_cluster]. *)
   let cluster_ref = ref [||] in
   let make_cluster () =
-    let prng = Riptide_sim.Prng.create 1 in
-    let cluster = Riptide_sim.Sim_transport.create_cluster prng 3 in
+    let cluster = Riptide_sim.Sim_transport.create_cluster ~seed:1 3 in
     cluster_ref := cluster;
     cluster
   in

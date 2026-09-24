@@ -728,8 +728,7 @@ let with_cluster_and_storage ~replica_count ~svc_limit
       reconnect:(int -> unit) ->
       unit) =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Riptide_sim.Prng.create 1 in
-  let net = Riptide_sim.Network.create prng () (* faults default to Network.default_fault_config *) in
+  let net = Riptide_sim.Network.create ~seed:1 () (* faults default to Network.default_fault_config *) in
   for id = 1 to replica_count do
     Riptide_sim.Network.register net (string_of_int id)
   done;

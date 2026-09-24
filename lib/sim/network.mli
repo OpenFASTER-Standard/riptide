@@ -1,7 +1,14 @@
-(** An in-memory, peer-addressed, fault-injecting network for deterministic simulation. All fault
-    decisions are drawn from the single {!Prng.t} passed to {!create} — the same seed always
-    produces the same sequence of drop/duplicate/corrupt decisions and delays, called in the same
-    order. *)
+(** An in-memory, peer-addressed, fault-injecting network for deterministic simulation. Fault
+    decisions (drop/duplicate/corrupt) are keyed per-sender: the same [seed] always produces the
+    same decision for "the Nth message a given sender ([~from_]) sends", regardless of the real
+    order {!send} is called in across different senders — i.e. independent of cross-replica
+    delivery interleaving, which is the one thing genuine (non-mocked) I/O timing can vary run to
+    run. This is deliberately NOT "the same seed produces the same sequence of decisions in the
+    same [send]-call order" (a promise this module's earlier docs made but never actually held
+    under real, non-mocked I/O — a shared, order-consumed PRNG made fault decisions depend on
+    whichever replica's fiber happened to resume first after a real I/O completion). Delivery
+    *delay* jitter (see {!schedule}) is unaffected by this and still comes from one shared stream
+    seeded at {!create} time, since delay jitter was never what caused that dependence. *)
 
 type peer_id = string
 type 'msg t
@@ -18,8 +25,14 @@ val default_fault_config : fault_config
 (** All probabilities [0.0], [min_delay = max_delay = 0.0] — i.e. immediate, reliable, single
     delivery, matching this module's Task 2 behavior exactly. *)
 
-val create : ?faults:fault_config -> Prng.t -> unit -> 'msg t
-(** [create ?faults prng ()] is a new network. [faults] defaults to {!default_fault_config}. *)
+val create : ?faults:fault_config -> seed:int -> unit -> 'msg t
+(** [create ?faults ~seed ()] is a new network. [faults] defaults to {!default_fault_config}. Fault
+    decisions are derived from [seed] plus each sender's own send count (see this module's top
+    comment and {!send}) — [seed] is threaded through explicitly rather than a caller-supplied
+    {!Prng.t} precisely so this module owns deriving those per-sender sub-seeds itself, rather than
+    a caller handing in one already-built {!Prng.t} whose own internal seed cannot be recovered
+    from it. Delivery-delay jitter still comes from one {!Prng.t} seeded from [seed] at this call,
+    shared across all sends -- unaffected by, and not the cause of, the per-sender keying above. *)
 
 val register : 'msg t -> peer_id -> unit
 (** [register net id] gives [id] an inbox on [net]. Sending to or receiving from an

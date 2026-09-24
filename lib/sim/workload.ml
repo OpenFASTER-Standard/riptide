@@ -108,7 +108,7 @@ let random_payload prng =
 let run_toy_cluster ~seed ~peer_count ~message_count ~faults =
   Eio_mock.Backend.run @@ fun () ->
   let prng = Prng.create seed in
-  let net = Network.create ~faults prng () in
+  let net = Network.create ~faults ~seed () in
   let peers = List.init peer_count peer_name in
   List.iter (Network.register net) peers;
   let trace = ref [] in

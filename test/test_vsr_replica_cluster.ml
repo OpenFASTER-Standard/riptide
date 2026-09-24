@@ -101,8 +101,7 @@ let record_value name =
 let with_cluster ?(replica_count = default_replica_count)
     (body : replicas:Replica.t array -> settle:(unit -> unit) -> net:string Network.t -> unit) =
   Eio_mock.Backend.run @@ fun () ->
-  let prng = Prng.create 1 in
-  let net = Network.create prng () (* faults default to Network.default_fault_config *) in
+  let net = Network.create ~seed:1 () (* faults default to Network.default_fault_config *) in
   for id = 1 to replica_count do
     Network.register net (string_of_int id)
   done;

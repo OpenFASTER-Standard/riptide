@@ -68,9 +68,10 @@ val create : ?corrupt:(string -> string) -> string Network.t -> int -> t
 (** [create net me] is a handle onto [net], acting as peer [me]. [me] must already be registered
     on [net] (i.e. [Network.register net (string_of_int me)] must have already been called) --
     {!receive}/{!receive_nonblocking} below raise [Invalid_argument] (via {!Network}'s own check)
-    if it isn't. {!send} does NOT validate [me]'s own registration this way: [Network.send]
-    ignores its [~from_] argument entirely, so an unregistered sender is not rejected at {!send}
-    time -- a send to an unregistered {e destination} is also not rejected at {!send} time, only
+    if it isn't. {!send} does NOT validate [me]'s own registration this way: [Network.send] never
+    checks whether [~from_] is a registered peer (it only uses [~from_] to key fault decisions per
+    sender, not to validate it), so an unregistered sender is not rejected at {!send} time -- a
+    send to an unregistered {e destination} is also not rejected at {!send} time, only
     deferred until a later {!pump_one}/{!pump_all} attempts delivery, where it can surface far
     from the original {!send} call. This is real, pre-existing {!Network} behavior this adapter
     faithfully passes through, not something introduced here. Multiple {!t}s may be created over
@@ -78,9 +79,9 @@ val create : ?corrupt:(string -> string) -> string Network.t -> int -> t
     sends/receives/pumps against it, matching {!Network.t} itself being a single shared
     god's-eye-view fabric. *)
 
-val create_cluster : ?faults:Network.fault_config -> Prng.t -> int -> t array
-(** [create_cluster ?faults prng peer_count] is a convenience wrapper around {!Network.create} +
-    {!Network.register} + {!create}: a fresh [string Network.t] (seeded from [prng], with fault
+val create_cluster : ?faults:Network.fault_config -> seed:int -> int -> t array
+(** [create_cluster ?faults ~seed peer_count] is a convenience wrapper around {!Network.create} +
+    {!Network.register} + {!create}: a fresh [string Network.t] (seeded from [seed], with fault
     behavior [faults], defaulting to {!Network.default_fault_config} same as {!Network.create}
     itself), with peer ids [0, 1, ..., peer_count - 1] registered on it, returning one {!t} per
     peer id, indexed so the array's [i]-th element is the handle for peer [i]. All returned
