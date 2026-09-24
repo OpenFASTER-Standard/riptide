@@ -249,7 +249,7 @@
           {
             "id": 7,
             "title": "Resolve File_storage's ring-capacity data-loss/liveness wedge",
-            "description": "File_storage's fixed-size ring WAL silently destroys committed, acknowledged entries once a log exceeds ring_capacity, and with no checkpointing anywhere in this system yet, every entry stays live forever -- so the cluster permanently, cluster-wide wedges (fails loudly, not silently, but wedges nonetheless) once any replica's log outgrows its ring.",
+            "description": "File_storage's fixed-size ring WAL silently destroys committed, acknowledged entries once a log exceeds ring_capacity, and with no checkpointing anywhere in this system yet, every entry stays live forever -- so the cluster permanently, cluster-wide wedges (fails loudly, not silently, but wedges nonetheless) once any replica's log outgrows its ring. UPDATE from task-master Task 4's work: PARTIALLY addressed for opted-in writes. Batch_commit.propose's ?merge_key now folds a write into a durable Materializer accumulator synchronously with commit, which makes ring eviction safe by construction FOR THE CASE where the same propose call observes the commit (a solo/replica_count=1 replica, or a replica an operator explicitly drives via `propose ~materialize:sink []` after the fact). The GENERAL watermark/eviction interlock this subtask's own text originally envisioned (File_storage's ring itself refusing to evict an entry until materialization has caught up, for a real replica_count>=3 cluster with async commit) was never built -- file_storage.ml is untouched by task-master Task 4's work. A real replica_count>=3 follower does not automatically materialize anything off an async commit; the hazard remains open for any write that never opts into ?merge_key, and for opted-in writes on a follower nobody drives. Kept pending, not closed -- see task-master Task 4's new subtask 4.5 (encryption ubiquity) for the analogous 'opt-in mechanism exists, general/automatic case doesn't' pattern this same work left in a second place.",
             "status": "pending",
             "dependencies": [
               "4"
@@ -257,6 +257,15 @@
             "details": "Found and reproduced deterministically (zero injected faults needed) during subtask 3.4's adversarial hunt, pinned as a permanent failing-by-design regression test (test/test_dst_scenarios.ml test 5) rather than fixed, since the obvious fix (refuse to evict a live entry) reverses a documented Tasks 1-3 design decision this project's own governance rule reserves for a small, aligned group. The real fix is almost certainly task-master Task 4's own scope (\"the incremental-projection mechanism so reads never replay the full log from sequence zero\") or an explicit, safe retention contract -- coordinate with Task 4 rather than solving this in isolation; hence the dependency.",
             "testStrategy": "",
             "parentId": "undefined"
+          },
+          {
+            "id": 8,
+            "title": "Fix dst_scenarios' wall-clock-dependent flake in the ring-capacity-boundary view-change test",
+            "description": "test_dst_scenarios.ml's ring-capacity-boundary view-change test (\"with a ring bigger than the log, the view change completes and every replica is Normal\") flakes at roughly 5% (reproduced 2/40 in isolated runs). Root cause: lib/dst/cluster.ml's settle() uses a real wall-clock sleep (Eio.Time.sleep clock 0.0001) as its wait_io budget, and delivery_rounds/io_waits' bounded budgets depend on real I/O batching timing, which shifts the order the seeded network fault stream gets consumed in -- a genuine pre-existing timing sensitivity in every run_on_file_storage-backed DST test, not caused by any of task-master Task 4's own work (confirmed: none of Task 4's new modules are even link-reachable from dst_scenarios' own dune library list).",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Found and independently reproduced during task-master Task 4's own final whole-branch review (2/40 isolated dst_scenarios runs) while investigating a claimed regression that turned out to be unrelated. Real fix: make settle()'s completion criterion independent of real wall-clock I/O timing -- e.g. drive it off a deterministic step/tick count instead of a real Eio.Time.sleep-based budget, matching this project's own DST-determinism goals more closely than the current mechanism does.",
+            "testStrategy": ""
           }
         ]
       },
@@ -264,7 +273,7 @@
         "id": "4",
         "title": "Lattice merge-law contract and incremental materialized state",
         "description": "Define the rule that mergeable types must satisfy join-semilattice laws, and build the incremental-projection mechanism so reads never replay the full log from sequence zero.",
-        "status": "pending",
+        "status": "in-progress",
         "priority": "high",
         "dependencies": [
           "3"
@@ -276,41 +285,115 @@
             "id": 1,
             "title": "Define and formally specify the join-semilattice law contract",
             "description": "The RULE that any type claiming to be mergeable must satisfy commutative/associative/idempotent join - this is Layer 0 mechanism. Which concrete lattice a given domain module uses for its own data is Layer 2 policy.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
-            "details": "Property-test: merge is order-independent and repeat-safe for any type claiming the contract.",
+            "details": "Property-test: merge is order-independent and repeat-safe for any type claiming the contract. DELIVERED: lib/lattice/lattice_intf.ml (module type S = { type t; val bottom; val join }) plus a reusable QCheck conformance harness (test/lattice_conformance.ml) checked against a concrete Last_write_wins instance and a deliberately-broken counter-instance (proving the harness is non-vacuous). Final whole-branch review found and fixed a real law violation in Last_write_wins.bottom itself (join bottom x <> x for ~half of possible values at the exact Int64.min_int timestamp boundary -- the harness's uniform-random generator could not have caught it; fixed with a structural bottom short-circuit in join, verified via a targeted corner-case generator).",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "a35ba79ff5ee4024c606d4b47fd3162acf04e8cc",
+                "cef284cd5a7de968f46bcaa0ccc00963252cb275",
+                "cb0ea7f1cb2b5cb2f68262c421d216879b573ae4"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 2,
             "title": "Build the incremental-projection (CQRS) mechanism",
             "description": "Log is source of truth; every read hits a materialized, incrementally-maintained projection, never a full replay. Mirrors the proven EventStoreDB/Marten/Axon pattern.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
-            "details": "Benchmark: read latency must stay flat as total log history grows, unlike the old Riptide's O(total history) get_since/2.",
+            "details": "Benchmark: read latency must stay flat as total log history grows, unlike the old Riptide's O(total history) get_since/2. DELIVERED, WITH A REAL SCOPE LIMIT: Riptide_storage.Kv_store_intf.S/File_kv_store (durable, arbitrarily-keyed storage with real per-key deletion) + Riptide_materialize.Materializer.Make(Lattice)(Kv_store) (generic incremental-projection engine, O(1) reads via KV lookup, never a full log replay) + wiring into Batch_commit.propose via an opt-in merge_key so materialized reads are a pure function of the committed log. SCOPE LIMIT found by the final whole-branch review: the design spec's own Decision 3 promised a general watermark/eviction interlock in File_storage's ring WAL itself; that interlock was never built (file_storage.ml is untouched by this work). What shipped is 'materialize synchronously with commit', which is safe by construction only when the SAME propose call observes the commit -- true for a solo (replica_count=1) replica, or a replica an operator explicitly drives via `propose ~materialize:sink []`. A real replica_count>=3 follower does NOT automatically materialize anything off an async commit. See new subtask 3.7's updated text and new subtask 4.5 for the tracked remainder.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "85dcc344a5bdcc500968ed48c3c1be0a47998786",
+                "fd071d7f28a9a2061e68bdaddc94a778fcebc20b",
+                "7f09d0cbdc3c1caa1cac8595530b0491a8c6508c",
+                "5763b3c345fded95056a3932e19523f865b8549e",
+                "4db78b34906addf4472c57d6893bbac93aa3b60a",
+                "3aa9805185e24dc9e19bdcdd19f5f702b9cc347b",
+                "4bd37a54d6957ece7bc040c986c021267173ae44",
+                "38b1dc43f23785e886a57f6a1304403e14e11152"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 3,
             "title": "Implement redaction-with-preserved-hash (tombstone) capability",
             "description": "The mechanism to redact a record's payload while preserving its leaf hash - structural GDPR-erasure-vs-immutability answer, following the crypto-shredding/pseudonymization pattern researched. WHO is allowed to invoke it is Layer 2 policy; that the capability exists safely is Layer 0.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
-            "details": "Test: a redacted record's hash-chain integrity is unaffected; the payload is genuinely unrecoverable.",
+            "details": "Test: a redacted record's hash-chain integrity is unaffected; the payload is genuinely unrecoverable. DELIVERED: Riptide_crypto.{Dek,Kek,Redaction_store} -- AES-256-GCM per-record envelope encryption with a genuinely independent, randomly-generated DEK per record (never HKDF-derived from the KEK, per the researched crypto-shredding precedent), wired so Envelope.content_hash covers ciphertext only. redact is one keystore-entry delete; hash-chain integrity unaffected (Log.verify_chain_list still passes, bit-identical content_hash); real decryption genuinely fails post-redaction (not just a keystore-lookup check). The end-to-end adversarial proof (subtask 9 of this same plan) found and fixed a real bug in this area: materialization was folding the caller's raw argument instead of the committed batch, which let an encrypted-then-redacted record's PLAINTEXT survive forever in an unredactable materialized accumulator -- fixed at the root (materialize now reads only from the committed log). Real disclosed limits: the keystore is unreplicated (one local directory on whichever replica ran encryption_sink) while the log it protects is fully replicated; sharing a KV directory between a keystore and a materializer causes real silent data destruction in three distinct ways (pinned by a dedicated regression test, not structurally prevented). See new subtask 4.6.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "8b04ac968acf5915be5a8657db12a4758891c5ca",
+                "b8dbd32969ebc88f0e0db65527a67e4a691f2675",
+                "4a54bd188a3f10427e9ff715f135aab3838e3077",
+                "e7727a00a3ed23639c366c4cf8acebe4025eef57",
+                "4bd37a54d6957ece7bc040c986c021267173ae44",
+                "38b1dc43f23785e886a57f6a1304403e14e11152"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 4,
             "title": "Add encryption at rest and mTLS in transit as non-optional infrastructure",
             "description": "Every byte that hits disk or the wire is encrypted, no escape hatch - directly fixes the old Riptide's total absence of encryption at rest and edge-only TLS.",
+            "status": "done",
+            "dependencies": [],
+            "details": "Test: inspect raw disk/wire bytes under test harness, confirm no plaintext domain data ever appears. DELIVERED, WITH A REAL SCOPE NUANCE ON 'non-optional': a minimal self-managed PKI (Riptide_pki.Ca -- self-signed Ed25519 root CA + per-replica leaf signing with a correct, validated X.509v3 extension set) wired into real, UNCONDITIONAL mutual TLS 1.3 (Riptide_transport.Tcp via tls-eio) -- there is no plaintext mode and no opt-in flag for transport; Tcp.create requires real X.509 material, matching this subtask's literal 'non-optional' framing exactly for transport. Encryption AT REST, by contrast, is opt-in via Batch_commit.propose's `?encryption` parameter, not unconditional for every envelope -- Log.append remains a second, structurally uncoverable, unencrypted envelope-construction site (riptide's core library cannot depend on riptide_crypto without a dependency cycle), and forcing ubiquity would silently break every existing plaintext caller/test. This was a deliberate, reviewed, conservative scope decision (mirrors this same plan's own Decision 4 text, which defers 'exact shape' to the implementation), not an oversight -- see new subtask 4.5 for tracking full closure. Also disclosed, not yet closed: a peer's claimed transport preamble id is not bound to its TLS certificate identity (mTLS proves cluster membership, not which specific replica -- a net improvement over the pre-existing zero-authentication state, not a regression); no certificate/key persistence across process boundaries (in-memory only, no PEM encode/decode anywhere -- see new subtask 4.7); no KEK rotation, no CRL/revocation, no cert rotation (all explicit Decision 5/6 non-goals).",
+            "testStrategy": "",
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "b19a2b7596d2fe6a5a14dac2c55ca0f2b6797e1f",
+                "c7f0741bceb64a61a2f0f8e74f96df67f0057835",
+                "4297d5dee49a88102cd9cf4388b89d0526b5405c",
+                "8e11c695197f253610ae6d4082ec56c5661ed571",
+                "4a54bd188a3f10427e9ff715f135aab3838e3077",
+                "e7727a00a3ed23639c366c4cf8acebe4025eef57"
+              ],
+              "prs": []
+            }
+          },
+          {
+            "id": 5,
+            "title": "Make encryption-at-rest genuinely non-optional across every envelope-construction site",
+            "description": "Batch_commit.propose's encryption is opt-in (?encryption); Log.append is a second, structurally uncoverable, unencrypted envelope-construction site outside Batch_commit entirely. Closing this for real needs either resolving the riptide/riptide_crypto dependency-cycle constraint that currently forces Log.append to stay plaintext, or removing/subsuming Log.append as a production write path.",
             "status": "pending",
             "dependencies": [],
-            "details": "Test: inspect raw disk/wire bytes under test harness, confirm no plaintext domain data ever appears.",
-            "testStrategy": "",
-            "parentId": "undefined"
+            "details": "Found and deliberately deferred during subtask 4.4's implementation and its own final whole-branch review: the design spec's Decision 4 text defers 'exact shape' to the implementation, and forcing unconditional encryption today would either require a dependency-graph restructure (riptide_crypto currently depends on riptide_storage, which depends on riptide -- pulling crypto into the base riptide library that Envelope/Log live in is a cycle, not a refactor) or silently break every existing plaintext caller/test. Coordinate with whoever owns Layer 0 governance before starting, per this repo's own small-aligned-group rule -- this is a real architectural change to the envelope-construction boundary, not a bolt-on.",
+            "testStrategy": ""
+          },
+          {
+            "id": 6,
+            "title": "Prevent keystore/materializer directory-namespace collisions",
+            "description": "Riptide_crypto.Redaction_store and Riptide_materialize.Materializer both use Riptide_storage.Kv_store_intf.S's flat key namespace with no structural separation. Sharing one File_kv_store directory between the two causes real, silent data destruction in three distinct, confirmed directions (a materializer's read-join-put can silently overwrite a wrapped DEK; a keystore put can silently overwrite an accumulator; a partial materializer decode can raise mid-materialize, diverging the accumulator from the committed log forever). Currently pinned by a dedicated regression test, not structurally prevented.",
+            "status": "pending",
+            "dependencies": [
+              "4"
+            ],
+            "details": "Found during subtask 9 (end-to-end adversarial proof)'s own investigation of the materialization/redaction interaction, escalated at the final whole-branch review for inconsistent treatment (the less-severe KV-size-bound finding got the same 'pin, don't fix' treatment for a good reason -- a real fix is real design work -- but this one has no error signal at all when it happens, unlike the size-bound case). Real fix options: namespace/prefix each Kv_store_intf.S consumer's key space distinctly, or give Kv_store_intf.S itself a typed/scoped notion of ownership per directory. Both are real design decisions, not oversights to patch in a test task.",
+            "testStrategy": ""
+          },
+          {
+            "id": 7,
+            "title": "Persist PKI certificate/key material across process boundaries",
+            "description": "Riptide_pki.Ca and Riptide_transport.Tls_identity are in-memory only -- no PEM (or other) encode/decode exists anywhere, and every real call site mints a fresh in-process CA. The composed PKI+mTLS mesh cannot currently span two separate OS processes or survive a restart, which is in tension with Decision 6's own 'certs are static and long-lived' framing (that framing presupposes persistence that doesn't exist yet).",
+            "status": "pending",
+            "dependencies": [
+              "4"
+            ],
+            "details": "Found and explicitly disclosed (not silently assumed away) at the final whole-branch review of subtask 4.4's mTLS work -- both lib/pki/ca.mli and lib/transport/tls_identity.mli now carry an honest 'open gap, tracked as future work' paragraph. Partly a project-stage fact: this repo has no replica server binary yet at all (library-only), so there is currently no real caller this would unblock. Distinct from, and a smaller/more immediate prerequisite than, task-master Task 8's own already-planned SPIFFE/SPIRE pluggable attestation subtask -- a minimal PEM save/load for this project's own self-managed CA is a much smaller ask than dynamic attestation, and SPIFFE/SPIRE is explicitly deferred until this project's later multi-tier/heterogeneous-hardware model exists (Decision 6's own non-goal).",
+            "testStrategy": ""
           }
         ]
       },
@@ -677,7 +760,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-23T18:52:28.932Z",
+      "lastModified": "2026-09-24T08:31:25.382Z",
       "taskCount": 11,
       "completedCount": 2,
       "tags": [
