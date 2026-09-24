@@ -671,15 +671,16 @@ let test_ring_capacity_boundary () =
       Alcotest.(check bool) "views kept climbing as each attempt forfeited" true
         (List.exists (fun v -> v >= 3) views))
 
-(* SOAK TEST, subtask 3.8: this exact scenario (same hardcoded seed:1 as [run_until_view_change]
-   above) was independently reproduced flaking at ~5% (2/40 isolated runs of
-   `dune exec test/test_riptide.exe -- test dst_scenarios 5`) before [lib/sim/network.ml]'s fault
-   decisions were keyed per-sender instead of drawn from one shared, send-order-consumed PRNG
-   stream -- a stream whose consumption order depended on real [File_storage] I/O completion
-   timing (which replica's fiber resumes first after a real io_uring completion), not on anything
-   seeded. Running the identical scenario N times in one process, each against a fresh real
-   [File_storage] directory, is the same reproduction technique the flake was originally isolated
-   with, kept here as permanent regression coverage rather than only a one-off shell loop. *)
+(* REGRESSION TEST, subtask 3.8: this scenario (same hardcoded seed:1 as [run_until_view_change]
+   above) exercises the ring-capacity boundary and view-change path against real [File_storage] I/O,
+   run repeatedly to catch flakes in that code path. This test's scenario itself has zero injected
+   fault probabilities on both network and storage (see the seed config in line 641-649 below),
+   so it does not exercise or prove anything about [lib/sim/network.ml]'s fault-decision keying
+   (whether per-sender or shared stream). Its value is purely as a real-I/O soak of the
+   ring-capacity/view-change mechanism itself, running the identical scenario N times in one
+   process each against a fresh real [File_storage] directory, catching any nondeterministic
+   flakes that may emerge from that path's interaction with File_storage timing or wall-clock
+   budget behavior. *)
 let test_ring_capacity_boundary_soak () =
   for iteration = 1 to 20 do
     Eio_main.run @@ fun env ->
