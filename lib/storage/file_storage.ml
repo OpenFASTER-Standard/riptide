@@ -99,6 +99,15 @@ type t = {
   superblocks : file_handle array;
       (* [superblock_copies] (3) independent files -- see this file's own top comment,
          "Task 3: the superblock", for the on-disk layout and quorum this backs. *)
+  may_evict : (op_number:int -> bool) option;
+      (* Subtask 3.7: the caller's veto over this ring's one destructive moment. Consulted by
+         [wal_append] with the op-number ABOUT TO BE EVICTED (never with the one being appended),
+         and only when an append genuinely overwrites a live prior entry. [None] -- the default --
+         means every eviction proceeds, which is this module's entire pre-3.7 behavior.
+
+         In-memory, per-[t], and deliberately NOT persisted: it is a policy the owner supplies
+         afresh on every [create], evaluated against whatever [recover_highest_op_number] found on
+         disk. Nothing about a refusal is durable either -- see [wal_append]. *)
 }
 
 let ring_file_name = "ring"
@@ -273,17 +282,51 @@ let recover_highest_op_number t =
    less-likely-to-bite number -- a caller still could not tell from its own call site what bound
    it had accepted. Making it explicit costs every call site one argument and makes the sizing
    decision impossible to inherit by accident. *)
-let create ~sw ~fs ~ring_capacity dir_path =
+let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
   let superblocks =
     Array.init superblock_copies (fun i ->
         open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
   in
-  let t = { sw; ring; ring_capacity; highest_op_number = 0; superblocks } in
+  let t = { sw; ring; ring_capacity; highest_op_number = 0; superblocks; may_evict } in
   t.highest_op_number <- recover_highest_op_number t;
   t
 
+(* Subtask 3.7: does appending [op_number] destroy a live prior entry, and if so which one?
+
+   Slot assignment is [(op_number - 1) mod ring_capacity], so op-numbers [1 .. ring_capacity] are
+   the only ones that land in a slot no prior op-number has ever occupied. Every op_number above
+   that reuses the slot last held by [op_number - ring_capacity] -- and because [wal_append]
+   enforces a strictly dense, gapless sequence ([op_number = highest_op_number + 1], the check
+   directly above), that earlier op-number was definitely written, so this is a genuine eviction
+   rather than a coincidence of arithmetic.
+
+   Deliberately NOT expressed as "is the slot currently occupied?" (a [read_header] probe): a
+   truncation zeroes discarded slots' headers, so a probe would call a post-truncation re-append
+   "not an eviction" and skip the gate even though the caller's own accounting may still care. The
+   arithmetic answers the question the owner is actually asking -- which op-number's data is about
+   to stop being readable -- without an I/O round-trip. *)
+let evicted_op_number t ~op_number =
+  if op_number > t.ring_capacity then Some (op_number - t.ring_capacity) else None
+
+(* The eviction gate sits AFTER both pre-existing argument checks, not before them, which is a
+   considered deviation from subtask 3.7's own plan sketch (it put the gate first).
+
+   [Out_of_sequence] and [Entry_rejected] are both statements about the CALL being wrong -- a
+   skipped op-number, an entry this ring physically cannot hold. [Eviction_blocked] is the opposite
+   kind of statement: the call is perfectly well-formed and would succeed at a later moment, once
+   the owner's predicate relents. {!Riptide_vsr.Replica}'s [append_refusals] doc draws exactly this
+   line ("this entry can never be durable here" vs. a retryable backpressure signal), and subtask
+   3.7's whole purpose is for a caller to trust [eviction_blocked]'s count as a materialization-lag
+   signal -- so an oversized entry must not be able to inflate it. Ordering the checks this way
+   also means an oversized or out-of-sequence call behaves identically whether or not [?may_evict]
+   was supplied.
+
+   A refusal is a clean no-op: nothing is written, [highest_op_number] does not move, and the entry
+   that would have been evicted stays readable. That is what makes retrying the SAME op_number
+   later sound, which is precisely what [Replica.durable_append]'s callers do with a classified
+   refusal (they decline to acknowledge and leave the op to be re-driven). *)
 let wal_append t ~op_number data =
   if op_number <> t.highest_op_number + 1 then
     invalid_arg
@@ -296,6 +339,11 @@ let wal_append t ~op_number data =
            "wal_append: entry of %d bytes exceeds this ring's max entry size of %d bytes (one \
             aligned data slot)"
            len max_entry_size);
+    (match (t.may_evict, evicted_op_number t ~op_number) with
+    | None, _ | _, None -> ()
+    | Some may_evict, Some evicted ->
+      if not (may_evict ~op_number:evicted) then
+        invalid_arg (Printf.sprintf "wal_append: eviction blocked for op_number %d" evicted));
     let slot = (op_number - 1) mod t.ring_capacity in
     let checksum = checksum_of data in
     write_header t ~slot ~op_number ~length:len ~checksum;

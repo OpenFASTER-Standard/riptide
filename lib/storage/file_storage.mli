@@ -11,7 +11,12 @@
 include Storage_intf.S
 
 val create :
-  sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> ring_capacity:int -> string -> t
+  sw:Eio.Switch.t ->
+  fs:Eio.Fs.dir_ty Eio.Path.t ->
+  ring_capacity:int ->
+  ?may_evict:(op_number:int -> bool) ->
+  string ->
+  t
 (** [create ~sw ~fs ~ring_capacity dir_path] opens (creating if necessary) a ring WAL directory
     at [dir_path]. [ring_capacity] is the number of fixed-size slots the ring holds
     -- [wal_append] of op_number [n] overwrites whatever was previously at op_number
@@ -36,4 +41,46 @@ val create :
     [File_storage]-specific limitation, not part of the abstract {!Storage_intf.S} contract:
     [wal_append] raises [Invalid_argument] for any entry larger than one aligned data slot
     (currently 4096 bytes), since each slot holds exactly one entry's data, zero-padded to the
-    slot's fixed size. *)
+    slot's fixed size.
+
+    {2 [?may_evict] — the caller's veto over an eviction}
+
+    [?may_evict] makes the silent data loss described above {e refusable} rather than merely
+    documented. It is the owner's answer to one question, asked at the one moment it matters:
+    {e may op_number [n] stop being readable now?}
+
+    - {b When it is consulted.} Only when an append genuinely overwrites a live prior entry —
+      i.e. when the appended [op_number] exceeds [ring_capacity]. Op-numbers
+      [1 .. ring_capacity] land in slots no op-number has ever occupied, so a ring-filling prefix
+      consults the predicate {e zero} times. Both pre-existing argument checks run first (see
+      below), so the predicate is never consulted for a call that was going to be rejected anyway.
+    - {b What it receives.} The op-number {b about to be evicted}, which is
+      [op_number - ring_capacity] — {e not} the op-number being appended. Appending op_number
+      [ring_capacity + 1] asks about op_number [1].
+    - {b What [false] does.} [wal_append] raises
+      [Invalid_argument "wal_append: eviction blocked for op_number <n>"], where [<n>] is the
+      evicted op-number the predicate was just asked about.
+      {!Riptide_vsr.Replica}'s [classify_append_refusal] recognizes that
+      ["wal_append: eviction blocked for op_number "] prefix as its [Eviction_blocked] refusal
+      shape, so the refusal arrives at the protocol layer already told apart from the other three
+      (and is counted in {!Riptide_vsr.Replica.append_refusals}) rather than as an unclassifiable
+      exception that would propagate. Rewording this message is therefore a cross-module change:
+      [test_vsr_replica_recovery.ml]'s own discrimination test drives a real refusal from this
+      module through a real replica and fails if the two sides drift apart.
+    - {b A refusal is a clean no-op.} Nothing is written, [wal_highest_op_number] does not advance,
+      and the entry that would have been evicted stays readable. Retrying the {e same} [op_number]
+      after the predicate relents is therefore sound and is the intended usage — the refusal is
+      backpressure, not a permanent rejection of the entry.
+    - {b Precedence.} The two pre-existing [Invalid_argument] refusals both win over this one: an
+      out-of-sequence [op_number], and an entry too large for one data slot, are each reported as
+      themselves even when the same call would also have evicted a blocked op-number. They mean
+      "this call is malformed" / "this entry can never be durable here"; a blocked eviction means
+      "not yet". Conflating the two would both mislead a retrier and inflate [eviction_blocked]'s
+      count, whose whole value is as a trustworthy signal that materialization has fallen behind.
+    - {b Omitting it preserves this module's exact pre-existing behavior.} With no [?may_evict],
+      every eviction proceeds silently, as it always did — which is what every call site that does
+      not pass it relies on.
+
+    The predicate is in-memory state on the returned [t] and is deliberately not persisted: it is a
+    policy, supplied afresh on each [create], evaluated against whatever [wal_highest_op_number]
+    recovery found already on disk. *)

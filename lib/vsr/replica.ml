@@ -115,39 +115,64 @@ type slot_state = Present of Value.value | Corrupt | Absent
        is safe (the gap reads back [Corrupt], never [Absent] -- see [slot_state] above), which is
        exactly why it must be visible rather than silently equated with the case above.
 
-   All three still mean "not durable" to the protocol, and the protocol still behaves identically
-   -- the replica declines to acknowledge. What changes is that they are told apart and COUNTED
-   (see [for_test_append_refusals]), so a harness can assert on them, and that an Invalid_argument
-   matching NONE of them now propagates instead of being swallowed: an unrecognized exception out
-   of a backend is not a documented storage refusal, and treating it as one is the very
-   conflation this finding names. *)
-type append_refusal = Fault_injection_cap | Entry_rejected | Out_of_sequence
+   SUBTASK 3.7 adds a fourth, and the first genuinely TRANSIENT one:
 
-let append_refusal_kinds = [ Fault_injection_cap; Entry_rejected; Out_of_sequence ]
+     [Eviction_blocked] -- {!Riptide_storage.File_storage}'s [?may_evict] predicate declining to let
+       this append overwrite an entry the ring's owner still needs (the ring is fixed-size and
+       nothing in this system ever truncates a committed prefix away, so every append past
+       [ring_capacity] destroys an older, already-acknowledged entry). Unlike the three above, this
+       one is not a statement that anything is wrong: the call is well-formed and the SAME
+       [op_number] succeeds once the owner's predicate relents. It is backpressure -- the real
+       signal that materialization has fallen behind the log -- which is why it must not be
+       flattened into [Entry_rejected]'s "this entry can never be durable here".
+
+   All four still mean "not durable" to the protocol, and the protocol still behaves identically
+   -- the replica declines to acknowledge. What changes is that they are told apart and COUNTED
+   (see [append_refusals]), so a harness -- or, since subtask 3.7, a real caller -- can assert on
+   them, and that an Invalid_argument matching NONE of them now propagates instead of being
+   swallowed: an unrecognized exception out of a backend is not a documented storage refusal, and
+   treating it as one is the very conflation this finding names. *)
+type append_refusal = Fault_injection_cap | Entry_rejected | Out_of_sequence | Eviction_blocked
+
+let append_refusal_kinds =
+  [ Fault_injection_cap; Entry_rejected; Out_of_sequence; Eviction_blocked ]
 
 let append_refusal_index = function
   | Fault_injection_cap -> 0
   | Entry_rejected -> 1
   | Out_of_sequence -> 2
+  | Eviction_blocked -> 3
 
 let append_refusal_name = function
   | Fault_injection_cap -> "fault_injection_cap"
   | Entry_rejected -> "entry_rejected"
   | Out_of_sequence -> "out_of_sequence"
+  | Eviction_blocked -> "eviction_blocked"
 
 (* Matched on the message, because [Storage_intf.S] has no dedicated exception for any of these
    and giving it one is a contract change to every backend and every conformance test -- out of
    scope for this fix. The two [wal_append: ] prefixes are raised verbatim, from one shared format
    string each, by BOTH {!Riptide_storage.Memory_storage} and {!Riptide_storage.File_storage};
    ["faults_max exceeded"] is raised verbatim from two sites in
-   {!Riptide_storage.Fault_injecting_storage}. All three are pinned by
+   {!Riptide_storage.Fault_injecting_storage}. The fourth,
+   ["wal_append: eviction blocked for op_number "] (subtask 3.7), is raised from one site in
+   {!Riptide_storage.File_storage} only -- it is that module's [?may_evict] gate, and
+   {!Riptide_storage.Memory_storage} has no ring to evict from. All four are pinned by
    [test_vsr_replica_recovery.ml]'s own discrimination test, which asserts the real exceptions
    those modules raise land in the intended buckets -- so a message reworded on either side fails
-   a test rather than silently falling through to the propagating arm. *)
+   a test rather than silently falling through to the propagating arm.
+
+   The two ["wal_append: "] prefixes that share a first word are disjoint by construction:
+   ["wal_append: op_number "] is followed by a digit, ["wal_append: eviction blocked for op_number "]
+   never reaches that arm because it does not start with ["wal_append: op_number "]. Order is
+   therefore not load-bearing here, but the prefixes are deliberately long enough that it never
+   becomes so. *)
 let classify_append_refusal msg =
   if String.equal msg "faults_max exceeded" then Some Fault_injection_cap
   else if String.starts_with ~prefix:"wal_append: entry of " msg then Some Entry_rejected
   else if String.starts_with ~prefix:"wal_append: op_number " msg then Some Out_of_sequence
+  else if String.starts_with ~prefix:"wal_append: eviction blocked for op_number " msg then
+    Some Eviction_blocked
   else None
 
 (* One received DOVIEWCHANGE, as an element of VSR.tla's own [rep_recv_dvc[r]] (VSR.tla:34, typed
@@ -321,7 +346,7 @@ type t = {
       (* I2: one counter per {!append_refusal}, indexed by [append_refusal_index]. Pure
          diagnostics -- nothing in the protocol ever reads it -- but it is what makes the three
          refusal shapes told apart above OBSERVABLE rather than merely distinguished in a comment.
-         See [for_test_append_refusals]. *)
+         See [append_refusals]. *)
 }
 
 (* ---- the superblock record: VSR.tla's DURABLE per-replica state ----
@@ -652,11 +677,20 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
    input (an oversized value on the wire must drop the message, never escape as an exception).
 
    I2: WHICH refusal is now classified and counted rather than flattened -- see [append_refusal]'s
-   own comment above for the three shapes, the measurement behind them, and why an Invalid_argument
-   matching none of them PROPAGATES instead. That propagation does not weaken the totality
-   guarantee above: every refusal a real backend in this repo raises for a real entry is one of the
-   three classified shapes (pinned by a test), so what escapes here is a backend contract violation,
-   which is precisely the thing that must not be laundered into "the protocol declined an op".
+   own comment above for the four shapes (three from I2, [Eviction_blocked] added by subtask 3.7),
+   the measurement behind them, and why an Invalid_argument matching none of them PROPAGATES
+   instead. That propagation does not weaken the totality guarantee above: every refusal a real
+   backend in this repo raises for a real entry is one of the four classified shapes (pinned by a
+   test), so what escapes here is a backend contract violation, which is precisely the thing that
+   must not be laundered into "the protocol declined an op".
+
+   Subtask 3.7's [Eviction_blocked] is worth one extra note HERE, at the call site, because it is
+   the first refusal a well-formed append can hit: returning [false] for it means this replica
+   declines to acknowledge an op it could otherwise have taken on, deliberately trading liveness for
+   the durability of an older entry its owner has not finished with. Both real callers of this
+   function already treat a classified refusal as a silent no-op, so that trade needs no new code
+   here -- but it is the reason [append_refusals] was promoted out of test-only visibility: a
+   refusal that is CORRECT and INDEFINITE is one an operator has to be able to see.
 
    [Value.canonical_encode] is evaluated OUTSIDE the handler on purpose: it has its own
    [Invalid_argument] failure modes, and catching those here would put an encoding bug in the
@@ -1801,10 +1835,16 @@ let for_test_truncate_wal t ~op_number =
 let for_test_wal_read t ~op_number =
   match slot_state t ~op_number with Present v -> Some v | Corrupt | Absent -> None
 
-(* I2. Diagnostics, not protocol: how many durable appends this replica has had refused, per
-   refusal shape (see [append_refusal]'s own comment for what each one means and why flattening
-   them into one "not durable" was the finding). Returned as (name, count) pairs in a fixed order
-   so a test can assert on exact values. *)
-let for_test_append_refusals t =
+(* I2, promoted to a real accessor by subtask 3.7: how many durable appends this replica has had
+   refused, per refusal shape (see [append_refusal]'s own comment for what each one means and why
+   flattening them into one "not durable" was the finding). Returned as (name, count) pairs in a
+   fixed order so a caller can assert on exact values or track one name's growth over time.
+
+   Renamed from [for_test_append_refusals] rather than shadowed by a second accessor: subtask 3.7's
+   own consumer is production code watching [eviction_blocked] climb, so a [for_test_] prefix would
+   now be actively false, and keeping both names would leave the misleading one as the obvious thing
+   to reach for. Still NOT protocol -- nothing in this module reads it, and the counts influence no
+   decision here; see replica.mli for the intended real use. *)
+let append_refusals t =
   List.map (fun r -> (append_refusal_name r, t.append_refusals.(append_refusal_index r)))
     append_refusal_kinds

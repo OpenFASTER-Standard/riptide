@@ -271,7 +271,7 @@ type run_result = {
           and the sweep is quietly covering far fewer committed batches than it reports. *)
   fault_cap_hits : int;
       (** [Fault_injecting_storage]'s own ["faults_max exceeded"] guard declining to inject more
-          corruption, as counted by {!Replica.for_test_append_refusals}'s [fault_injection_cap] --
+          corruption, as counted by {!Replica.append_refusals}'s [fault_injection_cap] --
           which replica.mli itself says is "worth asserting on rather than discovering by
           instrumenting", because a non-zero value means this sweep's EFFECTIVE fault rate is below
           its configured one. *)
@@ -313,7 +313,7 @@ let message_drop_probability = 0.02
    [faults_max = quorum - 1 = 2] simultaneously-live corrupted slots PER REPLICA, and an append
    whose corrupt decision would reach that cap declines to corrupt (raising its own
    ["faults_max exceeded"], which {!Riptide_vsr.Replica} catches and counts as
-   [fault_injection_cap] rather than propagating -- see replica.mli's [for_test_append_refusals]).
+   [fault_injection_cap] rather than propagating -- see replica.mli's [append_refusals]).
    Nothing in this scenario truncates the WAL, so a replica's corrupted slots stay live for the
    whole run: the cap is a budget over the run, not an instantaneous one. 0.05 over the ~15 appends
    a replica sees here leaves that budget unspent, which [fault_cap_hits] asserts directly rather
@@ -635,7 +635,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
   let fault_cap_hits =
     Array.fold_left
       (fun acc r ->
-        acc + (try List.assoc "fault_injection_cap" (Replica.for_test_append_refusals r) with Not_found -> 0))
+        acc + (try List.assoc "fault_injection_cap" (Replica.append_refusals r) with Not_found -> 0))
       0 replicas
   in
   let storage_faults_observed =

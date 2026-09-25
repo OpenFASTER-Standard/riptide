@@ -378,6 +378,180 @@ let test_superblock_none_without_majority () =
       Alcotest.(check (option string)) "2 of 3 corrupted -- no majority, honest None" None
         (File_storage.superblock_read t2))
 
+(* ============================================================================================
+   SUBTASK 3.7: the [?may_evict] eviction gate.
+
+   A ring of [ring_capacity] slots silently destroys op_number [n - ring_capacity] when op_number
+   [n] is appended, and nothing in this system ever truncates a committed prefix away -- which is
+   exactly the unsignalled data loss [~ring_capacity]'s own required-argument comment describes.
+   [?may_evict] is the caller's veto over that one moment: it is consulted with the op-number ABOUT
+   TO BE EVICTED, and a [false] turns the silent overwrite into a classifiable [Invalid_argument]
+   refusal that {!Riptide_vsr.Replica}'s existing [classify_append_refusal] buckets as
+   [eviction_blocked].
+
+   Three properties are pinned here, deliberately as three separate tests rather than one: that a
+   refused eviction raises with the exact message the classifier matches, that a permitted one is
+   completely unaffected (the predicate is a gate, not a hard stop), and that omitting the argument
+   preserves this module's pre-existing behavior byte for byte -- the last of these is what every
+   existing call site in the repo relies on and is the one that would silently regress. *)
+
+(* Only a GENUINE eviction consults the predicate. With [ring_capacity = 2], op-numbers 1 and 2
+   land in fresh, never-written slots (no eviction, no consultation at all); op_number 3 is the
+   first append that overwrites a live prior entry, and the entry it overwrites is op_number
+   [3 - 2 = 1]. The predicate below refuses exactly that one op-number, so the message's "for
+   op_number 1" proves the ARGUMENT is the evicted op-number and not the appending one. *)
+let test_may_evict_blocks_a_genuine_eviction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number -> op_number > 1)
+          dir
+      in
+      File_storage.wal_append t ~op_number:1 "a";
+      File_storage.wal_append t ~op_number:2 "b";
+      Alcotest.check_raises "eviction of a blocked op-number raises, classifiably"
+        (Invalid_argument "wal_append: eviction blocked for op_number 1")
+        (fun () -> File_storage.wal_append t ~op_number:3 "c");
+      (* The refusal is a clean no-op, not a partial write: nothing about the ring moved. This is
+         load-bearing for the protocol above -- [Replica.durable_append] treats a classified
+         refusal as "not durable, declined" and expects to be able to retry the SAME op_number
+         later once the predicate relents, which is only sound if the failed attempt left no
+         trace. *)
+      Alcotest.(check int) "highest_op_number did not advance" 2
+        (File_storage.wal_highest_op_number t);
+      Alcotest.(check (option string)) "the entry that would have been evicted is still there"
+        (Some "a") (File_storage.wal_read t ~op_number:1);
+      Alcotest.(check (option string)) "and op 3 was not written" None
+        (File_storage.wal_read t ~op_number:3))
+
+let test_may_evict_allows_a_permitted_eviction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number:_ -> true)
+          dir
+      in
+      File_storage.wal_append t ~op_number:1 "a";
+      File_storage.wal_append t ~op_number:2 "b";
+      File_storage.wal_append t ~op_number:3 "c";
+      Alcotest.(check (option string)) "op 3 landed, op 1's slot was reused" (Some "c")
+        (File_storage.wal_read t ~op_number:3);
+      Alcotest.(check (option string)) "op 1 is gone, exactly as an ungated ring would leave it"
+        None (File_storage.wal_read t ~op_number:1))
+
+let test_no_may_evict_supplied_is_unaffected () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2 dir in
+      File_storage.wal_append t ~op_number:1 "a";
+      File_storage.wal_append t ~op_number:2 "b";
+      File_storage.wal_append t ~op_number:3 "c";
+      Alcotest.(check (option string)) "eviction proceeds as before with no predicate" (Some "c")
+        (File_storage.wal_read t ~op_number:3))
+
+(* The predicate is consulted ONLY for a genuine eviction, never for a first-time write into a
+   fresh slot. A predicate that refuses everything must therefore still let the first
+   [ring_capacity] op-numbers through untouched -- if the gate were keyed on the APPENDING
+   op-number, or fired for every append, this would raise on op_number 1 and a caller using
+   [?may_evict] could never write anything at all. *)
+let test_may_evict_is_not_consulted_before_the_ring_is_full () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let consulted = ref [] in
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:3
+          ~may_evict:(fun ~op_number ->
+            consulted := op_number :: !consulted;
+            false)
+          dir
+      in
+      for op = 1 to 3 do
+        File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
+      done;
+      Alcotest.(check (list int)) "a ring-filling prefix consults the predicate zero times" []
+        !consulted;
+      Alcotest.(check int) "and all three appends landed" 3 (File_storage.wal_highest_op_number t);
+      Alcotest.check_raises "the first append that would evict is the first one refused"
+        (Invalid_argument "wal_append: eviction blocked for op_number 1")
+        (fun () -> File_storage.wal_append t ~op_number:4 "entry-4");
+      Alcotest.(check (list int)) "consulted exactly once, with the evicted op-number" [ 1 ]
+        !consulted)
+
+(* Precedence between two refusals that can both apply to one call: an oversized entry that would
+   ALSO evict is reported as the oversize (=> [entry_rejected]), not as the blocked eviction.
+
+   This is deliberate and is a considered deviation from the plan's own sketch, which put the
+   eviction gate ahead of the length check. The two refusals mean opposite things to a caller:
+   [eviction_blocked] means "not yet, retry this exact op_number once the predicate relents", while
+   [entry_rejected] means "this entry can never be durable here" (see [replica.mli]'s own
+   [append_refusals] doc). Reporting a permanently-impossible entry as a retryable backpressure
+   signal would both lie to the retrier and inflate the very counter subtask 3.7 exists to make
+   trustworthy as a materialization-lag signal. Checking the entry's own validity first also keeps
+   this module's behavior for an oversized entry identical whether or not [?may_evict] was
+   supplied. *)
+let test_oversized_entry_beats_a_blocked_eviction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number:_ -> false)
+          dir
+      in
+      File_storage.wal_append t ~op_number:1 "a";
+      File_storage.wal_append t ~op_number:2 "b";
+      Alcotest.check_raises "the entry's own un-storability is reported, not the blocked eviction"
+        (Invalid_argument
+           "wal_append: entry of 4097 bytes exceeds this ring's max entry size of 4096 bytes \
+            (one aligned data slot)")
+        (fun () -> File_storage.wal_append t ~op_number:3 (String.make 4097 'x')))
+
+(* An out-of-sequence op_number is also reported as itself, not as a blocked eviction -- the
+   sequence check already ran first before this change and still does. Pins that adding the gate
+   did not reorder the two. *)
+let test_out_of_sequence_beats_a_blocked_eviction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number:_ -> false)
+          dir
+      in
+      File_storage.wal_append t ~op_number:1 "a";
+      File_storage.wal_append t ~op_number:2 "b";
+      Alcotest.check_raises "out-of-sequence is reported as out-of-sequence"
+        (Invalid_argument "wal_append: op_number 5 is not wal_highest_op_number t + 1")
+        (fun () -> File_storage.wal_append t ~op_number:5 "e"))
+
+(* The gate is in-memory state on [t], not on disk, and it governs FUTURE appends only -- a reopen
+   of the same directory with no predicate must not inherit a refusal, and one WITH a predicate
+   must apply it against the recovered [highest_op_number] rather than restarting the count. *)
+let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2 dir in
+       File_storage.wal_append t ~op_number:1 "a";
+       File_storage.wal_append t ~op_number:2 "b");
+      Eio.Switch.run @@ fun sw ->
+      let t2 =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number -> op_number > 1)
+          dir
+      in
+      Alcotest.(check int) "reopen recovered the pre-existing log" 2
+        (File_storage.wal_highest_op_number t2);
+      Alcotest.check_raises "the predicate gates the next eviction, not a restarted count"
+        (Invalid_argument "wal_append: eviction blocked for op_number 1")
+        (fun () -> File_storage.wal_append t2 ~op_number:3 "c"))
+
 let tests =
   [
     ("write then read, same handle", `Quick, test_write_then_read_same_handle);
@@ -416,4 +590,25 @@ let tests =
     ( "superblock read returns None without a majority (2 of 3 corrupted)",
       `Quick,
       test_superblock_none_without_majority );
+    ( "3.7: ?may_evict refuses a genuine eviction, raising the classifiable message",
+      `Quick,
+      test_may_evict_blocks_a_genuine_eviction );
+    ( "3.7: ?may_evict permitting an eviction leaves the ring's behavior unchanged",
+      `Quick,
+      test_may_evict_allows_a_permitted_eviction );
+    ( "3.7: omitting ?may_evict preserves this module's pre-existing eviction behavior",
+      `Quick,
+      test_no_may_evict_supplied_is_unaffected );
+    ( "3.7: ?may_evict is not consulted for first-time writes into fresh slots",
+      `Quick,
+      test_may_evict_is_not_consulted_before_the_ring_is_full );
+    ( "3.7: an oversized entry is reported as oversized, not as a blocked eviction",
+      `Quick,
+      test_oversized_entry_beats_a_blocked_eviction );
+    ( "3.7: an out-of-sequence op_number is reported as itself, not as a blocked eviction",
+      `Quick,
+      test_out_of_sequence_beats_a_blocked_eviction );
+    ( "3.7: ?may_evict after a reopen gates against the recovered highest_op_number",
+      `Quick,
+      test_may_evict_applies_after_a_reopen_against_the_recovered_op_number );
   ]

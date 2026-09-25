@@ -617,7 +617,8 @@ let test_restart_still_accepts_a_genuinely_empty_backend () =
   Alcotest.(check int) "it accepts a Prepare like any freshly created replica" 1 (Replica.op_number t)
 
 (* ============================================================================================
-   FINAL-REVIEW FINDING I2: the three refusal shapes [durable_append] used to flatten into one.
+   FINAL-REVIEW FINDING I2 (+ SUBTASK 3.7): the refusal shapes [durable_append] used to flatten
+   into one. Three of them came from I2; [eviction_blocked] was added by subtask 3.7.
 
    [durable_append] caught EVERY [Invalid_argument] as "the backend refused this entry". Three
    unrelated conditions arrived through that one arm, and nothing counted them, so the conflation
@@ -627,11 +628,15 @@ let test_restart_still_accepts_a_genuinely_empty_backend () =
    These tests drive each shape through a REAL backend raising its own REAL exception, rather than
    asserting against a hand-written message string -- which is what makes them a guard against the
    classifier silently rotting if any of those modules rewords its message. The protocol effect is
-   identical in all three cases (the entry is not durable, so it is not acknowledged); what is
+   identical in all four cases (the entry is not durable, so it is not acknowledged); what is
    pinned here is that they are told apart, and that an UNRECOGNIZED exception propagates instead
-   of joining them. *)
+   of joining them.
 
-let refusals t = Replica.for_test_append_refusals t
+   Every one of these tests asserts the FULL count vector, not just its own bucket, so a classifier
+   change that starts double-counting or mis-bucketing shows up here even in the shapes the test
+   was not written about. *)
+
+let refusals t = Replica.append_refusals t
 
 (* [fault_injection_cap]: Fault_injecting_storage's own "faults_max exceeded" (Task 6, Decision 7).
    [replication_quorum = 1] makes [faults_max = 0], so the very first corrupting append is refused
@@ -652,7 +657,8 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Alcotest.(check (list (pair string int)))
     "counted as fault_injection_cap, and as nothing else"
-    [ ("fault_injection_cap", 1); ("entry_rejected", 0); ("out_of_sequence", 0) ]
+    [ ("fault_injection_cap", 1); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0) ]
     (refusals t);
   (* The protocol effect is unchanged by the classification: not durable, so not acknowledged. *)
   Alcotest.(check int) "the op was NOT taken on" 0 (Replica.op_number t);
@@ -672,7 +678,8 @@ let test_refusal_out_of_sequence_is_counted_as_its_own_shape () =
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 1 }));
   Alcotest.(check (list (pair string int)))
     "counted as out_of_sequence, and as nothing else"
-    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 1) ]
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 1);
+      ("eviction_blocked", 0) ]
     (refusals t);
   Alcotest.(check int) "the op was NOT taken on" 2 (Replica.op_number t)
 
@@ -700,7 +707,8 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = oversized; k = 0 }));
       Alcotest.(check (list (pair string int)))
         "counted as entry_rejected, and as nothing else"
-        [ ("fault_injection_cap", 0); ("entry_rejected", 1); ("out_of_sequence", 0) ]
+        [ ("fault_injection_cap", 0); ("entry_rejected", 1); ("out_of_sequence", 0);
+          ("eviction_blocked", 0) ]
         (refusals t);
       Alcotest.(check int) "the oversized op was NOT taken on" 0 (Replica.op_number t);
       Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = []);
@@ -708,8 +716,87 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
       Alcotest.(check int) "a normal-sized op right afterwards is accepted" 1 (Replica.op_number t))
 
+(* [eviction_blocked] (SUBTASK 3.7): a real {!Riptide_storage.File_storage}, constructed with a real
+   [?may_evict] predicate that refuses, declining to overwrite an entry its owner still needs.
+
+   The fourth shape, and the first one that is genuinely TRANSIENT: the other three each say the call
+   or the injector was wrong, while this one says the call was fine and would succeed later. Driven
+   end to end through a replica over a real on-disk backend, exactly like [entry_rejected] above, so
+   that the message [File_storage] actually raises and the prefix [classify_append_refusal] actually
+   matches are pinned against each other rather than against a hand-written string. *)
+let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
+  Eio_main.run @@ fun env ->
+  let dir = Filename.temp_file "riptide_37_eviction_blocked" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () ->
+      Eio.Switch.run @@ fun sw ->
+      (* A ring of 2, with op_number 1 pinned as un-evictable: op-numbers 1 and 2 land in fresh
+         slots, and op_number 3 is the first append that would destroy op_number 1.
+
+         The predicate closes over a mutable watermark rather than being a constant, because that is
+         the real shape of subtask 3.7's consumer: "everything at or below [!watermark] has been
+         materialized and may be evicted", advanced as materialization progresses. Starting it at 0
+         means nothing may be evicted yet. *)
+      let materialized_through = ref 0 in
+      let backend =
+        Riptide_storage.File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2
+          ~may_evict:(fun ~op_number -> op_number <= !materialized_through)
+          dir
+      in
+      let send, sent = capturing_send () in
+      let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
+      let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
+      Alcotest.(check int) "the ring-filling prefix was taken on normally" 2 (Replica.op_number t);
+      Alcotest.(check (list (pair string int)))
+        "and refused nothing on the way"
+        [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+          ("eviction_blocked", 0) ]
+        (refusals t);
+      let before = decoded_sent sent in
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0 }));
+      Alcotest.(check (list (pair string int)))
+        "counted as eviction_blocked, and as nothing else"
+        [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+          ("eviction_blocked", 1) ]
+        (refusals t);
+      (* The protocol effect is the same as every other refusal: not durable, so not acknowledged.
+         Nothing new went out on the wire beyond what the first two Prepares already produced. *)
+      Alcotest.(check int) "the blocked op was NOT taken on" 2 (Replica.op_number t);
+      Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = before);
+      (* The entry the predicate protected is still readable -- which is the whole point of the
+         gate, not merely that the append was declined. *)
+      Alcotest.(check bool) "the protected entry survived" true
+        (Replica.for_test_wal_read t ~op_number:1 = Some (v "a"));
+      (* TRANSIENT, unlike the other three: the SAME replica, the SAME backend and the SAME
+         op_number succeed once the watermark advances. Nothing is restarted, recreated or repaired
+         in between -- the only thing that changes is the owner's answer, which is exactly what
+         makes this backpressure rather than a defect.
+
+         (Deliberately NOT written as a second [Replica.create] over a second handle on the same
+         directory: [create] correctly refuses a backend that already holds durable state and
+         directs the caller to [restart] -- C1's own guard. Re-driving the same replica is both
+         legal and a closer model of the real consumer anyway.) *)
+      materialized_through := 1;
+      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0 }));
+      Alcotest.(check (list (pair string int)))
+        "the identical op_number is refused no further times once eviction is permitted"
+        [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+          ("eviction_blocked", 1) ]
+        (refusals t);
+      Alcotest.(check int) "and it is taken on" 3 (Replica.op_number t);
+      Alcotest.(check bool) "the retried entry is durably readable" true
+        (Replica.for_test_wal_read t ~op_number:3 = Some (v "c"));
+      Alcotest.(check bool) "and op 1 is now genuinely gone, as a permitted eviction should leave it"
+        true
+        (Replica.for_test_wal_read t ~op_number:1 = None))
+
 (* THE PROPAGATING ARM, which is the half of this fix that is not merely bookkeeping: an
-   [Invalid_argument] matching NONE of the three known shapes is a backend contract violation, not
+   [Invalid_argument] matching NONE of the four known shapes is a backend contract violation, not
    a documented storage refusal, and swallowing it as "the protocol declined this op" is exactly
    the conflation I2 names. It escapes to the caller instead. *)
 module Unhelpful_backend : Riptide_storage.Storage_intf.S with type t = unit = struct
@@ -732,7 +819,8 @@ let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed 
       Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 })));
   Alcotest.(check (list (pair string int)))
     "and it is not counted as any known refusal shape either"
-    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0) ]
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0) ]
     (refusals t)
 
 (* ============================================================================================
@@ -1120,6 +1208,9 @@ let tests =
     ( "I2: File_storage's oversized-entry refusal is counted as its own shape",
       `Quick,
       test_refusal_entry_rejected_is_counted_as_its_own_shape );
+    ( "3.7: File_storage's blocked-eviction refusal is counted as its own shape",
+      `Quick,
+      test_refusal_eviction_blocked_is_counted_as_its_own_shape );
     ( "I2: an unrecognized backend refusal propagates rather than being swallowed",
       `Quick,
       test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed );
