@@ -207,21 +207,48 @@ val create :
     re-enters this replica from inside the callback does not see a uniformly post-action [t]. At
     all four commit sites, {!commit_number}, {!op_number} and {!entries} are already fully
     updated and final — reading those from inside the hook is always safe, and is the intended
-    way to use it. But at the two {b view-change-related} sites — [try_send_sv] ([SendSV],
-    VSR.tla:499-516) and [handle_start_view] ([ReceiveSV], VSR.tla:567-578) — the hook fires
-    {b before} the view-change bookkeeping is written: {!status} still reads [View_change] and
-    {!last_normal_view} still holds its old value at both, and at [handle_start_view]
-    additionally {!view_number} still holds the OLD view (at [try_send_sv] the new view was
-    already in place before the action began). All of them are updated a few lines later in the
-    same call, and the view change does complete.
+    way to use it. But at the two {b view-change-related} sites the hook fires {b before} the
+    view-change bookkeeping is written, and {b what those fields read is NOT the same at the two
+    sites} — so they are stated separately rather than jointly:
 
-    {b Therefore: never gate work done inside the callback on [status t = Normal] (or on
-    {!view_number} having reached the new view).} The commit advance being reported is real and
-    final regardless of what those fields read, and a consumer that skipped it whenever
-    [status <> Normal] would silently drop exactly the advances a {b follower learns through a
-    view change} — the follower-catch-up case, which is the main reason this hook exists. If a
-    consumer genuinely needs post-action view state, it must do that work after
-    {!propose}/{!handle_message} returns, not inside the hook. *)
+    - [try_send_sv] ([SendSV], VSR.tla:499-516). {!status} is {b guaranteed} to read [View_change]
+      here: this site is reachable only past [has_dvc_quorum], whose own first conjunct
+      (VSR.tla:489) {i is} [status = View_change]. {!view_number} already holds the NEW view — the
+      replica entered it before this action began, and [try_send_sv] never writes [view_number] at
+      all. {!last_normal_view} still holds its OLD value.
+    - [handle_start_view] ([ReceiveSV], VSR.tla:567-578). {!status} holds whatever its
+      {b pre-action} value was, which is {b either [View_change] or [Normal]} — VSR.tla:567-570's
+      guard is only [ReceivableMsg(m, "StartView", r) /\ m.v >= View(r)], with {b no status
+      conjunct at all} (the implementation's own guard matches, deliberately). So a replica that is
+      still [Normal] and has never entered a view change can receive a higher-view [Start_view] and
+      advance its {!commit_number} through this site with [status = Normal] the whole time — a real,
+      reachable follower-catch-up case, pinned by [test_vsr_replica.ml]'s own
+      [test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup], which reads {!status} from
+      inside the callback and requires [Normal]. {!view_number} still holds the OLD view here, and
+      {!last_normal_view} its old value.
+
+    All of those fields are updated a few lines later in the same call, and the view change does
+    complete.
+
+    {b Nothing is durable yet when the hook fires — at any of the four sites.} The advance is an
+    in-memory assignment; the [persist_superblock] that puts the new [commit_number] on disk runs
+    {b after} the callback returns, at every site ([primary_execute_op] additionally batches: it can
+    fire the hook several times and persist once at the end of the loop). A crash between the two
+    therefore loses the advance — the replica comes back up at the {i older} [commit_number]. This
+    matters for a consumer that writes its own derived state durably from inside the callback: that
+    write can survive a crash the replica's own [commit_number] did not, so such a consumer must
+    tolerate its watermark being {i ahead} of the restarted replica's [commit_number], not assume
+    the two are in lockstep.
+
+    {b Therefore: never gate work done inside the callback on {!status} or {!view_number} at all —
+    in either direction.} Not on [status t = Normal] (a consumer that skipped an advance whenever
+    [status <> Normal] would silently drop exactly the advances a {b follower learns through a view
+    change}, the follower-catch-up case that is the main reason this hook exists), and equally not
+    on [status t = View_change] as a way to recognise "this advance came from a view change" (per
+    the split above that inference is simply false at [handle_start_view], the very site where
+    follower catch-up happens). The commit advance being reported is real and final regardless of
+    what those fields read. If a consumer genuinely needs post-action view state, it must do that
+    work after {!propose}/{!handle_message} returns, not inside the hook. *)
 
 val restart :
   ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->

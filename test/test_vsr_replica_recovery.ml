@@ -305,7 +305,10 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   (* Real durable state to recover: [Primary(0) = 3] at [replica_count = 3], so [my_id = 1] is a
      backup in view 0 and these are ordinary in-view Prepares. The second one's [k = 1] is what
-     commits op 1 (VSR.tla:118's [m.k > @] update), so the pre-crash replica really does reach
+     commits op 1 ([ReceivePrepareMsg]'s own [IF m.k > @ THEN m.k ELSE @] update, VSR.tla:255 --
+     NOT :118, which is unrelated storage-model prose; that wrong citation was copied verbatim from
+     replica.ml:930's own comment in fix round 1 instead of being checked against VSR.tla, and
+     replica.ml's copy is wrong too), so the pre-crash replica really does reach
      [commit_number = 1] rather than merely appending. *)
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
@@ -329,9 +332,15 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
     [] !observed;
   Alcotest.(check bool) "and the restarted replica is Normal, so it can accept a further Prepare" true
     (Replica.status t' = Replica.Normal);
-  (* One more GENUINE advance on the restarted replica. [k = 2 < n = 3] is well-formed per
-     VSR.tla:106-109's own [m.k < m.n] precondition (handle_prepare rejects [k >= n]), so this
-     commits op 2 and moves commit_number 1 -> 2. *)
+  (* One more GENUINE advance on the restarted replica. [k = 2 < n = 3] is well-formed: VSR.tla:239
+     states [m.k < m.n] as the invariant a correct primary's Prepares satisfy -- as PROSE justifying
+     why the unconditional [m.k > @] raise is safe, NOT as a conjunct of [ReceivePrepareMsg], whose
+     real guards are VSR.tla:248-251. (Both halves of this citation were wrong in fix round 1:
+     ":106-109" is the corrupt/absent slot definitions, and "precondition" overstated what :239 is.)
+     Our own [handle_prepare] does enforce a bound the model leaves implicit -- replica.ml:958's
+     [k > t.commit_number && k < op_number t] -- but note it rejects only the [k] FIELD's effect at
+     [k >= n]; the Prepare itself is still appended and still acked (see replica.ml:953-955). Here
+     [k = 2] is inside that bound, so this commits op 2 and moves commit_number 1 -> 2. *)
   Replica.handle_message t' (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 2 }));
   Alcotest.(check int) "the next real advance landed" 2 (Replica.commit_number t');
   Alcotest.(check (list (pair int int)))

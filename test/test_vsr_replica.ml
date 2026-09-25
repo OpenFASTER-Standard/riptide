@@ -1681,7 +1681,61 @@ let test_on_commit_advanced_fires_from_send_sv_increase () =
      required to be one-at-a-time -- a consumer must handle a multi-step jump)"
     [ (0, 2) ] !observed
 
-(* The four tests above cover all four commit sites on a replica built by [create]. The FIFTH thing
+let test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup () =
+  (* Fix-round-2 finding. replica.mli used to claim [status] "still reads [View_change]" at BOTH
+     view-change-related commit sites. That is true at [try_send_sv] (reachable only past
+     [has_dvc_quorum], whose own first conjunct IS [status = View_change], VSR.tla:489) but FALSE at
+     [handle_start_view]: VSR.tla:567-570's guard is only
+     [ReceivableMsg(m, "StartView", r) /\ m.v >= View(r)] -- no status conjunct at all, deliberately
+     matched by the implementation -- so a replica that is still [Normal] and has NEVER entered a
+     view change can receive a higher-view StartView and advance its commit_number through that site
+     with [status = Normal] throughout.
+
+     [test_on_commit_advanced_fires_from_receive_sv] above cannot catch this: it calls
+     [check_timeout] first, which forces [View_change] before the StartView ever arrives. This test
+     is the same scenario with that one line REMOVED, and it reads [status] from INSIDE the callback
+     (not after [handle_message] returns, where the post-action [Normal] would prove nothing) so the
+     observation is of the hook-time value the .mli documents. *)
+  let observed = ref [] in
+  let status_inside_callback = ref None in
+  let self = ref None in
+  let send, _sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send
+      ~on_commit_advanced:(fun ~old_commit ~new_commit ->
+        observed := (old_commit, new_commit) :: !observed;
+        match !self with
+        | Some t -> status_inside_callback := Some (Replica.status t)
+        | None -> () (* only reachable for an advance during construction, which never happens *))
+      ()
+  in
+  self := Some t;
+  (* [Primary(1) = 1 + ((1-1) mod 3) = 1], so [my_id = 3] is an ordinary backup in view 1. *)
+  Replica.for_test_set_view_number t 1;
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check bool) "PRECONDITION: this backup never timed out and is still Normal" true
+    (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "PRECONDITION: it has real prior commit progress to advance PAST" 1
+    (Replica.commit_number t);
+  status_inside_callback := None;
+  (* A higher-view StartView delivered directly to that still-Normal backup. No [check_timeout], no
+     Start_view_change, no view-change activity of any kind on this replica beforehand. *)
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+  Alcotest.(check int) "a GENUINE commit advance really happened through handle_start_view" 2
+    (Replica.commit_number t);
+  Alcotest.(check (list (pair int int))) "and the hook fired for it, 1 -> 2" [ (1, 2); (0, 1) ] !observed;
+  Alcotest.(check (option bool))
+    "THE POINT: [status] observed from INSIDE the callback is Normal, NOT View_change -- so the \
+     .mli must not promise View_change at this site, and a consumer must never read this hook's \
+     [status] as evidence of anything"
+    (Some true)
+    (Option.map (fun s -> s = Replica.Normal) !status_inside_callback);
+  Alcotest.(check bool) "the view change still completed normally afterwards" true
+    (Replica.status t = Replica.Normal && Replica.view_number t = 2)
+
+(* The tests above cover all four commit sites on a replica built by [create], plus the hook-time
+   [status] the .mli documents at [handle_start_view]. The one remaining thing
    replica.mli promises about this hook -- that [restart] reports nothing retroactively for the
    [commit_number] it RECOVERS, and that its first callback's [~old_commit] is that recovered value
    rather than 0 -- cannot be tested from here, because a [create]d replica always starts at
@@ -1878,5 +1932,9 @@ let tests =
     ( "3.7: the hook fires from SendSV's own site on a genuine increase (3rd of 4, positive case)",
       `Quick,
       test_on_commit_advanced_fires_from_send_sv_increase );
+    ( "3.7: hook-time [status] at ReceiveSV's site is the PRE-action value and can be Normal -- a \
+       still-Normal backup receiving a higher-view StartView directly",
+      `Quick,
+      test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup );
   ]
   @ create_invalid_arg_tests

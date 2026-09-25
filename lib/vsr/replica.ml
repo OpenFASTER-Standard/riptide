@@ -927,8 +927,10 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
       () (* out-of-order: action not enabled, per VSR.tla -- silently drop, no reply, no state change *)
     | () ->
       t.op_number <- n;
-      (* VSR.tla:106-109's own comment argues the unguarded [m.k > @] update (VSR.tla:118) is safe
-         because a well-formed [Prepare] always has [m.k < m.n] -- a property only true of
+      (* VSR.tla:236-241's own comment argues the unguarded [m.k > @] update (VSR.tla:255) is safe
+         because a well-formed [Prepare] always has [m.k < m.n] (VSR.tla:239 -- prose only; it is
+         NOT a conjunct of [ReceivePrepareMsg], whose real guards are VSR.tla:248-251) -- a
+         property only true of
          messages produced by the spec's OWN actions, which a decoded, possibly network-corrupted
          message is not guaranteed to have. [k <= op_number t] (== [m.n], just appended above)
          bounds [k] explicitly instead of trusting that precondition, so a corrupted/forged [k]
