@@ -29,29 +29,46 @@ exception Did_not_settle
     measurement behind that.
 
     {b The in-flight-handler budget is itself two DIFFERENT mechanisms, not one} (task-master
-    subtask 3.8): {!run}'s own mock-backend entry point supplies neither a wall-clock budget nor a
-    clock, so it keeps the ORIGINAL fixed attempt countdown (5000 waits) -- which is fine there
-    because, under {!Eio_mock.Backend.run} with every storage operation synchronous, this branch is
-    never meaningfully exercised to begin with (the in-flight counter is back at zero after the
-    first yield of every round). {!run_on_file_storage} supplies both, because a fixed attempt
-    countdown is CPU-load-sensitive there: each real wait genuinely takes longer under load, so the
-    same fixed countdown exhausts in less real elapsed time than it would unloaded, at exactly the
-    moment a real cluster most needs longer to make progress (measured: 3/5 real failures -- the
-    calling suite's own wall-clock watchdog, not even reaching this exception -- under real induced
-    CPU load on a run that is 0/5 unloaded). Its budget is instead a genuine progress-based one:
-    keep waiting as long as real delivery is still happening, bounded by real wall-clock elapsed
-    time since the LAST real delivery (30s, deliberately generous -- a liveness bound for a
-    genuinely stuck cluster, not a tuning knob for normal operation), not a raw attempt count. See
-    {!for_test_settle_loop}'s own doc comment for the exact mechanism and the investigation behind
-    why it is tested the way it is. *)
+    subtask 3.8): {!run}'s own mock-backend entry point supplies no [deadline_budget], so it keeps
+    the ORIGINAL fixed attempt countdown (5000 waits) -- which is fine there because, under
+    {!Eio_mock.Backend.run} with every storage operation synchronous, this branch is never
+    meaningfully exercised to begin with (the in-flight counter is back at zero after the first
+    yield of every round). {!run_on_file_storage} supplies a [deadline_budget], because a fixed
+    attempt countdown IS a theoretical CPU-load risk in principle: under sufficiently extreme load
+    each real wait could take long enough that the same fixed countdown spans more real elapsed
+    time than it would unloaded, at exactly the moment a real cluster most needs longer to make
+    progress. Its budget there is instead a genuine progress-based one: keep waiting as long as
+    real delivery is still happening, bounded by real wall-clock elapsed time since the LAST real
+    delivery (10s -- a liveness bound for a genuinely stuck cluster, not a tuning knob for normal
+    operation, and deliberately kept below {!Did_not_settle}'s own calling suite's external 15s
+    per-test watchdog so this exception can actually fire instead of being pre-empted by that
+    watchdog's own, less specific failure), not a raw attempt count.
+
+    {b Correction, made in the fix round following this feature's original review} (finding I1):
+    an earlier version of this paragraph, and the original commit introducing this budget, claimed
+    the progress-based replacement was a MEASURED fix for a real, observed flake ("3/5 failures ->
+    5/5 passes" under induced CPU load). That causal claim did not survive independent, rigorous
+    re-verification and has been retracted: instrumenting the OLD fixed-countdown mechanism
+    directly showed it was never observed within 2x of exhausting and never once produced a clean
+    {!Did_not_settle} for this scenario; every originally-reported "before" failure was the calling
+    suite's own EXTERNAL wall-clock watchdog firing, not this internal exception, and an internal
+    budget change cannot rescue a run from an external kill switch it has no relationship to; and a
+    fair, load-controlled, interleaved comparison of the old and new logic found no measurable
+    difference between them at any load level (the original sequential measurement was very likely
+    a load-variance artifact of a shared, noisy, multi-tenant box). This change is real, tested
+    HARDENING against a genuine theoretical risk, not a proven fix for that specific flake -- the
+    flake's real, better-diagnosed cause is the interaction between the calling suite's own
+    external per-test watchdog and a real-I/O-heavy [Slow]-tagged test taking longer under CPU
+    contention, a different mechanism this change does not address. See {!for_test_settle_loop}'s
+    own doc comment for the exact mechanism and the investigation behind why it is tested the way
+    it is. *)
 
 val for_test_settle_loop :
   drain_round:(unit -> bool) ->
   inflight:(unit -> int) ->
   yield:(unit -> unit) ->
   wait_io:(unit -> unit) ->
-  now:(unit -> float) option ->
-  max_wait_duration:float option ->
+  deadline_budget:(float * (unit -> float)) option ->
   delivery_rounds:int ->
   unit
 (** [settle]'s own decision logic (both budgets described on {!Did_not_settle} above), factored out
@@ -61,6 +78,17 @@ val for_test_settle_loop :
     reimplementation a fix could silently diverge from) it is the ONLY place this logic lives:
     {!run}'s and {!run_on_file_storage}'s own [settle] both call this, supplying their real
     callbacks, nothing more.
+
+    [deadline_budget], when [Some (max_wait_duration, now)], is what makes the wall-clock bound
+    apply instead of the original fixed [io_waits] countdown; [None] keeps the original countdown.
+    {b Finding M1, fix round}: this used to be two separate arguments ([max_wait_duration:float
+    option] and [now:(unit -> float) option]), which made "one [Some], one [None]" a representable
+    call -- a combination in which the old countdown is disabled (it only applies when
+    [max_wait_duration = None]) AND the new deadline tracking is inert (it requires both to be
+    [Some]), silently leaving the loop with no bound at all. Unreachable through {!run}'s and
+    {!run_on_file_storage}'s own wiring (they always pass both or neither), but nothing in this
+    exported function's own contract forbade a future caller from doing it. Bundling the pair into
+    one option makes that state unconstructible instead of merely undocumented.
 
     {b Why this exists, not just [run]/{!run_on_file_storage} themselves} (subtask 3.8's own
     investigation, disclosed in full in this task's own report): the obvious end-to-end test of
@@ -81,9 +109,11 @@ val for_test_settle_loop :
 
     [drain_round ()] delivers everything currently pending for one round (as a side effect,
     incrementing whatever the caller's own in-flight counter is) and returns whether it delivered
-    anything. [inflight ()] reads that same counter. [now] is [None] exactly when
-    [max_wait_duration] is [None] -- both real callers always supply the pair together or neither,
-    mirroring [with_cluster]'s own [(?max_wait_duration, ?clock)] pairing. *)
+    anything. [inflight ()] reads that same counter. Both real callers ([run] and
+    {!run_on_file_storage}, via [with_cluster]'s own [(?max_wait_duration, ?clock)] pair) either
+    construct a [Some (max_wait_duration, now)] together or pass [None] -- see finding M1 above for
+    why [deadline_budget] bundles them into one option rather than leaving that pairing to
+    convention. *)
 
 val run :
   seed:int ->

@@ -1042,8 +1042,8 @@ let test_settle_loop_still_raises_did_not_settle_when_genuinely_stuck () =
         ~inflight:(fun () -> !inflight_val)
         ~yield:(fun () -> ())
         ~wait_io:(fun () -> clock_t := !clock_t +. 0.05)
-        ~now:(Some (fun () -> !clock_t))
-        ~max_wait_duration:(Some 1.0) ~delivery_rounds:500);
+        ~deadline_budget:(Some (1.0, fun () -> !clock_t))
+        ~delivery_rounds:500);
   (* Non-vacuity: this must have taken many real wait_io iterations to cross the deadline, not
      raised immediately for some unrelated reason (e.g. [delivery_rounds] exhausting instead). *)
   Alcotest.(check bool)
@@ -1080,8 +1080,8 @@ let test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_prog
     ~wait_io:(fun () ->
       clock_t := !clock_t +. 1000.0;
       inflight_val := 0)
-    ~now:(Some (fun () -> !clock_t))
-    ~max_wait_duration:(Some 1.0) ~delivery_rounds:(progress_rounds + 10);
+    ~deadline_budget:(Some (1.0, fun () -> !clock_t))
+    ~delivery_rounds:(progress_rounds + 10);
   (* Reached here at all means it did not raise -- and non-vacuously exercised a total elapsed
      time far past [max_wait_duration], not a trivially short run. *)
   Alcotest.(check bool)

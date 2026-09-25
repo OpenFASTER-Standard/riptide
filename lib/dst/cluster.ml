@@ -111,28 +111,35 @@ let check_storage_fault_config ~replica_count ~faults_max
    [drain_round] mirrors [with_cluster]'s own [while Network.pump_one net do delivered := true; incr
    inflight done] -- deliver everything currently pending, as a side effect on the caller's own
    inflight counter, and report whether anything was delivered this round. [inflight] reads that
-   counter (mutated elsewhere, e.g. by a dispatch fiber's own [decr]). [now] is [None] exactly when
-   [max_wait_duration] is [None] (mirrors [with_cluster]'s own [(max_wait_duration, clock)] pairing
-   -- both real entry points always supply the two together or neither). *)
-let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~now ~max_wait_duration
-    ~delivery_rounds =
+   counter (mutated elsewhere, e.g. by a dispatch fiber's own [decr]).
+
+   FIX-ROUND FINDING M1: [max_wait_duration] and [now]/[clock] used to be two separate optional
+   arguments, which made "one [Some], one [None]" a representable call -- a combination in which
+   the OLD [io_waits] floor is disabled (it only applies when [max_wait_duration = None]) and the
+   NEW deadline tracking is inert (it requires both to be [Some]), silently leaving the loop with
+   NO bound at all. Unreachable through [with_cluster]'s own two real callers (they always pass
+   both or neither), but nothing in this exported function's own contract forbade a future caller
+   from doing it. Bundled into one [deadline_budget] option instead, so that state is no longer
+   constructible: a caller either supplies both (the wall-clock bound applies) or neither (the
+   original fixed-[io_waits]-countdown bound applies), never a partial pair. *)
+let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~deadline_budget ~delivery_rounds =
   (* [deadline] is a NEW ref on every call -- see this task's own report for why that is what
      makes each [settle] call's own budget independent of any previous call's. *)
   let deadline = ref None in
   let start_deadline_tracking () =
-    match (max_wait_duration, now) with
-    | Some max_d, Some now -> deadline := Some (now () +. max_d)
-    | _ -> ()
+    match deadline_budget with
+    | Some (max_d, now) -> deadline := Some (now () +. max_d)
+    | None -> ()
   in
   let deadline_exceeded () =
-    match (!deadline, now) with
-    | Some d, Some now -> now () > d
+    match (!deadline, deadline_budget) with
+    | Some d, Some (_, now) -> now () > d
     | _ -> false
   in
   let rec loop delivery_rounds io_waits =
     if delivery_rounds <= 0 then raise Did_not_settle
       (* Real livelock signal, unaffected by this fix: a cluster generating messages forever. *)
-    else if max_wait_duration = None && io_waits <= 0 then raise Did_not_settle
+    else if Option.is_none deadline_budget && io_waits <= 0 then raise Did_not_settle
       (* The ORIGINAL, unmodified behaviour ([run]'s own mock-backend path, and any other caller
          that does not opt into the wall-clock budget): a fixed attempt countdown. *)
     else begin
@@ -261,17 +268,44 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
        3-replica view change over File_storage exhausts 20 and raises Did_not_settle).
 
        SUBTASK 3.8. The second budget used to be a fixed [io_waits : int] attempt countdown
-       (5000), which is CPU-load-sensitive: under load each wait attempt takes longer in real
-       time, so the same fixed countdown exhausts in less real elapsed time than it would
-       unloaded, at exactly the moment the cluster most needs longer to make progress (measured:
-       3/5 real failures -- the suite's own 15s watchdog, not even reaching this exception --
-       under real induced CPU load on a run that is 0/5 unloaded; see this task's own report). For
-       [run_on_file_storage] (the only caller that supplies [max_wait_duration]/[clock]) this is
-       now a genuine progress-based budget instead: keep waiting as long as real delivery is still
-       happening, bounded by real wall-clock elapsed time since the LAST real delivery, not a raw
-       attempt count. [run]'s own mock-backend entry point supplies neither, so its behaviour is
-       byte-for-byte the original fixed-countdown one -- see [for_test_settle_loop]'s own doc
-       comment for why, and for the full investigation behind this design. *)
+       (5000). That IS a theoretical CPU-load risk in principle -- under sufficiently extreme
+       load each wait attempt takes longer in real time, so the same fixed countdown could in
+       principle span more real elapsed time than it would unloaded, and if load were extreme
+       enough for long enough, the countdown could still exhaust while the cluster is genuinely
+       still making progress.
+
+       FIX-ROUND CORRECTION (finding I1): an earlier version of this comment, and this task's own
+       original report/commit message, claimed this was a MEASURED fix for a real observed flake
+       (subtask 3.8's "3/5 failures -> 5/5 passes" under induced load). That causal claim does not
+       hold up and has been retracted, not merely softened -- independent re-measurement (direct
+       instrumentation of the OLD countdown across ~37 runs at three load levels, plus a fair,
+       load-controlled interleaved A/B of old vs. new) found: (a) the old [io_waits] countdown was
+       NEVER observed within 2x of exhausting (worst case 2401-4759 of 5000 remaining) and never
+       once produced a clean [Did_not_settle] for this scenario; (b) every "before" failure this
+       task originally reported was the SUITE'S OWN EXTERNAL 15s per-test watchdog
+       (test_riptide.ml's [Suite_timeout]) firing, not [settle]'s own internal exception -- and an
+       internal budget change cannot rescue a run from an external wall-clock kill switch, it can
+       only leave that run's speed unchanged or slower; (c) with a fair, interleaved measurement
+       (alternating base/head runs to control for this being a shared, noisy, multi-tenant box)
+       there was NO measurable difference between the old and new logic at any load level -- the
+       originally-reported improvement was very likely a load-variance artifact of sequential (not
+       interleaved) measurement, reproduced in the OPPOSITE direction under an unfair ordering.
+       The real, better-diagnosed cause of the observed flakiness is the interaction between that
+       external 15s watchdog and a real-I/O-heavy [Slow]-tagged soak test
+       (test_ring_capacity_boundary_soak) genuinely taking longer under CPU contention -- a
+       completely different mechanism from this budget, which this change does not address and
+       which remains an open problem.
+
+       What this change actually is, honestly stated: real, tested HARDENING against the
+       theoretical risk described above, not a proven fix for the flake subtask 3.8 was originally
+       reported against. For [run_on_file_storage] (the only caller that supplies a
+       [deadline_budget]) the io-wait bound is now progress-based: keep waiting as long as real
+       delivery is still happening, bounded by real wall-clock elapsed time since the LAST real
+       delivery, not a raw attempt count -- see the [max_wait_duration] value below (finding I2)
+       for why it must stay below the suite's own 15s watchdog to ever actually fire. [run]'s own
+       mock-backend entry point supplies no [deadline_budget], so its behaviour is byte-for-byte
+       the original fixed-countdown one -- see [for_test_settle_loop]'s own doc comment for why,
+       and for the full investigation behind this design. *)
     for_test_settle_loop
       ~drain_round:(fun () ->
         let delivered = ref false in
@@ -282,8 +316,11 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
         !delivered)
       ~inflight:(fun () -> !inflight)
       ~yield:Eio.Fiber.yield ~wait_io
-      ~now:(Option.map (fun clock () -> Eio.Time.now clock) clock)
-      ~max_wait_duration ~delivery_rounds
+      ~deadline_budget:
+        (match (max_wait_duration, clock) with
+        | Some max_d, Some clock -> Some (max_d, fun () -> Eio.Time.now clock)
+        | _ -> None)
+      ~delivery_rounds
   in
   (* FINAL-REVIEW FINDING I1: a real crash-and-come-back, the capability whose absence meant
      nothing in this branch could ever have caught finding C1.
@@ -412,8 +449,17 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
     ~wait_io:(fun () -> Eio.Time.sleep clock 0.0001)
     ~delivery_rounds:500
       (* SUBTASK 3.8: a genuine progress-based liveness bound, not a tuning knob for normal
-         operation -- 30s is deliberately generous, since its only job is to still catch a cluster
-         that has genuinely stopped delivering anything real for that long, while never penalising
-         one that keeps making real progress no matter how slowly (see [for_test_settle_loop]'s own
-         doc comment). *)
-    ~max_wait_duration:30.0 ~clock body
+         operation -- its only job is to still catch a cluster that has genuinely stopped
+         delivering anything real, while never penalising one that keeps making real progress no
+         matter how slowly (see [for_test_settle_loop]'s own doc comment).
+
+         FIX-ROUND CORRECTION (finding I2): this was originally 30.0, which is ABOVE
+         [test/test_riptide.ml]'s own external per-test watchdog (`timeout_seconds = 15.`) -- so a
+         [settle] call that genuinely rode this deadline out could never actually raise
+         [Did_not_settle] from here; the external SIGALRM watchdog would always kill the test
+         first, at 15s, with a less accurate failure message ("likely a busy-poll livelock") than
+         this module's own. 10.0 is comfortably below that 15s budget (leaving room for the rest
+         of a test's own non-settle work before the watchdog's own deadline), so a genuinely stuck
+         cluster now gets diagnosed by this module's own, more accurate [Did_not_settle] instead of
+         being silently pre-empted. *)
+    ~max_wait_duration:10.0 ~clock body
