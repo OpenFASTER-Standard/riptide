@@ -810,6 +810,60 @@ val handle_message : t -> string -> unit
       caller. A real network provides no payload integrity ({!Riptide_transport.Transport_intf.S}'s
       own documented guarantee), and this replica must not crash when it is handed garbage. *)
 
+(** {2 Observability}
+
+    Unlike the test-support surface below, {!append_refusals} is production-facing: real callers
+    are expected to read it, not just tests. *)
+
+val append_refusals : t -> (string * int) list
+(** [append_refusals t] is how many durable WAL appends this replica has had REFUSED over
+    its lifetime, broken down by the reason, as [(name, count)] pairs in a fixed order:
+    [fault_injection_cap], [entry_rejected], [out_of_sequence], [eviction_blocked].
+
+    {b Not protocol, but no longer test-only} — nothing in this module reads it, and all four
+    refusals have exactly the same protocol effect (the entry is not durable, so it is not
+    acknowledged). It was introduced as [for_test_append_refusals] because they used to be
+    indistinguishable, which is final-review finding I2: one blanket [Invalid_argument] catch
+    reported "the backend refused this entry" for three unrelated conditions, and nothing counted
+    them, so the conflation was invisible. Instrumenting the suite before the fix recorded 317
+    refusals in a single [dune test --force], 308 of one kind and 9 of another, none of them
+    observable anywhere.
+
+    Subtask 3.7 dropped the [for_test_] prefix, because the fourth shape below gave it a real,
+    non-test consumer. {b The intended production use:} a caller that has supplied
+    {!Riptide_storage.File_storage}'s [?may_evict] gate watches [eviction_blocked]'s count {e grow}
+    — alongside {!commit_number} failing to advance — as the real signal that materialization has
+    genuinely fallen behind the log, rather than inferring it from a stalled cluster. Either
+    observation alone is ambiguous: a growing [eviction_blocked] with commit progress still
+    advancing is healthy backpressure doing its job, and a stalled [commit_number] on its own has
+    many other causes. It is their conjunction that identifies this one. The counts are monotonic
+    and per-replica, so the useful reading is a delta between two samples, not an absolute value.
+
+    - [fault_injection_cap] — {!Riptide_storage.Fault_injecting_storage}'s own deliberate
+      ["faults_max exceeded"] guard. Not a storage failure at all: the fault INJECTOR declining to
+      inject more simultaneous corruption than the configured replication quorum tolerates. When
+      this is non-zero, a sweep's effective fault rate is below its configured one — which is worth
+      asserting on rather than discovering by instrumenting.
+    - [entry_rejected] — a backend that cannot store an entry of this size
+      ({!Riptide_storage.File_storage}'s one-aligned-data-slot limit). The only shape the original
+      blanket catch actually documented.
+    - [out_of_sequence] — the backend's own [wal_highest_op_number] is not [op_number - 1].
+      Reachable by design, not a programming error: a log adoption refused partway through has
+      already truncated and partially re-appended, so the durable log sits below this replica's own
+      {!op_number} until a [StartView] repairs it. The gap reads back as corrupt, never absent, so
+      the degradation is safe — which is exactly why it has to be visible rather than silently
+      equated with the case above.
+    - [eviction_blocked] — {!Riptide_storage.File_storage}'s [?may_evict] predicate declining to
+      let this append overwrite an older entry the ring's owner still needs (subtask 3.7). {b The
+      only transient shape of the four:} the call is well-formed, and the same [op_number] succeeds
+      once the predicate relents, so this is backpressure rather than a defect. Flattening it into
+      [entry_rejected] would say the exact opposite of what it means — that the entry can never be
+      durable here — and would make this counter useless for the lag signal described above.
+
+    An [Invalid_argument] matching none of the four is NOT counted and NOT swallowed: it
+    propagates, because an unrecognized exception out of a backend is a contract violation rather
+    than a documented storage refusal. *)
+
 (** {2 Test-support surface}
 
     Everything below exists purely to make [t] constructible into specific test scenarios; it is
@@ -922,52 +976,3 @@ val for_test_wal_read : t -> op_number:int -> Riptide.Value.value option
     entry really reached the WAL, or that a truncation really removed it — rather than inferring it
     from {!entries}, which is the in-memory copy and would pass even if nothing were ever written
     through to storage at all. *)
-
-val append_refusals : t -> (string * int) list
-(** [append_refusals t] is how many durable WAL appends this replica has had REFUSED over
-    its lifetime, broken down by the reason, as [(name, count)] pairs in a fixed order:
-    [fault_injection_cap], [entry_rejected], [out_of_sequence], [eviction_blocked].
-
-    {b Not protocol, but no longer test-only} — nothing in this module reads it, and all four
-    refusals have exactly the same protocol effect (the entry is not durable, so it is not
-    acknowledged). It was introduced as [for_test_append_refusals] because they used to be
-    indistinguishable, which is final-review finding I2: one blanket [Invalid_argument] catch
-    reported "the backend refused this entry" for three unrelated conditions, and nothing counted
-    them, so the conflation was invisible. Instrumenting the suite before the fix recorded 317
-    refusals in a single [dune test --force], 308 of one kind and 9 of another, none of them
-    observable anywhere.
-
-    Subtask 3.7 dropped the [for_test_] prefix, because the fourth shape below gave it a real,
-    non-test consumer. {b The intended production use:} a caller that has supplied
-    {!Riptide_storage.File_storage}'s [?may_evict] gate watches [eviction_blocked]'s count {e grow}
-    — alongside {!commit_number} failing to advance — as the real signal that materialization has
-    genuinely fallen behind the log, rather than inferring it from a stalled cluster. Either
-    observation alone is ambiguous: a growing [eviction_blocked] with commit progress still
-    advancing is healthy backpressure doing its job, and a stalled [commit_number] on its own has
-    many other causes. It is their conjunction that identifies this one. The counts are monotonic
-    and per-replica, so the useful reading is a delta between two samples, not an absolute value.
-
-    - [fault_injection_cap] — {!Riptide_storage.Fault_injecting_storage}'s own deliberate
-      ["faults_max exceeded"] guard. Not a storage failure at all: the fault INJECTOR declining to
-      inject more simultaneous corruption than the configured replication quorum tolerates. When
-      this is non-zero, a sweep's effective fault rate is below its configured one — which is worth
-      asserting on rather than discovering by instrumenting.
-    - [entry_rejected] — a backend that cannot store an entry of this size
-      ({!Riptide_storage.File_storage}'s one-aligned-data-slot limit). The only shape the original
-      blanket catch actually documented.
-    - [out_of_sequence] — the backend's own [wal_highest_op_number] is not [op_number - 1].
-      Reachable by design, not a programming error: a log adoption refused partway through has
-      already truncated and partially re-appended, so the durable log sits below this replica's own
-      {!op_number} until a [StartView] repairs it. The gap reads back as corrupt, never absent, so
-      the degradation is safe — which is exactly why it has to be visible rather than silently
-      equated with the case above.
-    - [eviction_blocked] — {!Riptide_storage.File_storage}'s [?may_evict] predicate declining to
-      let this append overwrite an older entry the ring's owner still needs (subtask 3.7). {b The
-      only transient shape of the four:} the call is well-formed, and the same [op_number] succeeds
-      once the predicate relents, so this is backpressure rather than a defect. Flattening it into
-      [entry_rejected] would say the exact opposite of what it means — that the entry can never be
-      durable here — and would make this counter useless for the lag signal described above.
-
-    An [Invalid_argument] matching none of the four is NOT counted and NOT swallowed: it
-    propagates, because an unrecognized exception out of a backend is a contract violation rather
-    than a documented storage refusal. *)

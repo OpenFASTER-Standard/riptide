@@ -687,10 +687,22 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
    Subtask 3.7's [Eviction_blocked] is worth one extra note HERE, at the call site, because it is
    the first refusal a well-formed append can hit: returning [false] for it means this replica
    declines to acknowledge an op it could otherwise have taken on, deliberately trading liveness for
-   the durability of an older entry its owner has not finished with. Both real callers of this
-   function already treat a classified refusal as a silent no-op, so that trade needs no new code
-   here -- but it is the reason [append_refusals] was promoted out of test-only visibility: a
-   refusal that is CORRECT and INDEFINITE is one an operator has to be able to see.
+   the durability of an older entry its owner has not finished with. [propose] and [handle_prepare]
+   already treat a classified refusal as a silent no-op, and for THEM that is accurate: nothing has
+   happened yet, so the trade needs no new code there. [adopt_durable_log] (reached via
+   [try_send_sv]/[handle_start_view]) is a third real caller, through its own [append_rest] loop,
+   and is NOT the same shape: by the time that loop reaches this call, [truncate_wal] has already
+   zeroed every discarded slot, so a refusal here does not land on a clean no-op -- it leaves the
+   durable log partially rewritten (only [prefix_ok] plus however much of the canonical suffix did
+   get re-appended before the refusal) until a subsequent successful re-append or another StartView
+   completes the adoption. That degradation is still safe, by the same argument [Out_of_sequence]
+   above already relies on: the un-rewritten gap reads back [Corrupt], never [Absent] (see
+   [slot_state]), and no exception escapes -- but it is "log adoption left incomplete", not
+   "nothing happened", and any [?may_evict] predicate a future consumer (Task 6) supplies must stay
+   permissive enough that adoption/repair traffic through [adopt_durable_log] is never itself
+   starved by the same eviction gate meant for ordinary [propose]/[handle_prepare] appends. It is
+   also the reason [append_refusals] was promoted out of test-only visibility: a refusal that is
+   CORRECT and INDEFINITE is one an operator has to be able to see.
 
    [Value.canonical_encode] is evaluated OUTSIDE the handler on purpose: it has its own
    [Invalid_argument] failure modes, and catching those here would put an encoding bug in the
