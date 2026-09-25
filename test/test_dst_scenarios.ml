@@ -1092,6 +1092,76 @@ let test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_prog
     true
     (!clock_t > 1.0 *. Float.of_int progress_rounds)
 
+(* NOTHING DELIVERED ON THE VERY FIRST ROUND, WITH A HANDLER ALREADY IN FLIGHT -- the one scenario
+   that reaches [for_test_settle_loop]'s [if !deadline = None then start_deadline_tracking ()]
+   fallback, and the only thing keeping the loop bounded in it (final-review finding I3).
+
+   WHY THIS SHAPE. The deadline is normally armed by the [if delivered then start_deadline_tracking
+   ()] line, which only runs on a round that actually delivered something. A caller supplying
+   [deadline_budget = Some _] has the OLD fixed [io_waits] countdown disabled by that very fact
+   (it applies only when [deadline_budget = None]), so if the first round delivers nothing while
+   [inflight () > 0] and the fallback did not arm the deadline, [deadline_exceeded ()] would stay
+   [false] forever and this loop would spin without any bound at all: [delivery_rounds] is never
+   decremented either, because nothing is ever delivered.
+
+   Both existing direct tests above miss this branch entirely -- the stuck one delivers on round 1
+   (so the deadline is armed by the normal path), and the progressing one delivers on every round.
+   Deleting the fallback line leaves the whole suite green, which is exactly the untested-rule
+   liability this repo's own CLAUDE.md treats as a defect; hence this test.
+
+   [max_fake_waits] is what makes the mutation test fail FAST instead of hanging the suite: with
+   the fallback line removed, the loop never terminates, so the fake [wait_io] itself raises a
+   distinct exception once it has been called absurdly more times than the real deadline needs
+   (21). [Alcotest.check_raises] then reports the wrong exception rather than the run wedging. *)
+exception Settle_loop_ran_unbounded
+
+let max_fake_waits = 10_000
+
+let test_settle_loop_bounds_a_first_round_that_delivers_nothing_while_inflight () =
+  let rounds = ref 0 in
+  let waits = ref 0 in
+  let clock_t = ref 0.0 in
+  (* Never delivers anything, not even on the first round -- while a handler is reported in flight
+     from the very start. *)
+  let drain_round () =
+    incr rounds;
+    false
+  in
+  let wait_io () =
+    incr waits;
+    if !waits > max_fake_waits then raise Settle_loop_ran_unbounded;
+    clock_t := !clock_t +. 0.05
+  in
+  Alcotest.check_raises
+    "a first round that delivers nothing while a handler is in flight is still bounded: the \
+     deadline engages from that very round and Did_not_settle fires"
+    Riptide_dst.Cluster.Did_not_settle (fun () ->
+      Riptide_dst.Cluster.for_test_settle_loop ~drain_round
+        ~inflight:(fun () -> 1)
+        ~yield:(fun () -> ())
+        ~wait_io
+        ~deadline_budget:(Some (1.0, fun () -> !clock_t))
+        ~delivery_rounds:500);
+  (* Non-vacuity, three ways. (1) It really was the wall-clock deadline that stopped this, crossed
+     by accumulated small waits, not some unrelated budget. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "the deadline was crossed by real accumulated wait time (clock reached %f)"
+       !clock_t)
+    true
+    (!clock_t > 1.0 && !clock_t < 2.0);
+  (* (2) It stopped nowhere near the guard above -- i.e. the deadline, not the guard, is the bound
+     being demonstrated. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "...far below the test's own runaway guard (%d waits of %d)" !waits
+       max_fake_waits)
+    true
+    (!waits < max_fake_waits / 10);
+  (* (3) Every single round of this run delivered nothing, so [delivery_rounds] (500) was never
+     consumed and cannot be what raised: rounds and waits track each other one-for-one, with the
+     final round raising before it waits. *)
+  Alcotest.(check int) "every round waited exactly once, the last one raising instead" (!waits + 1)
+    !rounds
+
 (* ---------------------------------------------------------------------------------------------
    Test 12 (task-master subtask 3.7, Task 6 of the ring-eviction-watermark plan): RESTART RECOVERY
    for the ring-eviction materialization watermark needs NO new durable state of its own.
@@ -1572,6 +1642,9 @@ let tests =
     ( "settle's wall-clock budget (subtask 3.8) tolerates unbounded real time between deliveries \
        while the cluster keeps genuinely progressing", `Quick,
       test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_progressing );
+    ( "settle's wall-clock budget (final-review finding I3) still bounds a FIRST round that \
+       delivers nothing while a handler is in flight", `Quick,
+      test_settle_loop_bounds_a_first_round_that_delivers_nothing_while_inflight );
     ( "subtask 3.7: the ring-eviction materialization watermark survives a real crash-and-come-back \
        with no durable state of its own", `Slow,
       test_restart_recovery_needs_no_new_durable_watermark_state );

@@ -56,12 +56,40 @@ exception Did_not_settle
     fair, load-controlled, interleaved comparison of the old and new logic found no measurable
     difference between them at any load level (the original sequential measurement was very likely
     a load-variance artifact of a shared, noisy, multi-tenant box). This change is real, tested
-    HARDENING against a genuine theoretical risk, not a proven fix for that specific flake -- the
-    flake's real, better-diagnosed cause is the interaction between the calling suite's own
-    external per-test watchdog and a real-I/O-heavy [Slow]-tagged test taking longer under CPU
-    contention, a different mechanism this change does not address. See {!for_test_settle_loop}'s
-    own doc comment for the exact mechanism and the investigation behind why it is tested the way
-    it is. *)
+    HARDENING against a genuine theoretical risk, not a proven fix for that specific flake.
+
+    {b Second correction, made in the fix round following this branch's final whole-branch review}
+    (finding I4): that fix round went on to name a REPLACEMENT cause -- the interaction between the
+    calling suite's own external per-test watchdog and a real-I/O-heavy [Slow]-tagged test taking
+    longer under CPU contention -- and stated it here as settled fact. That is retracted too, for
+    the same reason the first diagnosis was: it is not established. {b The mechanism behind the
+    observed flakiness is not identified.} What is actually known, kept separate rather than folded
+    into one causal story:
+
+    - This budget change is real, tested hardening against a genuine theoretical risk, directly
+      unit-tested via {!for_test_settle_loop}. It is not proven to fix any specific observed flake.
+    - At least TWO distinct failure shapes have been observed under induced load on this codebase,
+      and they are not the same phenomenon. One is a {!Did_not_settle}-free, external-per-test-
+      watchdog ([Suite_timeout]) shape, which is real and reliable -- confirmed first-hand at 10/10
+      full-suite runs under 16 busy loops on a 16-core box -- but which fired on
+      [test_lattice_materialize_crypto_scenarios.ml]'s [test_adversarial_sweep], not on the
+      [test_ring_capacity_boundary_soak] the fix round's hypothesis named (that one passed in all
+      22 loaded runs). So the watchdog selects for whichever real-I/O-heavy test is slowest under
+      whatever load is present, which is not a statement about any one test and still nothing an
+      internal budget can affect. The other is a plain assertion failure in
+      [test_dst_scenarios.ml]'s own [test_ring_capacity_boundary] (a [`Quick] test, not the [`Slow]
+      soak) with neither {!Did_not_settle} nor [Suite_timeout] involved -- reported by this branch's
+      final whole-branch review at 1/10 runs at HEAD, and NOT reproduced in this fix wave's own
+      0/22, which at that rate settles nothing either way. It is not about [settle]'s own budget, so
+      this change neither addresses nor could address it.
+    - A fair, load-controlled, interleaved A/B between this branch's root commit and its HEAD (10
+      runs each, identical induced load) measured the same flake rate at both ends -- so this
+      branch neither fixed nor worsened the underlying flake.
+
+    Consequently {b task-master subtask 3.8 is not closed by this work and stays genuinely
+    open/pending}: what it asked for (identify and fix a specific observed flake's cause) was not
+    delivered; the hardening above was. See {!for_test_settle_loop}'s own doc comment for the exact
+    mechanism and the investigation behind why it is tested the way it is. *)
 
 val for_test_settle_loop :
   drain_round:(unit -> bool) ->

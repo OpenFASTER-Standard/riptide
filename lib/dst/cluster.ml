@@ -290,15 +290,67 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
        there was NO measurable difference between the old and new logic at any load level -- the
        originally-reported improvement was very likely a load-variance artifact of sequential (not
        interleaved) measurement, reproduced in the OPPOSITE direction under an unfair ordering.
-       The real, better-diagnosed cause of the observed flakiness is the interaction between that
-       external 15s watchdog and a real-I/O-heavy [Slow]-tagged soak test
-       (test_ring_capacity_boundary_soak) genuinely taking longer under CPU contention -- a
-       completely different mechanism from this budget, which this change does not address and
-       which remains an open problem.
 
-       What this change actually is, honestly stated: real, tested HARDENING against the
-       theoretical risk described above, not a proven fix for the flake subtask 3.8 was originally
-       reported against. For [run_on_file_storage] (the only caller that supplies a
+       FINAL-REVIEW CORRECTION (finding I4): the fix round above went on to name a REPLACEMENT
+       cause -- "the interaction between that external 15s watchdog and a real-I/O-heavy
+       [Slow]-tagged soak test (test_ring_capacity_boundary_soak) genuinely taking longer under CPU
+       contention" -- and stated it as settled fact. That is now retracted too, for the same reason
+       the first diagnosis was: it is not established. The branch's own final whole-branch review
+       reproduced a flake at this branch's HEAD, under induced CPU load, in a THIRD shape that
+       neither diagnosis predicts: [test_ring_capacity_boundary] -- a [`Quick] test, NOT the
+       [`Slow] soak this comment used to blame -- failed its own plain assertion ("with a ring
+       bigger than the log, the view change completes and every replica is Normal", i.e. the
+       [ring_capacity:64] half), with no [Did_not_settle] and no [Suite_timeout] involved at all.
+       That is not a budget/watchdog interaction of any kind: it is the cluster genuinely not
+       having reached [Normal] on every replica by the time the scenario looked.
+
+       WHAT IS ACTUALLY KNOWN, stated as the three separate things they are rather than folded into
+       one causal story:
+
+       (a) This change is real, tested HARDENING against the theoretical CPU-load risk described
+           above, and it is directly unit-tested ([test_dst_scenarios.ml]'s three
+           [for_test_settle_loop] tests). It is NOT proven to be the fix for any specific observed
+           flake, and nothing here should be read as claiming it is.
+       (b) At least TWO distinct failure shapes have been observed on this codebase under induced
+           load, and they are not the same phenomenon:
+
+           - AN EXTERNAL-WATCHDOG ([Suite_timeout]) SHAPE, which this fix wave confirmed
+             first-hand rather than inheriting: with 16 busy-loop processes on this 16-core box,
+             a full-suite run at this branch's HEAD hit test_riptide.ml's own 15s per-test
+             watchdog in 10 of 10 runs -- reliably, not flakily. Two details cut against the fix
+             round's own hypothesis rather than for it. The test that timed out was
+             [test_lattice_materialize_crypto_scenarios.ml]'s own [test_adversarial_sweep], NOT
+             [test_ring_capacity_boundary_soak] -- the test the retracted paragraph above named as
+             THE cause, and which passed in every one of those same 10 runs (and in 12 further
+             dst_scenarios-only runs under the same load). What the watchdog actually selects for
+             is therefore "whichever real-I/O-heavy test happens to be slowest under whatever load
+             is present", a property of the watchdog-plus-load pair rather than of any one test --
+             which is why naming one specific test as the cause was itself part of the overclaim.
+             This shape remains something [settle]'s own internal budget cannot affect in either
+             direction: an internal bound cannot rescue a run from an external wall-clock kill
+             switch.
+           - A PLAIN ASSERTION-FAILURE SHAPE in [test_ring_capacity_boundary] (a [`Quick] test),
+             failing "with a ring bigger than the log, the view change completes and every replica
+             is Normal" with neither [Did_not_settle] nor [Suite_timeout] involved. Observed by
+             this branch's final whole-branch review at HEAD, at 1/10 runs under its own induced
+             load. NOT reproduced by this fix wave (0/22 runs under the load described above),
+             which at a reported rate of ~1/10 neither confirms nor refutes it -- so it is recorded
+             here with its provenance rather than as an established mechanism. It is not about
+             [settle]'s own budget at all, so this change neither addresses nor could address it.
+             Note it also contradicts the "0/5 for [test_ring_capacity_boundary]" figure
+             [test_dst_scenarios.ml]'s own soak-test comment records from an earlier review -- a
+             5-run sample simply did not have the resolution to see a ~1-in-10 event either way.
+       (c) A fair, interleaved A/B under identical induced load (alternating between this branch's
+           root commit and its HEAD, 10 runs each) put the flake rate at 1/10 at BOTH ends. So
+           this branch neither fixed nor worsened the underlying flake, which is the honest
+           summary of its effect on it: none measurable.
+
+       CONSEQUENCE FOR THE TRACKER: subtask 3.8 is not closed by this change and must stay
+       genuinely open/pending. What it asked for -- identify and fix the cause of a specific
+       observed flake -- has not been delivered; what was delivered is (a).
+
+       WHAT THE MECHANISM ITSELF IS, independent of any flake claim. For [run_on_file_storage] (the
+       only caller that supplies a
        [deadline_budget]) the io-wait bound is now progress-based: keep waiting as long as real
        delivery is still happening, bounded by real wall-clock elapsed time since the LAST real
        delivery, not a raw attempt count -- see the [max_wait_duration] value below (finding I2)

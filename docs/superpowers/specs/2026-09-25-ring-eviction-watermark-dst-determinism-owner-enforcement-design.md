@@ -1,11 +1,29 @@
 # General ring-eviction watermark, deterministic DST completion, and type-level owner enforcement
 
+> **Correction, made after this branch shipped (final-review finding I2).** As originally written,
+> this document asserted in four places that subtask 3.8's root cause had been *decisively proven*
+> by a load experiment ("5/5 reproducible failures under artificial CPU load … versus 0/30 without
+> load"). **That claim is false and is retracted throughout this document**, not merely softened —
+> an independent re-review during this branch's own Task 1 found it does not hold up (a
+> load-variance artifact of sequential rather than interleaved measurement, plus an inverted causal
+> mechanism: the old fixed countdown exhausts in *less* real time under load only if you assume the
+> thing that was actually failing was `settle`'s own internal budget, and it was not — it was the
+> test suite's own external per-test watchdog, which no internal budget change can rescue a run
+> from). The shipped code's own doc comments (`lib/dst/cluster.ml`, `lib/dst/cluster.mli`) carry the
+> honest framing; the inline corrections below bring this document into line with them so the
+> design authority no longer contradicts the code it authorized. **Net effect on subtask 3.8: it is
+> not closed by this branch and stays genuinely open/pending.**
+
 Design spec for three related task-master subtasks — 3.7 (general multi-replica ring-eviction
-watermark), 3.8 (the real, decisively-proven root cause behind a flaky DST test), and 4.8
+watermark), 3.8 (a flaky DST test, believed at the time of writing to have a decisively-proven root
+cause — see the correction above; it does not), and 4.8
 (type-level owner-tag enforcement, the residual left open by the just-merged
 `layer0-followup-hardening` branch). Brainstormed and specified together because all three touch
-the DST/storage layer 3.7's own testing depends on, and because 3.8's fix needs to land before
-3.7's new multi-replica tests can be trusted not to flake for an unrelated reason. This document
+the DST/storage layer 3.7's own testing depends on, and because 3.8's fix was believed to need to
+land before 3.7's new multi-replica tests could be trusted not to flake for an unrelated reason
+(that sequencing rationale does not survive the correction above either: 3.8's change is not known
+to fix any specific flake, so it cannot have been a prerequisite for 3.7's tests being
+trustworthy — they stand on their own). This document
 is the argument; the implementation plan and running code that follow it are the authority, per
 `CLAUDE.md`'s "no spec without running code" rule.
 
@@ -15,9 +33,14 @@ is the argument; the implementation plan and running code that follow it are the
 plan as its own dedicated pass (Tasks 6-8 of that plan's own document were never started). 3.8 was
 originally believed to be about `Network`'s fault-injection PRNG order-dependence; that fix landed
 (closing a real, separate gap) but two independent investigations, by direct code reading,
-confirmed it cannot be the mechanism behind the specific named flake — the real cause was later
-decisively proven during unrelated work on subtask 4.7 (5/5 reproducible failures under artificial
-CPU load on a tree with every other fix stashed out, versus 0/30 without load). 4.8 is the
+confirmed it cannot be the mechanism behind the specific named flake — a load experiment during
+unrelated work on subtask 4.7 (5/5 reproducible failures under artificial CPU load on a tree with
+every other fix stashed out, versus 0/30 without load) was then believed to have decisively proven
+the real cause. **Retracted (finding I2): it did not.** Fair, interleaved re-measurement found no
+difference between the old and new logic at any load level, and every "before" failure in that
+experiment was the suite's own external per-test watchdog firing rather than `settle`'s own
+internal budget. The mechanism behind the flake is **not identified**; see Decision 5's own
+correction below for what is actually known. 4.8 is the
 residual the just-merged plan's own final whole-branch review found and the spec for that plan
 corrected rather than closed: neither `Materializer.create` nor `Redaction_store.create` enforces
 an owner tag at the constructor level, only by convention at every current real call site.
@@ -160,7 +183,24 @@ exception propagates out of a single `propose`/`handle_prepare` call.
 
 ## Decision 5 (subtask 3.8): a progress-based completion budget for `settle()`, not a raw iteration count
 
-**Root cause, decisively confirmed** (5/5 reproducible failures under artificial CPU load on a
+> **Correction (finding I2), read this before the rest of this section.** What follows was written
+> as a *decisively confirmed root cause*, on the strength of a 5/5-under-load versus 0/30-without
+> experiment. **That confirmation is retracted.** What survives re-verification is only the
+> *theoretical* risk the paragraph below describes — a fixed attempt count is not a fixed amount of
+> real time — and the change it motivates is therefore **hardening against that theoretical risk,
+> not a diagnosed fix for any observed flake**. Three things re-measurement established, none of
+> them in this section's original favour: the old `io_waits` countdown was never observed within 2x
+> of exhausting and never once produced a clean `Did_not_settle` for this scenario; every
+> originally-reported "before" failure was the suite's own *external* per-test watchdog firing,
+> which an internal budget change cannot rescue a run from; and a fair, interleaved A/B of the old
+> and new logic found no measurable difference at any load level. The mechanism of the underlying
+> flake remains unidentified, and at least two distinct failure shapes have since been observed
+> under induced load (see the Testing section's own correction). The shipped `lib/dst/cluster.ml` /
+> `lib/dst/cluster.mli` doc comments are the authoritative statement of this; subtask 3.8 stays
+> open/pending.
+
+**Root cause, as originally believed — see the correction above, this was not confirmed** (5/5
+reproducible failures under artificial CPU load on a
 tree with every other recent fix stashed out, versus 0/30 without load, discovered during
 unrelated work on subtask 4.7): `lib/dst/cluster.ml`'s `settle()` bounds its I/O-wait branch with
 a fixed `io_waits : int` countdown (`cluster.ml:186-203`, starts at 5000, decremented once per
@@ -168,9 +208,15 @@ a fixed `io_waits : int` countdown (`cluster.ml:186-203`, starts at 5000, decrem
 `File_storage` I/O, `wait_io` is a genuine `Eio.Time.sleep` (`cluster.ml:324-329`, needed because a
 fiber parked on an io_uring completion cannot be advanced by `Eio.Fiber.yield` alone) — legitimate
 and untouched by this decision. What's wrong is that a fixed number of *attempts* doesn't
-correspond to a fixed amount of *real time* once the machine is under load: each attempt takes
-longer, so the same countdown exhausts in less real elapsed time than it would unloaded, at
-exactly the moment the cluster most needs longer to make progress.
+correspond to a fixed amount of *real time* once the machine is under load.
+
+The causal sentence that stood here — "each attempt takes longer, so the same countdown exhausts in
+*less* real elapsed time than it would unloaded" — is **inverted and is corrected** (finding I2):
+attempts taking longer makes a fixed countdown span *more* real elapsed time, not less. The real,
+surviving risk is the other direction, and it is the one `lib/dst/cluster.ml` states: under
+sufficiently extreme load a cluster can need *more attempts* to make the same progress, so a fixed
+countdown can exhaust while the cluster is genuinely still progressing. That is a theoretical risk
+worth hardening against; it is not a measured explanation of any observed failure.
 
 **Mechanism:** `with_cluster` gains `?max_wait_duration:float` (real seconds). `run_on_file_storage`
 passes it, using the `Eio.Time.clock` it already has via `env` (`cluster.ml:315`,
@@ -220,12 +266,43 @@ write stays durably logged, and materializes once the backlog clears) and observ
 explicit test proving a write with no `merge_key` is never blocked by the gate regardless of
 backlog state — the existing, disclosed boundary must stay completely unaffected.
 
-**3.8:** the previously-flaky scenario run repeatedly under real, induced CPU load (matching the
-load-generation technique already used to decisively prove the root cause — busy-loop processes
-pinned against available cores), proving it no longer flakes where it reliably did before. A
-second, deliberately-stuck-forever scenario (e.g., a storage backend that never completes I/O)
-proving `Did_not_settle` still fires, in bounded real time, when the cluster genuinely cannot make
+**3.8, as originally prescribed:** the previously-flaky scenario run repeatedly under real, induced
+CPU load, proving it no longer flakes where it reliably did before. A second,
+deliberately-stuck-forever scenario (e.g., a storage backend that never completes I/O) proving
+`Did_not_settle` still fires, in bounded real time, when the cluster genuinely cannot make
 progress — the fix must not silently disable the harness's own livelock detection.
+
+> **Correction (finding I2/I4): the first of those two was not delivered, and the prescription
+> itself was unsound.** "Proving it no longer flakes where it reliably did before" presupposes a
+> baseline that does not exist: the scenario never flaked *reliably*, and the failures attributed to
+> it were the suite's own external watchdog, not `settle`'s internal budget. What was actually
+> delivered instead, and is the honest statement of 3.8's test coverage:
+>
+> - **Three direct unit tests of `Cluster.for_test_settle_loop`** (`test/test_dst_scenarios.ml`),
+>   driving the extracted loop with a fake `drain_round`/clock: that a genuinely stuck cluster still
+>   raises `Did_not_settle` in bounded time (the second prescription above, delivered); that a
+>   slow-but-steadily-progressing one never does, however long it runs; and that a *first* round
+>   delivering nothing while a handler is in flight is still bounded (finding I3 — the deadline's
+>   own fallback arming, previously the only untested line in that loop).
+> - **An A/B under induced load that came out neutral, not positive.** A fair, interleaved
+>   comparison of this branch's root commit against its HEAD (10 runs each, identical load) measured
+>   the same flake rate at both ends: this branch neither fixed nor worsened the flake.
+> - **A newly observed, distinct failure shape** that neither the original nor the replacement
+>   diagnosis predicts: `test_ring_capacity_boundary` (a `` `Quick `` test, not the `` `Slow `` soak)
+>   failing its own plain assertion under load, with neither `Did_not_settle` nor the suite timeout
+>   involved (final review, 1/10 runs at HEAD; not reproduced in 22 further loaded runs during the
+>   fix wave, which at that rate settles nothing either way). Mechanism unidentified; unaffected by
+>   this branch's change, since it is not about `settle`'s budget at all.
+> - **A `Suite_timeout` shape that is real and reliable, but on a different test than was blamed.**
+>   Under 16 busy loops on this 16-core box, 10 of 10 full-suite runs at HEAD hit the suite's own 15s
+>   per-test watchdog — every time on `test_lattice_materialize_crypto_scenarios.ml`'s
+>   `test_adversarial_sweep`, while `test_ring_capacity_boundary_soak` (the test the replacement
+>   diagnosis named) passed in all 22 loaded runs. The watchdog selects for whichever real-I/O-heavy
+>   test is slowest under whatever load is present; that is a property of the watchdog-plus-load
+>   pair, not of any one test, and still nothing an internal `settle` budget can affect.
+>
+> So the end-to-end "no longer flakes" claim is **not** part of this branch's evidence, and subtask
+> 3.8 stays open/pending until a mechanism is actually identified.
 
 **4.8:** a real construction-time rejection test — `Redaction_store.create` given a `kv` tagged
 with a different or absent owner — proving it raises before any keystore operation, mirroring the

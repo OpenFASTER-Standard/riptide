@@ -180,6 +180,14 @@ val materialize_up_to :
     that reached into that tail would fold an uncommitted entry into the lattice accumulator,
     which no later view change discarding that same log entry could ever undo.
 
+    {b That clamp keeps this WALK safe; it does not make a caller's own WATERMARK correct}
+    (final-review finding I1). Passing an over-large [through_commit_number] never materializes
+    something uncommitted, but a caller that then records that same number as its watermark can be
+    claiming coverage of entries this walk never reached -- which is exactly what happens after a
+    restart over a ring that has wrapped. See {!write_at_op_number_has_merge_key}'s own doc comment
+    for the mechanism and for the honest [min (commit_number) (List.length entries)] bound a
+    restart-capable caller must use instead.
+
     {b Safe to call repeatedly over an overlapping or fully-covered range}: re-materializing a
     write already folded into the accumulator is a no-op, because {!materialize_sink}'s
     underlying join is idempotent (joining the same value into an already-converged accumulator
@@ -214,6 +222,36 @@ val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int ->
     is deliberate and load-bearing: it lets a caller ask this question uniformly across the whole
     op-number space, including op-numbers the log hasn't reached yet, without a separate bounds
     check.
+
+    {b AFTER A RESTART OVER A WRAPPED RING, THIS FUNCTION IS INERT, AND [false] HERE NO LONGER
+    MEANS "SAFE TO EVICT"} (final-review finding I1; the behaviour itself is pinned by
+    [test_dst_scenarios.ml]'s own
+    [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry]). The "past the
+    current log's end" clause above is literally true but understates the hazard, because after a
+    restart the log's end can be {b 0}. {!Riptide_vsr.Replica.restart} rebuilds its in-memory log
+    with a strictly CONTIGUOUS scan up from op 1, stopping at the first slot that does not read
+    back, while {!Riptide_storage.File_storage}'s ring always evicts the LOWEST live op-number
+    first -- so once the ring has wrapped even once, that scan stops at op 1 and the rebuilt log is
+    completely EMPTY, even for the higher op-numbers the ring genuinely does still hold (a prefix
+    scan cannot skip a hole). This function reads that rebuilt log, so it then answers [false] for
+    {e every} op-number, including ops that are genuinely still un-materialized rather than
+    genuinely safe to evict -- while {!Riptide_vsr.Replica.commit_number}, recovered from the
+    superblock, still reports the true, higher value.
+
+    Two consequences a caller must build around rather than discover:
+
+    - {b The honest post-restart watermark bound} is
+      [min (Riptide_vsr.Replica.commit_number t) (List.length (Riptide_vsr.Replica.entries t))],
+      {b not} [Riptide_vsr.Replica.commit_number t] alone. The latter falsely claims coverage of
+      every op the rebuilt log can no longer see; the former is exactly how far
+      {!materialize_up_to} can possibly have got over that log, and needs no durable state of its
+      own either.
+    - {b Where the rebuilt log is shorter than what was actually committed, any committed-but-
+      unmaterialized entry the ring already evicted is permanently unrecoverable.} The raw bytes
+      are gone and no consumer-side bookkeeping can reconstruct them. That is a real, disclosed
+      limitation of this whole mechanism -- gating eviction protects an entry only for as long as
+      the process that can still observe it is alive -- not a bug, and not something this function
+      or {!materialize_up_to} attempts to repair.
 
     This is intended as {b the second half of task-master Task 6's own [?may_evict] predicate}
     for ring eviction: the first half -- "is this op-number at or below the current

@@ -80,6 +80,13 @@ val create :
     - {b Omitting it preserves this module's exact pre-existing behavior.} With no [?may_evict],
       every eviction proceeds silently, as it always did — which is what every call site that does
       not pass it relies on.
+    - {b Its protection is scoped to one process's lifetime} (final-review finding I1). After a
+      restart over a ring that has already wrapped, a predicate driven by
+      {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key} can no longer see the
+      entries the ring already evicted — {!Riptide_vsr.Replica.restart}'s log rebuild is a
+      contiguous scan up from op 1 and this ring always evicts the lowest live op-number first, so
+      the rebuilt log it reads is empty — and it cannot protect what it can no longer observe. See
+      that function's own doc comment for the honest post-restart watermark bound this implies.
 
     The predicate is in-memory state on the returned [t] and is deliberately not persisted: it is a
     policy, supplied afresh on each [create], evaluated against whatever [wal_highest_op_number]

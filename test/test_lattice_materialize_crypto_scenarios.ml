@@ -1112,7 +1112,21 @@ let with_watermark_cluster ~env ~sw ~wiring f =
            the hook is "not invoked retroactively" and a restart-time consumer must read
            [commit_number] itself. On a fresh replica that prefix is empty and this is a no-op --
            asserted rather than assumed by the caller below, which is the only honest way to claim
-           the mechanism is safe to run unconditionally at every construction. *)
+           the mechanism is safe to run unconditionally at every construction.
+
+           DO NOT COPY THE [watermark := Replica.commit_number r] FORM BELOW BLINDLY (final-review
+           finding I1). It is safe HERE only because this file's own harness never restarts a
+           replica (see this file's header, which states that as a deliberate boundary), so the log
+           always holds every op [commit_number] counts. A caller that DOES restart must use the
+           honest bound instead --
+           [min (Replica.commit_number r) (List.length (Replica.entries r))] -- because
+           [Replica.restart] rebuilds its log with a contiguous scan from op 1 while the ring evicts
+           the lowest live op-number first, so after a single wrap the rebuilt log is EMPTY while
+           [commit_number] still reports the true, higher value; seeding a watermark from
+           [commit_number] alone there falsely claims coverage of entries nothing can still see.
+           Pinned proof, including that such an entry is then permanently unrecoverable:
+           [test_dst_scenarios.ml]'s
+           [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry]. *)
         Batch_commit.materialize_up_to r ~materialize:sinks.(i)
           ~through_commit_number:(Replica.commit_number r);
         watermarks.(i) := Replica.commit_number r;

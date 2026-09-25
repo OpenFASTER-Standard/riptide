@@ -215,10 +215,13 @@ this is a real design change to a load-bearing function, not a mechanical edit; 
 confirm the deadline is genuinely reset on every real delivery (`!delivered`), not just once at
 `settle`'s own start, matching the spec's own "quiet window since last real delivery" design.
 
-`run_on_file_storage` (`:302-330`) passes `~max_wait_duration:30.0 ~clock` (using its own
-already-available `clock = Eio.Stdenv.clock env`) — pick 30.0 as a generous default budget;
-document the choice in a comment (this is a liveness bound for a genuinely stuck cluster, not a
-tuning knob for normal operation, so err generous). `run` (`:274-301`) passes neither, keeping its
+`run_on_file_storage` (`:302-330`) passes `~max_wait_duration:10.0 ~clock` (using its own
+already-available `clock = Eio.Stdenv.clock env`) — document the choice in a comment (this is a
+liveness bound for a genuinely stuck cluster, not a tuning knob for normal operation, so err
+generous). **Corrected from this plan's original `30.0` (final-review finding I2): the shipped value
+is `10.0`**, because it has to stay *below* the calling suite's own external 15s per-test watchdog
+for `Did_not_settle` to ever actually fire rather than be pre-empted by that watchdog's own, less
+specific failure — a constraint "err generous" alone gets wrong. `run` (`:274-301`) passes neither, keeping its
 existing fixed-`io_waits`-only behavior exactly as before (both new parameters default to `None`).
 
 - [ ] **Step 4: Run to verify the stuck-cluster test passes, and the load-sensitivity test in Step 1 no longer fails**
