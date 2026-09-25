@@ -152,6 +152,54 @@ type encryption_sink = {
     every existing call site. Making encryption unconditional is a live option for a later task,
     once a real caller exists to define what happens to plaintext-reading paths. *)
 
+val materialize_up_to :
+  Riptide_vsr.Replica.t -> materialize:materialize_sink -> through_commit_number:int -> unit
+(** [materialize_up_to t ~materialize ~through_commit_number] walks [t]'s committed log from its
+    very start through [through_commit_number] -- a 1-based op-number/commit-count bound,
+    INCLUSIVE, matching {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared
+    against each batch's 0-based {!Riptide_vsr.Replica.entries} list position [i] as [i <
+    through_commit_number], the same correspondence {!committed_batch_values} already
+    establishes: list position [i] is commit position/op-number [i + 1]) -- materializing every
+    write of every well-formed batch in that range that carries [merge_key = Some k], via
+    [materialize.write ~merge_key:k payload], in commit order. A batch that fails to decode (see
+    {!committed_envelopes}'s own decode-failure handling) contributes nothing and is skipped, like
+    everywhere else in this module.
+
+    {b Safe to call repeatedly over an overlapping or fully-covered range}: re-materializing a
+    write already folded into the accumulator is a no-op, because {!materialize_sink}'s
+    underlying join is idempotent (joining the same value into an already-converged accumulator
+    changes nothing) -- so calling this function twice with the same (or a smaller)
+    [through_commit_number] is always safe, including immediately after a crash and restart.
+
+    {b Does NOT track its own "last materialized" position} -- every call walks from the very
+    start of the log, unconditionally. The caller (task-master Task 6) owns any watermark it
+    wants to keep, to avoid redundant re-walks across calls; this function has no persistent state
+    of its own and is a pure function of [t]'s current log plus the range given. Its own cost is
+    real and disclosed, not hidden: {b O(through_commit_number)} work per call, since it always
+    re-decodes and re-walks the whole prefix up to the bound rather than resuming from where a
+    previous call left off. *)
+
+val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int -> bool
+(** [write_at_op_number_has_merge_key t ~op_number] is [true] iff the batch committed at the
+    1-based [op_number] decodes as well-formed and at least one of its writes carries
+    [merge_key = Some _].
+
+    {b [false] for an op_number that doesn't exist in the log (yet, or ever, e.g. 0, negative, or
+    past the current log's end) or whose entry fails to decode as a well-formed batch} -- both
+    treated identically to "no write here claims a merge_key", never an error or exception. This
+    is deliberate and load-bearing: it lets a caller ask this question uniformly across the whole
+    op-number space, including op-numbers the log hasn't reached yet, without a separate bounds
+    check.
+
+    This is intended as {b the second half of task-master Task 6's own [?may_evict] predicate}
+    for ring eviction: the first half -- "is this op-number at or below the current
+    materialization watermark" -- is state Task 6 owns itself, not this module; this function
+    only ever answers "did the write here opt into materialization at all". A slot this returns
+    [true] for must not be evicted until it is known to be materialized (via the watermark half);
+    a slot this returns [false] for was never claiming materialization's protection in the first
+    place, by {!write}'s own [merge_key] doc comment ([None] leaves a write exactly as evictable
+    as before this mechanism existed). *)
+
 val propose :
   Riptide_vsr.Replica.t ->
   idempotency_key:string ->

@@ -210,6 +210,141 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
             (converged.timestamp <> Last_write_wins.bottom.timestamp);
           Alcotest.(check int64) "converged to the retried write's timestamp" 1L converged.timestamp))
 
+(* ---- materialize_up_to / write_at_op_number_has_merge_key (Task 5 of the ring-eviction plan,
+   part 3 of subtask 3.7) ----
+
+   These tests don't care about ring eviction at all -- that's this file's EARLIER tests' own
+   concern, proven against real File_storage above. What matters here is draining a RANGE of the
+   committed log, so a plain volatile (in-memory) replica is the right topology: same
+   [replica_count = 1, f = 0] solo convention test_batch_commit.ml's own [create_solo] establishes
+   (Replica.propose commits synchronously, no network/quorum needed), just with
+   [Replica.volatile_storage ()] instead of a real [File_storage] -- matching create_solo's own
+   real, current construction (`Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1
+   ~replica_count:1 ~svc_limit:_ ~send ()`, note the trailing unit). No
+   [Replica.for_test_set_view_number] call is needed: create_solo's own precedent proposes
+   directly against a freshly-created solo replica with no view-number setup at all, and that
+   already works (this file's own two tests above do the same, just via Batch_commit.propose
+   rather than Replica.propose directly). *)
+
+let create_solo_volatile () =
+  Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:10
+    ~send:(fun ~to_:_ (_ : string) -> ())
+    ()
+
+(* Proposes one single-write batch under a fresh idempotency_key, WITHOUT a materialize sink --
+   so nothing is drained until materialize_up_to itself does it. Solo replica, so this commits
+   synchronously; the returned Batch_commit.write is exactly what was proposed, for tests that
+   want to assert against it directly. *)
+let propose_one_write replica ~idempotency_key ~merge_key ~timestamp ~value_str =
+  let actor = "actor-1" in
+  let payload =
+    lww_to_value
+      { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String value_str);
+        timestamp = Int64.of_int timestamp
+      }
+  in
+  let write =
+    {
+      Batch_commit.actor;
+      causation = fake_event_id (idempotency_key ^ "-c");
+      correlation = fake_event_id (idempotency_key ^ "-r");
+      payload;
+      merge_key;
+    }
+  in
+  Batch_commit.propose replica ~idempotency_key [ write ]
+
+let make_materializer kv_dir env sw =
+  let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
+  M.create ~kv
+    ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
+    ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
+
+let make_sink materializer : Batch_commit.materialize_sink =
+  { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+
+let test_materialize_up_to_drains_the_whole_committed_prefix () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      (* 3 batches, 3 distinct idempotency keys, all writes under the SAME merge_key "mk" with
+         increasing timestamps -- Last_write_wins's join keeps the highest timestamp, so the
+         converged result should be exactly the third write. *)
+      propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
+      propose_one_write replica ~idempotency_key:"k2" ~merge_key:(Some "mk") ~timestamp:2 ~value_str:"v2";
+      propose_one_write replica ~idempotency_key:"k3" ~merge_key:(Some "mk") ~timestamp:3 ~value_str:"v3";
+      Alcotest.(check int) "3 batches committed on the solo replica" 3
+        (List.length (Batch_commit.committed_envelopes replica));
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      (* Nothing materialized yet: materialize_up_to is the only thing draining here, propose was
+         called with no ~materialize sink at all. *)
+      Alcotest.(check int64) "nothing materialized before materialize_up_to runs"
+        Last_write_wins.bottom.timestamp (M.read materializer ~merge_key:"mk").timestamp;
+      Batch_commit.materialize_up_to replica ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replica);
+      let expected : Last_write_wins.t =
+        { value = Riptide.Value.Scalar (Riptide.Value.String "v3"); timestamp = 3L }
+      in
+      Alcotest.(check bool) "the materializer converged to the join of all 3 writes (highest timestamp wins)"
+        true
+        (M.read materializer ~merge_key:"mk" = expected))
+
+let test_materialize_up_to_is_idempotent () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      let once = M.read materializer ~merge_key:"mk" in
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      let twice = M.read materializer ~merge_key:"mk" in
+      Alcotest.(check bool) "re-materializing an already-covered range is a safe no-op" true
+        (once = twice))
+
+let test_materialize_up_to_respects_the_through_bound () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk1") ~timestamp:1 ~value_str:"v1";
+      propose_one_write replica ~idempotency_key:"k2" ~merge_key:(Some "mk2") ~timestamp:1 ~value_str:"v2";
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      Alcotest.(check bool) "only the first batch's key materialized" true
+        (M.read materializer ~merge_key:"mk1" <> Last_write_wins.bottom);
+      Alcotest.(check bool) "the second batch's key, past the bound, did not" true
+        (M.read materializer ~merge_key:"mk2" = Last_write_wins.bottom))
+
+(* write_at_op_number_has_merge_key: Task 6's own [?may_evict] predicate's second half. The
+   false-for-out-of-bounds behaviour is explicitly load-bearing per this task's own brief, so it's
+   tested directly here rather than only documented in the .mli. *)
+let test_write_at_op_number_has_merge_key_true_and_false_within_bounds () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
+  propose_one_write replica ~idempotency_key:"k2" ~merge_key:None ~timestamp:2 ~value_str:"v2";
+  Alcotest.(check bool) "op-number 1 (merge_key = Some _) is true" true
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:1);
+  Alcotest.(check bool) "op-number 2 (merge_key = None) is false" false
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:2)
+
+let test_write_at_op_number_has_merge_key_false_out_of_bounds () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
+  Alcotest.(check bool) "op-number 0 is false (never a valid op-number)" false
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:0);
+  Alcotest.(check bool) "a negative op-number is false" false
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:(-1));
+  Alcotest.(check bool) "an op-number past the end of the log is false" false
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:2)
+
 let tests =
   [
     ( "a write's own merge_key survives WAL ring eviction that genuinely destroys the raw entry",
@@ -217,4 +352,13 @@ let tests =
     ( "materialize fires on a later retry that supplies a sink for an already-committed batch \
        (crash-then-retry)",
       `Quick, test_materialize_fires_on_a_later_retry_for_an_already_committed_batch );
+    ( "materialize_up_to drains the whole committed prefix",
+      `Quick, test_materialize_up_to_drains_the_whole_committed_prefix );
+    ("materialize_up_to is idempotent over a repeated range", `Quick, test_materialize_up_to_is_idempotent);
+    ( "materialize_up_to respects the through_commit_number bound",
+      `Quick, test_materialize_up_to_respects_the_through_bound );
+    ( "write_at_op_number_has_merge_key is true/false correctly within the log's bounds",
+      `Quick, test_write_at_op_number_has_merge_key_true_and_false_within_bounds );
+    ( "write_at_op_number_has_merge_key is false for any out-of-bounds op-number",
+      `Quick, test_write_at_op_number_has_merge_key_false_out_of_bounds );
   ]

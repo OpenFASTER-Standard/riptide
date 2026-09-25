@@ -155,6 +155,51 @@ let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : boo
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
+(* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
+   step: walks the WHOLE committed prefix up to [through_commit_number] (not just the one batch
+   claiming a particular idempotency_key), materializing every write carrying a [merge_key] along
+   the way. See batch_commit.mli for the full contract (idempotent, restart-safe, no own
+   watermark state, O(through_commit_number) per call). *)
+let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
+    ~(through_commit_number : int) : unit =
+  let entries = Riptide_vsr.Replica.entries t in
+  List.iteri
+    (fun i v ->
+      if i < through_commit_number then
+        match batch_of_value v with
+        | None -> ()
+        | Some (_idempotency_key, writes) ->
+          List.iter
+            (fun (w : write) ->
+              match w.merge_key with
+              | None -> ()
+              | Some k -> materialize.write ~merge_key:k w.payload)
+            writes)
+    entries
+
+(* Task 6's own [?may_evict] predicate needs to answer "did the write committed at this op-number
+   opt into materialization at all" without re-implementing batch_of_value's own decode logic a
+   second time outside this module. [entries] is 0-based by list position; op-number N is at list
+   index N - 1 (matching committed_batch_values' own established i <-> op-number correspondence
+   used throughout this file). Returns false for an op-number outside the log's current bounds or
+   a malformed batch -- both cases mean nothing here is claiming a merge_key, which is the same as
+   "never opted in" as far as [?may_evict] cares. *)
+let write_at_op_number_has_merge_key (t : Riptide_vsr.Replica.t) ~(op_number : int) : bool =
+  (* [op_number < 1] must be excluded BEFORE reaching [List.nth_opt]: unlike a too-large index
+     (which [List.nth_opt] itself turns into [None]), a NEGATIVE index makes [List.nth_opt] raise
+     [Invalid_argument] rather than return [None] (confirmed live: this was a real crash, not a
+     hypothetical, caught by this function's own test for [op_number = 0] and a negative
+     op_number). [op_number = 0] is never valid either way (op-numbers are 1-based), so both cases
+     fold into the same early [false]. *)
+  if op_number < 1 then false
+  else
+    match List.nth_opt (Riptide_vsr.Replica.entries t) (op_number - 1) with
+    | None -> false
+    | Some v -> (
+      match batch_of_value v with
+      | None -> false
+      | Some (_idempotency_key, writes) -> List.exists (fun (w : write) -> Option.is_some w.merge_key) writes)
+
 (* The keystore key for one write, derived from data available BEFORE the write enters the
    replicated log -- which is the only moment encryption can happen, since Envelope.content_hash
    covers the payload (lib/envelope.ml's to_value) and is therefore already committed to whatever
