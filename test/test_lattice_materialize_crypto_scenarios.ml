@@ -989,6 +989,15 @@ type wm_ctx = {
           genuinely backlogged consumer looks like from the ring's point of view, and it is the
           state [?may_evict] exists to make safe. *)
   wm_asks : evict_ask list ref;
+  wm_tap : (int * string) list ref;
+      (** Every message this harness has DELIVERED, newest first, as [(destination_replica_id,
+          bytes)] -- recorded at delivery time, not at send time, so a message that was delivered
+          and then had no effect (e.g. a [Prepare] whose append the eviction gate refused) is still
+          here afterwards, verbatim. This is what makes the RETRY half of the mechanism testable at
+          all: this VSR subset has no retransmission timer (VSR.tla deliberately models none, and
+          [Replica]'s only re-drive is [check_timeout]'s view change), so nothing in the protocol
+          would ever re-offer a refused [Prepare] on its own -- the test has to hand the very same
+          bytes back, which is exactly what a real deployment's transport-level retry would do. *)
   wm_propose : int -> unit;  (** propose op-number [n]'s batch, on the primary, with no sink *)
   wm_deliver : unit -> unit;
   wm_clear_stall : int -> unit;
@@ -998,6 +1007,20 @@ type wm_ctx = {
 
 let refusal_count r name =
   try List.assoc name (Replica.append_refusals r) with Not_found -> 0
+
+(* The exact bytes of the [Prepare] for op-number [n] that this harness delivered to replica [to_],
+   found by DECODING the tap rather than by position, so "this is the message that carried op 13" is
+   proven from the wire format itself and not inferred from delivery order. *)
+let wm_find_prepare tap ~to_ ~n =
+  List.find_map
+    (fun (dest, bytes) ->
+      if dest <> to_ then None
+      else
+        match Message.decode bytes with
+        | Message.Prepare { n = prepared; _ } when prepared = n -> Some bytes
+        | _ -> None
+        | exception Message.Malformed_message _ -> None)
+    (List.rev !tap)
 
 let wm_expected_accumulator ~through =
   G_set.of_list
@@ -1097,9 +1120,11 @@ let with_watermark_cluster ~env ~sw ~wiring f =
   in
   (* Same view pin, for the same reason, as every other cluster harness in this file. *)
   Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
+  let tap = ref [] in
   let deliver () =
     while not (Queue.is_empty inflight) do
       let to_, bytes = Queue.pop inflight in
+      tap := (to_, bytes) :: !tap;
       Replica.handle_message replicas.(to_ - 1) bytes
     done
   in
@@ -1128,6 +1153,7 @@ let with_watermark_cluster ~env ~sw ~wiring f =
       wm_watermarks = watermarks;
       wm_stalled = stalled;
       wm_asks = asks;
+      wm_tap = tap;
       wm_propose = propose;
       wm_deliver = deliver;
       wm_clear_stall = clear_stall;
@@ -1350,11 +1376,18 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
   Alcotest.(check int) "and refused no further eviction anywhere" blocked_after_clearing
     (Array.fold_left (fun acc r -> acc + refusal_count r "eviction_blocked") 0 ctx.wm_replicas);
   wm_check_accumulators ~phase:"phase-C" ctx;
-  (* The replica that refused an append stays behind until a [Start_view] repairs its durable hole
-     (replica.mli's [out_of_sequence]/[op_number] docs) -- deliberately NOT exercised here, since
-     this file excludes view changes by its own stated scope. What matters for THIS mechanism is
-     that being behind costs liveness on that one replica and nothing else: no lost data, and the
-     four replicas that kept up still agree exactly. *)
+  (* WHY THAT FOLLOWER IS BEHIND, stated precisely (fix round 1, review finding 5 -- the earlier
+     wording here claimed it "stays behind until a [Start_view] repairs its durable hole", which
+     describes a state this scenario never reaches). It is NOT holding a durable hole:
+     [handle_prepare]'s eviction refusal returns BEFORE the in-memory [Replica_log.append], so
+     nothing was half-applied -- its WAL, its [op_number] and its in-memory log all still agree
+     exactly at op 12, and every entry it holds is readable (that is the [Replica_log.length <>
+     op_number] state replica.mli's own [out_of_sequence]/restart-time guidance is about, and this
+     follower is not in it). What it lost is one MESSAGE: the [Prepare] carrying op 13, which this
+     harness never retransmits because this VSR subset has no retransmission timer at all. Every
+     LATER [Prepare] is then dropped by [handle_prepare]'s own [n = op_number + 1] ordering guard --
+     by message ordering, not by any storage state. So the cost of a refusal is exactly "this replica
+     needs that one [Prepare] again", which phase D below proves is all it needs. *)
   Alcotest.(check bool) "the follower that refused an append is genuinely behind the others" true
     (Replica.commit_number ctx.wm_replicas.(follower) < Replica.commit_number primary);
   for i = 2 to replica_count - 1 do
@@ -1362,7 +1395,106 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
       (Printf.sprintf "replicas 3 and %d, both caught up, hold identical accumulators" (i + 1))
       (G_set.elements (M.read ctx.wm_materializers.(2) ~merge_key:wm_merge_key))
       (G_set.elements (M.read ctx.wm_materializers.(i) ~merge_key:wm_merge_key))
-  done
+  done;
+
+  (* ---- PHASE D (fix round 1, review finding I1): THE REFUSAL IS A RETRIED NO-OP, not merely a
+     traceless one.
+
+     WHAT WAS MISSING. This plan's own Review Focus requires a blocked eviction to be "a silent,
+     RETRIED no-op". Everything above -- and test_file_storage.ml's own refusal tests -- proves only
+     the SILENT/traceless half: the refusal changed nothing, anywhere, so a retry COULD be safe.
+     Nothing anywhere re-offered the refused append after the gate's predicate relented, so "the same
+     op_number succeeds on retry" was asserted in prose and demonstrated nowhere.
+
+     WHY IT IS DONE BY RE-DELIVERING THE ORIGINAL BYTES, which is the real mechanism and not an
+     artificial one. The natural cluster flow CANNOT produce this retry by itself, and that is a
+     property of the protocol rather than of this harness: [handle_prepare]'s refusal is a total
+     no-op, so this follower's [op_number] stays at 12 and every subsequent [Prepare] (14, 15, ...)
+     is dropped by the [n = op_number + 1] ordering guard -- phase C above asserts exactly that
+     stall. There is no retransmission timer in this VSR subset (VSR.tla models none), and the only
+     re-drive [Replica] has is [check_timeout]'s view change, which this file excludes by its own
+     stated scope. The retry a real deployment supplies is therefore a transport-level redelivery of
+     the same [Prepare], and that is precisely what this does: the identical bytes the harness
+     already delivered once, taken from [wm_tap] and re-decoded to confirm which op they carry, fed
+     back into the SAME replica. Nothing is synthesised, no state is reached into. *)
+  let follower_r = ctx.wm_replicas.(follower) in
+  let refused_op = 13 in
+  let prepare_bytes =
+    match wm_find_prepare ctx.wm_tap ~to_:(follower + 1) ~n:refused_op with
+    | Some bytes -> bytes
+    | None ->
+      Alcotest.fail
+        (Printf.sprintf "harness precondition: no Prepare for op %d was ever delivered to replica %d"
+           refused_op (follower + 1))
+  in
+  (* The preconditions that make this a genuine RETRY of the refused append rather than a fresh one:
+     the entry is still absent durably, the replica is still exactly where the refusal left it, and
+     the predicate that refused now permits -- its watermark has passed op 9, the entry whose
+     eviction it was protecting. *)
+  Alcotest.(check int) "the stalled follower is still exactly where the refusal left it" 12
+    (Replica.op_number follower_r);
+  Alcotest.(check bool)
+    (Printf.sprintf "op %d is not durable on it (the refusal is why -- nothing was written)"
+       refused_op)
+    true
+    (File_storage.wal_read ctx.wm_storages.(follower) ~op_number:refused_op = None);
+  Alcotest.(check bool)
+    "...and the predicate that refused has now relented: this replica's watermark has passed op 9, \
+     the entry whose eviction op 13's append needs"
+    true
+    (!(ctx.wm_watermarks.(follower)) >= 9);
+  let refusals_before_retry = refusal_count follower_r "eviction_blocked" in
+  let watermark_after_clearing = !(ctx.wm_watermarks.(follower)) in
+  (* THE NEGATIVE CONTROL, permanent rather than an experiment someone once ran by hand -- the same
+     discipline assertion 5's two controls above already follow. It is the RELENTING that makes the
+     retry succeed, not the redelivery: with this consumer's own watermark rolled back to where the
+     stall left it (7 -- a plain in-memory value it owns, so rolling it back is modelling a consumer
+     that has not caught up, not reaching into any protocol state), the identical bytes are refused
+     all over again, leaving the identical traceless no-op. Without this, "the retry succeeded"
+     would be equally consistent with the gate having become inert. *)
+  ctx.wm_watermarks.(follower) := watermark_at_stall;
+  Replica.handle_message follower_r prepare_bytes;
+  Alcotest.(check int)
+    "negative control: redelivered to a consumer still behind, the SAME bytes are refused again"
+    (refusals_before_retry + 1)
+    (refusal_count follower_r "eviction_blocked");
+  Alcotest.(check int) "...leaving the replica exactly where it was, again" 12
+    (Replica.op_number follower_r);
+  Alcotest.(check bool) "...and op 13 still not durable" true
+    (File_storage.wal_read ctx.wm_storages.(follower) ~op_number:refused_op = None);
+  ctx.wm_watermarks.(follower) := watermark_after_clearing;
+  let refusals_before_retry = refusal_count follower_r "eviction_blocked" in
+  let asks_before_retry = List.length !(ctx.wm_asks) in
+  (* THE RETRY: byte-identical redelivery, one message, no other stimulus. *)
+  Replica.handle_message follower_r prepare_bytes;
+  ctx.wm_deliver () (* let the [Prepare_ok] it now sends reach the primary, as normal *);
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "the gate was consulted again on the retry (so this is a real second pass through it)" )
+    true
+    (List.length !(ctx.wm_asks) > asks_before_retry);
+  Alcotest.(check int)
+    (Printf.sprintf "THE SAME op_number %d now appends successfully on retry" refused_op)
+    refused_op (Replica.op_number follower_r);
+  Alcotest.(check bool)
+    (Printf.sprintf "...and op %d is now genuinely DURABLE on the replica that refused it" refused_op)
+    true
+    (File_storage.wal_read ctx.wm_storages.(follower) ~op_number:refused_op <> None);
+  Alcotest.(check int)
+    "...with no NEW refusal recorded: the retry was accepted, not refused a second time"
+    refusals_before_retry
+    (refusal_count follower_r "eviction_blocked");
+  (* And the eviction the gate had been holding back happened, exactly now that it is safe: op 9's
+     slot is what op 13 reuses, and op 9 has been materialized since [clear_stall]. Retained exactly
+     while it was needed, reclaimed as soon as it was not -- the whole mechanism, in one op-number. *)
+  Alcotest.(check bool)
+    "op 9's slot -- held back by the refusal, materialized since -- was reclaimed by op 13's append"
+    true
+    (File_storage.wal_read ctx.wm_storages.(follower) ~op_number:9 = None);
+  Alcotest.(check bool) "...and op 9's contribution is still in the accumulator, unaffected" true
+    (List.mem (wm_value 9)
+       (G_set.elements (M.read ctx.wm_materializers.(follower) ~merge_key:wm_merge_key)));
+  wm_check_accumulators ~phase:"phase-D-retry-after-relent" ctx
 
 (* ASSERTION 5, NON-VACUITY, as two permanent running controls rather than an experiment.
 

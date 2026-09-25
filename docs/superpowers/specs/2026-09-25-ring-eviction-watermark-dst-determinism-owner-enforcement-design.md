@@ -76,6 +76,37 @@ commit_number `materialize_up_to` has been called through — is a plain in-memo
 whoever wires the hook, not tracked inside `Batch_commit` (which stays stateless, per its own
 already-established design confirmed during subtask 4.5's own work).
 
+**Exactly how far "restart recovery is free" reaches — narrowed in Task 6's fix round 1 (review
+finding C1) after the original wording above was found to overclaim, and proven rather than
+argued.** The re-prime recovers exactly what the **restarted replica's own rebuilt log** still
+holds, and that log is `Replica.restart`'s `readable_prefix` (`lib/vsr/replica.ml`): a strictly
+**contiguous** scan up from op 1 that stops at the first slot not reading back `Present`. Because
+`File_storage`'s ring always destroys the *lowest* live op-number first (slot assignment is
+`(op_number - 1) mod ring_capacity`, so appending `n` overwrites `n - ring_capacity`), once the ring
+has wrapped even once that scan stops at op 1 and the rebuilt log is **empty** — not merely missing
+the evicted entries, but missing the later ones the ring genuinely does still hold, since a prefix
+scan cannot skip a hole. Two consequences, both now pinned as running tests
+(`test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry`,
+`test/test_dst_scenarios.ml`):
+
+- An entry that was **both** evicted from the ring **and** never materialized before the crash is
+  genuinely, permanently lost after the restart. That is a real, disclosed limitation of this
+  mechanism, not a bug it claims to solve: the raw bytes are gone and no consumer-side bookkeeping
+  could reconstruct them. The correct statement of this decision's guarantee is therefore *"no new
+  durable watermark state is needed for whatever the rebuilt log still holds"*, **not** "restart is
+  loss-proof regardless of how far behind the consumer was".
+- The safe re-prime is consequently **not** `watermark := Replica.commit_number r` — which would
+  falsely claim coverage of every op the rebuilt log can no longer see — but
+  `min (Replica.commit_number r) (List.length (Replica.entries r))`, exactly how far
+  `materialize_up_to` can have got. That bound is still derived entirely from the replica, so it
+  needs no new durable state either; only the *coverage* claim needed narrowing, not the footprint
+  claim.
+
+The gate is also inert for those op-numbers after such a restart (`write_at_op_number_has_merge_key`
+reads the same rebuilt log and answers `false` for anything it cannot see). In that state it costs
+nothing — the entries it would protect are already gone — but it is documented here so a future
+caller does not mistake the gate for a second line of defence against a backlog this deep.
+
 ## Decision 3 (subtask 3.7): the gate — reusing `Replica`'s existing refusal-classification machinery
 
 **The real mechanism, found only by reading `replica.ml` before writing this decision, not
@@ -209,7 +240,12 @@ non-vacuity discipline already established for `File_kv_store.create`'s own `?ow
 - **A `Kv_store_intf.S` interface change for `Materializer`** — Decision 6's own explicit choice;
   `Materializer.create` stays convention-only, honestly documented.
 - **New durable watermark persistence** — Decision 2's restart-time re-materialization through the
-  replica's own current `commit_number` makes this unnecessary.
+  replica's own current `commit_number` makes this unnecessary *for whatever the restarted replica's
+  rebuilt log still holds*, which is the whole of what this plan claims. It does **not** make a
+  still-unmaterialized entry the ring has already evicted recoverable: that entry is permanently
+  lost, a disclosed limitation pinned by a running test (see Decision 2's own narrowing paragraph).
+  Closing *that* gap would need either checkpointing or a durable consumer-side watermark, both
+  out of scope here.
 - **Automatic materialization retry/backoff scheduling inside `Replica` or `Batch_commit`** —
   Decision 3's reuse of the existing refusal-classification machinery means VSR's own ordinary
   retry semantics already provide this; no new scheduler or clock dependency is introduced into

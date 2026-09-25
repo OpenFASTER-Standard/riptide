@@ -1117,6 +1117,21 @@ let test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_prog
    whole mechanism stays exactly (a) the replica's own WAL/superblock and (b) the materializer's own
    KV directory, with nothing new added by restart recovery.
 
+   EXACTLY HOW FAR THAT CLAIM REACHES, narrowed in fix round 1 after a review (finding C1) found this
+   test's original framing overclaimed it. This test runs at the harness's DEFAULT [ring_capacity]
+   (4096) over 2 committed ops, so its ring never wraps and nothing is ever evicted: the restarted
+   replica's log rebuild recovers the WHOLE log from disk. What the re-prime recovers is therefore
+   exactly what the RESTARTED REPLICA'S OWN REBUILT LOG still holds -- and that log is
+   {!Riptide_vsr.Replica.restart}'s [readable_prefix], a strictly CONTIGUOUS scan up from op 1, not
+   every slot the ring happens to still hold. It cannot recover a still-unmaterialized entry once the
+   ring has evicted anything at all, and the correct statement of Decision 2's guarantee is therefore
+   "no new durable watermark state is needed for whatever the rebuilt log still holds", NOT "restart
+   is loss-proof regardless of how far behind the consumer was". That boundary is a real, disclosed
+   limitation of this mechanism rather than something it claims to solve, and it is pinned as a
+   running test of its own: see [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry]
+   (test 13) below, which runs the same re-prime at a [ring_capacity] small enough that the ring
+   genuinely wraps and proves what actually survives.
+
    Both halves are asserted, and the second is the one that makes this more than a re-run of
    [test_materialize_up_to_is_idempotent] (test_batch_commit_materialize.ml): the materialized value
    must be IDENTICAL across a real crash-and-come-back of the replica that produced it, AND the
@@ -1180,20 +1195,26 @@ let durable_snapshot root =
   in
   List.sort compare (walk [] root)
 
-let test_restart_recovery_needs_no_new_durable_watermark_state () =
-  Eio_main.run @@ fun env ->
-  with_tmp_dir @@ fun dir ->
-  with_tmp_dir @@ fun mat_dir ->
-  Eio.Switch.run @@ fun sw ->
-  (* ONE real [File_kv_store]-backed materializer, living in its OWN directory outside every
-     replica's [File_storage] directory, and surviving the restart untouched -- which is what a real
-     crash looks like from its point of view: only in-memory state (the [Replica.t] and the
-     watermark ref) is discarded, everything durable stays. *)
+(* [durable_snapshot] in the form Alcotest can print and compare: one line per file, its length and
+   its digest. Shared by both restart tests below. *)
+let fingerprint snapshot =
+  List.map
+    (fun (p, s) -> Printf.sprintf "%s:%d:%s" p (String.length s) (Digest.to_hex (Digest.string s)))
+    snapshot
+
+(* The one [merge_key] every write in both restart tests below carries. *)
+let restart_merge_key = "mk"
+
+(* ONE real [File_kv_store]-backed materializer, living in its OWN directory outside every replica's
+   [File_storage] directory, so it survives a [restart] untouched -- which is what a real crash looks
+   like from its point of view: only in-memory state (the [Replica.t] and the watermark ref) is
+   discarded, everything durable stays. Returned together with the {!Batch_commit.materialize_sink}
+   pre-applied over it, since no caller here ever wants one without the other. *)
+let make_lww_materializer ~env ~sw dir =
   let materializer =
     Lww_materializer.create
       ~kv:
-        (Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer"
-           mat_dir)
+        (Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)
       ~decode:(fun s -> lww_of_value (Value.canonical_decode s))
       ~encode:(fun w -> Value.canonical_encode (lww_to_value w))
   in
@@ -1204,26 +1225,28 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
           Lww_materializer.write materializer ~merge_key (lww_of_value payload));
     }
   in
-  let merge_key = "mk" in
-  let fingerprint snapshot =
-    List.map
-      (fun (p, s) ->
-        Printf.sprintf "%s:%d:%s" p (String.length s) (Digest.to_hex (Digest.string s)))
-      snapshot
-  in
-  let propose_write replicas ~idempotency_key ~timestamp ~value_str =
-    Riptide_batch_commit.Batch_commit.propose replicas ~idempotency_key
-      [
-        {
-          Riptide_batch_commit.Batch_commit.actor = "actor-1";
-          causation = Value.content_hash (v (idempotency_key ^ "-c"));
-          correlation = Value.content_hash (v (idempotency_key ^ "-r"));
-          payload =
-            lww_to_value { Riptide_lattice.Last_write_wins.value = v value_str; timestamp };
-          merge_key = Some merge_key;
-        };
-      ]
-  in
+  (materializer, sink)
+
+let propose_lww_write replica ~idempotency_key ~timestamp ~value_str =
+  Riptide_batch_commit.Batch_commit.propose replica ~idempotency_key
+    [
+      {
+        Riptide_batch_commit.Batch_commit.actor = "actor-1";
+        causation = Value.content_hash (v (idempotency_key ^ "-c"));
+        correlation = Value.content_hash (v (idempotency_key ^ "-r"));
+        payload = lww_to_value { Riptide_lattice.Last_write_wins.value = v value_str; timestamp };
+        merge_key = Some restart_merge_key;
+      };
+    ]
+
+let test_restart_recovery_needs_no_new_durable_watermark_state () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir @@ fun dir ->
+  with_tmp_dir @@ fun mat_dir ->
+  Eio.Switch.run @@ fun sw ->
+  let materializer, sink = make_lww_materializer ~env ~sw mat_dir in
+  let merge_key = restart_merge_key in
+  let propose_write = propose_lww_write in
   let first : Riptide_lattice.Last_write_wins.t =
     { value = v "materialized-before-the-crash"; timestamp = 7L }
   in
@@ -1336,6 +1359,189 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
         (fingerprint snapshot_caught_up)
         (fingerprint (durable_snapshot mat_dir)))
 
+(* ---------------------------------------------------------------------------------------------
+   Test 13 (fix round 1, review finding C1): THE BOUNDARY of test 12's claim -- what restart recovery
+   actually does once the ring has genuinely WRAPPED, pinned rather than left implied.
+
+   WHY THIS EXISTS. Test 12 above runs at [run_on_file_storage]'s DEFAULT [ring_capacity] (4096, see
+   [Riptide_dst.Cluster.default_ring_capacity]) over 2 committed ops. That is the regime in which the
+   ring never wraps, nothing is ever evicted, and [Replica.restart] rebuilds the WHOLE log from disk
+   -- so test 12 proves Decision 2's "no new durable watermark state" claim only where ring eviction,
+   the entire subject of this plan, has NOT happened. This test is the same mechanism in the regime
+   that matters, at a [ring_capacity] deliberately smaller than the number of ops committed (the same
+   technique [test_ring_capacity_boundary] above already uses to make eviction real rather than
+   hypothetical), with the consumer deliberately BEHIND when the crash lands.
+
+   WHAT IT FINDS, and it is the honest, narrower behaviour rather than the one the design's own prose
+   invited. Two facts about the real code, read rather than assumed:
+
+   1. [Replica.restart]'s log rebuild is [readable_prefix], a CONTIGUOUS scan up from op 1 that stops
+      at the first slot that does not read back [Present]. Eviction always destroys the LOWEST live
+      op-number first (File_storage's slot assignment is [(op_number - 1) mod ring_capacity], so
+      appending [n] overwrites [n - ring_capacity]). Therefore: once the ring has wrapped even ONCE,
+      that scan stops immediately at op 1 and the rebuilt in-memory log is EMPTY -- not merely
+      missing the evicted entries, but missing the later ones the ring genuinely does still hold,
+      because a prefix scan cannot skip a hole. (That is the same [Replica_log.length <> op_number]
+      state [propose]/[handle_prepare] already decline to serve from, and the protocol-level
+      consequence -- no view change can ever complete past the ring -- is already pinned by
+      [test_ring_capacity_boundary] above.)
+   2. [materialize_up_to] walks [Replica.entries], i.e. that rebuilt log. So the construction-time
+      re-prime recovers NOTHING at all here, for any op, however high the replica's own recovered
+      [commit_number] is.
+
+   THE CONSEQUENCE, stated as the disclosed limitation it is: an entry that was BOTH evicted from the
+   ring AND never materialized before the crash is genuinely, permanently lost after the restart.
+   Nothing in this plan claims otherwise, and nothing in [lib/] is changed to "fix" it -- the raw
+   bytes are gone, and no amount of consumer-side bookkeeping can reconstruct them. What Decision 2
+   actually guarantees is narrower than its original wording: no new durable watermark state is
+   needed for whatever the REBUILT LOG still holds. The safe way for a real consumer to re-prime is
+   therefore NOT [watermark := Replica.commit_number r] -- which would falsely claim coverage of
+   every op the rebuilt log can no longer see -- but the bound this test asserts,
+   [min (Replica.commit_number r) (List.length (Replica.entries r))], which is exactly how far
+   [materialize_up_to] can have got and needs no durable state of its own either.
+
+   AND THE SECOND-ORDER EFFECT, asserted here too because a reader will ask: after such a restart the
+   eviction gate stops protecting those entries, since
+   [Batch_commit.write_at_op_number_has_merge_key] reads the same rebuilt log and answers [false] for
+   every op it can no longer see. In this state that costs nothing -- the entries it would have been
+   protecting are already gone -- but it is the reason this boundary must be documented rather than
+   left for a future caller to discover: the gate is not a second line of defence for a backlog this
+   deep, it is inert.
+   --------------------------------------------------------------------------------------------- *)
+
+(* Small enough that 4 committed ops wrap it twice, so ops 1 and 2 are physically destroyed while
+   ops 3 and 4 are still readable -- which is what makes finding (1) above observable as more than
+   "everything was evicted". *)
+let wrapped_ring_capacity = 2
+let wrapped_ring_ops = 4
+
+let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir @@ fun dir ->
+  with_tmp_dir @@ fun mat_dir ->
+  Eio.Switch.run @@ fun sw ->
+  let materializer, sink = make_lww_materializer ~env ~sw mat_dir in
+  let read () = Lww_materializer.read materializer ~merge_key:restart_merge_key in
+  let value_of n = Printf.sprintf "v%d" n in
+  (* Timestamps rise with the op-number, so op [n]'s value STRICTLY WINS [Last_write_wins]' join
+     against every earlier op's. That is what makes "the accumulator still holds op 1's value" a
+     discriminating assertion rather than a vacuous one: folding in ANY of ops 2..4, at any point,
+     would necessarily have changed it. *)
+  let lww n : Riptide_lattice.Last_write_wins.t =
+    { value = v (value_of n); timestamp = Int64.of_int n }
+  in
+  Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3
+    ~ring_capacity:wrapped_ring_capacity
+    (fun ~replicas ~settle ~restart ->
+      let r = replicas.(0) in
+      (* op 1: committed AND materialized. The only op this consumer ever gets to. *)
+      propose_lww_write r ~idempotency_key:"k1" ~timestamp:1L ~value_str:(value_of 1);
+      settle ();
+      Alcotest.(check int) "precondition: op 1 committed" 1 (Replica.commit_number r);
+      Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
+        ~through_commit_number:1;
+      let watermark = ref 1 in
+      Alcotest.(check bool) "precondition: op 1 really was materialized before the crash" true
+        (read () = lww 1);
+      (* ops 2..4: committed, and deliberately NEVER materialized -- the consumer is genuinely
+         behind, which is the whole point of this regime. *)
+      for n = 2 to wrapped_ring_ops do
+        propose_lww_write r
+          ~idempotency_key:(Printf.sprintf "k%d" n)
+          ~timestamp:(Int64.of_int n) ~value_str:(value_of n);
+        settle ()
+      done;
+      Alcotest.(check int) "precondition: all 4 batches committed" wrapped_ring_ops
+        (Replica.commit_number r);
+      Alcotest.(check bool)
+        "precondition: the consumer is still behind -- ops 2..4 committed, none materialized" true
+        (read () = lww 1);
+      Alcotest.(check int) "...with its watermark still at 1" 1 !watermark;
+      (* THE REGIME, asserted rather than assumed: the ring genuinely wrapped, and op 2 -- committed,
+         never materialized -- is among the slots it physically destroyed. *)
+      Alcotest.(check bool) "precondition: op 1's slot was destroyed by op 3's append" true
+        (Replica.for_test_wal_read r ~op_number:1 = None);
+      Alcotest.(check bool)
+        "precondition: op 2's slot -- committed AND never materialized -- was destroyed by op 4's \
+         append"
+        true
+        (Replica.for_test_wal_read r ~op_number:2 = None);
+      Alcotest.(check bool)
+        "...while the two most recent slots ARE still physically readable, which is what makes the \
+         prefix-scan finding below distinguishable from 'the whole ring was lost'"
+        true
+        (Replica.for_test_wal_read r ~op_number:3 <> None
+        && Replica.for_test_wal_read r ~op_number:4 <> None);
+      let snapshot_before = durable_snapshot mat_dir in
+      Alcotest.(check bool) "precondition: the materializer really did put bytes on disk" true
+        (snapshot_before <> []);
+      (* THE CRASH. Same ordinary restart as test 12's -- no [~lose_superblock]. *)
+      Alcotest.(check bool) "the replica came back from the crash" true (restart 0);
+      let r = replicas.(0) in
+      Alcotest.(check int)
+        "...and recovered its commit_number IN FULL from its own superblock, which is exactly what \
+         makes the naive re-prime tempting"
+        wrapped_ring_ops (Replica.commit_number r);
+      (* FINDING (1): the rebuilt log is EMPTY, even though two of its four slots are still readable
+         on disk -- [readable_prefix] is a contiguous scan from op 1 and op 1 is gone. *)
+      Alcotest.(check int)
+        "the restarted replica's rebuilt in-memory log is EMPTY: readable_prefix stops at op 1, so \
+         the still-readable ops 3 and 4 are not recovered either"
+        0
+        (List.length (Replica.entries r));
+      (* THE WHOLE OF RESTART RECOVERY, byte-for-byte the same two lines test 12's part 2 runs. *)
+      Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
+        ~through_commit_number:(Replica.commit_number r);
+      (* FINDING (2), stated honestly: it recovered NOTHING. Ops 2, 3 and 4 each carry a strictly
+         higher LWW timestamp than op 1, so folding any single one of them in would have moved this
+         value -- this assertion cannot pass by accident. *)
+      Alcotest.(check bool)
+        "the construction-time re-prime recovered NOTHING: ops 2..4 stay unmaterialized, and op 2 \
+         (evicted AND never materialized) is permanently lost -- a real, disclosed limitation"
+        true
+        (read () = lww 1);
+      (* Not a one-shot timing artefact: re-running the re-prime does not help, and never will,
+         because the bytes it would need are gone. *)
+      Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
+        ~through_commit_number:(Replica.commit_number r);
+      Alcotest.(check bool) "...and a second re-prime recovers nothing either" true
+        (read () = lww 1);
+      (* THE HONEST WATERMARK, and the reason the naive one is wrong. *)
+      let honest_watermark =
+        min (Replica.commit_number r) (List.length (Replica.entries r))
+      in
+      Alcotest.(check int)
+        "the honest re-primed watermark -- how far materialize_up_to can actually have got -- is 0"
+        0 honest_watermark;
+      Alcotest.(check bool)
+        "...and it is STRICTLY BELOW the replica's own recovered commit_number, so the naive \
+         [watermark := Replica.commit_number r] would falsely claim coverage of 4 ops it recovered \
+         none of"
+        true
+        (honest_watermark < Replica.commit_number r);
+      (* THE SECOND-ORDER EFFECT: the eviction gate reads the same rebuilt log, so it is now inert
+         for every one of these op-numbers. Nothing is being wrongly destroyed (the entries are
+         already gone) -- but the gate is not protecting them either, and that must be disclosed
+         rather than discovered later. *)
+      List.iter
+        (fun op_number ->
+          Alcotest.(check bool)
+            (Printf.sprintf
+               "after this restart the eviction gate sees no merge_key write at op %d, so it would \
+                freely permit that slot's reuse"
+               op_number)
+            false
+            (Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key r ~op_number))
+        [ 1; 2; 3; 4 ];
+      (* THE PART OF DECISION 2 THAT DOES STILL HOLD, kept as real bytes: even here, restart recovery
+         added no durable state of its own. The claim that needed narrowing was about COVERAGE, not
+         about footprint. *)
+      Alcotest.(check (list string))
+        "the materializer's durable directory is byte-identical across the crash and both re-primes: \
+         still no watermark file, no checkpoint, nothing new"
+        (fingerprint snapshot_before)
+        (fingerprint (durable_snapshot mat_dir)))
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -1369,4 +1575,7 @@ let tests =
     ( "subtask 3.7: the ring-eviction materialization watermark survives a real crash-and-come-back \
        with no durable state of its own", `Slow,
       test_restart_recovery_needs_no_new_durable_watermark_state );
+    ( "subtask 3.7, fix round 1 (finding C1): once the ring has WRAPPED, restart recovery cannot \
+       recover a still-unmaterialized entry -- the real, narrower boundary of that claim", `Slow,
+      test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry );
   ]

@@ -44,12 +44,30 @@ real end-to-end proof.
   reading "the ring refuses to evict" would expect this to behave like every other declined
   durable append already does in this codebase, not introduce a new failure mode a caller has to
   learn to handle. (3.7, Task 4)
+  - *Task 6 fix round 1 (review finding I1): the RETRIED half of this is now demonstrated, not just
+    the silent half. `test_a_followers_ring_eviction_is_gated_by_its_own_watermark`'s phase D
+    (`test/test_lattice_materialize_crypto_scenarios.ml`) re-delivers the exact `Prepare` bytes the
+    gate refused, after the watermark relents, and asserts the same op_number then appends durably
+    with no new refusal — plus a permanent negative control proving it is the relenting, not the
+    redelivery, that makes it succeed. Note what the protocol itself does NOT provide: this VSR
+    subset has no retransmission timer, so the retry must come from the transport/caller.*
 - **A write with no `merge_key` must be completely unaffected by the new eviction gate**, at every
   point in a real backlog, not just in the common case. (3.7, Task 4/6)
 - **Restart recovery must genuinely require no new durable state.** A replica that restarts and
   re-materializes through its own current `commit_number` must converge to the same state a
   never-restarted replica would have — proven, not just claimed to follow from lattice-join
   idempotence. (3.7, Task 6)
+  - *Task 6 fix round 1 (review finding C1): proven, and found to hold only in a narrower regime
+    than this wording implies. It holds exactly while the restarted replica's rebuilt log still
+    holds the entry — `Replica.restart`'s `readable_prefix` is a contiguous scan from op 1, so once
+    the ring has wrapped at all that log is empty and the re-prime recovers nothing. An entry both
+    evicted and never materialized before the crash is permanently lost; the honest re-prime bound
+    is `min (Replica.commit_number r) (List.length (Replica.entries r))`, not `commit_number`. Both
+    regimes are pinned by running tests in `test/test_dst_scenarios.ml`
+    (`test_restart_recovery_needs_no_new_durable_watermark_state` and
+    `test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry`), and the design
+    spec's Decision 2 is narrowed to match. The "no new durable state" FOOTPRINT claim survives
+    unchanged in both regimes; only the COVERAGE claim needed narrowing.*
 - **The DST determinism fix must still detect a genuinely stuck cluster**, not just stop detecting
   a merely-slow one. A fix that silently disables `Did_not_settle` entirely would pass every
   existing test while deleting the harness's own livelock detection. (3.8, Task 1)
