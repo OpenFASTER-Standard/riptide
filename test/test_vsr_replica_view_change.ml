@@ -179,7 +179,7 @@ let with_cluster ~replica_count ~svc_limit
               if isolated.(to_) then ()
                 (* Dropped at the point of send -- see [isolated]'s own doc comment: never queued,
                    so there is nothing left to deliver once [to_] is later reconnected. *)
-              else Sim_transport.send handles.(i) ~to_ bytes)
+              else Sim_transport.send handles.(i) ~to_ bytes) ()
         in
         Replica.for_test_set_view_number r 1;
         r)

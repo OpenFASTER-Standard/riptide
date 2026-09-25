@@ -288,7 +288,7 @@ let fake_event_id name = Riptide.Value.content_hash (Riptide.Value.Scalar (Ripti
 
 let create_solo () =
   Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3
-    ~send:(fun ~to_:_ (_ : string) -> ())
+    ~send:(fun ~to_:_ (_ : string) -> ()) ()
 
 let sink_of store : Batch_commit.encryption_sink =
   { encrypt = (fun ~event_id v -> Redaction_store.encrypt_value store ~event_id v) }
@@ -421,7 +421,7 @@ let with_store_and_cluster ~replica_count f =
       let replicas =
         Array.init replica_count (fun i ->
             Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:(i + 1) ~replica_count
-              ~svc_limit:3 ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight))
+              ~svc_limit:3 ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight) ())
       in
       (* Same reason every cluster harness in this repo does this (see test_batch_commit_cluster.ml
          and Riptide_dst.Cluster): a fresh replica starts at view 0, where Primary(0) =

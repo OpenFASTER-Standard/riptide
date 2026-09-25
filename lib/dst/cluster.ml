@@ -242,7 +242,7 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
         let my_id = i + 1 in
         let r =
           Riptide_vsr.Replica.create ~storage:storages.(i) ~my_id ~replica_count ~svc_limit
-            ~send:(send_for i)
+            ~send:(send_for i) ()
         in
         (* Deviation 1 (see this file's own top comment and [cluster.mli]): pin every replica's
            view to 1 so [Primary(1) = 1] and [replicas.(0)] is the primary a caller can [propose]
@@ -353,7 +353,7 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
       Riptide_storage.Fault_injecting_storage.for_test_lose_superblock fault_storages.(i);
     match
       Riptide_vsr.Replica.restart ~storage:storages.(i) ~my_id:(i + 1) ~replica_count ~svc_limit
-        ~send:(send_for i)
+        ~send:(send_for i) ()
     with
     | r ->
       replicas.(i) <- r;

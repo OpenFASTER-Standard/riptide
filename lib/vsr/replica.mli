@@ -106,17 +106,27 @@ val volatile_storage : unit -> storage
     that reason: the property that matters at a call site is what is lost, not where it is kept. *)
 
 val create :
+  ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->
   my_id:int ->
   replica_count:int ->
   svc_limit:int ->
   send:(to_:int -> string -> unit) ->
   storage:storage ->
+  unit ->
   t
-(** [create ~my_id ~replica_count ~svc_limit ~send] is a fresh replica matching VSR.tla's [Init]
+(** [create ~my_id ~replica_count ~svc_limit ~send ~storage ()] is a fresh replica matching VSR.tla's [Init]
     (VSR.tla:71-84) restricted to this replica [my_id]: empty log, [op_number = 0],
     [commit_number = 0], [status = Normal], [view_number = 0], [last_normal_view = 0],
     [recv_svc]/[recv_dvc] empty, [sent_dvc = false], [svc_count = 0], no peer acknowledgments
     recorded yet.
+
+    {b The trailing [()] is required by OCaml's own optional-argument erasure rule}, not
+    decoration: an optional argument is only erased when the function is applied to a
+    {i non-labelled} argument appearing after it. Every other parameter here is labelled, so
+    without a final [unit] a call that omits [?on_commit_advanced] would have type
+    [?on_commit_advanced:... -> t] rather than [t] and fail to typecheck (verified against the
+    real compiler — warning 16, [unerasable-optional-argument]). {!restart} carries the same [()]
+    for the same reason.
 
     {b There is no [primary_id] parameter any more} — an earlier, normal-case-only plan's fixed
     primary is gone; which replica id is primary is now always computed from {!view_number} via
@@ -156,21 +166,59 @@ val create :
     [Invalid_argument] if the backend already holds a WAL entry or a superblock, because a
     non-empty backend means a previous life whose durable [view_number]/[last_normal_view] this
     constructor would silently discard — and those two surviving a crash is the whole basis of
-    the recovery mechanism (VSR.tla's Decision 4). {!restart} is the constructor for that case. *)
+    the recovery mechanism (VSR.tla's Decision 4). {!restart} is the constructor for that case.
+
+    [?on_commit_advanced], if supplied, is a progress hook invoked {b synchronously and inline}
+    (from within whichever {!propose} or {!handle_message} call caused the advance, on that
+    caller's own stack — never queued or deferred, exactly like [send] above, so a hook that blocks
+    blocks the protocol; {!check_timeout} can never trigger it, since none of the four commit sites
+    is reachable from it — it reaches [SendDVC] only, never [SendSV]) {b exactly once per genuine increase} in {!commit_number},
+    with [~old_commit] the value immediately before the change and [~new_commit] the value
+    immediately after. It is given plain [int]s and nothing else: {!Replica} is Layer 0 and stays
+    domain-agnostic about what a consumer does with commit progress (the ring-eviction watermark is
+    the first consumer). Omitting it is the zero-cost default and leaves behaviour bit-for-bit
+    identical to before this parameter existed.
+
+    {b "Exactly once per genuine increase" is enforced by [Replica], not inherited from its commit
+    sites — and that distinction is real, not pedantic.} [commit_number] is assigned at four places
+    in the implementation. Three of them guard on a strict increase already ([primary_execute_op]'s
+    [next = commit_number + 1]; [handle_prepare]'s and {!handle_message}'s [Start_view] path's
+    [if k > commit_number]). The fourth, [SendSV] (VSR.tla:274's
+    [rep_commit_number' = HighestCommitNumber(r)]), is {b deliberately unconditional and can
+    genuinely LOWER [commit_number]} — the new primary starts the view from the winning DVC set's
+    own maximum, not from its own prior value, and [test_vsr_replica.ml]'s own
+    [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] pins a real 1 {b ->} 0
+    drop. A single internal writer therefore gates the callback on [new_commit > old_commit]: a
+    decrease still happens to the field (no protocol behaviour is changed by this hook) but is
+    {b never reported as an advance}, so a monotonic consumer such as a watermark can never be
+    driven backwards. Consequently the hook is {b not} a faithful audit log of every write to
+    [commit_number]; it is a report of forward progress only.
+
+    {b Not invoked retroactively.} No callback is made during {!create}/{!restart} itself for
+    commit progress the replica already knows about — in particular a {!restart} that recovers
+    [commit_number = 7] from its superblock fires nothing for 1..7, and the first callback that
+    replica ever makes is for its next real advance ([~old_commit = 7]). A caller that needs
+    restart-time catch-up must read {!commit_number} itself right after construction and seed its
+    own state from it. *)
 
 val restart :
+  ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->
   my_id:int ->
   replica_count:int ->
   svc_limit:int ->
   send:(to_:int -> string -> unit) ->
   storage:storage ->
+  unit ->
   t
-(** [restart ~my_id ~replica_count ~svc_limit ~send ~storage] is VSR.tla's [CrashRestart]
+(** [restart ~my_id ~replica_count ~svc_limit ~send ~storage ()] is VSR.tla's [CrashRestart]
     (VSR.tla:671-690): a replica coming back up on top of storage that already holds its durable
     state. Same argument validation as {!create}, and the same [Invalid_argument] cases for
     [my_id]/[replica_count]/[svc_limit] — but no emptiness requirement, since recovering existing
     durable state is the point. An empty backend (no superblock AND an empty WAL) is accepted and
-    yields exactly {!create}'s [Init] state — that is first boot, and it keeps working.
+    yields exactly {!create}'s [Init] state — that is first boot, and it keeps working. [?on_commit_advanced]
+    and the trailing [()] mean exactly what they mean on {!create} (see there) — including that
+    nothing is reported retroactively for the [commit_number] this constructor RECOVERS, which is
+    the case a restart-time consumer has to handle for itself.
 
     {b Raises [Invalid_argument] — fail-stop — if the superblock is unusable while the WAL is NOT
     empty}, i.e. if [superblock_read] returns [None] (fewer than a majority of copies verify and

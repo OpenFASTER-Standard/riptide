@@ -43,7 +43,7 @@ let decoded_sent sent_fn = List.map (fun (to_, bytes) -> (to_, Message.decode by
    note for why: [Primary(1) = 1] for any replica_count, so this is the standard way this suite
    puts replica id 1 in the primary role. *)
 let create_at_view_1 ~my_id ~replica_count ~send =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   t
 
@@ -60,7 +60,7 @@ let create_at_view_1 ~my_id ~replica_count ~send =
 
 let test_primary_formula_matches_tlc () =
   let primary_of ~replica_count ~view_number =
-    let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+    let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
     Replica.for_test_set_view_number t view_number;
     Replica.primary t
   in
@@ -94,13 +94,13 @@ let test_primary_formula_matches_tlc () =
 let test_is_primary_agrees_with_primary_formula () =
   (* is_primary t is documented as exactly [t.my_id = primary t] -- confirm both the true and
      false case at a view where the "natural" (view 0) primary is NOT replica 1. *)
-  let t3 = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t3 = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check bool) "replica 3 is primary at the default view_number=0 (Primary(0)=3)" true (Replica.is_primary t3);
-  let t1 = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t1 = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check bool) "replica 1 is NOT primary at the default view_number=0" false (Replica.is_primary t1)
 
 let test_view_number_round_trips_for_test_set_view_number () =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check int) "view_number starts at 0 (VSR.tla's own Init)" 0 (Replica.view_number t);
   Replica.for_test_set_view_number t 7;
   Alcotest.(check int) "view_number round-trips for_test_set_view_number" 7 (Replica.view_number t)
@@ -120,7 +120,7 @@ let test_view_number_round_trips_for_test_set_view_number () =
    old (pre-fix) version of for_test_set_view_number, which left last_normal_view at 0 here
    instead of advancing it to 5. *)
 let test_for_test_set_view_number_keeps_last_normal_view_in_sync () =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check int) "last_normal_view starts at 0 (VSR.tla's own Init)" 0 (Replica.last_normal_view t);
   Replica.for_test_set_view_number t 5;
   Alcotest.(check int) "view_number advances to 5" 5 (Replica.view_number t);
@@ -226,7 +226,7 @@ let test_prepare_wrong_view_dropped () =
      and the incoming Prepare carries view=1, a genuine mismatch -- exactly what this test needs to
      exercise the [m.view = View(r)] guard, independent of which replica happens to be primary. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "wrong-view"; k = 0 }) in
   Replica.handle_message t prepare;
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
@@ -340,7 +340,7 @@ let test_prepare_ok_is_noop_on_non_primary () =
      view manipulation required. is_primary is checked before the view check in
      handle_prepare_ok, so this message's own [view] field (left at 0) never even gets read. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 0; n = 1; i = 3 }));
   Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
@@ -572,20 +572,20 @@ let expect_invalid_arg name (f : unit -> Replica.t) =
 let create_invalid_arg_tests =
   [
     expect_invalid_arg "replica_count = 0 is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:0 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:0 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) ());
     expect_invalid_arg "negative replica_count is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:(-3) ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:(-3) ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) ());
     expect_invalid_arg "even replica_count is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:4 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:4 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) ());
     expect_invalid_arg "my_id below 1 is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:0 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:0 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) ());
     expect_invalid_arg "my_id above replica_count is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:4 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:4 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) ());
     (* L2 fix-round regression tests *)
     expect_invalid_arg "svc_limit = 0 is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:0 ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:0 ~send:(fun ~to_:_ _ -> ()) ());
     expect_invalid_arg "negative svc_limit is rejected" (fun () ->
-        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:(-1) ~send:(fun ~to_:_ _ -> ()));
+        Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:(-1) ~send:(fun ~to_:_ _ -> ()) ());
   ]
 
 (* L2 fix-round regression test: svc_limit = 1 (the smallest LEGAL value) must still be accepted
@@ -595,7 +595,7 @@ let create_invalid_arg_tests =
    test can pin is that [create] does not raise, and that the resulting replica is otherwise a
    perfectly normal, usable [Init] state. *)
 let test_svc_limit_boundary_one_is_accepted () =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:1 ~send:(fun ~to_:_ _ -> ()) in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:1 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check int) "op_number starts at 0, same as any other valid create" 0 (Replica.op_number t)
 
 let test_create_accepts_a_valid_single_replica_cluster () =
@@ -604,7 +604,7 @@ let test_create_accepts_a_valid_single_replica_cluster () =
      [for_test_set_view_number] call needed: Primary(v) = 1 + ((v-1) mod 1 + 1) mod 1 = 1 for
      EVERY v when replica_count = 1 (mod 1 is always 0), so replica 1 is primary at the default
      view_number = 0 too. *)
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   Alcotest.(check bool) "is_primary" true (Replica.is_primary t)
 
 (* ---- L2 fix-round regression test: propose must also drive PrimaryExecuteOp (the f=0 case) ---- *)
@@ -614,7 +614,7 @@ let test_propose_commits_immediately_in_single_replica_cluster () =
   (* See test_create_accepts_a_valid_single_replica_cluster above: replica 1 is primary at
      replica_count = 1 regardless of view_number, so no for_test_set_view_number call is needed
      here either. *)
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send () in
   Replica.propose t (v "solo");
   (* f = (1-1)/2 = 0, so IsCommitted is vacuously true for every op-number -- before the fix,
      nothing but a (nonexistent, since there are no other replicas) Prepare_ok could ever drive
@@ -628,7 +628,7 @@ let test_propose_commits_immediately_in_single_replica_cluster () =
 
 let test_handle_message_malformed_bytes_dropped () =
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.handle_message t "\xff\xff\xff not a valid encoding";
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "no messages sent" true (sent () = [])
@@ -649,7 +649,7 @@ let test_handle_message_malformed_bytes_dropped () =
    ReceiveSV section below, where its real acceptance is asserted instead. *)
 let test_do_view_change_wrong_view_dropped () =
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.handle_message t
     (Message.encode (Message.Do_view_change { v = 1; entries = []; nacks = []; last_normal_view = 0; n = 0; k = 0; i = 3 }));
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
@@ -664,7 +664,7 @@ let test_do_view_change_wrong_view_dropped () =
 
 let test_check_timeout_transitions_and_broadcasts_start_view_change () =
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
   Alcotest.(check bool) "starts Normal" true (Replica.status t = Replica.Normal);
   Alcotest.(check int) "starts at view_number 0" 0 (Replica.view_number t);
   Replica.check_timeout t;
@@ -682,7 +682,7 @@ let test_check_timeout_noop_when_already_view_change () =
      (svc_limit is generous here) -- a naive implementation that dropped this guard would let a
      second, back-to-back check_timeout call bump view_number again and re-broadcast. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:5 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:5 ~send () in
   Replica.check_timeout t;
   Alcotest.(check int) "1st timeout advances view_number to 1" 1 (Replica.view_number t);
   let sent_after_first = sent () in
@@ -702,7 +702,7 @@ let test_check_timeout_bounded_by_svc_limit () =
      only check_timeout's own real firings increment it), so this genuinely exercises svc_count's
      accumulation and bound, not a shortcut around it. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:2 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:2 ~send () in
   Replica.check_timeout t;
   Alcotest.(check bool) "1st timeout (svc_count 0 < 2) fires" true (Replica.status t = Replica.View_change);
   Alcotest.(check int) "view_number advances to 1" 1 (Replica.view_number t);
@@ -728,7 +728,7 @@ let test_check_timeout_resets_recv_svc_across_episodes () =
      fire a premature DoViewChange nobody else has asked for. Simulates that return-to-Normal via
      [for_test_set_view] (matching test_check_timeout_bounded_by_svc_limit's own convention). *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:5 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:5 ~send () in
   Replica.check_timeout t;
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
@@ -750,7 +750,7 @@ let test_receive_higher_svc_adopts_view_seeds_recv_svc_and_resets_episode () =
      first DoViewChange fires (sent_dvc -> true), a SECOND, even-higher StartViewChange only
      re-enables SendDVC if sent_dvc was really reset back to false. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
   Alcotest.(check bool) "starts Normal at view 0" true (Replica.status t = Replica.Normal && Replica.view_number t = 0);
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 5; i = 2 }));
   Alcotest.(check bool) "adopts the higher view: status -> View_change" true (Replica.status t = Replica.View_change);
@@ -778,7 +778,7 @@ let test_receive_matching_svc_unions_and_dedups_send_dvc_fires_once () =
      real set-union accumulation from a single-message trigger, AND from a naive list-append that
      would double-count a duplicate sender. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send () in
   Replica.check_timeout t;
   Alcotest.(check int) "view_number advances to 1" 1 (Replica.view_number t);
   let sent_after_timeout = List.length (sent ()) in
@@ -805,7 +805,7 @@ let test_send_dvc_message_content_matches_replica_state () =
      normal-case path (real Prepares), THEN drives it into a view change, to pin that SendDVC's
      own DoViewChange really does carry THIS replica's real state, not placeholder/zero values. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.for_test_set_view t ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
   (* my_id=3 is a backup at view 1 (Primary(1) = 1) -- feed it two in-order Prepares *)
   Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
@@ -848,7 +848,7 @@ let test_send_dvc_message_content_matches_replica_state () =
 
 let test_start_view_change_lower_or_equal_while_normal_dropped () =
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.for_test_set_view t ~status:Replica.Normal ~view_number:3 ~last_normal_view:3;
   (* LOWER: v=1 < view_number=3 -- matches neither ReceiveHigherSVC nor ReceiveMatchingSVC *)
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
@@ -869,7 +869,7 @@ let test_start_view_change_forged_out_of_range_i_dropped () =
      rejected wholesale (no state change at all, not even adopting the higher view); i = 2 (a
      genuinely valid id) must still work normally right after. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 5; i = 4 }));
   Alcotest.(check bool) "forged out-of-range i (4, first invalid id for replica_count=3) is dropped wholesale: \
                          status stays Normal"
@@ -892,7 +892,7 @@ let test_start_view_change_self_addressed_i_dropped () =
      reproduced here at replica_count=5 (f=2): one genuine other id plus a self-addressed id must
      NOT reach the f=2 threshold, since only one real corroborator exists. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send () in
   Replica.check_timeout t;
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 2 }));
   let sent_after_one_genuine = List.length (sent ()) in
@@ -908,7 +908,7 @@ let test_start_view_change_self_addressed_i_dropped () =
 (* ---- for_test_set_view (test-support surface) ---- *)
 
 let test_for_test_set_view_round_trips_independently () =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:(fun ~to_:_ _ -> ()) () in
   (* Deliberately mismatched view_number/last_normal_view, at status=View_change -- exactly the
      combination for_test_set_view_number cannot produce (it force-syncs the two), and exactly
      the combination a real mid-view-change replica is routinely in. *)
@@ -968,7 +968,7 @@ let sv_msg ~v ~log ~n ~k = Message.encode (Message.Start_view { v; log; n; k })
 (* A replica already mid-view-change at [view_number], with a [last_normal_view] genuinely below it
    -- the combination [for_test_set_view] exists for (see its doc comment in replica.mli). *)
 let create_in_view_change ~my_id ~replica_count ~view_number ~last_normal_view ~send =
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit:3 ~send () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number ~last_normal_view;
   t
 
@@ -1216,7 +1216,7 @@ let test_send_sv_commit_number_assignment_is_unconditional_not_monotonic () =
      force a view-change episode whose own HighestCommitNumber is 0 (lower), and confirm
      commit_number actually DROPS to 0, not stays at 1. *)
   let send, sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Alcotest.(check int) "a real Prepare exchange establishes commit_number = 1 before view-change" 1
@@ -1325,7 +1325,7 @@ let test_send_sv_refuses_when_highest_commit_exceeds_the_winning_log () =
 let test_send_sv_resets_svc_count () =
   let send, _sent = capturing_send () in
   (* svc_limit = 1: without the reset, the single timeout budget is spent for good. *)
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:1 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:1 ~send () in
   Replica.for_test_set_view_number t 1;
   Replica.check_timeout t;
   Alcotest.(check int) "the one permitted timeout moves this replica to view 2" 2 (Replica.view_number t);
@@ -1346,7 +1346,7 @@ let test_send_sv_resets_svc_count () =
 
 let test_receive_sv_adopts_log_view_and_returns_to_normal () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   (* Build real, non-trivial state first, through the well-tested normal-case path. *)
   Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
@@ -1371,7 +1371,7 @@ let test_receive_sv_adopts_log_view_and_returns_to_normal () =
    strictly lower view must still be dropped. *)
 let test_receive_sv_accepts_equal_view_and_rejects_lower () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   (* A fresh replica at its Init view 0 accepts a HIGHER view -- this is the Start_view case that
      used to live in this file's "out-of-scope message types" test. *)
   Replica.handle_message t (sv_msg ~v:1 ~log:[ v "p" ] ~n:1 ~k:0);
@@ -1393,7 +1393,7 @@ let test_receive_sv_accepts_equal_view_and_rejects_lower () =
    REGRESS a replica's commit_number, un-committing entries it has already reported committed. *)
 let test_receive_sv_commit_number_is_monotonic_only () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   List.iter
     (fun (n, value, k) ->
@@ -1417,7 +1417,7 @@ let test_receive_sv_commit_number_is_monotonic_only () =
 
 let test_receive_sv_refuses_to_truncate_below_commit_number () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   List.iter
     (fun (n, value, k) ->
@@ -1440,7 +1440,7 @@ let test_receive_sv_refuses_to_truncate_below_commit_number () =
 
 let test_receive_sv_forged_fields_rejected () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
   List.iter
     (fun (name, msg) ->
       Replica.handle_message t msg;
@@ -1474,7 +1474,7 @@ let test_receive_sv_does_not_reset_recv_dvc_or_recv_svc () =
   (* Primary(2) = 2 at replica_count=5, so this replica is the primary of the episode it starts --
      but only ONE DVC arrives (f+1 = 3 is needed), so SendSV never fires and ReceiveSV is genuinely
      what returns it to Normal. *)
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   Replica.check_timeout t;
   Alcotest.(check int) "mid-view-change at view 2" 2 (Replica.view_number t);
@@ -1500,7 +1500,7 @@ let test_receive_sv_does_not_reset_recv_dvc_or_recv_svc () =
    exactly this test once ReceiveDVC could populate recv_dvc for real. *)
 let test_new_view_change_episode_resets_recv_dvc_and_recv_svc () =
   let send, _sent = capturing_send () in
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send () in
   Replica.for_test_set_view_number t 1;
   Replica.check_timeout t;
   Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
@@ -1528,7 +1528,7 @@ let test_new_view_change_episode_resets_recv_dvc_and_recv_svc () =
 let test_receive_sv_resets_svc_count_only_on_a_real_transition () =
   let send, _sent = capturing_send () in
   (* Direction 1: a REAL View_change -> Normal transition DOES reset the budget. *)
-  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:1 ~send in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:1 ~send () in
   Replica.check_timeout t;
   Alcotest.(check bool) "the one permitted timeout fired" true (Replica.status t = Replica.View_change);
   Replica.handle_message t (sv_msg ~v:1 ~log:[] ~n:0 ~k:0);
@@ -1541,7 +1541,7 @@ let test_receive_sv_resets_svc_count_only_on_a_real_transition () =
      ReceiveSV (the existing check_timeout tests use the same device), so that svc_count genuinely
      accumulates to its limit. *)
   let send2, _sent2 = capturing_send () in
-  let u = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:2 ~send:send2 in
+  let u = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:2 ~send:send2 () in
   Replica.check_timeout u;
   Replica.for_test_set_view u ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
   Replica.check_timeout u;
@@ -1559,6 +1559,128 @@ let test_receive_sv_resets_svc_count_only_on_a_real_transition () =
      check_timeout is blocked and view_number stays at 2"
     2 (Replica.view_number u);
   Alcotest.(check bool) "and the replica stays Normal" true (Replica.status u = Replica.Normal)
+
+(* ---- [?on_commit_advanced] (subtask 3.7 part 1): the domain-agnostic commit-progress hook ----
+
+   [Replica] stays domain-agnostic: the hook takes two plain ints and knows nothing about what a
+   consumer (Task 6's ring-eviction watermark) does with them. *)
+
+let test_on_commit_advanced_fires_with_the_correct_before_and_after_values () =
+  let observed = ref [] in
+  let replica =
+    Replica.create ~my_id:1 ~replica_count:1 ~svc_limit:10
+      ~send:(fun ~to_:_ _ -> ())
+      ~storage:(Replica.volatile_storage ())
+      ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
+      ()
+  in
+  (* [replica_count = 1] means [f = 0], so [primary_execute_op]'s own [IsCommitted] is vacuously
+     true and each [propose] commits synchronously inside the same call -- this suite's established
+     solo-replica precedent. Two DISTINCT values, since [propose] dedups by value equality. *)
+  Replica.for_test_set_view_number replica 1;
+  Replica.propose replica (v "op-1");
+  Replica.propose replica (v "op-2");
+  Alcotest.(check int) "both proposals really did commit" 2 (Replica.commit_number replica);
+  Alcotest.(check (list (pair int int))) "commit_number advanced 0->1, then 1->2, in order"
+    [ (1, 2); (0, 1) ]
+    !observed
+
+let test_no_hook_supplied_is_unaffected () =
+  (* Backward compatibility: existing callers that omit [?on_commit_advanced] see identical
+     behaviour -- just re-run a simple propose/commit sequence with no hook at all. *)
+  let replica =
+    Replica.create ~my_id:1 ~replica_count:1 ~svc_limit:10 ~send:(fun ~to_:_ _ -> ())
+      ~storage:(Replica.volatile_storage ()) ()
+  in
+  Replica.for_test_set_view_number replica 1;
+  Replica.propose replica (v "op-1");
+  Alcotest.(check int) "committed without a hook" 1 (Replica.commit_number replica)
+
+let test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease () =
+  (* task-3 DISCREPANCY D2, pinned as a real test rather than only disclosed in prose: the brief
+     asserted all four [commit_number <-] sites "only assign when genuinely increasing", which is
+     FALSE. [try_send_sv] (VSR.tla:274's [rep_commit_number' = HighestCommitNumber(r)]) is
+     deliberately UNCONDITIONAL and can genuinely LOWER commit_number -- pinned already by
+     [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] above, which proves a
+     real 1 -> 0 drop. The hook's documented contract is "exactly once per genuine INCREASE", so
+     the guarantee is enforced by [advance_commit_number] itself, not inherited from the sites.
+     This test is what makes that enforcement real rather than assumed: it replays that exact
+     scenario with a hook attached and requires the decrease to produce NO callback. *)
+  let observed = ref [] in
+  let send, sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send
+      ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
+      ()
+  in
+  ignore sent;
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "a real Prepare exchange establishes commit_number = 1" 1 (Replica.commit_number t);
+  Alcotest.(check (list (pair int int))) "and that genuine 0 -> 1 increase DID fire the hook" [ (0, 1) ] !observed;
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:6 ~last_normal_view:0;
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:2);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:3);
+  Replica.handle_message t (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "the view change completed" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "commit_number really did DROP to 0 (SendSV is unconditional)" 0 (Replica.commit_number t);
+  Alcotest.(check (list (pair int int)))
+    "the hook fired for the increase only -- a DECREASE is not a commit advance and must not be \
+     reported as one (a watermark consumer would otherwise move backwards)"
+    [ (0, 1) ] !observed
+
+(* The two tests above between them exercise only [primary_execute_op]'s site (solo commit),
+   [handle_prepare]'s site (the Prepare [k] field) and [try_send_sv]'s NEGATIVE case (a decrease
+   must not fire). That leaves two of the four real sites where a mutation deleting the hook call
+   outright would still pass the whole suite -- exactly the mutation-survives gap this file's own
+   fix-round M2/F2 comments were written about. The next two tests close it, so that all four sites
+   are individually load-bearing. *)
+
+let test_on_commit_advanced_fires_from_receive_sv () =
+  (* Site 4: [handle_start_view] / ReceiveSV (VSR.tla:298-299), a BACKUP learning commit progress
+     from the new primary's StartView. Mirrors [test_receive_sv_adopts_log_view_and_returns_to_normal]
+     exactly, with a hook attached. *)
+  let observed = ref [] in
+  let send, _sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count:3 ~svc_limit:3 ~send
+      ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
+      ()
+  in
+  Replica.for_test_set_view_number t 1;
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check (list (pair int int))) "handle_prepare's own site fired 0 -> 1" [ (0, 1) ] !observed;
+  Replica.check_timeout t;
+  Replica.handle_message t (sv_msg ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+  Alcotest.(check int) "ReceiveSV really did advance commit_number to m.k" 2 (Replica.commit_number t);
+  Alcotest.(check (list (pair int int))) "and ReceiveSV's own site fired 1 -> 2" [ (1, 2); (0, 1) ] !observed
+
+let test_on_commit_advanced_fires_from_send_sv_increase () =
+  (* Site 3's POSITIVE case: [try_send_sv] / SendSV (VSR.tla:274). The decrease test above proves
+     the gate suppresses a drop; this proves the gate does not suppress a genuine RISE at the same
+     site, so deleting the hook call there is detectable. [Primary(6) = 1 + ((6-1) mod 5) = 1], so
+     [my_id = 1] is the primary of view 6. HighestCommitNumber = 2 over the three DVCs, and the
+     winning log's length is also 2, so SendSV's own "commit must not exceed the winning log"
+     refusal does not trigger. *)
+  let observed = ref [] in
+  let send, sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send
+      ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
+      ()
+  in
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:6 ~last_normal_view:0;
+  Alcotest.(check int) "this replica starts the episode at commit_number 0" 0 (Replica.commit_number t);
+  let dvc i = dvc_msg ~v:6 ~log:[ v "a"; v "b" ] ~last_normal_view:1 ~n:2 ~k:2 ~i in
+  List.iter (fun i -> Replica.handle_message t (dvc i)) [ 2; 3; 4 ];
+  Alcotest.(check bool) "SendSV fired (status back to Normal, StartViews sent)" true
+    (Replica.status t = Replica.Normal && sent () <> []);
+  Alcotest.(check int) "SendSV raised commit_number to HighestCommitNumber" 2 (Replica.commit_number t);
+  Alcotest.(check (list (pair int int)))
+    "a genuine RISE at try_send_sv's own site is reported as one advance, 0 -> 2 (advances are not \
+     required to be one-at-a-time -- a consumer must handle a multi-step jump)"
+    [ (0, 2) ] !observed
 
 let tests =
   [
@@ -1731,5 +1853,22 @@ let tests =
        a duplicate StartView",
       `Quick,
       test_receive_sv_resets_svc_count_only_on_a_real_transition );
+    (* Subtask 3.7 part 1: ?on_commit_advanced *)
+    ( "3.7: on_commit_advanced fires synchronously with the correct before/after values, in order",
+      `Quick,
+      test_on_commit_advanced_fires_with_the_correct_before_and_after_values );
+    ( "3.7: omitting ?on_commit_advanced leaves behaviour identical (backward compatibility)",
+      `Quick,
+      test_no_hook_supplied_is_unaffected );
+    ( "3.7: SendSV's unconditional commit_number DECREASE does not fire the hook (D2: the \
+       increase-only guarantee is enforced by the helper, not the sites)",
+      `Quick,
+      test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease );
+    ( "3.7: the hook fires from ReceiveSV's own commit_number site (4th of 4)",
+      `Quick,
+      test_on_commit_advanced_fires_from_receive_sv );
+    ( "3.7: the hook fires from SendSV's own site on a genuine increase (3rd of 4, positive case)",
+      `Quick,
+      test_on_commit_advanced_fires_from_send_sv_increase );
   ]
   @ create_invalid_arg_tests

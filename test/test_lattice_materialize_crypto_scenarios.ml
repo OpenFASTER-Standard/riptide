@@ -377,7 +377,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
         in
         Replica.create ~storage ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
             Buffer.add_string sent_bytes bytes;
-            Queue.add (to_, bytes) inflight))
+            Queue.add (to_, bytes) inflight) ())
   in
   (* Same pin, for the same reason, as every cluster harness in this repo (see
      test_redaction.ml's own [with_store_and_cluster]): at view 0 the primary would be
@@ -793,7 +793,7 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
         Replica.create
           ~storage:(Replica.storage_of_module (module Fault_injecting_storage) fault_storages.(i))
           ~my_id:(i + 1) ~replica_count ~svc_limit:3
-          ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight))
+          ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight) ())
   in
   Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
   let primary = replicas.(0) in
@@ -977,7 +977,7 @@ let test_no_plaintext_on_a_real_mtls_wire () =
 
 let create_solo () =
   Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3
-    ~send:(fun ~to_:_ (_ : string) -> ())
+    ~send:(fun ~to_:_ (_ : string) -> ()) ()
 
 let test_materialization_is_a_function_of_the_committed_log () =
   Eio_main.run @@ fun env ->

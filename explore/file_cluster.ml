@@ -74,7 +74,7 @@ let run_scenario ~env ~seed ~replica_count ~ring_capacity ~rounds ~ops_per_round
                ~storage:
                  (Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) storages.(i))
                ~my_id:(i + 1) ~replica_count ~svc_limit:3
-               ~send:(fun ~to_ bytes -> Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes)
+               ~send:(fun ~to_ bytes -> Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes) ()
            in
            Replica.for_test_set_view_number r 1;
            r)

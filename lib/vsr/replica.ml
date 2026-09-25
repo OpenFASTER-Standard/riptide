@@ -300,6 +300,23 @@ type t = {
      added to prevent. *)
   peer_op_number : (int, int) Hashtbl.t;
   send : to_:int -> string -> unit;
+  on_commit_advanced : (old_commit:int -> new_commit:int -> unit) option;
+      (* Subtask 3.7: the domain-agnostic commit-progress hook, supplied (or not) at [create] time
+         and never reassigned afterwards -- hence immutable. Deliberately typed over two plain
+         [int]s: [Replica] is Layer 0 and must not learn anything about what a consumer does with
+         commit progress (Task 6's ring-eviction watermark is the first one). [None] is the
+         zero-cost default every pre-existing caller gets.
+
+         Invoked ONLY through [advance_commit_number] below, which is the single writer of
+         [commit_number] in this module and the one place the "exactly once per genuine INCREASE"
+         contract documented in replica.mli is enforced. It has to be enforced THERE rather than
+         inherited from the call sites: three of the four sites do guard on a strict increase, but
+         [try_send_sv]'s does NOT -- VSR.tla:274's [rep_commit_number' = HighestCommitNumber(r)] is
+         unconditional and genuinely lowers [commit_number] in a real, tested scenario (see
+         [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] and
+         [test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease] in
+         test_vsr_replica.ml). Reporting that decrease as an "advance" would drive a watermark
+         consumer backwards. *)
   append_refusals : int array;
       (* I2: one counter per {!append_refusal}, indexed by [append_refusal_index]. Pure
          diagnostics -- nothing in the protocol ever reads it -- but it is what makes the three
@@ -386,7 +403,7 @@ let validate_create_args ~fn ~my_id ~replica_count ~svc_limit =
    [rep_recv_dvc] and [rep_sent_dvc], and every one of them is initialized below, unconditionally,
    for both entry points. *)
 let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
-    ~commit_number ~status =
+    ~commit_number ~status ~on_commit_advanced =
   {
     my_id;
     replica_count;
@@ -404,10 +421,26 @@ let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_norm
     svc_count = 0;
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
     send;
+    on_commit_advanced;
     append_refusals = Array.make (List.length append_refusal_kinds) 0;
   }
 
-let create ~my_id ~replica_count ~svc_limit ~send ~storage =
+(* The SINGLE writer of [t.commit_number] in this module (verified: [grep 'commit_number <-'] finds
+   exactly this one assignment). Every action that advances commit progress goes through here, which
+   is what makes [?on_commit_advanced] impossible to forget when a future action is added.
+
+   The [new_commit > old_commit] gate is load-bearing, not defensive padding -- see the
+   [on_commit_advanced] field's own comment above for the real, tested [try_send_sv] decrease it
+   exists to filter out. The ASSIGNMENT stays unconditional, exactly as each of the four call sites
+   had it before this hook existed: this helper changes only what is OBSERVED, never what is
+   stored, so no protocol behaviour moves. *)
+let advance_commit_number t new_commit =
+  let old_commit = t.commit_number in
+  t.commit_number <- new_commit;
+  if new_commit > old_commit then
+    match t.on_commit_advanced with None -> () | Some f -> f ~old_commit ~new_commit
+
+let create ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.create" ~my_id ~replica_count ~svc_limit;
   if storage.wal_highest_op_number () > 0 || storage.superblock_read () <> None then
     invalid_arg
@@ -417,7 +450,7 @@ let create ~my_id ~replica_count ~svc_limit ~send ~storage =
        on";
   let t =
     make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number:0 (* VSR.tla's [Init] (:206) *)
-      ~last_normal_view:0 ~op_number:0 ~commit_number:0 ~status:Normal
+      ~last_normal_view:0 ~op_number:0 ~commit_number:0 ~status:Normal ~on_commit_advanced
   in
   (* Claim the backend immediately, so this replica's very first durable state is a well-formed
      superblock rather than "nothing at all" -- otherwise a crash before the first client request
@@ -739,7 +772,7 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
    still yield exactly [create]'s [Init] state -- otherwise [restart] stops being usable as a
    general entry point at all. *)
-let restart ~my_id ~replica_count ~svc_limit ~send ~storage =
+let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.restart" ~my_id ~replica_count ~svc_limit;
   let durable = Option.bind (storage.superblock_read ()) superblock_decode in
   if durable = None && storage.wal_highest_op_number () > 0 then
@@ -761,6 +794,7 @@ let restart ~my_id ~replica_count ~svc_limit ~send ~storage =
     make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
       ~commit_number
       ~status:(if view_number > last_normal_view then View_change else Normal)
+      ~on_commit_advanced
   in
   if storage.wal_highest_op_number () > op_number then
     truncate_wal t ~op_number ~committed:commit_number ~resulting_length:op_number;
@@ -830,7 +864,7 @@ let primary_execute_op t =
          copies. *)
       let readable = match slot_state t ~op_number:next with Present _ -> true | Corrupt | Absent -> false in
       if readable && is_committed_quorum t ~op_number:next then begin
-        t.commit_number <- next;
+        advance_commit_number t next;
         advanced := true
       end
       else continue_ := false
@@ -921,7 +955,7 @@ let handle_prepare t ~view ~n ~(v : Value.value) ~k =
          as for the out-of-bound case this bound has always rejected). test_vsr_replica.ml's own
          k-boundary tests pin all three of [k = n-1] (well-formed, accepted), [k = n] (now
          rejected) and [k = n+1] (rejected). *)
-      if k > t.commit_number && k < op_number t then t.commit_number <- k;
+      if k > t.commit_number && k < op_number t then advance_commit_number t k;
       (* One superblock write covers BOTH durable changes this action makes (the new op_number and
          any commit_number advance), and it happens BEFORE the PREPAREOK goes out: the reply is
          this replica's promise that the entry is durable, so every durable field the entry's
@@ -1371,7 +1405,7 @@ let try_send_sv t =
               Replica_log.replace_with t.log new_log (* VSR.tla:506 *);
               t.op_number <- l (* VSR.tla:507 -- now an explicit assignment, since [op_number] is
                                   its own durable field rather than the log's length *);
-              t.commit_number <- new_k;
+              advance_commit_number t new_k;
               (* VSR.tla:508 -- unconditional, NOT monotonic-guarded: unlike [ReceiveSV]'s own
                  update, this replica is the one STARTING the new view, and [new_k] is the maximum
                  over a quorum's worth of DVCs including (normally) its own. Pinned by
@@ -1698,7 +1732,7 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
   else begin
     Replica_log.replace_with t.log log (* VSR.tla:571-572: log and op_number adopted wholesale *);
     t.op_number <- n;
-    if k > t.commit_number then t.commit_number <- k;
+    if k > t.commit_number then advance_commit_number t k;
     (* VSR.tla:298-299's own [IF m.k > @ THEN m.k ELSE @] -- MONOTONIC ONLY. research §5.7 Part 4:
        applying [m.k] unconditionally is a REAL, documented defect (it caused a
        double-application-of-an-operation bug in the original published spec). Do not simplify this

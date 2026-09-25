@@ -47,7 +47,7 @@ let test_truncate_wal_below_commit_number_is_rejected () =
   let _backend, storage = fresh_storage () in
   (* A backup at view 0 (Primary(0) = 3 at replica_count = 3), driven to op_number = 2 /
      commit_number = 1 by two real Prepares. *)
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Alcotest.(check int) "op_number = 2 after two Prepares" 2 (Replica.op_number t);
@@ -81,7 +81,7 @@ let test_truncate_wal_below_commit_number_is_rejected () =
 let test_out_of_range_nack_is_a_total_no_op () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   Alcotest.(check bool) "this replica is Primary(5) at replica_count = 3" true (Replica.is_primary t);
   (* Non-positive nacks: op-numbers are 1-indexed (VSR.tla's [ops == 1..MaxOp]). *)
@@ -114,7 +114,7 @@ let test_out_of_range_nack_is_a_total_no_op () =
 let test_dvc_quorum_counts_distinct_senders_not_messages () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* Sender 1 speaks twice, exactly as a mid-view-change restart makes it: first with both
      entries readable, then (after a slot faulted to corrupt) with only one. Two DISTINCT
@@ -141,7 +141,7 @@ let test_dvc_quorum_counts_distinct_senders_not_messages () =
 let test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* Sender 1: the WINNER by (last_normal_view, n) -- n = 3 -- but it can only READ ops 1 and 2
      (op 3's slot is corrupt on its disk), so op 3 is neither fillable nor, yet, proven absent. *)
@@ -178,7 +178,7 @@ let test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it () =
 let test_forfeit_view_change_when_quorum_cannot_complete () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* The same permanently-contested shape as above, minus the resolving third DVC. *)
   Replica.handle_message t
@@ -198,7 +198,7 @@ let test_forfeit_view_change_when_quorum_cannot_complete () =
 let test_no_forfeit_below_a_dvc_quorum () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:5 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:7 ~last_normal_view:2;
   Alcotest.(check bool) "this replica is Primary(7) at replica_count = 5" true (Replica.is_primary t);
   (* One DVC only -- far below f+1 = 3. VSR.tla:528-531: forfeiting early would abandon an
@@ -219,7 +219,7 @@ let test_no_forfeit_below_a_dvc_quorum () =
 let test_corrupt_slot_is_neither_shipped_nor_nacked () =
   let send, sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
   Alcotest.(check bool) "both entries are durable before the fault" true
@@ -245,7 +245,7 @@ let test_corrupt_slot_is_neither_shipped_nor_nacked () =
 let test_restart_preserves_durable_state_and_reconstructs_view_change_status () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   (* Enter a view change for real, and accumulate the volatile bookkeeping a restart must lose. *)
@@ -257,7 +257,7 @@ let test_restart_preserves_durable_state_and_reconstructs_view_change_status () 
   (* The restart: a brand-new [Replica.t] over the SAME durable storage. *)
   let send2, _sent2 = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
-  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 () in
   Alcotest.(check int) "DURABLE: view_number" view_before (Replica.view_number t');
   Alcotest.(check int) "DURABLE: last_normal_view" lnv_before (Replica.last_normal_view t');
   Alcotest.(check int) "DURABLE: op_number" 2 (Replica.op_number t');
@@ -271,12 +271,12 @@ let test_restart_preserves_durable_state_and_reconstructs_view_change_status () 
 let test_restart_outside_a_view_change_reconstructs_normal_status () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Alcotest.(check bool) "Normal before the crash" true (Replica.status t = Replica.Normal);
   let send2, _ = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
-  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 () in
   Alcotest.(check bool) "view = log_view, so status reconstructs to Normal" true (Replica.status t' = Replica.Normal);
   Alcotest.(check int) "op_number survived" 1 (Replica.op_number t');
   Alcotest.(check bool) "log survived" true (Replica.entries t' = [ v "a" ])
@@ -287,13 +287,13 @@ let test_restart_outside_a_view_change_reconstructs_normal_status () =
 let test_restart_discovering_a_corrupt_slot_still_refuses_to_nack_it () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:2;
   let send2, sent2 = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
-  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 () in
   Alcotest.(check int) "op_number still 2 -- it comes from the superblock, not from readable slots" 2
     (Replica.op_number t');
   Replica.for_test_set_view t' ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
@@ -312,14 +312,14 @@ let test_restart_discovering_a_corrupt_slot_still_refuses_to_nack_it () =
 let test_readable_entries_are_not_merely_a_prefix () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
   (* The FIRST slot faults, not the last -- so a prefix-only scan would ship nothing at all. *)
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:1;
   let send2, sent2 = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
-  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 () in
   Alcotest.(check int) "op_number is still the full durable 2" 2 (Replica.op_number t');
   Alcotest.(check bool) "the in-memory log IS only the readable prefix -- here, empty" true (Replica.entries t' = []);
   Replica.for_test_set_view t' ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
@@ -339,7 +339,7 @@ let test_readable_entries_are_not_merely_a_prefix () =
 let test_an_unreadable_winner_entry_is_filled_from_a_same_log_view_peer () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* The winner by (last_normal_view, n) cannot read its own op 1. *)
   Replica.handle_message t
@@ -365,7 +365,7 @@ let test_an_unreadable_winner_entry_is_filled_from_a_same_log_view_peer () =
 let test_a_lower_log_view_dvc_is_not_an_admissible_entry_source () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   Replica.handle_message t
     (dvc_msg ~v:5 ~entries:[ (2, v "b") ] ~nacks:[] ~last_normal_view:3 ~n:2 ~k:0 ~i:1);
@@ -382,7 +382,7 @@ let test_a_lower_log_view_dvc_is_not_an_admissible_entry_source () =
 let test_forged_huge_n_does_not_hang () =
   let send, _sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* The winner claims an absurd op-number, and the OTHER f+1 = 2 senders structurally prove every
      op above their own [n] absent -- so every op from 1_000_000_000 down to 2 really IS
@@ -407,7 +407,7 @@ let test_forged_huge_n_does_not_hang () =
 let test_primary_does_not_commit_an_op_it_cannot_read () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.Normal ~view_number:1 ~last_normal_view:1;
   Alcotest.(check bool) "this replica is Primary(1)" true (Replica.is_primary t);
   Replica.propose t (v "a");
@@ -429,7 +429,7 @@ let test_primary_does_not_commit_an_op_it_cannot_read () =
 let test_restart_discards_wal_entries_the_superblock_never_saw () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Alcotest.(check int) "one durable, acknowledged entry" 1 (Replica.op_number t);
   (* The torn write: op 2's bytes landed, the superblock update did not. *)
@@ -438,7 +438,7 @@ let test_restart_discards_wal_entries_the_superblock_never_saw () =
     (Riptide_storage.Memory_storage.wal_highest_op_number backend);
   let send2, sent2 = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
-  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 () in
   Alcotest.(check int) "op_number is the superblock's, not the WAL's" 1 (Replica.op_number t');
   Alcotest.(check int) "the unacknowledged entry was discarded" 1
     (Riptide_storage.Memory_storage.wal_highest_op_number backend);
@@ -487,7 +487,7 @@ let restart_refusal_message =
 let test_restart_refuses_a_lost_superblock_over_a_non_empty_wal () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Alcotest.(check int) "precondition: op 1 is committed and durable" 1 (Replica.commit_number t);
@@ -500,7 +500,7 @@ let test_restart_refuses_a_lost_superblock_over_a_non_empty_wal () =
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
   Alcotest.check_raises "restart refuses rather than coming up at op_number = 0"
     (Invalid_argument restart_refusal_message) (fun () ->
-      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2));
+      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 ()));
   (* THE REFUSAL IS A TOTAL NO-OP on durable state, which is what makes it a recoverable failure
      rather than a differently-shaped data loss: the WAL is not truncated, and the committed entry
      is still there to be recovered by whatever rebuilds the superblock. *)
@@ -518,7 +518,7 @@ let test_restart_refuses_a_lost_superblock_over_a_non_empty_wal () =
 let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Riptide_storage.Memory_storage.superblock_write backend "not a superblock record at all";
   Alcotest.(check bool) "precondition: storage hands back bytes, they just are not usable" true
@@ -527,7 +527,7 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
   Alcotest.check_raises "an undecodable superblock is refused exactly like a missing one"
     (Invalid_argument restart_refusal_message) (fun () ->
-      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2))
+      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 ()))
 
 (* THE OTHER SIDE OF THE GUARD, and the reason it is conditioned on the WAL rather than on the
    superblock alone: first boot. A genuinely empty backend -- no superblock, no WAL -- is not a
@@ -537,7 +537,7 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
 let test_restart_still_accepts_a_genuinely_empty_backend () =
   let send, _sent = capturing_send () in
   let _backend, storage = fresh_storage () in
-  let t = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Alcotest.(check int) "Init: view_number" 0 (Replica.view_number t);
   Alcotest.(check int) "Init: last_normal_view" 0 (Replica.last_normal_view t);
   Alcotest.(check int) "Init: op_number" 0 (Replica.op_number t);
@@ -580,7 +580,7 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
       (Riptide_storage.Memory_storage.create ())
   in
   let storage = Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) backend in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Alcotest.(check (list (pair string int)))
     "counted as fault_injection_cap, and as nothing else"
@@ -597,7 +597,7 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
 let test_refusal_out_of_sequence_is_counted_as_its_own_shape () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Riptide_storage.Memory_storage.wal_truncate_after backend ~op_number:0;
@@ -626,7 +626,7 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       in
       let send, sent = capturing_send () in
       let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
-      let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+      let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
       (* Comfortably past one 4096-byte data slot once canonically encoded. *)
       let oversized = v (String.make 5000 'x') in
       Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = oversized; k = 0 }));
@@ -658,7 +658,7 @@ end
 let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed () =
   let send, _sent = capturing_send () in
   let storage = Replica.storage_of_module (module Unhelpful_backend) () in
-  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Alcotest.check_raises "an unclassifiable backend exception is not laundered into 'not durable'"
     (Invalid_argument "something else entirely") (fun () ->
       Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 })));
@@ -760,7 +760,7 @@ let with_cluster_and_storage ~replica_count ~svc_limit
           Replica.create
             ~storage:(Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) storages.(i))
             ~my_id ~replica_count ~svc_limit
-            ~send:(fun ~to_ bytes -> if isolated.(to_) then () else Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes)
+            ~send:(fun ~to_ bytes -> if isolated.(to_) then () else Riptide_sim.Sim_transport.send handles.(i) ~to_ bytes) ()
         in
         Replica.for_test_set_view_number r 1;
         r)
