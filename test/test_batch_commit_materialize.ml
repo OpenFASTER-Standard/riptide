@@ -409,6 +409,140 @@ let test_write_at_op_number_has_merge_key_true_and_false_within_bounds () =
   Alcotest.(check bool) "op-number 2 (merge_key = None) is false" false
     (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:2)
 
+(* Fix-round-2 review finding (Task 5): every existing test above that exercises
+   [materialize_up_to] passes [~through_commit_number:(Replica.commit_number replica)] -- so the
+   function's own internal `min through_commit_number (Replica.commit_number t)` clamp (added in
+   fix round 1) is never actually exercised; deleting it leaves the whole suite green. Reuses
+   test_batch_commit.ml's own [test_uncommitted_tail_is_excluded] harness verbatim (a 3-replica,
+   no-Eio, no-transport cluster where backups 2 and 3 silently drop every reply, so the primary
+   appends an entry that never reaches the f+1=2 quorum needed to commit) to get a real,
+   appended-but-uncommitted op-number 1 with [commit_number = 0], then calls [materialize_up_to]
+   with [~through_commit_number:1] -- deliberately >= the appended op-number, i.e. NOT already
+   <=[commit_number], since a bound that were would make this test pass regardless of whether the
+   clamp exists at all. Only the function's OWN internal clamp against
+   [Riptide_vsr.Replica.commit_number] can be what keeps the uncommitted entry out here. *)
+let test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for_more () =
+  let replica_count = 3 in
+  let replicas = Array.make replica_count None in
+  let silent_send ~to_:_ (_ : string) = () in
+  let primary_send ~to_ bytes =
+    match replicas.(to_ - 1) with Some r -> Replica.handle_message r bytes | None -> ()
+  in
+  replicas.(0) <-
+    Some
+      (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count ~svc_limit:3
+         ~send:primary_send ());
+  replicas.(1) <-
+    Some
+      (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count ~svc_limit:3
+         ~send:silent_send ());
+  replicas.(2) <-
+    Some
+      (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count ~svc_limit:3
+         ~send:silent_send ());
+  List.iter
+    (fun opt -> match opt with Some r -> Replica.for_test_set_view_number r 1 | None -> ())
+    (Array.to_list replicas);
+  let primary = Option.get replicas.(0) in
+  let actor = "actor-1" in
+  let payload =
+    lww_to_value
+      { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String "uncommitted-value");
+        timestamp = 1L
+      }
+  in
+  Batch_commit.propose primary ~idempotency_key:"k-never-commits"
+    [
+      {
+        Batch_commit.actor;
+        causation = fake_event_id "c-uncommitted";
+        correlation = fake_event_id "r-uncommitted";
+        payload;
+        merge_key = Some "mk-uncommitted";
+      };
+    ];
+  Alcotest.(check int) "the entry is appended to the raw log" 1 (List.length (Replica.entries primary));
+  Alcotest.(check int) "but nothing committed -- silent backups never form a quorum" 0
+    (Replica.commit_number primary);
+  let materialized_keys = ref [] in
+  let sink : Batch_commit.materialize_sink =
+    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+  in
+  (* through_commit_number:1 is >= the appended-but-uncommitted op-number (1), deliberately NOT
+     <= commit_number (0) -- so a caller-side bound alone would not protect this call; only the
+     function's own internal clamp against Replica.commit_number can. *)
+  Batch_commit.materialize_up_to primary ~materialize:sink ~through_commit_number:1;
+  Alcotest.(check (list string))
+    "materialize_up_to must not materialize the uncommitted entry even though through_commit_number \
+     itself reaches its op-number -- only the internal commit_number clamp protects this"
+    [] !materialized_keys
+
+(* Fix-round-2 review finding (Task 5): no test constructs two committed batches sharing one
+   idempotency key, both carrying a merge_key write with different payloads, to prove
+   [materialize_up_to]'s own first-wins-per-idempotency-key dedup (the `Hashtbl`-based [seen_keys]
+   check added in fix round 1) actually protects the materialized accumulator -- deleting that
+   Hashtbl check leaves the whole suite green. Mirrors test_batch_commit.ml's own
+   [test_repeated_idempotency_key_with_different_writes_keeps_only_the_first]: uses raw
+   [Riptide_vsr.Replica.propose] directly, bypassing [Batch_commit.propose]'s own [already_in_log]
+   guard (which would otherwise refuse to append a second batch under a key already in the log),
+   to construct a genuine duplicate -- two well-formed, separately committed batches under the SAME
+   idempotency_key, each carrying one write under the SAME merge_key but with a different
+   [Last_write_wins] timestamp. [Last_write_wins]'s own join always keeps the HIGHER timestamp, so
+   if the dedup were removed and both batches' writes reached the sink, the converged read would
+   silently flip to the second (higher-timestamp) payload -- observably different from "only the
+   first materialized", which is exactly what this test pins. *)
+let test_materialize_up_to_dedups_first_wins_per_idempotency_key () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let key = "dup-key-materialize" in
+      let merge_key = "mk-dedup" in
+      let make_batch_value payload_value_str timestamp =
+        Riptide.Value.Record
+          [
+            ("idempotency_key", Riptide.Value.Scalar (Riptide.Value.String key));
+            ("writes",
+              Riptide.Value.Sequence
+                [
+                  Riptide.Value.Record
+                    [
+                      ("actor", Riptide.Value.Scalar (Riptide.Value.String "actor-1"));
+                      ("causation",
+                        Riptide.Value.Scalar (Riptide.Value.Bytes (fake_event_id (payload_value_str ^ "-c"))));
+                      ("correlation",
+                        Riptide.Value.Scalar (Riptide.Value.Bytes (fake_event_id (payload_value_str ^ "-r"))));
+                      ("payload",
+                        lww_to_value
+                          { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String payload_value_str);
+                            timestamp = Int64.of_int timestamp
+                          });
+                      ("merge_key",
+                        Riptide.Value.Sum ("some", Riptide.Value.Scalar (Riptide.Value.String merge_key)));
+                    ];
+                ]);
+          ]
+      in
+      (* Genuinely different payloads/timestamps under the SAME idempotency key -- via raw
+         Replica.propose so Batch_commit.propose's own already_in_log guard never gets a chance to
+         refuse the second one. *)
+      Replica.propose replica (make_batch_value "first-payload" 1);
+      Replica.propose replica (make_batch_value "second-payload-should-be-ignored" 99);
+      Alcotest.(check int) "both batches genuinely committed as 2 separate entries" 2
+        (Replica.commit_number replica);
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      Batch_commit.materialize_up_to replica ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replica);
+      let expected : Last_write_wins.t =
+        { value = Riptide.Value.Scalar (Riptide.Value.String "first-payload"); timestamp = 1L }
+      in
+      Alcotest.(check bool)
+        "only the FIRST batch's write materialized -- not the second, and not a join of both (which \
+         Last_write_wins's own join would resolve to the higher, second timestamp)"
+        true
+        (M.read materializer ~merge_key = expected))
+
 let test_write_at_op_number_has_merge_key_false_out_of_bounds () =
   Eio_main.run @@ fun _env ->
   let replica = create_solo_volatile () in
@@ -437,6 +571,12 @@ let tests =
       `Quick, test_materialize_up_to_skips_writes_with_no_merge_key );
     ( "materialize_up_to and write_at_op_number_has_merge_key both skip a malformed/non-batch entry",
       `Quick, test_materialize_up_to_and_write_at_op_number_skip_a_malformed_entry );
+    ( "materialize_up_to clamps to commit_number even when the caller's own through_commit_number \
+       asks for more (fix round 2)",
+      `Quick, test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for_more );
+    ( "materialize_up_to dedups first-wins per idempotency_key across two committed batches sharing \
+       one key (fix round 2)",
+      `Quick, test_materialize_up_to_dedups_first_wins_per_idempotency_key );
     ( "write_at_op_number_has_merge_key is true/false correctly within the log's bounds",
       `Quick, test_write_at_op_number_has_merge_key_true_and_false_within_bounds );
     ( "write_at_op_number_has_merge_key is false for any out-of-bounds op-number",
