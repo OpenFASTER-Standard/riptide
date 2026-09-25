@@ -156,34 +156,59 @@ type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
 (* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
-   step: walks the WHOLE committed prefix up to [through_commit_number] (not just the one batch
+   step: walks the committed prefix up to [through_commit_number] (not just the one batch
    claiming a particular idempotency_key), materializing every write carrying a [merge_key] along
-   the way. See batch_commit.mli for the full contract (idempotent, restart-safe, no own
-   watermark state, O(through_commit_number) per call). *)
+   the way, first-wins per idempotency_key (the same dedup rule [committed_envelopes_keyed] below
+   already uses -- a batch here must never win out over the SAME [committed_writes_for] a caller
+   sharing this key via [propose] would see). See batch_commit.mli for the full contract
+   (idempotent, restart-safe, no own watermark state, O(through_commit_number) per call).
+
+   [through_commit_number] is clamped against [Riptide_vsr.Replica.commit_number t] BEFORE it is
+   used as a walk bound, exactly like [committed_batch_values] above already clamps its own walk
+   -- never trust the caller-supplied bound alone. [Replica.entries] includes the
+   replicated-but-not-yet-committed tail (its own .mli says so explicitly), so an un-clamped walk
+   would fold an uncommitted entry into the lattice accumulator on any caller-supplied bound at or
+   past [commit_number] -- including a restart-recovered watermark, which [replica.mli]'s own
+   restart guidance documents can land ahead of a freshly-restarted replica's [commit_number]. A
+   lattice join can never undo that: a later view change can then discard the very log entry that
+   was materialized (see [Replica_log.replace_with]), leaving permanently materialized data with
+   no committed entry ever backing it -- the same class of "permanent, unauditable divergence a
+   lattice join can never undo" this module's own [propose] doc comment already names for a
+   different hazard. *)
 let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
     ~(through_commit_number : int) : unit =
+  let bound = min through_commit_number (Riptide_vsr.Replica.commit_number t) in
   let entries = Riptide_vsr.Replica.entries t in
+  let seen_keys = Hashtbl.create 16 in
   List.iteri
     (fun i v ->
-      if i < through_commit_number then
+      if i < bound then
         match batch_of_value v with
         | None -> ()
-        | Some (_idempotency_key, writes) ->
-          List.iter
-            (fun (w : write) ->
-              match w.merge_key with
-              | None -> ()
-              | Some k -> materialize.write ~merge_key:k w.payload)
-            writes)
+        | Some (idempotency_key, writes) ->
+          if Hashtbl.mem seen_keys idempotency_key then ()
+          else begin
+            Hashtbl.add seen_keys idempotency_key ();
+            List.iter
+              (fun (w : write) ->
+                match w.merge_key with
+                | None -> ()
+                | Some k -> materialize.write ~merge_key:k w.payload)
+              writes
+          end)
     entries
 
-(* Task 6's own [?may_evict] predicate needs to answer "did the write committed at this op-number
-   opt into materialization at all" without re-implementing batch_of_value's own decode logic a
-   second time outside this module. [entries] is 0-based by list position; op-number N is at list
-   index N - 1 (matching committed_batch_values' own established i <-> op-number correspondence
-   used throughout this file). Returns false for an op-number outside the log's current bounds or
-   a malformed batch -- both cases mean nothing here is claiming a merge_key, which is the same as
-   "never opted in" as far as [?may_evict] cares. *)
+(* Task 6's own [?may_evict] predicate needs to answer "did the write at this op-number opt into
+   materialization at all" without re-implementing batch_of_value's own decode logic a second time
+   outside this module. Deliberately reads the WHOLE log via [Replica.entries] -- including the
+   replicated-but-not-yet-committed tail -- not just the committed prefix: refusing to evict an
+   entry that may yet commit is the safe direction for [?may_evict] to err in, so an
+   appended-but-uncommitted [merge_key] write must answer [true] here, same as a committed one.
+   [entries] is 0-based by list position; op-number N is at list index N - 1 (matching
+   committed_batch_values' own established i <-> op-number correspondence used throughout this
+   file). Returns false for an op-number outside the log's current bounds or a malformed batch --
+   both cases mean nothing here is claiming a merge_key, which is the same as "never opted in" as
+   far as [?may_evict] cares. *)
 let write_at_op_number_has_merge_key (t : Riptide_vsr.Replica.t) ~(op_number : int) : bool =
   (* [op_number < 1] must be excluded BEFORE reaching [List.nth_opt]: unlike a too-large index
      (which [List.nth_opt] itself turns into [None]), a NEGATIVE index makes [List.nth_opt] raise

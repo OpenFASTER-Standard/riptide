@@ -321,6 +321,81 @@ let test_materialize_up_to_respects_the_through_bound () =
       Alcotest.(check bool) "the second batch's key, past the bound, did not" true
         (M.read materializer ~merge_key:"mk2" = Last_write_wins.bottom))
 
+(* Fix-round-1 review finding (Task 5): an EXPLICIT binding constraint of this task was that a
+   write with [merge_key = None] must be completely unaffected by materialization -- no prior test
+   exercised that for [materialize_up_to] specifically (only [propose]'s own single-key path had
+   coverage, via write_of_value's decode tests in test_batch_commit.ml). Uses a recording sink
+   rather than a real Materializer: the assertion that matters is which merge_keys the sink's
+   [write] was invoked for at all, which a plain ref list answers directly without needing a real
+   lattice/KV store. *)
+let test_materialize_up_to_skips_writes_with_no_merge_key () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  let actor = "actor-1" in
+  let payload_of value_str timestamp =
+    lww_to_value
+      { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String value_str);
+        timestamp = Int64.of_int timestamp
+      }
+  in
+  let write_with_key =
+    {
+      Batch_commit.actor;
+      causation = fake_event_id "c-mk";
+      correlation = fake_event_id "r-mk";
+      payload = payload_of "v-mk" 1;
+      merge_key = Some "mk";
+    }
+  in
+  let write_without_key =
+    {
+      Batch_commit.actor;
+      causation = fake_event_id "c-none";
+      correlation = fake_event_id "r-none";
+      payload = payload_of "v-none" 1;
+      merge_key = None;
+    }
+  in
+  (* One batch, one committed entry, carrying BOTH writes -- a mix within the same batch, not two
+     separate batches, so a bug that materialized "everything in a committed batch regardless of
+     merge_key" would be caught here. *)
+  Batch_commit.propose replica ~idempotency_key:"k-mixed" [ write_with_key; write_without_key ];
+  Alcotest.(check int) "one batch (op-number) committed" 1 (Replica.commit_number replica);
+  Alcotest.(check int) "both writes of the batch published as envelopes (envelope publishing is \
+                         orthogonal to materialization)" 2
+    (List.length (Batch_commit.committed_envelopes replica));
+  let materialized_keys = ref [] in
+  let sink : Batch_commit.materialize_sink =
+    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+  in
+  Batch_commit.materialize_up_to replica ~materialize:sink
+    ~through_commit_number:(Replica.commit_number replica);
+  Alcotest.(check (list string))
+    "materialize_up_to invoked the sink exactly once, only for the merge_key = Some write" [ "mk" ]
+    !materialized_keys
+
+(* Fix-round-1 review finding (Task 5): neither function had a test exercising a malformed/
+   non-batch log entry -- mirrors test_batch_commit.ml's own
+   test_malformed_committed_entry_is_zero_envelopes, which already establishes that a foreign
+   value proposed directly via Replica.propose (bypassing Batch_commit's own encoding entirely)
+   must not crash anything reading the log back out. *)
+let test_materialize_up_to_and_write_at_op_number_skip_a_malformed_entry () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  Replica.propose replica (Riptide.Value.Scalar (Riptide.Value.String "not-a-batch"));
+  Alcotest.(check int) "the malformed value contributes zero envelopes" 0
+    (List.length (Batch_commit.committed_envelopes replica));
+  let materialized_keys = ref [] in
+  let sink : Batch_commit.materialize_sink =
+    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+  in
+  Batch_commit.materialize_up_to replica ~materialize:sink
+    ~through_commit_number:(Replica.commit_number replica);
+  Alcotest.(check (list string)) "materialize_up_to materializes nothing for a malformed entry" []
+    !materialized_keys;
+  Alcotest.(check bool) "write_at_op_number_has_merge_key is false for a malformed entry" false
+    (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:1)
+
 (* write_at_op_number_has_merge_key: Task 6's own [?may_evict] predicate's second half. The
    false-for-out-of-bounds behaviour is explicitly load-bearing per this task's own brief, so it's
    tested directly here rather than only documented in the .mli. *)
@@ -357,6 +432,11 @@ let tests =
     ("materialize_up_to is idempotent over a repeated range", `Quick, test_materialize_up_to_is_idempotent);
     ( "materialize_up_to respects the through_commit_number bound",
       `Quick, test_materialize_up_to_respects_the_through_bound );
+    ( "materialize_up_to skips a write with merge_key = None even inside an otherwise-materialized \
+       batch",
+      `Quick, test_materialize_up_to_skips_writes_with_no_merge_key );
+    ( "materialize_up_to and write_at_op_number_has_merge_key both skip a malformed/non-batch entry",
+      `Quick, test_materialize_up_to_and_write_at_op_number_skip_a_malformed_entry );
     ( "write_at_op_number_has_merge_key is true/false correctly within the log's bounds",
       `Quick, test_write_at_op_number_has_merge_key_true_and_false_within_bounds );
     ( "write_at_op_number_has_merge_key is false for any out-of-bounds op-number",

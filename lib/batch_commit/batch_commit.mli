@@ -155,15 +155,30 @@ type encryption_sink = {
 val materialize_up_to :
   Riptide_vsr.Replica.t -> materialize:materialize_sink -> through_commit_number:int -> unit
 (** [materialize_up_to t ~materialize ~through_commit_number] walks [t]'s committed log from its
-    very start through [through_commit_number] -- a 1-based op-number/commit-count bound,
-    INCLUSIVE, matching {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared
-    against each batch's 0-based {!Riptide_vsr.Replica.entries} list position [i] as [i <
-    through_commit_number], the same correspondence {!committed_batch_values} already
-    establishes: list position [i] is commit position/op-number [i + 1]) -- materializing every
-    write of every well-formed batch in that range that carries [merge_key = Some k], via
-    [materialize.write ~merge_key:k payload], in commit order. A batch that fails to decode (see
-    {!committed_envelopes}'s own decode-failure handling) contributes nothing and is skipped, like
-    everywhere else in this module.
+    very start through [min through_commit_number (Riptide_vsr.Replica.commit_number t)] -- a
+    1-based op-number/commit-count bound, INCLUSIVE, matching
+    {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared against each batch's
+    0-based {!Riptide_vsr.Replica.entries} list position [i] as [i < bound], the same
+    correspondence {!committed_batch_values} already establishes: list position [i] is commit
+    position/op-number [i + 1]) -- materializing every write of every well-formed batch in that
+    range that carries [merge_key = Some k], via [materialize.write ~merge_key:k payload], in
+    commit order, first-wins per [idempotency_key] (the same dedup rule
+    {!committed_envelopes_keyed} uses: a later batch sharing a key already seen earlier in the
+    walk contributes nothing, matching what {!committed_writes_for} would return for that key). A
+    batch that fails to decode (see {!committed_envelopes}'s own decode-failure handling)
+    contributes nothing and is skipped, like everywhere else in this module.
+
+    {b [through_commit_number] is a caller-supplied ADDITIONAL upper bound, never the sole one}:
+    this function independently clamps its own walk to [Riptide_vsr.Replica.commit_number t] no
+    matter what [through_commit_number] is, so it can never materialize an entry that is not
+    actually committed on [t] -- including a [through_commit_number] at or past [commit_number]
+    (e.g. {!Riptide_vsr.Replica.op_number}, or a restart-recovered watermark that
+    {!Riptide_vsr.Replica}'s own restart guidance documents can legitimately land ahead of a
+    freshly-restarted replica's [commit_number]). This matters because
+    {!Riptide_vsr.Replica.entries} -- what this function reads -- includes the
+    replicated-but-not-yet-committed tail; without this internal clamp a caller-supplied bound
+    that reached into that tail would fold an uncommitted entry into the lattice accumulator,
+    which no later view change discarding that same log entry could ever undo.
 
     {b Safe to call repeatedly over an overlapping or fully-covered range}: re-materializing a
     write already folded into the accumulator is a no-op, because {!materialize_sink}'s
@@ -180,9 +195,18 @@ val materialize_up_to :
     previous call left off. *)
 
 val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int -> bool
-(** [write_at_op_number_has_merge_key t ~op_number] is [true] iff the batch committed at the
-    1-based [op_number] decodes as well-formed and at least one of its writes carries
-    [merge_key = Some _].
+(** [write_at_op_number_has_merge_key t ~op_number] is [true] iff the batch at the 1-based
+    [op_number] in [t]'s WHOLE log -- as {!Riptide_vsr.Replica.entries} reports it, including the
+    replicated-but-not-yet-committed tail, {b not} only the committed prefix -- decodes as
+    well-formed and at least one of its writes carries [merge_key = Some _].
+
+    {b Deliberately not clamped to the committed prefix}, unlike {!materialize_up_to} above:
+    refusing to evict an entry that has merely been appended and may yet commit is the
+    conservative, safe direction for Task 6's [?may_evict] to fail in, whereas treating an
+    uncommitted [merge_key] entry as freely evictable would not be. A caller relying only on this
+    function's doc comment (rather than its implementation) must not conclude an
+    appended-but-not-yet-committed [merge_key] write is evictable -- it is exactly the case this
+    function returns [true] for.
 
     {b [false] for an op_number that doesn't exist in the log (yet, or ever, e.g. 0, negative, or
     past the current log's end) or whose entry fails to decode as a well-formed batch} -- both
