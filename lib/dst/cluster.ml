@@ -86,13 +86,89 @@ let check_storage_fault_config ~replica_count ~faults_max
        copies of the same slot"
 
 (* ---------------------------------------------------------------------------------------------
+   SUBTASK 3.8's FIX: [settle]'s own decision logic, factored out of [with_cluster] as a small,
+   independently testable function, injected with its own I/O rather than closing over
+   [with_cluster]'s [net]/[inflight] -- so a test can drive it with a FAKE round-delivery/clock and
+   assert its termination behaviour deterministically and fast, without needing real protocol
+   dynamics or real wall-clock sleeps. [with_cluster]'s own [settle] below is a thin wrapper
+   supplying the real callbacks; this is the ONLY place either of them runs, so there is no risk of
+   the tested logic drifting from the shipped logic.
+
+   WHY THIS WAS NECESSARY, not just a nicety (see this task's own report for the full
+   investigation): the obvious end-to-end test -- corrupt/truncate the primary's own about-to-
+   commit slot via a real cluster, propose, call [settle] once, expect [Did_not_settle] -- does NOT
+   reproduce. In this VSR subset [check_timeout] is the ONLY thing that ever re-drives a stalled
+   replica (VSR.tla deliberately does not model automatic retry timers), so a primary that can
+   never commit still reaches a genuine, correct QUIESCENT state once the initial Prepare/
+   Prepare_ok exchange finishes: nothing further is pending and no handler is still running, which
+   is exactly [settle]'s own definition of "done" (see [cluster.mli]'s own [Did_not_settle] doc).
+   [settle] returning normally there is CORRECT, not a bug -- [Did_not_settle] exists to catch a
+   cluster that never stops being busy, and this protocol, by design, has no self-perpetuating
+   message loop for any caller to exploit into one. Testing the wall-clock deadline logic itself
+   therefore needs its own entry point, independent of whether this protocol happens to have a
+   reachable livelock at all.
+
+   [drain_round] mirrors [with_cluster]'s own [while Network.pump_one net do delivered := true; incr
+   inflight done] -- deliver everything currently pending, as a side effect on the caller's own
+   inflight counter, and report whether anything was delivered this round. [inflight] reads that
+   counter (mutated elsewhere, e.g. by a dispatch fiber's own [decr]). [now] is [None] exactly when
+   [max_wait_duration] is [None] (mirrors [with_cluster]'s own [(max_wait_duration, clock)] pairing
+   -- both real entry points always supply the two together or neither). *)
+let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~now ~max_wait_duration
+    ~delivery_rounds =
+  (* [deadline] is a NEW ref on every call -- see this task's own report for why that is what
+     makes each [settle] call's own budget independent of any previous call's. *)
+  let deadline = ref None in
+  let start_deadline_tracking () =
+    match (max_wait_duration, now) with
+    | Some max_d, Some now -> deadline := Some (now () +. max_d)
+    | _ -> ()
+  in
+  let deadline_exceeded () =
+    match (!deadline, now) with
+    | Some d, Some now -> now () > d
+    | _ -> false
+  in
+  let rec loop delivery_rounds io_waits =
+    if delivery_rounds <= 0 then raise Did_not_settle
+      (* Real livelock signal, unaffected by this fix: a cluster generating messages forever. *)
+    else if max_wait_duration = None && io_waits <= 0 then raise Did_not_settle
+      (* The ORIGINAL, unmodified behaviour ([run]'s own mock-backend path, and any other caller
+         that does not opt into the wall-clock budget): a fixed attempt countdown. *)
+    else begin
+      let delivered = drain_round () in
+      yield ();
+      let delivery_rounds = if delivered then delivery_rounds - 1 else delivery_rounds in
+      (* THE FIX ITSELF: the deadline resets on every round that ACTUALLY delivered something --
+         not just once at this function's own start -- which is what lets a slow-but-steadily-
+         progressing cluster run arbitrarily long while a genuinely stuck one still times out, in
+         bounded real time since its OWN last real delivery. *)
+      if delivered then start_deadline_tracking ();
+      if inflight () > 0 then begin
+        if deadline_exceeded () then raise Did_not_settle;
+        (* Covers the (believed unreachable in the real wiring, since [inflight] only ever goes
+           positive together with [delivered] in the same round -- see this task's own report)
+           case of entering this branch with [inflight > 0] but no deadline yet tracked. Kept as a
+           defensive fallback: cheap, and it is what makes this function correct even if a FUTURE
+           caller's [drain_round]/[inflight] pairing does not carry that same invariant. *)
+        if !deadline = None then start_deadline_tracking ();
+        wait_io ();
+        loop delivery_rounds (io_waits - 1)
+      end
+      else if delivered then loop delivery_rounds io_waits
+      (* else: nothing pending and nothing in flight -- genuinely quiesced, return (). *)
+    end
+  in
+  loop delivery_rounds 5000
+
+(* ---------------------------------------------------------------------------------------------
    THE SHARED WIRING, parameterised by exactly the two things the two entry points differ in:
    how a replica's storage is built ([make_storage]) and what "let in-flight I/O make progress"
    means ([wait_io]).
    --------------------------------------------------------------------------------------------- *)
 
 let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
-    ~make_storage ~wait_io ~delivery_rounds body =
+    ~make_storage ~wait_io ~delivery_rounds ?max_wait_duration ?clock body =
   let net_seed, storage_seeds = split_seed seed ~replica_count in
   let net = Riptide_sim.Network.create ~faults:net_fault_config ~seed:net_seed () in
   for id = 1 to replica_count do
@@ -170,10 +246,10 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
   let settle () =
     (* Two independent budgets, deliberately not one. [delivery_rounds] bounds rounds that each
        actually delivered something, which is the real livelock signal (a cluster generating
-       messages forever); [io_waits] bounds only the waiting-for-a-suspended-handler path, which
-       delivers nothing by definition and so could never consume the first budget. Folding them
-       together would have meant either weakening the livelock detector by an order of magnitude or
-       timing out legitimate real-I/O runs.
+       messages forever); the second budget bounds only the waiting-for-a-suspended-handler path,
+       which delivers nothing by definition and so could never consume the first budget. Folding
+       them together would have meant either weakening the livelock detector by an order of
+       magnitude or timing out legitimate real-I/O runs.
 
        [delivery_rounds] is per-mode, and that is not a fudge factor: a round delivers whatever is
        pending at that instant, so the number of rounds needed to settle scales with how BATCHED
@@ -182,25 +258,32 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
        protocol hop -- 20 is ample, and it is the bound this harness has always used. With real
        io_uring I/O the same hop's replies complete at different times and dribble out over many
        rounds, so one view change can legitimately need an order of magnitude more (measured: a
-       3-replica view change over File_storage exhausts 20 and raises Did_not_settle). *)
-    let rec loop delivery_rounds io_waits =
-      if delivery_rounds <= 0 || io_waits <= 0 then raise Did_not_settle
-      else begin
+       3-replica view change over File_storage exhausts 20 and raises Did_not_settle).
+
+       SUBTASK 3.8. The second budget used to be a fixed [io_waits : int] attempt countdown
+       (5000), which is CPU-load-sensitive: under load each wait attempt takes longer in real
+       time, so the same fixed countdown exhausts in less real elapsed time than it would
+       unloaded, at exactly the moment the cluster most needs longer to make progress (measured:
+       3/5 real failures -- the suite's own 15s watchdog, not even reaching this exception --
+       under real induced CPU load on a run that is 0/5 unloaded; see this task's own report). For
+       [run_on_file_storage] (the only caller that supplies [max_wait_duration]/[clock]) this is
+       now a genuine progress-based budget instead: keep waiting as long as real delivery is still
+       happening, bounded by real wall-clock elapsed time since the LAST real delivery, not a raw
+       attempt count. [run]'s own mock-backend entry point supplies neither, so its behaviour is
+       byte-for-byte the original fixed-countdown one -- see [for_test_settle_loop]'s own doc
+       comment for why, and for the full investigation behind this design. *)
+    for_test_settle_loop
+      ~drain_round:(fun () ->
         let delivered = ref false in
         while Riptide_sim.Network.pump_one net do
           delivered := true;
           incr inflight
         done;
-        Eio.Fiber.yield ();
-        let delivery_rounds = if !delivered then delivery_rounds - 1 else delivery_rounds in
-        if !inflight > 0 then begin
-          wait_io ();
-          loop delivery_rounds (io_waits - 1)
-        end
-        else if !delivered then loop delivery_rounds io_waits
-      end
-    in
-    loop delivery_rounds 5000
+        !delivered)
+      ~inflight:(fun () -> !inflight)
+      ~yield:Eio.Fiber.yield ~wait_io
+      ~now:(Option.map (fun clock () -> Eio.Time.now clock) clock)
+      ~max_wait_duration ~delivery_rounds
   in
   (* FINAL-REVIEW FINDING I1: a real crash-and-come-back, the capability whose absence meant
      nothing in this branch could ever have caught finding C1.
@@ -327,4 +410,10 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
          the one place this harness genuinely spends wall-clock time; every DECISION in the run
          stays seeded and deterministic (Prng-driven), only the real I/O's timing does not. *)
     ~wait_io:(fun () -> Eio.Time.sleep clock 0.0001)
-    ~delivery_rounds:500 body
+    ~delivery_rounds:500
+      (* SUBTASK 3.8: a genuine progress-based liveness bound, not a tuning knob for normal
+         operation -- 30s is deliberately generous, since its only job is to still catch a cluster
+         that has genuinely stopped delivering anything real for that long, while never penalising
+         one that keeps making real progress no matter how slowly (see [for_test_settle_loop]'s own
+         doc comment). *)
+    ~max_wait_duration:30.0 ~clock body

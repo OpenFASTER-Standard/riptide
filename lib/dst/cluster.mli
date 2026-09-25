@@ -20,13 +20,70 @@ exception Did_not_settle
     {b Quiesced means two things, not one} (the second added by Task 11): nothing further was
     delivered, AND no already-delivered message is still being handled. [settle] bounds those two
     with separate budgets: rounds that each actually delivered something (a cluster generating
-    messages forever is the real livelock signal) and 5000 waits for an in-flight handler (which by
-    definition deliver nothing, so they could never consume the first budget). Either running out
-    raises this. The delivery-round budget is per-mode -- 20 for {!run}, the bound this harness has
-    always used, and 500 for {!run_on_file_storage}, because real io_uring replies to one protocol
-    hop complete at different times and dribble across many more rounds than the same hop does when
-    every handler is synchronous. See [cluster.ml]'s own comment at the budget for the measurement
-    behind that. *)
+    messages forever is the real livelock signal), and a second budget for an in-flight handler
+    (which by definition delivers nothing, so it could never consume the first budget). Either
+    running out raises this. The delivery-round budget is per-mode -- 20 for {!run}, the bound this
+    harness has always used, and 500 for {!run_on_file_storage}, because real io_uring replies to
+    one protocol hop complete at different times and dribble across many more rounds than the same
+    hop does when every handler is synchronous. See [cluster.ml]'s own comment at the budget for the
+    measurement behind that.
+
+    {b The in-flight-handler budget is itself two DIFFERENT mechanisms, not one} (task-master
+    subtask 3.8): {!run}'s own mock-backend entry point supplies neither a wall-clock budget nor a
+    clock, so it keeps the ORIGINAL fixed attempt countdown (5000 waits) -- which is fine there
+    because, under {!Eio_mock.Backend.run} with every storage operation synchronous, this branch is
+    never meaningfully exercised to begin with (the in-flight counter is back at zero after the
+    first yield of every round). {!run_on_file_storage} supplies both, because a fixed attempt
+    countdown is CPU-load-sensitive there: each real wait genuinely takes longer under load, so the
+    same fixed countdown exhausts in less real elapsed time than it would unloaded, at exactly the
+    moment a real cluster most needs longer to make progress (measured: 3/5 real failures -- the
+    calling suite's own wall-clock watchdog, not even reaching this exception -- under real induced
+    CPU load on a run that is 0/5 unloaded). Its budget is instead a genuine progress-based one:
+    keep waiting as long as real delivery is still happening, bounded by real wall-clock elapsed
+    time since the LAST real delivery (30s, deliberately generous -- a liveness bound for a
+    genuinely stuck cluster, not a tuning knob for normal operation), not a raw attempt count. See
+    {!for_test_settle_loop}'s own doc comment for the exact mechanism and the investigation behind
+    why it is tested the way it is. *)
+
+val for_test_settle_loop :
+  drain_round:(unit -> bool) ->
+  inflight:(unit -> int) ->
+  yield:(unit -> unit) ->
+  wait_io:(unit -> unit) ->
+  now:(unit -> float) option ->
+  max_wait_duration:float option ->
+  delivery_rounds:int ->
+  unit
+(** [settle]'s own decision logic (both budgets described on {!Did_not_settle} above), factored out
+    here so a test can drive it directly with a FAKE round-delivery/clock and assert its
+    termination behaviour deterministically and fast -- no real protocol dynamics, no real
+    wall-clock sleeps, and (this is what makes it trustworthy rather than a parallel
+    reimplementation a fix could silently diverge from) it is the ONLY place this logic lives:
+    {!run}'s and {!run_on_file_storage}'s own [settle] both call this, supplying their real
+    callbacks, nothing more.
+
+    {b Why this exists, not just [run]/{!run_on_file_storage} themselves} (subtask 3.8's own
+    investigation, disclosed in full in this task's own report): the obvious end-to-end test of
+    "genuinely, permanently stuck cluster still raises {!Did_not_settle}" -- corrupt or truncate
+    the primary's own about-to-commit slot via a real {!run_on_file_storage} cluster, propose one
+    op, call the exposed [settle] once, expect {!Did_not_settle} -- does NOT reproduce against this
+    VSR subset's real behaviour. [check_timeout] is the only thing that ever re-drives a stalled
+    replica (VSR.tla deliberately does not model automatic retry timers), so a primary that can
+    never commit still reaches a genuine, CORRECT quiescent state once its initial Prepare/
+    Prepare_ok exchange finishes -- nothing further pending, no handler still running, which is
+    exactly [settle]'s own definition of "done". [settle] returning normally there is right, not a
+    gap: {!Did_not_settle} exists to catch a cluster that never stops being busy, and this protocol,
+    by design, has no self-perpetuating message loop for any caller to exploit into one. Testing the
+    wall-clock deadline logic itself -- that it still fires for a cluster that genuinely never stops
+    delivering something (or never stops holding an in-flight handler), not merely one that is
+    slow-but-finite -- needs an entry point independent of whether this protocol happens to have a
+    reachable livelock at all, which is what this is.
+
+    [drain_round ()] delivers everything currently pending for one round (as a side effect,
+    incrementing whatever the caller's own in-flight counter is) and returns whether it delivered
+    anything. [inflight ()] reads that same counter. [now] is [None] exactly when
+    [max_wait_duration] is [None] -- both real callers always supply the pair together or neither,
+    mirroring [with_cluster]'s own [(?max_wait_duration, ?clock)] pairing. *)
 
 val run :
   seed:int ->

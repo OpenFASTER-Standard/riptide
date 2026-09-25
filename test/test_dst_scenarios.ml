@@ -991,6 +991,107 @@ let test_a_crash_with_a_torn_superblock_refuses_to_come_back () =
     (List.map (Option.map (function Value.Scalar (Value.String x) -> x | _ -> "?")) !durable_after);
   fail_on_violations ~what:"torn-superblock crash scenario" c.violations
 
+(* ---------------------------------------------------------------------------------------------
+   REGRESSION TESTS, subtask 3.8: [Cluster.for_test_settle_loop] itself, exercised directly with a
+   FAKE round-delivery/clock rather than through a real cluster.
+
+   WHY NOT A REAL CLUSTER, per this task's own report. The obvious end-to-end test -- corrupt or
+   truncate the primary's own about-to-commit slot via a real [run_on_file_storage] cluster,
+   propose one op, call the exposed [settle] once, expect [Did_not_settle] -- was tried first and
+   does NOT reproduce: this VSR subset has no self-perpetuating message loop ([check_timeout] is
+   the only thing that ever re-drives a stalled replica, and it is purely caller-driven, never
+   automatic), so a primary that can never commit still reaches a genuine, CORRECT quiescent state
+   once its initial Prepare/Prepare_ok exchange finishes -- nothing further pending, no handler
+   still running, which is exactly what [settle] is defined to recognise as "done". [settle]
+   returning normally there is right, not a gap. Testing the wall-clock deadline mechanism itself
+   -- that it still fires for a cluster that genuinely never stops needing to wait, and still
+   tolerates one that keeps making real progress no matter how slowly -- needs an entry point
+   independent of whether this protocol happens to have a reachable livelock at all, which is
+   exactly what [for_test_settle_loop] is for (see its own doc comment in [cluster.mli]).
+
+   Driving the loop directly like this is also what makes both properties checkable in a few
+   milliseconds with zero real sleeping, rather than needing minutes of real wall-clock time (or a
+   flaky small [max_wait_duration]) to prove a "runs arbitrarily long without a reset" claim. *)
+
+(* GENUINELY, PERMANENTLY STUCK: real delivery happens exactly once (round 1), and the simulated
+   in-flight handler never completes after that -- [inflight] stays at 1 forever, with no further
+   round ever delivering anything to reset the deadline. This is what a truly hung handler (an I/O
+   operation that never completes at all, not merely a slow one) looks like from [settle]'s own
+   perspective, and it must still raise [Did_not_settle] -- proving the fix does not silently
+   disable the harness's own livelock detection. The fake clock advances by a small, realistic
+   step per wait (mirroring [run_on_file_storage]'s own real [wait_io]'s tiny real sleep), so the
+   deadline is crossed by many small steps accumulating past [max_wait_duration], not by one giant
+   jump -- the same way it would happen for real. *)
+let test_settle_loop_still_raises_did_not_settle_when_genuinely_stuck () =
+  let round = ref 0 in
+  let inflight_val = ref 0 in
+  let clock_t = ref 0.0 in
+  let drain_round () =
+    incr round;
+    if !round = 1 then begin
+      inflight_val := 1;
+      true
+    end
+    else false
+  in
+  Alcotest.check_raises
+    "a cluster whose in-flight handler never completes again still raises Did_not_settle, bounded \
+     by real wall-clock time since its last real delivery"
+    Riptide_dst.Cluster.Did_not_settle (fun () ->
+      Riptide_dst.Cluster.for_test_settle_loop ~drain_round
+        ~inflight:(fun () -> !inflight_val)
+        ~yield:(fun () -> ())
+        ~wait_io:(fun () -> clock_t := !clock_t +. 0.05)
+        ~now:(Some (fun () -> !clock_t))
+        ~max_wait_duration:(Some 1.0) ~delivery_rounds:500);
+  (* Non-vacuity: this must have taken many real wait_io iterations to cross the deadline, not
+     raised immediately for some unrelated reason (e.g. [delivery_rounds] exhausting instead). *)
+  Alcotest.(check bool)
+    (Printf.sprintf "the deadline was crossed by real accumulated wait time (clock reached %f)"
+       !clock_t)
+    true (!clock_t > 1.0 && !clock_t < 2.0)
+
+(* SLOW BUT GENUINELY, STEADILY PROGRESSING: every one of 200 rounds delivers something real, and
+   each round's simulated wait_io jumps the fake clock forward by 1000 "seconds" -- a jump that
+   would trivially blow through [max_wait_duration] if the deadline were only ever set once, at
+   [settle]'s own start. Requirement (a) of subtask 3.8's fix is that the deadline resets on EVERY
+   real delivery, not just once: this is what lets a cluster that keeps making real progress run
+   arbitrarily long in wall-clock terms. Total simulated elapsed time here (~200,000 "seconds") is
+   many orders of magnitude past [max_wait_duration] (1.0), and this must still return normally. *)
+let test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_progressing () =
+  let round = ref 0 in
+  let progress_rounds = 200 in
+  let inflight_val = ref 0 in
+  let clock_t = ref 0.0 in
+  let drain_round () =
+    incr round;
+    if !round <= progress_rounds then begin
+      inflight_val := 1;
+      true
+    end
+    else begin
+      inflight_val := 0;
+      false
+    end
+  in
+  Riptide_dst.Cluster.for_test_settle_loop ~drain_round
+    ~inflight:(fun () -> !inflight_val)
+    ~yield:(fun () -> ())
+    ~wait_io:(fun () ->
+      clock_t := !clock_t +. 1000.0;
+      inflight_val := 0)
+    ~now:(Some (fun () -> !clock_t))
+    ~max_wait_duration:(Some 1.0) ~delivery_rounds:(progress_rounds + 10);
+  (* Reached here at all means it did not raise -- and non-vacuously exercised a total elapsed
+     time far past [max_wait_duration], not a trivially short run. *)
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "settled normally despite %d rounds of real progress spanning far more simulated \
+        wall-clock time (%f) than max_wait_duration (1.0) would tolerate between two deliveries"
+       progress_rounds !clock_t)
+    true
+    (!clock_t > 1.0 *. Float.of_int progress_rounds)
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -1015,4 +1116,10 @@ let tests =
     (Printf.sprintf "ring capacity boundary soak (subtask 3.8 regression coverage, %d iterations)"
        soak_iterations,
       `Slow, test_ring_capacity_boundary_soak);
+    ( "settle's wall-clock budget (subtask 3.8) still raises Did_not_settle when genuinely, \
+       permanently stuck", `Quick,
+      test_settle_loop_still_raises_did_not_settle_when_genuinely_stuck );
+    ( "settle's wall-clock budget (subtask 3.8) tolerates unbounded real time between deliveries \
+       while the cluster keeps genuinely progressing", `Quick,
+      test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_progressing );
   ]
