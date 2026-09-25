@@ -68,3 +68,16 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> ?owner:string -> 
     before this task existed. Opting a directory in requires every consumer of it to pass
     [~owner], consistently, from that directory's very first [create] onward; this function has
     no way to retroactively protect a caller who chooses not to. *)
+
+val owner : t -> string option
+(** [owner t] is the tag [t] was constructed with, i.e. [t]'s own [create] call's [?owner]
+    argument: [Some tag] if [t] was built with [~owner:tag] (whether that [create] confirmed an
+    existing marker or wrote a fresh one -- both cases mean [tag] is now what the marker file
+    actually holds on disk), or [None] if [t] was built with no [?owner] at all.
+
+    Exposed for callers that themselves construct a [t] on another module's behalf and need to
+    verify, after the fact, that it was tagged the way that module requires --
+    {!Riptide_crypto.Redaction_store.create} (subtask 4.8) is the first such caller: it receives an
+    already-built [t] rather than constructing one itself, so [create] above's own owner-marker
+    guard cannot protect it unless it checks this function's result against its own expected
+    tag. *)

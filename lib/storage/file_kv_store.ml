@@ -77,7 +77,12 @@
 
 type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_capable : bool }
 
-type t = { sw : Eio.Switch.t; fs : Eio.Fs.dir_ty Eio.Path.t; dir_path : string }
+type t = {
+  sw : Eio.Switch.t;
+  fs : Eio.Fs.dir_ty Eio.Path.t;
+  dir_path : string;
+  owner : string option;
+}
 
 (* Same single alignment used uniformly for both header and data regions as [File_storage]
    (see that file's own top comment) -- this box's confirmed [O_DIRECT] alignment requirement
@@ -342,7 +347,14 @@ let check_or_write_owner_marker ~fs ~dir_path owner =
 let create ~sw ~fs ?owner dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   check_or_write_owner_marker ~fs ~dir_path owner;
-  { sw; fs; dir_path }
+  { sw; fs; dir_path; owner }
+
+(* [check_or_write_owner_marker] above is a no-op for [None] and, for [Some tag], either confirms
+   [tag] against the existing on-disk marker or writes a fresh one holding exactly [tag] -- it
+   never resolves or hands back a tag of its own. So by the time [create] returns without raising,
+   [owner] (the caller-supplied argument itself) IS what the marker file now holds: [t.owner] below
+   is that same argument, not a re-read of the marker, but the two are guaranteed to agree. *)
+let owner t = t.owner
 
 let get t ~key = durable_read t (path_for t ~key)
 let put t ~key data = durable_write t (path_for t ~key) data

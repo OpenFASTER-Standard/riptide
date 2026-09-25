@@ -5,7 +5,16 @@
 
 type t = { kv : Riptide_storage.File_kv_store.t; kek : Kek.t }
 
-let create ~kv ~kek = { kv; kek }
+let owner_tag = "redaction-keystore"
+
+let create ~kv ~kek =
+  let actual = Riptide_storage.File_kv_store.owner kv in
+  if actual <> Some owner_tag then
+    invalid_arg
+      (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S"
+         (Option.value actual ~default:"(none)")
+         owner_tag);
+  { kv; kek }
 
 (* The DEK's raw bytes, encrypted under the KEK with the record's own event_id bound in as GCM
    additional authenticated data -- so a wrapped DEK moved to a different keystore slot fails to

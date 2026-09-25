@@ -36,6 +36,15 @@
 
 type t
 
+val owner_tag : string
+(** [owner_tag] is [create]'s own required {!Riptide_storage.File_kv_store.owner} value,
+    ["redaction-keystore"] -- the one fixed, project-wide-unique tag every real caller in this
+    codebase passes as [~owner:owner_tag] to the {!Riptide_storage.File_kv_store.create} that
+    builds the [kv] it later hands to [create] below. Exported so every call site references this
+    constant instead of repeating the string literal (subtask 4.8; previously scattered across the
+    codebase by convention alone, with nothing enforcing it -- see [create]'s own doc comment
+    below for what closed that gap). *)
+
 val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
 (** [create ~kv ~kek] builds a keystore over [kv], wrapping every DEK it stores under [kek].
 
@@ -55,23 +64,42 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     shaped like [\{length\}:\{idempotency_key\}#\{index\}] is all it takes.
 
     {b Subtask 4.6 gave {!Riptide_storage.File_kv_store.create} a real, construction-time guard
-    against exactly this}: build the [kv] you pass here with [~owner:"redaction-keystore"] (any
-    fixed, project-wide-unique tag works; this is the one every {!Riptide_crypto} caller in this
-    codebase actually uses), and a second, differently-tagged {!Riptide_storage.File_kv_store.create}
-    aimed at the same directory now raises [Invalid_argument] immediately, before either consumer
-    can touch the shared directory's data at all -- turning the three silent outcomes below into a
-    loud rejection at construction. {b This function itself cannot enforce that}: [create] above
-    receives an already-built [kv], the same way {!Riptide_materialize.Materializer.Make.create}
-    does, so there is no [File_kv_store.create] call inside this module for an owner tag to attach
-    to -- the guard only works if the caller building [kv] opts in. Passing no [~owner] (or two
-    different, uncoordinated tags on the two sides of a real collision) leaves the hazard exactly as
-    unprotected as it was before subtask 4.6, and the three outcomes below still apply in full:
+    against exactly this}: build the [kv] you pass here with [~owner:owner_tag], and a second,
+    differently-tagged {!Riptide_storage.File_kv_store.create} aimed at the same directory now
+    raises [Invalid_argument] immediately, before either consumer can touch the shared directory's
+    data at all -- turning the three silent outcomes below into a loud rejection at construction.
+
+    {b Subtask 4.8 closes the one residual gap that left open}: [create] above used to receive an
+    already-built [kv] on faith, the same way {!Riptide_materialize.Materializer.Make.create}
+    still does -- there was no [File_kv_store.create] call inside this module for an owner tag to
+    attach to, so the subtask 4.6 guard only ever worked if the caller building [kv] happened to
+    opt in, and nothing here could tell whether it had. [create] now checks
+    {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap:
+
+    @raise Invalid_argument if [kv]'s own owner (as {!Riptide_storage.File_kv_store.owner} reports
+      it) is not [Some owner_tag] -- i.e. [kv] was built with a different [~owner], or with no
+      [~owner] at all -- before this function returns a usable [t] and before either consumer can
+      touch the shared directory's data.
+
+    This still cannot protect a directory that a SECOND consumer -- one that never goes through
+    this function, e.g. a {!Riptide_materialize.Materializer} built directly over the same
+    [dir_path] -- points its own {!Riptide_storage.File_kv_store.create} at without passing
+    [~owner] at all. That call's own [check_or_write_owner_marker] is a no-op for [None]
+    regardless of what marker, if any, already sits on disk from this side (which, after subtask
+    4.8, is now unconditionally [owner_tag]) -- so one missing [~owner] on the OTHER consumer's
+    side, alone, is now enough for the collision to still happen; the redaction-store side no
+    longer needs to cooperate in the omission the way subtask 4.6 alone would have required. The
+    three outcomes below still apply in full to that remaining, narrower case:
 
     All three consequences below were reproduced live, and were pinned by
     [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) as the
-    ordinary, no-[~owner] case; that test now proves subtask 4.6's construction-time rejection
-    instead (both sides opting in), which is why what follows is a description of what still
-    happens if you skip [~owner], not something currently exercised end-to-end by that test:
+    ordinary, no-[~owner]-on-either-side case; that test now proves subtask 4.6's
+    construction-time rejection for an opted-in pair instead, plus (subtask 4.8) that a
+    correctly-tagged keystore alone is not sufficient -- the residual negative control there keeps
+    the keystore side correctly tagged (this function no longer allows otherwise) and omits
+    [~owner] only on the materializer side, which is why what follows is a description of what
+    still happens when the OTHER side skips [~owner], not something this function's own check can
+    reach:
 
     - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
       materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse

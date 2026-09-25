@@ -31,7 +31,7 @@ let with_store f =
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let kv =
-        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
           dir
       in
       let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
@@ -108,7 +108,7 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let kv =
-        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
           dir
       in
       let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
@@ -143,6 +143,39 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
         (Kek.unwrap kek ~aad:"e2" wrapped_e1);
       Alcotest.(check bool) "e1 is untouched by the attack and still opens normally" true
         (Redaction_store.decrypt store ~event_id:"e1" ct = Some v))
+
+(* -- Subtask 4.8's [Redaction_store] half: [create] must itself verify [kv] was actually built
+   with its own [owner_tag], not just document the convention every real call site already
+   follows. Closes the residual gap left open by subtask 4.6/the layer0-followup-hardening plan:
+   this function receives an already-built [kv], so [File_kv_store.create]'s own owner-marker
+   guard only protects a caller of THIS function if that caller opted in -- these two tests pin
+   that [create] now enforces it directly, rather than trusting the caller. *)
+
+let test_create_rejects_a_kv_tagged_for_a_different_owner () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"some-other-owner" dir
+      in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      Alcotest.check_raises "a kv tagged for a different owner is rejected at construction"
+        (Invalid_argument
+           (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S" "some-other-owner"
+              Redaction_store.owner_tag))
+        (fun () -> ignore (Redaction_store.create ~kv ~kek)))
+
+let test_create_rejects_an_untagged_kv () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      Alcotest.check_raises "an untagged kv is rejected at construction"
+        (Invalid_argument
+           (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S" "(none)"
+              Redaction_store.owner_tag))
+        (fun () -> ignore (Redaction_store.create ~kv ~kek)))
 
 let test_decrypt_of_tampered_ciphertext_is_none () =
   with_store (fun store ->
@@ -380,7 +413,7 @@ let with_store_and_cluster ~replica_count f =
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let kv =
-        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
           dir
       in
       let store = Redaction_store.create ~kv ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32)) in
@@ -504,6 +537,10 @@ let tests =
     ("redacted payload is genuinely unrecoverable", `Quick, test_redacted_payload_is_genuinely_unrecoverable);
     ("redaction is per record", `Quick, test_redaction_is_per_record);
     ("wrapped DEK is bound to its event_id", `Quick, test_wrapped_dek_is_bound_to_its_event_id);
+    ( "create rejects a kv tagged for a different owner",
+      `Quick,
+      test_create_rejects_a_kv_tagged_for_a_different_owner );
+    ("create rejects an untagged kv", `Quick, test_create_rejects_an_untagged_kv);
     ("decrypt of tampered ciphertext is None", `Quick, test_decrypt_of_tampered_ciphertext_is_none);
     ("Kek.load reads a well-formed file", `Quick, test_kek_load_reads_a_well_formed_file);
     ("Kek.load on a missing file raises", `Quick, test_kek_load_missing_file_raises);

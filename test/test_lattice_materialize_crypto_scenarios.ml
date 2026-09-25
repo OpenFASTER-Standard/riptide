@@ -153,12 +153,12 @@ let make_materializer ~sw ~fs dir =
     ~encode:(fun g -> Riptide.Value.canonical_encode (G_set.to_value g))
 
 (* The deliberately UNPROTECTED counterpart, used by exactly one test below
-   ([test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek]) and nothing else. It exists
-   to keep file_kv_store.mli's own honest disclosure -- "if EITHER side of a real collision omits
-   [owner] ... the pair is exactly as unprotected as before this task existed" -- backed by running
-   code rather than prose alone. Its [decode] is TOTAL (unparseable bytes decode as [bottom] rather
-   than raising), which is a legitimate, even defensive, caller choice and is what makes the
-   collision below silent rather than loud. *)
+   ([test_omitting_owner_on_the_materializer_side_alone_still_destroys_a_wrapped_dek]) and nothing
+   else. It exists to keep file_kv_store.mli's own honest disclosure -- that an untagged
+   [File_kv_store.create] is a no-op with respect to the marker check, regardless of what's already
+   claimed on disk -- backed by running code rather than prose alone. Its [decode] is TOTAL
+   (unparseable bytes decode as [bottom] rather than raising), which is a legitimate, even
+   defensive, caller choice and is what makes the collision below silent rather than loud. *)
 let make_unowned_lenient_materializer ~sw ~fs dir =
   M.create
     ~kv:(File_kv_store.create ~sw ~fs dir)
@@ -358,7 +358,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
   @@ fun () ->
   let store =
     Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs ~owner:"redaction-keystore" keystore_dir)
+      ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag keystore_dir)
       ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
   in
   (* One real, independent, on-disk materializer per replica -- (a) and (b) are meaningless against
@@ -1013,7 +1013,7 @@ let test_a_redacted_records_plaintext_cannot_re_enter_via_materialization () =
   let fs = Eio.Stdenv.fs env in
   let store =
     Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs ~owner:"redaction-keystore" keystore_dir)
+      ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag keystore_dir)
       ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
   in
   let materializer = make_materializer ~sw ~fs mat_dir in
@@ -1051,7 +1051,7 @@ let test_encrypted_and_materialized_is_still_rejected () =
   Eio.Switch.run @@ fun sw ->
   let store =
     Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" keystore_dir)
+      ~kv:(File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag keystore_dir)
       ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
   in
   let replica = create_solo () in
@@ -1177,7 +1177,7 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
    accident.
 
    {!Riptide_storage.File_kv_store.create}'s new [?owner] (subtask 4.6) closes it, FOR CALLERS WHO
-   PASS IT: this test builds the keystore's [kv] with [~owner:"redaction-keystore"] and then
+   PASS IT: this test builds the keystore's [kv] with [~owner:Redaction_store.owner_tag] and then
    attempts to build a real materializer -- through this file's own [make_materializer], the same
    constructor every other materializer here is built with -- pointed at the exact same directory,
    and asserts that the [File_kv_store.create] inside that helper raises [Invalid_argument] before
@@ -1192,9 +1192,11 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
    assertion to the production-shaped call path, so it fails the moment that path stops opting in.
 
    The protection is strictly opt-in and this file proves BOTH halves of that: see
-   [test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek] at the end of this file for the
-   running negative control showing the original hazard is entirely undiminished for a pair that
-   omits [~owner], exactly as file_kv_store.mli's own [?owner] doc discloses.
+   [test_omitting_owner_on_the_materializer_side_alone_still_destroys_a_wrapped_dek] at the end of
+   this file for the running negative control showing the hazard is entirely undiminished for a
+   materializer that omits [~owner], even though (subtask 4.8) the keystore side there is, and now
+   must be, correctly tagged -- exactly as file_kv_store.mli's own [?owner] doc, and
+   redaction_store.mli's own [create] doc, both disclose.
 
    {b What the guard buys, stated against what this hazard used to cost} -- and note this is an
    improvement ON TOP OF the reproduction, not a replacement for it: an opted-in pair can never
@@ -1217,7 +1219,7 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
      without opting into [?owner]. This test opts in on the keystore side. *)
   let store =
     Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs ~owner:"redaction-keystore" shared_dir)
+      ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir)
       ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
   in
   let replica = create_solo () in
@@ -1256,39 +1258,57 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
     (List.length (Batch_commit.committed_envelopes replica))
 
 (* ---------------------------------------------------------------------------------------------
-   THE SAME HAZARD, STILL FULLY LIVE FOR ANYONE WHO OPTS OUT -- a running proof of the limitation
-   file_kv_store.mli's [?owner] doc states in prose: "if EITHER side of a real collision omits
-   [owner] -- not just both -- the pair is exactly as unprotected as before this task existed."
+   THE SAME HAZARD, STILL LIVE FOR A MATERIALIZER THAT OPTS OUT -- a running proof of the
+   limitation file_kv_store.mli's [?owner] doc states in prose: an untagged
+   [File_kv_store.create] is a pure no-op with respect to the marker check, REGARDLESS of what
+   marker, if any, already sits on disk from a correctly-tagged co-claimant.
 
-   This test exists because that sentence is a real, load-bearing disclosure about the shape of
-   subtask 4.6's fix, not a caveat: the guard is a marker file compared between two CLAIMING
-   callers, so it cannot possibly protect a directory nobody claims. An earlier fix round deleted
-   this file's original three-direction reproduction of the hazard on the grounds that construction
-   now fails first -- which is true only on the opted-in path, and left the documented opted-out
-   path asserted in prose with nothing running behind it. This is the reduced restoration: two of
-   the original three directions, enough to show the destruction is real and bidirectional, without
+   {b Narrowed by subtask 4.8, from what it used to demonstrate.} Before subtask 4.8,
+   [Redaction_store.create] accepted whatever [kv] it was handed on faith, so this test's keystore
+   side could -- and did -- omit [~owner] too, matching the "if EITHER side ... omits [owner] --
+   not just both" phrasing that sentence still uses about {!Riptide_storage.File_kv_store.create}'s
+   own, generic guard. Subtask 4.8 changed what's reachable through {!Redaction_store.create}
+   specifically: it now REQUIRES [kv]'s owner to read back as [Some Redaction_store.owner_tag], so
+   a redaction store whose own [kv] omits [~owner] can no longer be constructed at all -- that
+   half of the original two-sided omission is gone, and the test below reflects that: its keystore
+   is built with [~owner:Redaction_store.owner_tag], exactly like every other keystore in this
+   file. What subtask 4.8 does NOT and cannot close is the other side: a SECOND consumer (here, a
+   materializer) pointing its own {!Riptide_storage.File_kv_store.create} at the same directory
+   with no [~owner] at all skips the marker check on ITS OWN call entirely, independent of
+   anything already claimed there -- so that omission, alone, still reproduces the full hazard.
+
+   This test exists because that residual, one-sided gap is a real, load-bearing fact about the
+   shape of subtask 4.6+4.8 together, not a caveat: the guard is a marker file compared between two
+   CLAIMING callers, so it cannot possibly protect a directory that a second caller never claims,
+   no matter how correctly the first caller claimed it. An earlier fix round deleted this file's
+   original three-direction reproduction of the hazard on the grounds that construction now fails
+   first -- which is true only on the opted-in path, and left the documented opted-out path
+   asserted in prose with nothing running behind it. This is the reduced restoration: two of the
+   original three directions, enough to show the destruction is real and bidirectional, without
    re-litigating the partial-vs-total [decode] distinction the opted-in test above already makes
    moot for every protected caller.
 
    Read it as the negative control for
    [test_a_shared_kv_directory_is_rejected_at_construction] above: same directory-sharing setup,
-   same collision, the only difference being that neither side passes [~owner] -- and the outcome
-   flips from "rejected at construction, data provably intact" back to "silent, total destruction
-   with nothing raising anywhere." That contrast is what shows the guard's protection comes from
-   the tags themselves and not from something incidental about the scenario.
+   same collision, the only difference being that the materializer side doesn't pass [~owner] --
+   and the outcome flips from "rejected at construction, data provably intact" back to "silent,
+   total destruction with nothing raising anywhere," even though the keystore side is, and now must
+   be, correctly tagged. That contrast is what shows the guard's protection comes from BOTH sides
+   claiming the directory, not from either side alone, however correctly that one side claims it.
    --------------------------------------------------------------------------------------------- *)
 
-let test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek () =
+let test_omitting_owner_on_the_materializer_side_alone_still_destroys_a_wrapped_dek () =
   Eio_main.run @@ fun env ->
   with_tmp_dir @@ fun shared_dir ->
   Eio.Switch.run @@ fun sw ->
   let fs = Eio.Stdenv.fs env in
-  (* Neither side claims the directory: the keystore's [kv] is built with NO [~owner] (unlike
-     every other keystore in this file), and the materializer below goes through the deliberately
-     untagged [make_unowned_lenient_materializer]. Nothing here is protected, by construction. *)
+  (* The keystore side is correctly tagged -- subtask 4.8 makes this mandatory, not optional, for
+     any [kv] passed to [Redaction_store.create]. Only the materializer below, built through the
+     deliberately untagged [make_unowned_lenient_materializer], omits [~owner]. That single
+     omission, on the one side subtask 4.8 cannot reach, is enough on its own. *)
   let store =
     Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs shared_dir)
+      ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir)
       ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
   in
   let replica = create_solo () in
@@ -1355,7 +1375,7 @@ let tests =
       ("sharing one KV directory between a keystore and a materializer is now rejected at \
         construction (subtask 4.6)", `Quick,
        test_a_shared_kv_directory_is_rejected_at_construction);
-      ("...but opting out of ?owner on both sides still silently destroys a wrapped DEK, exactly \
-        as file_kv_store.mli documents (negative control)", `Quick,
-       test_omitting_owner_on_both_sides_still_destroys_a_wrapped_dek);
+      ("...but a materializer alone opting out of ?owner still silently destroys a wrapped DEK, \
+        even with a correctly-tagged keystore (negative control)", `Quick,
+       test_omitting_owner_on_the_materializer_side_alone_still_destroys_a_wrapped_dek);
     ]

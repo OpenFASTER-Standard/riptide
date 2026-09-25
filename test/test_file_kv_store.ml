@@ -270,6 +270,28 @@ let test_no_owner_supplied_is_unaffected () =
       Alcotest.(check (option string)) "put/get with no owner tag still works" (Some "v")
         (File_kv_store.get t ~key:"k"))
 
+(* -- Subtask 4.8's [File_kv_store] half: [owner] must read back the exact construction-time tag
+   the marker mechanism above resolved -- not merely echo the argument uninspected, though for
+   this backend those two happen to coincide (see [check_or_write_owner_marker]: it is a no-op
+   for [None], and for [Some tag] either matches the existing marker or writes a fresh one with
+   exactly [tag], so reaching [create]'s return means [tag] IS what's now on disk). This is what
+   [Redaction_store.create] (subtask 4.8's other half) verifies against below. *)
+
+let test_owner_reads_back_the_tag_used_at_construction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"a-real-tag" dir in
+      Alcotest.(check (option string)) "owner reads back the construction-time tag" (Some "a-real-tag")
+        (File_kv_store.owner t))
+
+let test_owner_is_none_when_no_tag_was_supplied () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      Alcotest.(check (option string)) "no tag supplied reads back as None" None (File_kv_store.owner t))
+
 let tests =
   [
     ("put then get", `Quick, test_put_then_get);
@@ -288,4 +310,7 @@ let tests =
     ("matching owner reopens cleanly", `Quick, test_matching_owner_reopens_cleanly);
     ("no owner supplied is unaffected (backward compatibility)", `Quick,
       test_no_owner_supplied_is_unaffected);
+    ("owner reads back the tag used at construction", `Quick,
+      test_owner_reads_back_the_tag_used_at_construction);
+    ("owner is None when no tag was supplied", `Quick, test_owner_is_none_when_no_tag_was_supplied);
   ]
