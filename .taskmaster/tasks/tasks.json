@@ -239,12 +239,19 @@
           {
             "id": 6,
             "title": "Add message integrity to VSR's wire protocol",
-            "description": "A single corrupted network byte can currently make the cluster retroactively destroy an already-committed, client-acknowledged value and replace it cluster-wide with the corrupted one -- VSR's message format (lib/vsr/message.ml) has no payload integrity field of any kind, and this repo's own Transport_intf.S explicitly assigns integrity responsibility to the caller (VSR), which has never provided it.",
-            "status": "pending",
+            "description": "A single corrupted network byte can currently make the cluster retroactively destroy an already-committed, client-acknowledged value and replace it cluster-wide with the corrupted one -- VSR's message format (lib/vsr/message.ml) has no payload integrity field of any kind, and this repo's own Transport_intf.S explicitly assigns integrity responsibility to the caller (VSR), which has never provided it. DELIVERED: lib/vsr/message.ml's encode/decode gain a trailing 8-byte truncated-SHA256 checksum (accidental-corruption detection, not a security boundary -- the real network-corruption case is already closed for every real deployment by mandatory mTLS on the only production transport). Reuses the existing Malformed_message exception; Replica.handle_message needed zero changes (it already silently drops any decode failure). The pinned DST corruption test (test_wire_corruption_diverges_committed_state) was flipped from proving the bug's presence to proving it's caught and dropped, verified non-vacuous by a literal git-stash revert-and-rerun showing the identical pre-existing failure signature (33 divergences, 1 write erased cluster-wide) pre-fix. Two review rounds found and fixed real issues: a stale contradictory header comment left in place despite claiming removal; all 9 pre-existing malformed-input tests silently losing power (decode's new checksum-stripping made them test truncation instead of the shape-validation they were meant for) -- fixed with a real checksum-appending test helper, hand-traced against every raise site to confirm real coverage restored.",
+            "status": "done",
             "dependencies": [],
             "details": "Found and reproduced deterministically during subtask 3.4's adversarial hunt, pinned as a permanent failing-by-design regression test (test/test_dst_scenarios.ml test 6) rather than fixed, per this project's own governance rule. This is a real, open design fork, not a rubber-stamp checksum addition: either VSR's own message format needs integrity of its own (a checksum only defends against random corruption), or the project should decide outright that VSR requires an integrity-preserving transport (Riptide_transport.Tcp already is one) and document that as a real precondition rather than an implicit assumption. Whichever way this is decided, spec/tla/VSR.tla's own message model (structured, uncorruptible records) should be revisited to make sure it still matches reality once the decision is made.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "d3108c756ca6e05c639bf90a0f4d0a3f5a841464",
+                "2cba1876c18549972b21f7dd42420f1190c71c8d"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 7,
@@ -261,7 +268,7 @@
           {
             "id": 8,
             "title": "Fix dst_scenarios' wall-clock-dependent flake in the ring-capacity-boundary view-change test",
-            "description": "test_dst_scenarios.ml's ring-capacity-boundary view-change test (\"with a ring bigger than the log, the view change completes and every replica is Normal\") flakes at roughly 5% (reproduced 2/40 in isolated runs). Root cause: lib/dst/cluster.ml's settle() uses a real wall-clock sleep (Eio.Time.sleep clock 0.0001) as its wait_io budget, and delivery_rounds/io_waits' bounded budgets depend on real I/O batching timing, which shifts the order the seeded network fault stream gets consumed in -- a genuine pre-existing timing sensitivity in every run_on_file_storage-backed DST test, not caused by any of task-master Task 4's own work (confirmed: none of Task 4's new modules are even link-reachable from dst_scenarios' own dune library list).",
+            "description": "test_dst_scenarios.ml's ring-capacity-boundary view-change test (\"with a ring bigger than the log, the view change completes and every replica is Normal\") flakes at roughly 5% (reproduced 2/40 in isolated runs). Root cause: lib/dst/cluster.ml's settle() uses a real wall-clock sleep (Eio.Time.sleep clock 0.0001) as its wait_io budget, and delivery_rounds/io_waits' bounded budgets depend on real I/O batching timing, which shifts the order the seeded network fault stream gets consumed in -- a genuine pre-existing timing sensitivity in every run_on_file_storage-backed DST test, not caused by any of task-master Task 4's own work (confirmed: none of Task 4's new modules are even link-reachable from dst_scenarios' own dune library list). UPDATE: a real, independent fix landed (lib/sim/network.ml's fault-injection decisions are now keyed per-sender instead of drawn from one shared PRNG consumed in real send-call order), closing a genuine determinism gap -- but two independent investigations (this task's own implementer, and later, separately, task-master subtask 4.7's implementer investigating an unrelated suite failure) confirmed by direct code reading that this fix CANNOT be the mechanism behind the specific named flake: test_ring_capacity_boundary runs with zero fault probabilities on both network and storage, so Prng.bool's order-dependence is irrelevant by construction. The real mechanism was independently, decisively proven: lib/dst/cluster.ml's settle() uses a real wall-clock Eio.Time.sleep-based wait_io with a bounded io_waits budget -- reproduced 5/5 failures under artificial CPU load (16 busy-loops on 16 cores) on a tree with ALL of this session's fixes stashed out (proving pre-existing, not caused by anything shipped), versus 0/30 without load. A newly-added 20-iteration soak test for this same scenario was later found to be the single most load-fragile test in the whole suite (4/4 failures under the same load, vs 0/5 for the test it soaks) and was reduced to 5 iterations + marked `Slow` to stop it dominating wall-clock and misfiring under CI load -- a mitigation, not a fix of the root cause. Kept pending: the real fix (replacing settle()'s wall-clock-budget completion criterion with one that isn't CPU-load-sensitive) remains open and is now backed by decisive, reproducible evidence rather than a single historical 2/40 observation.",
             "status": "pending",
             "dependencies": [],
             "details": "Found and independently reproduced during task-master Task 4's own final whole-branch review (2/40 isolated dst_scenarios runs) while investigating a claimed regression that turned out to be unrelated. Real fix: make settle()'s completion criterion independent of real wall-clock I/O timing -- e.g. drive it off a deterministic step/tick count instead of a real Eio.Time.sleep-based budget, matching this project's own DST-determinism goals more closely than the current mechanism does.",
@@ -367,32 +374,65 @@
           {
             "id": 5,
             "title": "Make encryption-at-rest genuinely non-optional across every envelope-construction site",
-            "description": "Batch_commit.propose's encryption is opt-in (?encryption); Log.append is a second, structurally uncoverable, unencrypted envelope-construction site outside Batch_commit entirely. Closing this for real needs either resolving the riptide/riptide_crypto dependency-cycle constraint that currently forces Log.append to stay plaintext, or removing/subsuming Log.append as a production write path.",
-            "status": "pending",
+            "description": "Batch_commit.propose's encryption is opt-in (?encryption); Log.append is a second, structurally uncoverable, unencrypted envelope-construction site outside Batch_commit entirely. Closing this for real needs either resolving the riptide/riptide_crypto dependency-cycle constraint that currently forces Log.append to stay plaintext, or removing/subsuming Log.append as a production write path. DELIVERED, NARROWER THAN THE TITLE: Batch_commit.propose gains ?require_encryption:bool (default false) -- when true, raises Invalid_argument immediately if no ~encryption sink is supplied, checked before the pre-existing merge_key+encryption rejection so the two guards never compete (proven by a real interaction test copying the exact pre-existing rejection message verbatim). This is an opt-in-at-call-time policy primitive a real deployment can enable, NOT the fully automatic 'every envelope always encrypted' ubiquity the title implies -- that would require either resolving a real riptide/riptide_crypto dependency cycle or removing Log.append (confirmed, via repo-wide grep, to have zero production callers -- it predates VSR consensus and is now documented as a pre-VSR prototype module, not removed). This narrowing is deliberate and recorded in the design spec, not an oversight.",
+            "status": "done",
             "dependencies": [],
             "details": "Found and deliberately deferred during subtask 4.4's implementation and its own final whole-branch review: the design spec's Decision 4 text defers 'exact shape' to the implementation, and forcing unconditional encryption today would either require a dependency-graph restructure (riptide_crypto currently depends on riptide_storage, which depends on riptide -- pulling crypto into the base riptide library that Envelope/Log live in is a cycle, not a refactor) or silently break every existing plaintext caller/test. Coordinate with whoever owns Layer 0 governance before starting, per this repo's own small-aligned-group rule -- this is a real architectural change to the envelope-construction boundary, not a bolt-on.",
-            "testStrategy": ""
+            "testStrategy": "",
+            "evidence": {
+              "commits": [
+                "d05e231689522298e021aa868db2afdf80694eb9",
+                "b4091051d2d9205019b4ce615a4b34d4b21a6cf1"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 6,
             "title": "Prevent keystore/materializer directory-namespace collisions",
-            "description": "Riptide_crypto.Redaction_store and Riptide_materialize.Materializer both use Riptide_storage.Kv_store_intf.S's flat key namespace with no structural separation. Sharing one File_kv_store directory between the two causes real, silent data destruction in three distinct, confirmed directions (a materializer's read-join-put can silently overwrite a wrapped DEK; a keystore put can silently overwrite an accumulator; a partial materializer decode can raise mid-materialize, diverging the accumulator from the committed log forever). Currently pinned by a dedicated regression test, not structurally prevented.",
-            "status": "pending",
+            "description": "Riptide_crypto.Redaction_store and Riptide_materialize.Materializer both use Riptide_storage.Kv_store_intf.S's flat key namespace with no structural separation. Sharing one File_kv_store directory between the two causes real, silent data destruction in three distinct, confirmed directions (a materializer's read-join-put can silently overwrite a wrapped DEK; a keystore put can silently overwrite an accumulator; a partial materializer decode can raise mid-materialize, diverging the accumulator from the committed log forever). Currently pinned by a dedicated regression test, not structurally prevented. DELIVERED: File_kv_store.create gains ?owner:string -- a construction-time marker-file check (write on first creation, compare on every reopen) that makes a real directory collision between a redaction keystore and a materializer fail loudly with Invalid_argument instead of silently destroying data. Initial version had a real gap the final whole-branch review caught: the keystore side opted in at every real call site but the materializer side opted in at ZERO, so the guard was inert against every actual materializer construction in the repo, and the collision test exercised only a bare, artificial construction rather than the real production-shaped path -- compounded by an earlier fix round deleting the original 3-direction hazard reproduction entirely. Fixed in the final review's mandatory fix wave: all 4 real materializer call sites now tagged, the collision test rewritten to go through the real construction helper (non-vacuity proven live by stripping the tag and reproducing 'got nothing'), and a reduced 2-direction reproduction of the both-sides-opt-out hazard restored. RESIDUAL, tracked separately (see new subtask 8): neither Materializer.create nor Redaction_store.create enforces the tag at the type level -- every real construction site in this repo is protected today, but a future caller that forgets ~owner gets no protection and none is possible without an interface change to one or both constructors.",
+            "status": "done",
             "dependencies": [
               "4"
             ],
             "details": "Found during subtask 9 (end-to-end adversarial proof)'s own investigation of the materialization/redaction interaction, escalated at the final whole-branch review for inconsistent treatment (the less-severe KV-size-bound finding got the same 'pin, don't fix' treatment for a good reason -- a real fix is real design work -- but this one has no error signal at all when it happens, unlike the size-bound case). Real fix options: namespace/prefix each Kv_store_intf.S consumer's key space distinctly, or give Kv_store_intf.S itself a typed/scoped notion of ownership per directory. Both are real design decisions, not oversights to patch in a test task.",
-            "testStrategy": ""
+            "testStrategy": "",
+            "evidence": {
+              "commits": [
+                "8922e6609c22118cdfd34c588add1b1aeaf9528a",
+                "8d77b5cea0a283753fbf61c045952977d2367261"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 7,
             "title": "Persist PKI certificate/key material across process boundaries",
-            "description": "Riptide_pki.Ca and Riptide_transport.Tls_identity are in-memory only -- no PEM (or other) encode/decode exists anywhere, and every real call site mints a fresh in-process CA. The composed PKI+mTLS mesh cannot currently span two separate OS processes or survive a restart, which is in tension with Decision 6's own 'certs are static and long-lived' framing (that framing presupposes persistence that doesn't exist yet).",
-            "status": "pending",
+            "description": "Riptide_pki.Ca and Riptide_transport.Tls_identity are in-memory only -- no PEM (or other) encode/decode exists anywhere, and every real call site mints a fresh in-process CA. The composed PKI+mTLS mesh cannot currently span two separate OS processes or survive a restart, which is in tension with Decision 6's own 'certs are static and long-lived' framing (that framing presupposes persistence that doesn't exist yet). DELIVERED, ROOT ONLY: Ca.save/Ca.load -- real PEM persistence for the self-managed root CA's certificate and private key, with permission-check discipline mirroring Kek.load's established TOCTOU-free pattern (fstat on the already-open descriptor). A fix round hardened save to guarantee 0600 even over a pre-existing loose-mode key file (Unix.openfile's perm argument only applies at creation, not overwrite) and to defend against a symlink-planting attack (unlink then O_CREAT|O_EXCL, both proven live against a real attacker sequence). Round-trip proven genuine, not merely 'doesn't crash': a loaded CA can still sign a leaf that validates against the ORIGINAL in-memory root. RESIDUAL, disclosed not fixed: only the root CA's material persists -- leaf certificate/key material (what a real replica would actually need) still has no persistence story, so the mTLS mesh remains a single-process construct in practice despite this subtask's own closure. Also found and disclosed along the way: decisive, reproducible evidence that subtask 3.8's real remaining flake mechanism is cluster.ml's wall-clock settle() budget (see 3.8's own updated notes).",
+            "status": "done",
             "dependencies": [
               "4"
             ],
             "details": "Found and explicitly disclosed (not silently assumed away) at the final whole-branch review of subtask 4.4's mTLS work -- both lib/pki/ca.mli and lib/transport/tls_identity.mli now carry an honest 'open gap, tracked as future work' paragraph. Partly a project-stage fact: this repo has no replica server binary yet at all (library-only), so there is currently no real caller this would unblock. Distinct from, and a smaller/more immediate prerequisite than, task-master Task 8's own already-planned SPIFFE/SPIRE pluggable attestation subtask -- a minimal PEM save/load for this project's own self-managed CA is a much smaller ask than dynamic attestation, and SPIFFE/SPIRE is explicitly deferred until this project's later multi-tier/heterogeneous-hardware model exists (Decision 6's own non-goal).",
+            "testStrategy": "",
+            "evidence": {
+              "commits": [
+                "c90e94b9431afe6da95a8f986aefaf69ea8bc1a6",
+                "4f662e6d90e826f52a8da3c03afb0c519c387f7e",
+                "8d77b5cea0a283753fbf61c045952977d2367261"
+              ],
+              "prs": []
+            }
+          },
+          {
+            "id": 8,
+            "title": "Require an owner tag at the Materializer.create/Redaction_store.create type level, not just by convention",
+            "description": "Subtask 4.6 closed the real-world hazard (every actual construction site in this repo now passes ~owner to File_kv_store.create, proven by a real, non-vacuous collision test), but neither Materializer.create nor Redaction_store.create enforces this at the constructor level -- a future caller that forgets ~owner gets silently unprotected, and File_kv_store.create itself cannot detect this (a directory with no marker has nothing to compare against).",
+            "status": "pending",
+            "dependencies": [
+              "4"
+            ],
+            "details": "Found during subtask 4.6's own final whole-branch review and its fix wave; the design spec's Decision 4 text originally (incorrectly) claimed both constructors already required a tag -- corrected in the same commit that fixed the code gap (docs/superpowers/specs/2026-09-24-layer0-followup-hardening-design.md). The two constructors are not symmetric: Materializer.create takes its kv already built through the deliberately backend-agnostic Kv_store_intf.S, which carries no ownership concept at all, so requiring a tag there is a real interface change to that module type. Redaction_store.create is easier to close -- it takes a concrete File_kv_store.t (not an abstracted Kv_store_intf.S), so exposing and checking the store's own owner tag at construction is feasible without touching Kv_store_intf.S at all. Consider closing the Redaction_store half first as the lower-cost win.",
             "testStrategy": ""
           }
         ]
@@ -760,7 +800,7 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-24T08:31:25.382Z",
+      "lastModified": "2026-09-25T09:29:18.937Z",
       "taskCount": 11,
       "completedCount": 2,
       "tags": [
