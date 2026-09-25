@@ -1599,7 +1599,7 @@ let test_no_hook_supplied_is_unaffected () =
 let test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease () =
   (* task-3 DISCREPANCY D2, pinned as a real test rather than only disclosed in prose: the brief
      asserted all four [commit_number <-] sites "only assign when genuinely increasing", which is
-     FALSE. [try_send_sv] (VSR.tla:274's [rep_commit_number' = HighestCommitNumber(r)]) is
+     FALSE. [try_send_sv] (VSR.tla:508's [rep_commit_number' = HighestCommitNumber(r)]) is
      deliberately UNCONDITIONAL and can genuinely LOWER commit_number -- pinned already by
      [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] above, which proves a
      real 1 -> 0 drop. The hook's documented contract is "exactly once per genuine INCREASE", so
@@ -1607,13 +1607,12 @@ let test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease () =
      This test is what makes that enforcement real rather than assumed: it replays that exact
      scenario with a hook attached and requires the decrease to produce NO callback. *)
   let observed = ref [] in
-  let send, sent = capturing_send () in
+  let send, _sent = capturing_send () in
   let t =
     Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send
       ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
       ()
   in
-  ignore sent;
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
   Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
   Alcotest.(check int) "a real Prepare exchange establishes commit_number = 1" 1 (Replica.commit_number t);
@@ -1637,7 +1636,7 @@ let test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease () =
    are individually load-bearing. *)
 
 let test_on_commit_advanced_fires_from_receive_sv () =
-  (* Site 4: [handle_start_view] / ReceiveSV (VSR.tla:298-299), a BACKUP learning commit progress
+  (* Site 4: [handle_start_view] / ReceiveSV (VSR.tla:574-575), a BACKUP learning commit progress
      from the new primary's StartView. Mirrors [test_receive_sv_adopts_log_view_and_returns_to_normal]
      exactly, with a hook attached. *)
   let observed = ref [] in
@@ -1657,7 +1656,7 @@ let test_on_commit_advanced_fires_from_receive_sv () =
   Alcotest.(check (list (pair int int))) "and ReceiveSV's own site fired 1 -> 2" [ (1, 2); (0, 1) ] !observed
 
 let test_on_commit_advanced_fires_from_send_sv_increase () =
-  (* Site 3's POSITIVE case: [try_send_sv] / SendSV (VSR.tla:274). The decrease test above proves
+  (* Site 3's POSITIVE case: [try_send_sv] / SendSV (VSR.tla:508). The decrease test above proves
      the gate suppresses a drop; this proves the gate does not suppress a genuine RISE at the same
      site, so deleting the hook call there is detectable. [Primary(6) = 1 + ((6-1) mod 5) = 1], so
      [my_id = 1] is the primary of view 6. HighestCommitNumber = 2 over the three DVCs, and the
@@ -1681,6 +1680,15 @@ let test_on_commit_advanced_fires_from_send_sv_increase () =
     "a genuine RISE at try_send_sv's own site is reported as one advance, 0 -> 2 (advances are not \
      required to be one-at-a-time -- a consumer must handle a multi-step jump)"
     [ (0, 2) ] !observed
+
+(* The four tests above cover all four commit sites on a replica built by [create]. The FIFTH thing
+   replica.mli promises about this hook -- that [restart] reports nothing retroactively for the
+   [commit_number] it RECOVERS, and that its first callback's [~old_commit] is that recovered value
+   rather than 0 -- cannot be tested from here, because a [create]d replica always starts at
+   [commit_number = 0] and so has no prior progress to retroactively report. It lives with the other
+   CrashRestart coverage instead: see
+   [test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advance] in
+   test_vsr_replica_recovery.ml, which shares that file's [fresh_storage] durable-state helper. *)
 
 let tests =
   [

@@ -311,7 +311,7 @@ type t = {
          [commit_number] in this module and the one place the "exactly once per genuine INCREASE"
          contract documented in replica.mli is enforced. It has to be enforced THERE rather than
          inherited from the call sites: three of the four sites do guard on a strict increase, but
-         [try_send_sv]'s does NOT -- VSR.tla:274's [rep_commit_number' = HighestCommitNumber(r)] is
+         [try_send_sv]'s does NOT -- VSR.tla:508's [rep_commit_number' = HighestCommitNumber(r)] is
          unconditional and genuinely lowers [commit_number] in a real, tested scenario (see
          [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] and
          [test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease] in

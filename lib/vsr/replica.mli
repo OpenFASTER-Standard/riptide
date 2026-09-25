@@ -183,7 +183,7 @@ val create :
     sites — and that distinction is real, not pedantic.} [commit_number] is assigned at four places
     in the implementation. Three of them guard on a strict increase already ([primary_execute_op]'s
     [next = commit_number + 1]; [handle_prepare]'s and {!handle_message}'s [Start_view] path's
-    [if k > commit_number]). The fourth, [SendSV] (VSR.tla:274's
+    [if k > commit_number]). The fourth, [SendSV] (VSR.tla:508's
     [rep_commit_number' = HighestCommitNumber(r)]), is {b deliberately unconditional and can
     genuinely LOWER [commit_number]} — the new primary starts the view from the winning DVC set's
     own maximum, not from its own prior value, and [test_vsr_replica.ml]'s own
@@ -199,7 +199,29 @@ val create :
     [commit_number = 7] from its superblock fires nothing for 1..7, and the first callback that
     replica ever makes is for its next real advance ([~old_commit = 7]). A caller that needs
     restart-time catch-up must read {!commit_number} itself right after construction and seed its
-    own state from it. *)
+    own state from it.
+
+    {b What replica state is settled when the hook fires — [commit_number]/[op_number]/[entries]
+    always, [status]/[view_number]/[last_normal_view] NOT always.} The hook is invoked from the
+    middle of the action that caused the advance, not after it returns, so a consumer that
+    re-enters this replica from inside the callback does not see a uniformly post-action [t]. At
+    all four commit sites, {!commit_number}, {!op_number} and {!entries} are already fully
+    updated and final — reading those from inside the hook is always safe, and is the intended
+    way to use it. But at the two {b view-change-related} sites — [try_send_sv] ([SendSV],
+    VSR.tla:499-516) and [handle_start_view] ([ReceiveSV], VSR.tla:567-578) — the hook fires
+    {b before} the view-change bookkeeping is written: {!status} still reads [View_change] and
+    {!last_normal_view} still holds its old value at both, and at [handle_start_view]
+    additionally {!view_number} still holds the OLD view (at [try_send_sv] the new view was
+    already in place before the action began). All of them are updated a few lines later in the
+    same call, and the view change does complete.
+
+    {b Therefore: never gate work done inside the callback on [status t = Normal] (or on
+    {!view_number} having reached the new view).} The commit advance being reported is real and
+    final regardless of what those fields read, and a consumer that skipped it whenever
+    [status <> Normal] would silently drop exactly the advances a {b follower learns through a
+    view change} — the follower-catch-up case, which is the main reason this hook exists. If a
+    consumer genuinely needs post-action view state, it must do that work after
+    {!propose}/{!handle_message} returns, not inside the hook. *)
 
 val restart :
   ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->

@@ -281,6 +281,65 @@ let test_restart_outside_a_view_change_reconstructs_normal_status () =
   Alcotest.(check int) "op_number survived" 1 (Replica.op_number t');
   Alcotest.(check bool) "log survived" true (Replica.entries t' = [ v "a" ])
 
+(* ---- [restart ?on_commit_advanced]: recovered commit progress is NOT reported retroactively ----
+
+   Fix-round finding F1 (task-3-review.md). [restart] gained its own [?on_commit_advanced] in this
+   task, and replica.mli documents a specific guarantee for it -- "nothing is reported
+   retroactively for the [commit_number] this constructor RECOVERS ... a restart that recovers
+   [commit_number = 7] fires nothing for 1..7, and the first callback that replica ever makes is
+   for its next real advance ([~old_commit = 7])". That was a documented assertion no code checked:
+   the reviewer proved it by hard-wiring [restart]'s own hook to [None] and watching the entire
+   402-test suite still pass. This test is what makes the guarantee real rather than merely
+   written down, and it is the ONLY place the "not retroactive" half can be tested at all -- a
+   fresh [create] always starts at [commit_number = 0], so there is no prior progress there to
+   retroactively report even if the implementation wanted to.
+
+   Both halves matter and neither alone is sufficient:
+     - the ZERO-callbacks assertion would pass vacuously if [restart] dropped the hook entirely;
+     - the SUBSEQUENT-advance assertion is what fails if it does, and it additionally pins the
+       BASELINE ([~old_commit] = the recovered value, not 0), which is the part a consumer seeding
+       a monotonic watermark from this hook actually depends on. *)
+let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advance () =
+  let send, _sent = capturing_send () in
+  let backend, storage = fresh_storage () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  (* Real durable state to recover: [Primary(0) = 3] at [replica_count = 3], so [my_id = 1] is a
+     backup in view 0 and these are ordinary in-view Prepares. The second one's [k = 1] is what
+     commits op 1 (VSR.tla:118's [m.k > @] update), so the pre-crash replica really does reach
+     [commit_number = 1] rather than merely appending. *)
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Alcotest.(check int) "pre-crash: real, non-zero committed progress exists to be recovered" 1
+    (Replica.commit_number t);
+  (* The restart, with a hook attached from the very first instant of this replica's life. *)
+  let observed = ref [] in
+  let send2, _sent2 = capturing_send () in
+  let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
+  let t' =
+    Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2
+      ~on_commit_advanced:(fun ~old_commit ~new_commit -> observed := (old_commit, new_commit) :: !observed)
+      ()
+  in
+  Alcotest.(check int) "the restart really did recover commit_number = 1 from the superblock" 1
+    (Replica.commit_number t');
+  Alcotest.(check (list (pair int int)))
+    "NOT RETROACTIVE: recovering commit_number = 1 fires nothing at all for op 1 -- construction \
+     makes zero callbacks, so a consumer never sees a phantom 0 -> 1 advance for progress that \
+     happened in a previous life"
+    [] !observed;
+  Alcotest.(check bool) "and the restarted replica is Normal, so it can accept a further Prepare" true
+    (Replica.status t' = Replica.Normal);
+  (* One more GENUINE advance on the restarted replica. [k = 2 < n = 3] is well-formed per
+     VSR.tla:106-109's own [m.k < m.n] precondition (handle_prepare rejects [k >= n]), so this
+     commits op 2 and moves commit_number 1 -> 2. *)
+  Replica.handle_message t' (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 2 }));
+  Alcotest.(check int) "the next real advance landed" 2 (Replica.commit_number t');
+  Alcotest.(check (list (pair int int)))
+    "the FIRST callback this restarted replica ever makes is that next real advance, and its \
+     baseline is the RECOVERED commit_number (1), not 0 -- a hook wired only on create would \
+     report nothing here at all"
+    [ (1, 2) ] !observed
+
 (* A restart that DISCOVERS a corrupt slot: the durable op_number (superblock) is what makes the
    slot "corrupt" rather than "absent" after the restart, which is the single property the whole
    nack-soundness argument rests on (VSR.tla:112-147). *)
@@ -1018,6 +1077,10 @@ let tests =
     ( "CrashRestart outside a view change reconstructs Normal",
       `Quick,
       test_restart_outside_a_view_change_reconstructs_normal_status );
+    ( "Fix-round F1: restart's ?on_commit_advanced reports nothing retroactively, then fires on the \
+       next real advance with the RECOVERED baseline",
+      `Quick,
+      test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advance );
     ( "a slot discovered corrupt at restart is still never nacked",
       `Quick,
       test_restart_discovering_a_corrupt_slot_still_refuses_to_nack_it );
