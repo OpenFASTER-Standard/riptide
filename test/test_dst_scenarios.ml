@@ -1092,6 +1092,250 @@ let test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_prog
     true
     (!clock_t > 1.0 *. Float.of_int progress_rounds)
 
+(* ---------------------------------------------------------------------------------------------
+   Test 12 (task-master subtask 3.7, Task 6 of the ring-eviction-watermark plan): RESTART RECOVERY
+   for the ring-eviction materialization watermark needs NO new durable state of its own.
+
+   WHY THIS TEST IS HERE AND NOT IN test_lattice_materialize_crypto_scenarios.ml, where the rest of
+   that mechanism's end-to-end proof lives: that file's own header states, as a deliberate design
+   boundary, that it does no view changes and no restarts, because its harness is hand-rolled (real
+   [Eio_linux] io_uring cannot nest inside the fiber-based [Riptide_dst.Cluster] transport) and
+   because restarts are "exhaustively covered by the prior plan's own Task 11 over this same
+   [Replica.t] code" -- i.e. by this file. Respecting that boundary rather than overriding it means
+   the one piece of Task 6 that needs a real crash-and-come-back lands here, on the harness that
+   already has one ([Riptide_dst.Cluster.run_on_file_storage]'s own [restart], used by tests 1, 2
+   and 8 above).
+
+   WHAT THE DESIGN CLAIMS, and it is a claim worth testing precisely because it is a claim about
+   something NOT existing. The watermark a ring-eviction consumer keeps
+   ({!Riptide_batch_commit.Batch_commit.materialize_up_to}'s own doc: "the caller owns any watermark
+   it wants to keep") is pure in-memory state, and this plan's Decision 2 says a restarted consumer
+   needs no persisted copy of it: it re-primes itself by reading the replica's own recovered
+   {!Riptide_vsr.Replica.commit_number} and re-running [materialize_up_to] once at construction.
+   That is sound only if re-materializing an already-materialized range is genuinely inert, which is
+   a property of the lattice join rather than of any bookkeeping -- so the durable footprint of the
+   whole mechanism stays exactly (a) the replica's own WAL/superblock and (b) the materializer's own
+   KV directory, with nothing new added by restart recovery.
+
+   Both halves are asserted, and the second is the one that makes this more than a re-run of
+   [test_materialize_up_to_is_idempotent] (test_batch_commit_materialize.ml): the materialized value
+   must be IDENTICAL across a real crash-and-come-back of the replica that produced it, AND the
+   materializer's whole on-disk directory must be byte-identical afterwards -- so the claim "no new
+   durable watermark state" is evidence about real bytes on a real disk rather than an argument about
+   what the code appears to write. Non-vacuity is asserted in both directions too: the value must be
+   genuinely non-[bottom] before the restart (otherwise "identical afterwards" is trivially true of
+   two empty accumulators), and the snapshot must be genuinely non-empty.
+
+   WHAT IS DELIBERATELY *NOT* WIRED HERE, stated because it is a real, disclosed gap rather than an
+   oversight: [Riptide_dst.Cluster]'s own [restart] rebuilds a replica with
+   {!Riptide_vsr.Replica.restart} and does not (and has no parameter to) re-attach
+   [?on_commit_advanced], nor does [run_on_file_storage] have a way to pass
+   {!Riptide_storage.File_storage.create}'s [?may_evict] at all. This test needs neither: it drives
+   [materialize_up_to] directly, which is exactly the construction-time re-prime Decision 2
+   specifies, and it is that re-prime -- not the hook -- that restart recovery rests on. Closing
+   that harness gap belongs with a real caller (there is still no [bin/] entrypoint in this repo);
+   see this task's own report. *)
+
+module Lww_materializer =
+  Riptide_materialize.Materializer.Make (Riptide_lattice.Last_write_wins)
+    (Riptide_storage.File_kv_store)
+
+(* The same real codec convention test_materializer.ml and test_batch_commit_materialize.ml already
+   establish for [Last_write_wins]: the lattice value as a two-field [Value.Record], then
+   [Value.canonical_encode]/[canonical_decode] -- this repo's own wire-encoding primitive, not a
+   placeholder and not a new format invented here. Used twice over, exactly as in that file: as the
+   materializer's own KV codec ([string <-> t]) and as the [Value.value -> t] payload decoder
+   {!Riptide_batch_commit.Batch_commit.materialize_sink} needs. *)
+let lww_to_value (w : Riptide_lattice.Last_write_wins.t) =
+  Value.Record [ ("value", w.value); ("timestamp", Value.Scalar (Value.Int w.timestamp)) ]
+
+let lww_of_value = function
+  | Value.Record fields ->
+      let value = List.assoc "value" fields in
+      let timestamp =
+        match List.assoc "timestamp" fields with
+        | Value.Scalar (Value.Int i) -> i
+        | _ -> invalid_arg "Last_write_wins codec: malformed timestamp field"
+      in
+      Riptide_lattice.Last_write_wins.{ value; timestamp }
+  | _ -> invalid_arg "Last_write_wins codec: expected a Record"
+
+(* Every byte of every regular file under [root], keyed by path -- the evidence behind "no new
+   durable state", read off the filesystem directly rather than through the API of the module that
+   wrote it (the same technique test_lattice_materialize_crypto_scenarios.ml's own [raw_bytes_under]
+   uses for its no-plaintext-on-disk property). *)
+let durable_snapshot root =
+  let rec walk acc d =
+    Array.fold_left
+      (fun acc name ->
+        let p = Filename.concat d name in
+        if Sys.is_directory p then walk acc p
+        else begin
+          let ic = open_in_bin p in
+          Fun.protect
+            ~finally:(fun () -> close_in ic)
+            (fun () -> (p, really_input_string ic (in_channel_length ic)) :: acc)
+        end)
+      acc (Sys.readdir d)
+  in
+  List.sort compare (walk [] root)
+
+let test_restart_recovery_needs_no_new_durable_watermark_state () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir @@ fun dir ->
+  with_tmp_dir @@ fun mat_dir ->
+  Eio.Switch.run @@ fun sw ->
+  (* ONE real [File_kv_store]-backed materializer, living in its OWN directory outside every
+     replica's [File_storage] directory, and surviving the restart untouched -- which is what a real
+     crash looks like from its point of view: only in-memory state (the [Replica.t] and the
+     watermark ref) is discarded, everything durable stays. *)
+  let materializer =
+    Lww_materializer.create
+      ~kv:
+        (Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer"
+           mat_dir)
+      ~decode:(fun s -> lww_of_value (Value.canonical_decode s))
+      ~encode:(fun w -> Value.canonical_encode (lww_to_value w))
+  in
+  let sink : Riptide_batch_commit.Batch_commit.materialize_sink =
+    {
+      write =
+        (fun ~merge_key payload ->
+          Lww_materializer.write materializer ~merge_key (lww_of_value payload));
+    }
+  in
+  let merge_key = "mk" in
+  let fingerprint snapshot =
+    List.map
+      (fun (p, s) ->
+        Printf.sprintf "%s:%d:%s" p (String.length s) (Digest.to_hex (Digest.string s)))
+      snapshot
+  in
+  let propose_write replicas ~idempotency_key ~timestamp ~value_str =
+    Riptide_batch_commit.Batch_commit.propose replicas ~idempotency_key
+      [
+        {
+          Riptide_batch_commit.Batch_commit.actor = "actor-1";
+          causation = Value.content_hash (v (idempotency_key ^ "-c"));
+          correlation = Value.content_hash (v (idempotency_key ^ "-r"));
+          payload =
+            lww_to_value { Riptide_lattice.Last_write_wins.value = v value_str; timestamp };
+          merge_key = Some merge_key;
+        };
+      ]
+  in
+  let first : Riptide_lattice.Last_write_wins.t =
+    { value = v "materialized-before-the-crash"; timestamp = 7L }
+  in
+  let second : Riptide_lattice.Last_write_wins.t =
+    { value = v "committed-but-not-yet-materialized"; timestamp = 9L }
+  in
+  Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3
+    (fun ~replicas ~settle ~restart ->
+      (* ---- PART 1: a consumer that was fully CAUGHT UP when it crashed. The brief's own core
+         claim: the value comes back identical, and the re-prime adds nothing durable. ---- *)
+      let watermark = ref 0 in
+      propose_write replicas.(0) ~idempotency_key:"k1" ~timestamp:7L
+        ~value_str:"materialized-before-the-crash";
+      settle ();
+      Alcotest.(check int) "precondition: the batch really did commit across the cluster" 1
+        (Replica.commit_number replicas.(0));
+      (* The pre-crash consumer: drain the committed prefix, record the watermark. No
+         [?on_commit_advanced] is involved -- this test is about the construction-time re-prime
+         Decision 2 specifies, which is what a restart actually depends on. *)
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replicas.(0));
+      watermark := Replica.commit_number replicas.(0);
+      let before_restart = Lww_materializer.read materializer ~merge_key in
+      (* NON-VACUITY, first direction: there is a real, non-bottom materialized value to compare. *)
+      Alcotest.(check bool) "precondition: the write really was materialized before the crash" true
+        (before_restart = first);
+      let snapshot_before = durable_snapshot mat_dir in
+      Alcotest.(check bool) "precondition: the materializer really did put bytes on disk" true
+        (snapshot_before <> []);
+      (* THE CRASH. In-memory [Replica.t] and this test's own watermark ref are both discarded;
+         the durable [File_storage] survives, per [restart]'s own contract. No [~lose_superblock],
+         so this is the ordinary restart every consumer must handle, not finding C1's torn-superblock
+         case (test 8 above owns that one). *)
+      Alcotest.(check bool) "the replica came back from the crash" true (restart 0);
+      Alcotest.(check int) "...and recovered its own committed prefix from its superblock" 1
+        (Replica.commit_number replicas.(0));
+      (* THE WHOLE OF RESTART RECOVERY: a fresh watermark ref, re-primed from the replica's own
+         recovered [commit_number], plus one re-materialize. Nothing is read back from any durable
+         store of the consumer's own, because there is none to read. *)
+      let fresh_watermark = ref 0 in
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replicas.(0));
+      fresh_watermark := Replica.commit_number replicas.(0);
+      let after_restart = Lww_materializer.read materializer ~merge_key in
+      Alcotest.(check bool)
+        "restart recovery converges to the identical materialized value, with no new durable \
+         watermark state"
+        true (before_restart = after_restart);
+      Alcotest.(check int)
+        "the fresh watermark re-primed to exactly its pre-crash value, from the replica's own \
+         recovered commit_number alone"
+        !watermark !fresh_watermark;
+      (* THE "NO NEW DURABLE STATE" HALF, as bytes rather than as an argument: the crash, the
+         restart and the re-materialize together added, removed and changed nothing on disk under
+         the materializer -- so there is no watermark file, no checkpoint, and no bookkeeping entry
+         anywhere for a future change to accidentally start depending on. (The re-materialize does
+         re-[put] the key; that its bytes are identical is the lattice join's idempotence showing up
+         directly in the durable layer.) *)
+      Alcotest.(check (list string))
+        "the materializer's durable directory is byte-identical after the restart and re-prime"
+        (fingerprint snapshot_before)
+        (fingerprint (durable_snapshot mat_dir));
+
+      (* ---- PART 2: a consumer that crashed BEHIND -- which is what makes the re-prime
+         load-bearing rather than decorative, and is the case Part 1 alone cannot distinguish.
+         Part 1's "identical value" holds even if the re-prime were deleted entirely: the
+         materializer is durable, so its READ was always going to return the same bytes. The
+         question restart recovery actually has to answer is what happens to a write that committed
+         durably but whose materialize step the crash interrupted (batch_commit.mli's own
+         crash-between-commit-and-materialize case) -- with no watermark on disk to tell the new
+         process how far it got. ---- *)
+      propose_write replicas.(0) ~idempotency_key:"k2" ~timestamp:9L
+        ~value_str:"committed-but-not-yet-materialized";
+      settle ();
+      Alcotest.(check int) "the second batch committed too" 2 (Replica.commit_number replicas.(0));
+      Alcotest.(check bool)
+        "...and is deliberately NOT materialized yet: this is the crash-between-commit-and-\
+         materialize state, reproduced rather than imagined"
+        true
+        (Lww_materializer.read materializer ~merge_key = first);
+      Alcotest.(check bool) "the second crash-and-come-back also succeeded" true (restart 0);
+      Alcotest.(check int) "...recovering commit_number 2 from its own superblock" 2
+        (Replica.commit_number replicas.(0));
+      (* The identical re-prime as in Part 1 -- same two lines, no extra recovery path -- and it
+         legitimately lands the watermark ABOVE where the previous process left it (2, not 1),
+         precisely because it is derived from the replica rather than from consumer-side state. *)
+      let recovered_watermark = ref 0 in
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replicas.(0));
+      recovered_watermark := Replica.commit_number replicas.(0);
+      Alcotest.(check bool)
+        "the construction-time re-prime alone recovered the committed-but-unmaterialized write"
+        true
+        (Lww_materializer.read materializer ~merge_key = second);
+      Alcotest.(check int)
+        "...and the re-primed watermark legitimately sits ABOVE the crashed process's own last \
+         value, being derived from the replica's commit_number and nothing else"
+        2 !recovered_watermark;
+      Alcotest.(check bool) "...which is strictly ahead of where the crashed consumer had got to"
+        true
+        (!recovered_watermark > !fresh_watermark);
+      (* And the re-prime is still inert once it has caught up: running it a second time changes
+         no byte on disk. This is the "no new durable state" claim taken around a re-prime that is
+         genuinely a no-op, which is the only place the claim is falsifiable. *)
+      let snapshot_caught_up = durable_snapshot mat_dir in
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Replica.commit_number replicas.(0));
+      Alcotest.(check (list string))
+        "a second, redundant re-prime writes no new durable state at all"
+        (fingerprint snapshot_caught_up)
+        (fingerprint (durable_snapshot mat_dir)))
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -1122,4 +1366,7 @@ let tests =
     ( "settle's wall-clock budget (subtask 3.8) tolerates unbounded real time between deliveries \
        while the cluster keeps genuinely progressing", `Quick,
       test_settle_loop_tolerates_unbounded_real_time_between_deliveries_while_progressing );
+    ( "subtask 3.7: the ring-eviction materialization watermark survives a real crash-and-come-back \
+       with no durable state of its own", `Slow,
+      test_restart_recovery_needs_no_new_durable_watermark_state );
   ]

@@ -868,6 +868,580 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
     (G_set.elements (M.read materializers.(0) ~merge_key:"mk"))
 
 (* ---------------------------------------------------------------------------------------------
+   SUBTASK 3.7's GENERAL CASE, WIRED END TO END (Task 6 of the ring-eviction-watermark plan).
+
+   WHAT WAS STILL OPEN, and it is a narrow, precise gap rather than a vague one. Task 4 of the
+   PREVIOUS plan (test_batch_commit_materialize.ml's own
+   [test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal]) already closed the
+   SCOPED case: a SOLO ([replica_count = 1], [f = 0]) replica, where {!Batch_commit.propose} itself
+   commits synchronously, so the very call that commits a [merge_key] write also materializes it --
+   strictly before any LATER [propose] on that same replica could evict its slot. That argument does
+   not survive contact with a real cluster, for a reason stated in batch_commit.mli's own [propose]
+   doc: at [replica_count >= 3] nothing commits synchronously, and a FOLLOWER never calls [propose]
+   at all. A follower learns a commit purely by receiving the next [Prepare], appends under a ring
+   that evicts [op_number - ring_capacity] on every append, and had nothing whatsoever driving its
+   own materializer. Every ingredient of silent loss was present with no fault injected: committed,
+   quorum-acknowledged, [merge_key]-carrying data destroyed on a follower's disk having never
+   reached that follower's accumulator.
+
+   WHAT CLOSES IT, and this is the whole of Task 6 -- three real mechanisms from Tasks 3-5 composed,
+   with nothing new added to [lib/]:
+
+   - {!Riptide_vsr.Replica.create}'s [?on_commit_advanced] (Task 3) fires synchronously and inline
+     at every genuine commit advance, INCLUDING the one a follower learns from a piggybacked
+     [Prepare] inside {!Riptide_vsr.Replica.handle_message}. That is the trigger a follower never
+     had.
+   - {!Riptide_batch_commit.Batch_commit.materialize_up_to} (Task 5) drains a replica's own
+     committed prefix into its own materializer, needing no writes in hand and no [propose] call.
+   - {!Riptide_storage.File_storage.create}'s [?may_evict] (Task 4) turns "materialization fell
+     behind" from silent loss into refusable backpressure, counted as [eviction_blocked] in
+     {!Riptide_vsr.Replica.append_refusals}.
+
+   The watermark closure below is the whole wiring, per replica, and it is deliberately ALL there is
+   to it: [on_commit_advanced] materializes through the new commit number and records it;
+   [may_evict] permits an eviction iff the evicted op-number is at or below that recorded number, or
+   never asked for materialization's protection in the first place. That closure is what a real
+   caller would write; there is still no [bin/] entrypoint in this repo, which is why it lives here
+   (this plan's own explicit non-goal).
+
+   HOW THIS SCENARIO DIFFERS FROM THE SWEEP ABOVE, deliberately:
+   - Every materializer here is fed EXCLUSIVELY by its own [?on_commit_advanced] hook. Nothing below
+     ever passes [~materialize] to {!Batch_commit.propose}, and [propose] is only ever called on the
+     primary -- so a follower's accumulator being correct is proof the hook fired on its own, off
+     [handle_message] processing a piggybacked commit, with no external call anywhere.
+   - No injected storage or network faults at all. A missing entry must have exactly one possible
+     explanation, and under faults there is always an innocent one (the sweep above is where faults
+     belong). The ring itself is the adversary here, and [ring_capacity = 4] makes it a very
+     effective one.
+   - The ring is deliberately TINY, where [test_sweep_against_real_file_storage] above deliberately
+     sets [ring_capacity] far above its op count so eviction is not what it measures. Here eviction
+     is the entire subject.
+
+   THE ONE RE-ENTRANCY THIS RELIES ON, stated because it is load-bearing: [may_evict] is consulted
+   from inside [wal_append], i.e. from inside the replica's own [handle_prepare]/[propose] action,
+   and it calls {!Batch_commit.write_at_op_number_has_merge_key} which reads
+   {!Riptide_vsr.Replica.entries} back. That is safe for the op-numbers it is ever asked about:
+   [entries] is a pure read of the in-memory log, the asked-about op-number is [ring_capacity]
+   behind the one being appended, and replica.mli's own hook-time settledness note confirms
+   [entries]/[op_number]/[commit_number] are always final when re-entered this way. What it is NOT
+   safe against is [adopt_durable_log]'s truncate-then-re-append repair window (replica.ml's own
+   [durable_append] comment says as much, and warns that a [?may_evict] predicate must stay
+   permissive enough not to starve adoption traffic) -- which this file already excludes by its own
+   stated scope: no view changes, no restarts. Restart recovery for this same mechanism is covered
+   in test_dst_scenarios.ml, where the harness that has restarts lives.
+   --------------------------------------------------------------------------------------------- *)
+
+(* Which pieces of the closure are wired, so the non-vacuity controls are permanent RUNNING tests
+   rather than an experiment someone once did by hand and wrote down. [Full] is the mechanism;
+   the other two are the two worlds it replaced, each still reachable and each asserted to exhibit
+   exactly the damage [Full] prevents. *)
+type watermark_wiring =
+  | Full  (** [?on_commit_advanced] and [?may_evict] both wired -- the mechanism under test. *)
+  | Hook_disabled
+      (** [?may_evict] wired, [?on_commit_advanced] NOT. The gate with nothing to relent it: every
+          watermark stays at 0 forever, so the first eviction of a [merge_key] entry is refused and
+          the log can never grow past [ring_capacity]. Nothing is LOST, but nothing progresses
+          either -- which is what makes the hook, not the gate, the part that closes 3.7. *)
+  | Ungated
+      (** Neither wired: the pre-subtask-3.7 world, byte-for-byte (file_storage.mli: omitting
+          [?may_evict] "preserves this module's exact pre-existing behavior"). This is the variant
+          that genuinely LOSES committed, acknowledged, [merge_key]-carrying data. *)
+
+let wm_ring_capacity = 4
+
+(* Op-numbers whose single write carries [merge_key = None]. They are the "existing, disclosed
+   boundary" assertion 3 is about (batch_commit.mli's own [write] doc: [None] leaves a write exactly
+   as evictable as before this mechanism existed), and their placement is CHOSEN, not incidental:
+   op 8 is what the stalled follower below is asked about while its watermark sits at 7, so its
+   eviction is permitted by the merge_key half of the predicate ALONE, with the watermark half
+   failing. Without an entry in exactly that position, assertion 3 would only ever observe
+   no-merge_key evictions that the watermark half would have permitted anyway -- true, but no
+   evidence about the second half at all. *)
+let wm_no_merge_key_ops = [ 4; 8 ]
+let wm_has_merge_key n = not (List.mem n wm_no_merge_key_ops)
+let wm_merge_key = "mk-watermark"
+let wm_value n = Printf.sprintf "v%d" n
+
+(* Deliberately a value that WOULD show up in the accumulator if a no-merge_key write were ever
+   materialized: the G-set's join is union, so a bug that folded one in is directly visible in the
+   same assertion that checks the expected contents, rather than needing its own. *)
+let wm_unmaterialized_value n = Printf.sprintf "NEVER-MATERIALIZED-v%d" n
+
+(* Every question [?may_evict] was ever asked, with the watermark AS IT WAS at that moment -- which
+   is what makes the two halves of the predicate distinguishable after the fact. Without
+   [ask_watermark] recorded, a permitted eviction is ambiguous between "already materialized" and
+   "never claimed materialization", and assertion 3 is exactly the claim that it was the second. *)
+type evict_ask = { ask_replica : int; ask_op_number : int; ask_watermark : int; ask_verdict : bool }
+
+type wm_ctx = {
+  wm_replicas : Replica.t array;
+  wm_storages : File_storage.t array;
+  wm_materializers : M.t array;
+  wm_watermarks : int ref array;  (** each replica's OWN watermark -- never shared *)
+  wm_stalled : bool ref array;
+      (** A materialize sink that cannot keep up, modelled as the hook declining to drain rather
+          than as a raising sink. The distinction is forced by the real code, not a softening:
+          [?on_commit_advanced] is invoked inline from the middle of [handle_prepare], and nothing
+          in [Replica] catches an exception out of it (replica.mli says the hook runs on the
+          caller's own stack, exactly like [send]), so a raising sink would tear the protocol action
+          in half and escape [handle_message] -- which is a statement about an ill-behaved consumer,
+          not about materialization lag. A hook that simply does not advance its watermark is what a
+          genuinely backlogged consumer looks like from the ring's point of view, and it is the
+          state [?may_evict] exists to make safe. *)
+  wm_asks : evict_ask list ref;
+  wm_propose : int -> unit;  (** propose op-number [n]'s batch, on the primary, with no sink *)
+  wm_deliver : unit -> unit;
+  wm_clear_stall : int -> unit;
+      (** The backlog clearing: drain everything this replica holds committed and republish the
+          watermark -- exactly what the hook itself does, which is the point. *)
+}
+
+let refusal_count r name =
+  try List.assoc name (Replica.append_refusals r) with Not_found -> 0
+
+let wm_expected_accumulator ~through =
+  G_set.of_list
+    (List.filter_map
+       (fun n -> if wm_has_merge_key n then Some (wm_value n) else None)
+       (List.init (max through 0) (fun i -> i + 1)))
+
+(* THE WIRING CLOSURE (Step 1), built per replica over its own real [File_storage] ring, its own
+   real on-disk [Materializer], and its own watermark. Nothing is shared across replicas except the
+   in-process message queue. *)
+let with_watermark_cluster ~env ~sw ~wiring f =
+  let fs = Eio.Stdenv.fs env in
+  let wal_root = make_tmp_dir "riptide_wm_wal" in
+  let mat_root = make_tmp_dir "riptide_wm_mat" in
+  Fun.protect
+    ~finally:(fun () ->
+      rm_rf wal_root;
+      rm_rf mat_root)
+  @@ fun () ->
+  let inflight : (int * string) Queue.t = Queue.create () in
+  let asks = ref [] in
+  let watermarks = Array.init replica_count (fun _ -> ref 0) in
+  let stalled = Array.init replica_count (fun _ -> ref false) in
+  let materializers =
+    Array.init replica_count (fun i ->
+        let d = Filename.concat mat_root (string_of_int i) in
+        Unix.mkdir d 0o700;
+        make_materializer ~sw ~fs d)
+  in
+  let sinks = Array.map mat_sink materializers in
+  (* The knot: [?may_evict] is handed to [File_storage.create], which must exist BEFORE the
+     [Replica.t] that both the predicate and the hook need to read back. A per-replica slot resolves
+     it in the only direction that is actually safe -- the predicate is consulted only from inside
+     an append, and no append can happen before the replica exists. *)
+  let slots = Array.init replica_count (fun _ -> ref None) in
+  let storages =
+    Array.init replica_count (fun i ->
+        let d = Filename.concat wal_root (string_of_int i) in
+        Unix.mkdir d 0o700;
+        let may_evict =
+          match wiring with
+          | Ungated -> None
+          | Full | Hook_disabled ->
+            Some
+              (fun ~op_number ->
+                let watermark = !(watermarks.(i)) in
+                let verdict =
+                  match !(slots.(i)) with
+                  | None -> true (* unreachable: nothing appends before the replica exists *)
+                  | Some r ->
+                    op_number <= watermark
+                    || not (Batch_commit.write_at_op_number_has_merge_key r ~op_number)
+                in
+                asks :=
+                  { ask_replica = i; ask_op_number = op_number; ask_watermark = watermark;
+                    ask_verdict = verdict }
+                  :: !asks;
+                verdict)
+        in
+        File_storage.create ~sw ~fs ~ring_capacity:wm_ring_capacity ?may_evict d)
+  in
+  let replicas =
+    Array.init replica_count (fun i ->
+        let on_commit_advanced =
+          match wiring with
+          | Hook_disabled | Ungated -> None
+          | Full ->
+            Some
+              (fun ~old_commit:_ ~new_commit ->
+                if not !(stalled.(i)) then
+                  match !(slots.(i)) with
+                  | None -> () (* unreachable: the hook is never invoked retroactively at create *)
+                  | Some r ->
+                    Batch_commit.materialize_up_to r ~materialize:sinks.(i)
+                      ~through_commit_number:new_commit;
+                    watermarks.(i) := new_commit)
+        in
+        let r =
+          Replica.create ?on_commit_advanced
+            ~storage:(Replica.storage_of_module (module File_storage) storages.(i))
+            ~my_id:(i + 1) ~replica_count ~svc_limit:3
+            ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight)
+            ()
+        in
+        slots.(i) := Some r;
+        (* DECISION 2's restart-recovery mechanism, run at construction on every replica: a
+           freshly-built consumer re-materializes its replica's already-recovered committed prefix
+           and seeds its watermark from [commit_number], because replica.mli states plainly that
+           the hook is "not invoked retroactively" and a restart-time consumer must read
+           [commit_number] itself. On a fresh replica that prefix is empty and this is a no-op --
+           asserted rather than assumed by the caller below, which is the only honest way to claim
+           the mechanism is safe to run unconditionally at every construction. *)
+        Batch_commit.materialize_up_to r ~materialize:sinks.(i)
+          ~through_commit_number:(Replica.commit_number r);
+        watermarks.(i) := Replica.commit_number r;
+        r)
+  in
+  (* Same view pin, for the same reason, as every other cluster harness in this file. *)
+  Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
+  let deliver () =
+    while not (Queue.is_empty inflight) do
+      let to_, bytes = Queue.pop inflight in
+      Replica.handle_message replicas.(to_ - 1) bytes
+    done
+  in
+  let propose n =
+    let payload, merge_key =
+      if wm_has_merge_key n then (G_set.to_value (G_set.of_list [ wm_value n ]), Some wm_merge_key)
+      else (G_set.to_value (G_set.of_list [ wm_unmaterialized_value n ]), None)
+    in
+    (* No [~materialize] anywhere, ever, and only ever against the primary: every accumulator below
+       is populated exclusively by [?on_commit_advanced]. *)
+    Batch_commit.propose replicas.(0)
+      ~idempotency_key:(Printf.sprintf "k%d" n)
+      [ write_of ?merge_key payload ]
+  in
+  let clear_stall i =
+    stalled.(i) := false;
+    Batch_commit.materialize_up_to replicas.(i) ~materialize:sinks.(i)
+      ~through_commit_number:(Replica.commit_number replicas.(i));
+    watermarks.(i) := Replica.commit_number replicas.(i)
+  in
+  f
+    {
+      wm_replicas = replicas;
+      wm_storages = storages;
+      wm_materializers = materializers;
+      wm_watermarks = watermarks;
+      wm_stalled = stalled;
+      wm_asks = asks;
+      wm_propose = propose;
+      wm_deliver = deliver;
+      wm_clear_stall = clear_stall;
+    }
+
+(* Every replica's accumulator must always be exactly the [merge_key] writes of ops
+   [1 .. its own watermark] -- the single invariant the whole closure exists to maintain, and
+   strictly stronger than "the evicted entry survived": it catches a MISSING contribution, an EXTRA
+   one (a no-merge_key payload folded in, a write materialized past the watermark it was recorded
+   at), and any divergence between two replicas that reached the same watermark. *)
+let wm_check_accumulators ~phase ctx =
+  Array.iteri
+    (fun i m ->
+      let expected = wm_expected_accumulator ~through:!(ctx.wm_watermarks.(i)) in
+      Alcotest.(check (list string))
+        (Printf.sprintf "[%s] replica %d's accumulator is exactly the merge_key writes through its \
+                         own watermark %d"
+           phase (i + 1) !(ctx.wm_watermarks.(i)))
+        (G_set.elements expected)
+        (G_set.elements (M.read m ~merge_key:wm_merge_key)))
+    ctx.wm_materializers
+
+let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  with_watermark_cluster ~env ~sw ~wiring:Full @@ fun ctx ->
+  let primary = ctx.wm_replicas.(0) in
+  let follower = 1 in
+  (* Step 1's own claim, asserted rather than assumed: the construction-time re-materialize every
+     replica just ran is a safe no-op on a fresh replica. *)
+  Array.iteri
+    (fun i r ->
+      Alcotest.(check int) (Printf.sprintf "replica %d starts at commit_number 0" (i + 1)) 0
+        (Replica.commit_number r);
+      Alcotest.(check int) "...and at watermark 0" 0 !(ctx.wm_watermarks.(i));
+      Alcotest.(check (list string))
+        "...and the construction-time re-materialize folded nothing in" []
+        (G_set.elements (M.read ctx.wm_materializers.(i) ~merge_key:wm_merge_key)))
+    ctx.wm_replicas;
+  Alcotest.(check int) "...and [?may_evict] has not been consulted at all yet" 0
+    (List.length !(ctx.wm_asks));
+
+  (* ---- PHASE A: run the ring right past its capacity, with everything healthy ---- *)
+  for n = 1 to 8 do
+    ctx.wm_propose n;
+    ctx.wm_deliver ()
+  done;
+  Alcotest.(check int) "the primary committed all 8 batches" 8 (Replica.commit_number primary);
+  (* A follower learns commit [n-1] from the [Prepare] carrying op [n] (there is no Commit message
+     in this VSR subset), so it necessarily trails the primary by exactly one here. *)
+  Alcotest.(check int) "every follower learned commit 7 from the last Prepare it processed" 7
+    !(ctx.wm_watermarks.(follower));
+  wm_check_accumulators ~phase:"phase-A" ctx;
+
+  (* ASSERTION 1: the ring genuinely evicted -- and it is the FOLLOWER's own durable slot, not the
+     primary's, that matters here. Op 1..4's slots were physically overwritten by ops 5..8. *)
+  Array.iteri
+    (fun i s ->
+      for op_number = 1 to 4 do
+        Alcotest.(check bool)
+          (Printf.sprintf "replica %d's ring genuinely evicted op %d" (i + 1) op_number)
+          true
+          (File_storage.wal_read s ~op_number = None)
+      done)
+    ctx.wm_storages;
+  Alcotest.(check bool) "...and the follower's own replica-level durable read agrees" true
+    (Replica.for_test_wal_read ctx.wm_replicas.(follower) ~op_number:1 = None);
+  Alcotest.(check bool) "...while the four most recent slots are all still readable" true
+    (Array.for_all
+       (fun s ->
+         List.for_all (fun op_number -> File_storage.wal_read s ~op_number <> None) [ 5; 6; 7; 8 ])
+       ctx.wm_storages);
+
+  (* ASSERTION 2: the evicted entry's contribution survives, on the FOLLOWER, converged -- with no
+     [propose ~materialize] and no [materialize_up_to] ever called against that follower by this
+     test. The only thing that could have put it there is its own [?on_commit_advanced] hook firing
+     off [handle_message]. *)
+  Alcotest.(check bool)
+    "the follower's accumulator still holds op 1's contribution, whose durable slot is gone" true
+    (List.mem (wm_value 1) (G_set.elements (M.read ctx.wm_materializers.(follower) ~merge_key:wm_merge_key)));
+  for i = 1 to replica_count - 1 do
+    Alcotest.(check (list string))
+      (Printf.sprintf "replica %d converged to the same accumulator as replica 2" (i + 1))
+      (G_set.elements (M.read ctx.wm_materializers.(1) ~merge_key:wm_merge_key))
+      (G_set.elements (M.read ctx.wm_materializers.(i) ~merge_key:wm_merge_key))
+  done;
+
+  (* ASSERTION 3, first half: no-merge_key writes are in the run and are genuinely evicted, and none
+     of them ever caused a refusal. Their payloads must also appear in no accumulator at all. *)
+  Alcotest.(check int) "no eviction has been refused anywhere yet" 0
+    (Array.fold_left (fun acc r -> acc + refusal_count r "eviction_blocked") 0 ctx.wm_replicas);
+  Alcotest.(check bool) "[?may_evict] was genuinely consulted, repeatedly (not a vacuous gate)" true
+    (List.length !(ctx.wm_asks) >= 4 * replica_count);
+  Array.iteri
+    (fun i m ->
+      let elements = G_set.elements (M.read m ~merge_key:wm_merge_key) in
+      Alcotest.(check bool)
+        (Printf.sprintf "replica %d never materialized a no-merge_key payload" (i + 1))
+        false
+        (List.exists
+           (fun n -> List.mem (wm_unmaterialized_value n) elements)
+           wm_no_merge_key_ops))
+    ctx.wm_materializers;
+
+  (* ---- PHASE B: one follower's materialize sink stalls, and its watermark falls behind ---- *)
+  let blocked_before = refusal_count ctx.wm_replicas.(follower) "eviction_blocked" in
+  ctx.wm_stalled.(follower) := true;
+  let watermark_at_stall = !(ctx.wm_watermarks.(follower)) in
+  Alcotest.(check int) "the stall begins with the follower's watermark at 7" 7 watermark_at_stall;
+  for n = 9 to 13 do
+    ctx.wm_propose n;
+    ctx.wm_deliver ()
+  done;
+  Alcotest.(check int) "the stalled follower's watermark genuinely froze" watermark_at_stall
+    !(ctx.wm_watermarks.(follower));
+  Alcotest.(check int) "...while the cluster kept committing without it (3 of 5 is a quorum)" 13
+    (Replica.commit_number primary);
+  wm_check_accumulators ~phase:"phase-B-backlog" ctx;
+
+  (* ASSERTION 4(b): the promoted refusal counter genuinely rises, on exactly the replica whose
+     materialization fell behind and nowhere else -- replica.mli's own "intended production use" for
+     it. Exactly ONE refusal, and that is a property of the protocol rather than a coincidence:
+     [handle_prepare]'s refusal is a total no-op, so this follower's [op_number] never advances to
+     13, and every later [Prepare] is dropped by the [n = op_number + 1] ordering guard BEFORE the
+     backend is reached at all. Asserting the exact value pins that, where [>= 1] would not. *)
+  Alcotest.(check int) "the stalled follower refused exactly one eviction" (blocked_before + 1)
+    (refusal_count ctx.wm_replicas.(follower) "eviction_blocked");
+  Array.iteri
+    (fun i r ->
+      if i <> follower then
+        Alcotest.(check int)
+          (Printf.sprintf "replica %d, whose materialization kept up, refused nothing" (i + 1))
+          0
+          (refusal_count r "eviction_blocked"))
+    ctx.wm_replicas;
+  (* And no OTHER refusal shape anywhere: no fault injector in this scenario, no oversized entry,
+     and (because a refusal stops this follower appending rather than leaving a rewritten hole) no
+     out-of-sequence append either. A non-zero count in any of these would mean this scenario is
+     measuring something other than eviction. *)
+  Array.iteri
+    (fun i r ->
+      List.iter
+        (fun name ->
+          Alcotest.(check int)
+            (Printf.sprintf "replica %d recorded no %s refusal" (i + 1) name)
+            0 (refusal_count r name))
+        [ "fault_injection_cap"; "entry_rejected"; "out_of_sequence" ])
+    ctx.wm_replicas;
+
+  (* ASSERTION 4(a), first half: NOTHING WAS LOST. The entry the refusal protected (op 9, a
+     merge_key write this follower has committed but not yet materialized) is still durably
+     readable on its own disk -- while the very same op-number has ALREADY been evicted on every
+     replica that did materialize it. Same op, same ring, same capacity: retained exactly where it
+     was still needed, reclaimed exactly where it was not. *)
+  Alcotest.(check bool) "op 9 is still durably readable on the stalled follower" true
+    (File_storage.wal_read ctx.wm_storages.(follower) ~op_number:9 <> None);
+  Alcotest.(check bool)
+    "...and op 9 has NOT yet been materialized there (which is precisely why it is still there)"
+    false
+    (List.mem (wm_value 9)
+       (G_set.elements (M.read ctx.wm_materializers.(follower) ~merge_key:wm_merge_key)));
+  Array.iteri
+    (fun i s ->
+      if i <> follower then
+        Alcotest.(check bool)
+          (Printf.sprintf "op 9 WAS evicted on replica %d, which had already materialized it"
+             (i + 1))
+          true
+          (File_storage.wal_read s ~op_number:9 = None))
+    ctx.wm_storages;
+
+  (* ASSERTION 3, second half -- the part that needs the stall to be observable at all. During the
+     backlog the predicate was asked about op 8, a NO-merge_key entry, with the watermark at 7: the
+     watermark half of the predicate said no and the eviction went ahead anyway, purely because that
+     write never claimed materialization's protection. That is the disclosed boundary proven intact
+     under exactly the conditions that would refuse a protected entry, rather than under conditions
+     where the watermark would have permitted it regardless. *)
+  let asks = !(ctx.wm_asks) in
+  Alcotest.(check bool)
+    "a no-merge_key entry ABOVE the watermark was still freely evicted (the disclosed boundary is \
+     untouched by the new gate)"
+    true
+    (List.exists
+       (fun a ->
+         a.ask_verdict && (not (wm_has_merge_key a.ask_op_number))
+         && a.ask_op_number > a.ask_watermark)
+       asks);
+  Alcotest.(check bool)
+    "...and NO no-merge_key entry was ever refused, on any replica, at any watermark" true
+    (List.for_all (fun a -> a.ask_verdict || wm_has_merge_key a.ask_op_number) asks);
+  Alcotest.(check bool)
+    "...while every refusal there was concerned a merge_key entry above that replica's watermark"
+    true
+    (List.for_all
+       (fun a -> a.ask_verdict || (wm_has_merge_key a.ask_op_number && a.ask_op_number > a.ask_watermark))
+       asks);
+
+  (* ASSERTION 4(a), second half: the backlog clears, and the write that was held durable
+     materializes. This is the same drain the hook itself performs -- the owner re-reads its own
+     committed prefix and republishes its watermark. *)
+  ctx.wm_clear_stall follower;
+  Alcotest.(check int) "the cleared follower's watermark caught up to its own commit_number"
+    (Replica.commit_number ctx.wm_replicas.(follower))
+    !(ctx.wm_watermarks.(follower));
+  Alcotest.(check bool) "op 9 -- durable throughout the backlog -- is now materialized" true
+    (List.mem (wm_value 9)
+       (G_set.elements (M.read ctx.wm_materializers.(follower) ~merge_key:wm_merge_key)));
+  wm_check_accumulators ~phase:"backlog-cleared" ctx;
+
+  (* ---- PHASE C: the cluster keeps working afterwards ---- *)
+  let blocked_after_clearing =
+    Array.fold_left (fun acc r -> acc + refusal_count r "eviction_blocked") 0 ctx.wm_replicas
+  in
+  for n = 14 to 15 do
+    ctx.wm_propose n;
+    ctx.wm_deliver ()
+  done;
+  Alcotest.(check int) "the cluster committed the later batches too" 15
+    (Replica.commit_number primary);
+  Alcotest.(check int) "and refused no further eviction anywhere" blocked_after_clearing
+    (Array.fold_left (fun acc r -> acc + refusal_count r "eviction_blocked") 0 ctx.wm_replicas);
+  wm_check_accumulators ~phase:"phase-C" ctx;
+  (* The replica that refused an append stays behind until a [Start_view] repairs its durable hole
+     (replica.mli's [out_of_sequence]/[op_number] docs) -- deliberately NOT exercised here, since
+     this file excludes view changes by its own stated scope. What matters for THIS mechanism is
+     that being behind costs liveness on that one replica and nothing else: no lost data, and the
+     four replicas that kept up still agree exactly. *)
+  Alcotest.(check bool) "the follower that refused an append is genuinely behind the others" true
+    (Replica.commit_number ctx.wm_replicas.(follower) < Replica.commit_number primary);
+  for i = 2 to replica_count - 1 do
+    Alcotest.(check (list string))
+      (Printf.sprintf "replicas 3 and %d, both caught up, hold identical accumulators" (i + 1))
+      (G_set.elements (M.read ctx.wm_materializers.(2) ~merge_key:wm_merge_key))
+      (G_set.elements (M.read ctx.wm_materializers.(i) ~merge_key:wm_merge_key))
+  done
+
+(* ASSERTION 5, NON-VACUITY, as two permanent running controls rather than an experiment.
+
+   This whole plan's established discipline is to prove a test discriminates by making the defect
+   reappear, not by reasoning that it would. Both controls below run the SAME workload as phase A
+   above through the SAME harness, with one piece of the closure removed each, and assert the exact
+   damage that piece prevents. If [test_a_followers_ring_eviction_is_gated_by_its_own_watermark]
+   above ever becomes vacuous, these two are what still fail.
+
+   [Ungated] is the one that matters most: it is the pre-subtask-3.7 world exactly (file_storage.mli
+   guarantees omitting [?may_evict] is byte-identical to the old behaviour), and it loses committed,
+   quorum-acknowledged, merge_key-carrying data on every replica at once with no fault injected. *)
+
+let test_without_the_watermark_hook_the_same_scenario_loses_the_entry () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  with_watermark_cluster ~env ~sw ~wiring:Ungated @@ fun ctx ->
+  for n = 1 to 8 do
+    ctx.wm_propose n;
+    ctx.wm_deliver ()
+  done;
+  Alcotest.(check int) "the cluster committed all 8 batches, exactly as in the gated run" 8
+    (Replica.commit_number ctx.wm_replicas.(0));
+  (* THE LOSS, in both places at once: op 1 was a committed, acknowledged merge_key write, and it is
+     now durably readable on NO replica and present in NO accumulator. Nothing raised, nothing was
+     counted, and the cluster looks perfectly healthy. *)
+  Alcotest.(check bool)
+    "with neither the hook nor the gate, op 1's durable slot is gone on EVERY replica" true
+    (Array.for_all (fun s -> File_storage.wal_read s ~op_number:1 = None) ctx.wm_storages);
+  Array.iteri
+    (fun i m ->
+      Alcotest.(check (list string))
+        (Printf.sprintf "...and replica %d's accumulator never received it (nothing drove it)"
+           (i + 1))
+        []
+        (G_set.elements (M.read m ~merge_key:wm_merge_key)))
+    ctx.wm_materializers;
+  Alcotest.(check int) "...and not one eviction was refused, because nothing was asked" 0
+    (Array.fold_left (fun acc r -> acc + refusal_count r "eviction_blocked") 0 ctx.wm_replicas);
+  Alcotest.(check int) "...indeed [?may_evict] was never consulted at all" 0
+    (List.length !(ctx.wm_asks))
+
+let test_the_gate_without_the_hook_is_a_brake_rather_than_a_mechanism () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  with_watermark_cluster ~env ~sw ~wiring:Hook_disabled @@ fun ctx ->
+  for n = 1 to 8 do
+    ctx.wm_propose n;
+    ctx.wm_deliver ()
+  done;
+  (* With no hook, every watermark stays at 0 forever, so the FIRST eviction of a merge_key entry is
+     refused -- on the primary, inside its own [propose], before any [Prepare] is ever sent. The log
+     therefore stops dead at [ring_capacity]. *)
+  Alcotest.(check int) "the log never grew past the ring's capacity" wm_ring_capacity
+    (Replica.op_number ctx.wm_replicas.(0));
+  Alcotest.(check int) "...and commit stopped there too" wm_ring_capacity
+    (Replica.commit_number ctx.wm_replicas.(0));
+  Alcotest.(check bool) "the primary refused every later proposal's append" true
+    (refusal_count ctx.wm_replicas.(0) "eviction_blocked" >= 1);
+  (* Nothing is LOST -- that is what the gate buys, and it is a real improvement over [Ungated]
+     above. But nothing is materialized either, so the committed prefix is protected by a promise
+     no consumer is keeping. The hook is what makes the gate relent, which is why Task 6 needs both
+     and why this file's main test wires both. *)
+  Alcotest.(check bool) "every committed entry is still durably readable (nothing was lost)" true
+    (Array.for_all
+       (fun s ->
+         List.for_all
+           (fun op_number -> File_storage.wal_read s ~op_number <> None)
+           [ 1; 2; 3; 4 ])
+       ctx.wm_storages);
+  Array.iteri
+    (fun i m ->
+      Alcotest.(check (list string))
+        (Printf.sprintf "replica %d materialized nothing, having no hook to do it" (i + 1))
+        []
+        (G_set.elements (M.read m ~merge_key:wm_merge_key)))
+    ctx.wm_materializers
+
+(* ---------------------------------------------------------------------------------------------
    PROPERTY (d), THE WIRE HALF: a real mutually-authenticated TLS connection, with the raw TCP
    bytes captured between the two peers.
 
@@ -1361,6 +1935,15 @@ let tests =
       ("the same scenario against the real on-disk ring WAL", `Slow, test_sweep_against_real_file_storage);
       ("a primary-side storage fault halts materialization exactly with commit", `Quick,
        test_a_primary_storage_fault_halts_materialization_exactly_with_commit);
+      ("subtask 3.7's general case: a FOLLOWER's ring eviction is gated by its own materialization \
+        watermark, driven only by ?on_commit_advanced", `Slow,
+       test_a_followers_ring_eviction_is_gated_by_its_own_watermark);
+      ("...and without either piece, the same scenario genuinely loses the committed entry \
+        (non-vacuity control)", `Slow,
+       test_without_the_watermark_hook_the_same_scenario_loses_the_entry);
+      ("...while ?may_evict without the hook only brakes: nothing lost, nothing materialized, the \
+        log stops at ring_capacity (non-vacuity control)", `Slow,
+       test_the_gate_without_the_hook_is_a_brake_rather_than_a_mechanism);
       ("no plaintext on a real mutually-authenticated TLS wire", `Slow, test_no_plaintext_on_a_real_mtls_wire);
       ("materialization is a function of the committed log, not of the caller's argument", `Quick,
        test_materialization_is_a_function_of_the_committed_log);
