@@ -823,7 +823,9 @@ git commit -m "batch_commit: materialize_up_to -- a range-based generalization o
 
 **Files:**
 - Test: `test/test_lattice_materialize_crypto_scenarios.ml` (extend, reusing this file's own real
-  5-replica adversarial harness conventions)
+  5-replica adversarial harness conventions — Steps 1-2)
+- Test: `test/test_dst_scenarios.ml` (extend, for restart-recovery specifically — Step 3; see the
+  pre-flight-scan correction below for why this is a separate file from Steps 1-2)
 
 **Interfaces:**
 - Consumes: `Riptide_vsr.Replica.create`'s `?on_commit_advanced` (Task 3), `File_storage.create`'s
@@ -901,31 +903,93 @@ Required assertions, matching this plan's own Review Focus:
    task's own `?on_commit_advanced` wiring (or construct a variant harness with it removed) and
    confirm the same scenario now genuinely loses the entry — proving the test has real power to
    catch the exact regression this task closes — then confirm it passes with the wiring in place.
-6. **Restart recovery, matching this plan's own Review Focus item 3 explicitly.** Using
-   `Cluster.run_on_file_storage`'s real `restart` callback (confirmed real from this file's own
-   existing use elsewhere in the just-merged plan's own Task 9 work — read its actual signature,
-   `?lose_superblock:bool -> int -> bool`, before writing this), restart one follower replica
-   mid-scenario (after it has committed and materialized at least one `merge_key`-carrying write,
-   but before the run ends): the restart discards its in-memory `Replica.t` and `watermark` ref
-   entirely, but its durable `File_storage`/materializer `File_kv_store` directories survive.
-   Reattach it with a fresh `Replica.t` over the same durable backend, wire the same
-   `?on_commit_advanced`/`?may_evict` closures with a fresh `watermark := 0`, and perform this
-   task's own construction-time `materialize_up_to ... ~through_commit_number:(commit_number
-   replica)` call. Assert the restarted replica's materializer converges to the *exact same* value
-   for that `merge_key` as a sibling replica that never restarted — proving restart recovery
-   genuinely requires no new durable watermark state, not merely asserting that it doesn't.
+**Pre-flight-scan correction, made before this task was ever dispatched:** the plan's own original
+draft assumed `test_lattice_materialize_crypto_scenarios.ml` uses `Cluster.run_on_file_storage` and
+has a real `restart` callback available. Verified false by reading the file's own top comment: its
+harness is deliberately **hand-rolled**, not built on `Riptide_dst.Cluster.run`/
+`run_on_file_storage` at all (real fiber-based `Cluster` transport can't nest with the real
+`Eio_linux`/io_uring backend every durable piece here needs), and the same comment states
+outright, as a deliberate design boundary: *"No view changes and no restarts. Both are
+exhaustively covered by the prior plan's own Task 11 over this same `Replica.t` code"* — meaning
+`test_dst_scenarios.ml`, not this file. Restart-recovery coverage (Review Focus item 3) is Step 3
+below, in that other file, respecting this file's own stated scope rather than overriding it.
 
-- [ ] **Step 3: Run to verify pass, and run the whole suite repeatedly**
+- [ ] **Step 3: Restart recovery — a separate, minimal addition to `test_dst_scenarios.ml`**
 
-Run: `dune clean && dune build && dune test --force`, at least 3 times, confirming stability (this
-task sits directly on top of Task 1's own determinism fix — if this new multi-replica test is
-itself flaky, investigate whether it's hitting a genuinely new mechanism before concluding it's
-done, rather than assuming Task 1 already covers it).
+Matching this plan's own Review Focus item 3 explicitly, and using the real, already-existing
+`restart` capability this file's own harness provides (`Riptide_dst.Cluster.run_on_file_storage`'s
+`restart:(?lose_superblock:bool -> int -> bool)` argument to its own `body` callback — read the
+real, current file's own existing use of `restart` first, e.g. around `test_dst_scenarios.ml:251-280`'s
+`scenario`/`maybe_restart`, to match its conventions rather than inventing new ones).
+
+Read `test_dst_scenarios.ml`'s real, current file in full for its own construction pattern before
+writing this addition — it does not have a per-replica `Materializer`/`File_kv_store` already
+wired (unlike `test_lattice_materialize_crypto_scenarios.ml`), so this test builds a small, real
+one just for itself, reusing Tasks 3/4/5's own real interfaces:
+
+```ocaml
+let test_restart_recovery_needs_no_new_durable_watermark_state () =
+  Eio_main.run @@ fun env ->
+  let dir = make_tmp_dir "riptide_watermark_restart_test" in
+  let mat_dir = make_tmp_dir "riptide_watermark_restart_materializer" in
+  Fun.protect ~finally:(fun () -> rm_rf dir; rm_rf mat_dir) @@ fun () ->
+  (* Build one real File_kv_store-backed Materializer(Last_write_wins) surviving across the
+     restart -- it lives in mat_dir, outside the replica's own File_storage directory, and is
+     NOT torn down when the replica restarts (only the in-memory Replica.t and watermark ref
+     are discarded, matching a real crash: everything durable survives). *)
+  Eio.Switch.run @@ fun sw ->
+  let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) mat_dir in
+  let module M = Riptide_materialize.Materializer.Make (Riptide_lattice.Last_write_wins) (Riptide_storage.File_kv_store) in
+  let materializer = M.create ~kv ~decode:(* this repo's own real Last_write_wins codec, matching
+    test_materializer.ml's/test_batch_commit_materialize.ml's already-established real pattern --
+    read one of those files before writing this, don't invent a new codec *) ~encode:(* same *) in
+  let sink = { Riptide_batch_commit.Batch_commit.write = (fun ~merge_key v -> M.write materializer ~merge_key (decode v)) } in
+  Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3
+    (fun ~replicas ~settle ~restart ->
+      let watermark = ref 0 in
+      (* Propose one merge_key-carrying write on the primary and let it commit across the
+         cluster, materializing it via this task's own real Task 5 function. *)
+      Riptide_batch_commit.Batch_commit.propose replicas.(0) ~idempotency_key:"k1"
+        [ (* one real write with merge_key = Some "mk", using this repo's own established
+             write-construction helper -- read test_batch_commit_materialize.ml's real pattern *) ];
+      settle ();
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Riptide_vsr.Replica.commit_number replicas.(0));
+      watermark := Riptide_vsr.Replica.commit_number replicas.(0);
+      let before_restart = M.read materializer ~merge_key:"mk" in
+      (* Crash and restart replica 0 -- in-memory Replica.t and this test's own watermark ref
+         are both discarded; durable File_storage survives, per restart's own real contract. *)
+      ignore (restart 0);
+      (* Simulate reattaching the SAME materializer (a real crash would restart the whole
+         process; here, discard only what the design says restart discards -- a fresh watermark
+         ref, re-primed via the construction-time re-materialize call this plan's Decision 2
+         specifies) without tearing down the on-disk materializer directory itself. *)
+      let fresh_watermark = ref 0 in
+      Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
+        ~through_commit_number:(Riptide_vsr.Replica.commit_number replicas.(0));
+      fresh_watermark := Riptide_vsr.Replica.commit_number replicas.(0);
+      let after_restart = M.read materializer ~merge_key:"mk" in
+      Alcotest.(check bool) "restart recovery converges to the identical materialized value, with no new durable watermark state" true
+        (before_restart = after_restart))
+```
+
+Resolve the write-construction/codec placeholders against the real, current
+`test_batch_commit_materialize.ml`/`test_materializer.ml` conventions before finalizing — this
+sketch shows the required shape and assertion, not unfamiliar helper names to transcribe verbatim.
+
+- [ ] **Step 4: Run to verify pass, and run the whole suite repeatedly**
+
+Run: `dune clean && dune build && dune test --force`, at least 3 times, confirming stability (Step
+2's new multi-replica scenario sits on `test_lattice_materialize_crypto_scenarios.ml`'s own
+existing, real harness, unaffected by Task 1's `cluster.ml` fix since that file doesn't use
+`Cluster`; Step 3's new restart test sits directly on both Task 1's fix and `test_dst_scenarios.ml`'s
+own harness — if either new test is flaky, investigate whether it's hitting a genuinely new
+mechanism before concluding it's done).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add test/test_lattice_materialize_crypto_scenarios.ml
+git add test/test_lattice_materialize_crypto_scenarios.ml test/test_dst_scenarios.ml
 git commit -m "test: wire the general multi-replica ring-eviction watermark end to end, closing subtask 3.7"
 ```
 
