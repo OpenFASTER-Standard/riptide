@@ -67,7 +67,15 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     open are both closed. *)
 
 val owner : t -> string
-(** [owner t] is the tag [t] was constructed with, i.e. [t]'s own [create] call's [~owner]
+(** Restates {!Kv_store_intf.S.owner}'s own spec with this backend's more specific detail below;
+    the [include Kv_store_intf.S] above already brings in a [val owner : t -> string] of its own,
+    and this local declaration shadows it (silently -- OCaml gives no error or warning for a
+    local [val] overriding a same-named included one), so it is this doc comment, not the
+    [include], that actually constrains [owner]'s contract here. Keep the two in agreement by
+    hand; a divergence would only surface indirectly, e.g. at a
+    [Materializer.Make(...)(File_kv_store)] application site.
+
+    [owner t] is the tag [t] was constructed with, i.e. [t]'s own [create] call's [~owner]
     argument -- what the marker file actually holds on disk, whether that [create] confirmed an
     existing marker or wrote a fresh one.
 

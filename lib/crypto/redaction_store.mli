@@ -77,9 +77,9 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap:
 
     @raise Invalid_argument if [kv]'s own owner (as {!Riptide_storage.File_kv_store.owner} reports
-      it) is not [Some owner_tag] -- i.e. [kv] was built with a different [~owner], or with no
-      [~owner] at all -- before this function returns a usable [t] and before either consumer can
-      touch the shared directory's data.
+      it) is not [owner_tag] -- i.e. [kv] was built with a different [~owner] -- before this
+      function returns a usable [t] and before either consumer can touch the shared directory's
+      data.
 
     A later task (following subtask 4.8) closed the one gap that used to remain here: previously,
     a SECOND consumer -- one that never goes through this function, e.g. a

@@ -1919,8 +1919,9 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
   with_tmp_dir @@ fun shared_dir ->
   Eio.Switch.run @@ fun sw ->
   let fs = Eio.Stdenv.fs env in
-  (* ONE directory, two consumers -- exactly what redaction_store.mli warns callers not to do
-     without opting into [?owner]. This test opts in on the keystore side. *)
+  (* ONE directory, two consumers -- exactly what redaction_store.mli warns callers not to do,
+     each with its own mandatory [~owner] tag: the keystore side here, and [make_materializer]'s
+     [File_kv_store.create] call on the materializer side. *)
   let store =
     Redaction_store.create
       ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir)
