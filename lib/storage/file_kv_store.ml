@@ -81,7 +81,7 @@ type t = {
   sw : Eio.Switch.t;
   fs : Eio.Fs.dir_ty Eio.Path.t;
   dir_path : string;
-  owner : string option;
+  owner : string;
 }
 
 (* Same single alignment used uniformly for both header and data regions as [File_storage]
@@ -314,9 +314,8 @@ let durable_read t path =
 let owner_marker_name = ".riptide-kv-owner"
 
 (* Enforces that at most one distinct [owner] tag ever claims [dir_path], across every [create] of
-   it for the lifetime of the directory. A no-op when [owner] is [None] -- deliberately: see this
-   file's [.mli] on [create]'s [?owner] for why an opt-out caller is not this function's
-   responsibility to protect from itself.
+   it for the lifetime of the directory. [owner] is mandatory (see this file's [.mli] on
+   [create]'s [~owner]), so every call here has a real tag to check or write.
 
    Same "try the operation, catch [Eio.Io]" discipline this file's own top comment already
    documents for every other existence check, since the installed Eio 0.12's [Path] has no
@@ -327,33 +326,30 @@ let owner_marker_name = ".riptide-kv-owner"
    first". [Eio.Path.load]/[Eio.Path.save] themselves are both confirmed real, current functions
    in the installed Eio 0.12 ([path.mli]) -- [save ~create:(`Exclusive perm)] confirmed via
    [fs.ml]'s own [type create] variant. *)
-let check_or_write_owner_marker ~fs ~dir_path owner =
-  match owner with
-  | None -> ()
-  | Some tag -> (
-    let marker_path = Eio.Path.(fs / dir_path / owner_marker_name) in
-    match Eio.Path.load marker_path with
-    | existing ->
-      if not (String.equal existing tag) then
-        invalid_arg
-          (Printf.sprintf "File_kv_store.create: %s is owned by %S, not %S" dir_path existing tag)
-    | exception Eio.Io _ -> Eio.Path.save ~create:(`Exclusive 0o600) marker_path tag)
+let check_or_write_owner_marker ~fs ~dir_path tag =
+  let marker_path = Eio.Path.(fs / dir_path / owner_marker_name) in
+  match Eio.Path.load marker_path with
+  | existing ->
+    if not (String.equal existing tag) then
+      invalid_arg
+        (Printf.sprintf "File_kv_store.create: %s is owned by %S, not %S" dir_path existing tag)
+  | exception Eio.Io _ -> Eio.Path.save ~create:(`Exclusive 0o600) marker_path tag
 
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
    top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
    owner-marker check runs strictly after this, since it needs [dir_path] to already exist (an
    [Eio.Path.save] into a nonexistent directory would itself raise [Eio.Io], indistinguishable
    from this module's own "no marker yet" case, if the two were reordered). *)
-let create ~sw ~fs ?owner dir_path =
+let create ~sw ~fs ~owner dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   check_or_write_owner_marker ~fs ~dir_path owner;
   { sw; fs; dir_path; owner }
 
-(* [check_or_write_owner_marker] above is a no-op for [None] and, for [Some tag], either confirms
-   [tag] against the existing on-disk marker or writes a fresh one holding exactly [tag] -- it
-   never resolves or hands back a tag of its own. So by the time [create] returns without raising,
-   [owner] (the caller-supplied argument itself) IS what the marker file now holds: [t.owner] below
-   is that same argument, not a re-read of the marker, but the two are guaranteed to agree. *)
+(* [check_or_write_owner_marker] above either confirms [owner] against the existing on-disk marker
+   or writes a fresh one holding exactly [owner] -- it never resolves or hands back a tag of its
+   own. So by the time [create] returns without raising, [owner] (the caller-supplied argument
+   itself) IS what the marker file now holds: [t.owner] below is that same argument, not a re-read
+   of the marker, but the two are guaranteed to agree. *)
 let owner t = t.owner
 
 let get t ~key = durable_read t (path_for t ~key)

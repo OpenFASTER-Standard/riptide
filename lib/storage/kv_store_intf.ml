@@ -4,6 +4,10 @@
 module type S = sig
   type t
 
+  val owner : t -> string
+  (** The tag this store was constructed with. Every implementer must have one; a backend with no
+      real ownership/collision-risk concept can return a fixed placeholder. *)
+
   val get : t -> key:string -> string option
   (** [None] if the key was never put, was deleted, or its stored value is
       corrupt (checksum mismatch) — the same "cannot distinguish never-written

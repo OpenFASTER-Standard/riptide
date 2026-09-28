@@ -32,7 +32,7 @@ let test_put_then_get () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"foo" "bar";
       Alcotest.(check (option string)) "read back" (Some "bar") (File_kv_store.get t ~key:"foo"))
 
@@ -40,7 +40,7 @@ let test_get_of_never_put_key_is_none () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       Alcotest.(check (option string)) "never put" None (File_kv_store.get t ~key:"nope"))
 
 let test_delete_is_durable_across_reopen () =
@@ -49,11 +49,11 @@ let test_delete_is_durable_across_reopen () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
        File_kv_store.put t ~key:"secret" "shhh";
        File_kv_store.delete t ~key:"secret");
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       Alcotest.(check (option string)) "deleted key stays gone after reopen" None
         (File_kv_store.get t2 ~key:"secret"))
 
@@ -61,7 +61,7 @@ let test_put_overwrites () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"k" "v1";
       File_kv_store.put t ~key:"k" "v2";
       Alcotest.(check (option string)) "overwritten" (Some "v2") (File_kv_store.get t ~key:"k"))
@@ -86,7 +86,7 @@ let test_put_overwrite_leaves_no_leftover_tmp_file () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"k" "v1";
       File_kv_store.put t ~key:"k" "v2";
       Alcotest.(check bool) "no leftover temp file after rename" false
@@ -106,7 +106,7 @@ let test_interrupted_overwrite_leaves_old_value_intact () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"k" "original";
       let oc = open_out_bin (tmp_path_for dir "k") in
       output_string oc "garbage-partial-write-left-by-a-simulated-crash";
@@ -151,10 +151,10 @@ let test_put_is_durable_across_reopen () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       (Eio.Switch.run @@ fun sw ->
-       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
        File_kv_store.put t ~key:"wrapped-dek" "ciphertext-key-material");
       Eio.Switch.run @@ fun sw ->
-      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
+      let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       Alcotest.(check (option string))
         "put value is still there after a full close and reopen"
         (Some "ciphertext-key-material")
@@ -226,12 +226,13 @@ let test_put_and_delete_both_fsync_the_directory () =
     "delete still fsyncs the containing directory too" true
     (contains ~needle:"fsync_dir t" delete_body)
 
-(* -- Subtask 4.6: [create]'s [?owner] closes a confirmed, real data-destruction bug -- sharing one
+(* -- Subtask 4.6: [create]'s [~owner] closes a confirmed, real data-destruction bug -- sharing one
    [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator silently
    corrupts data (three distinct ways, pinned by
-   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test). These three
-   tests cover: a real mismatch is rejected loudly at construction, a matching owner reopens
-   exactly as before, and omitting [owner] entirely leaves every pre-existing caller unaffected. *)
+   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test). These tests
+   cover: a real mismatch is rejected loudly at construction, and a matching owner reopens exactly
+   as before. Ownership is mandatory (a later task), so there is no "omitting [owner] leaves a
+   caller unaffected" state left to cover -- that state no longer compiles. *)
 
 let test_owner_mismatch_is_rejected_at_construction () =
   Eio_main.run @@ fun env ->
@@ -258,39 +259,20 @@ let test_matching_owner_reopens_cleanly () =
       Alcotest.(check (option string)) "the same-owner reopen sees the same data" (Some "v")
         (File_kv_store.get t2 ~key:"k"))
 
-let test_no_owner_supplied_is_unaffected () =
-  (* Backward compatibility: every existing test/caller that omits [~owner] must see zero
-     behavior change -- this is just an ordinary put/get round trip with no [~owner] argument at
-     all, confirming [create] still works exactly as before this task. *)
-  Eio_main.run @@ fun env ->
-  with_tmp_dir (fun dir ->
-      Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
-      File_kv_store.put t ~key:"k" "v";
-      Alcotest.(check (option string)) "put/get with no owner tag still works" (Some "v")
-        (File_kv_store.get t ~key:"k"))
-
 (* -- Subtask 4.8's [File_kv_store] half: [owner] must read back the exact construction-time tag
    the marker mechanism above resolved -- not merely echo the argument uninspected, though for
-   this backend those two happen to coincide (see [check_or_write_owner_marker]: it is a no-op
-   for [None], and for [Some tag] either matches the existing marker or writes a fresh one with
-   exactly [tag], so reaching [create]'s return means [tag] IS what's now on disk). This is what
-   [Redaction_store.create] (subtask 4.8's other half) verifies against below. *)
+   this backend those two happen to coincide (see [check_or_write_owner_marker]: it either matches
+   the existing marker or writes a fresh one with exactly [tag], so reaching [create]'s return
+   means [tag] IS what's now on disk). This is what [Redaction_store.create] (subtask 4.8's other
+   half) verifies against below. *)
 
 let test_owner_reads_back_the_tag_used_at_construction () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"a-real-tag" dir in
-      Alcotest.(check (option string)) "owner reads back the construction-time tag" (Some "a-real-tag")
+      Alcotest.(check string) "owner reads back the construction-time tag" "a-real-tag"
         (File_kv_store.owner t))
-
-let test_owner_is_none_when_no_tag_was_supplied () =
-  Eio_main.run @@ fun env ->
-  with_tmp_dir (fun dir ->
-      Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
-      Alcotest.(check (option string)) "no tag supplied reads back as None" None (File_kv_store.owner t))
 
 let tests =
   [
@@ -308,9 +290,6 @@ let tests =
     ("owner mismatch is rejected at construction", `Quick,
       test_owner_mismatch_is_rejected_at_construction);
     ("matching owner reopens cleanly", `Quick, test_matching_owner_reopens_cleanly);
-    ("no owner supplied is unaffected (backward compatibility)", `Quick,
-      test_no_owner_supplied_is_unaffected);
     ("owner reads back the tag used at construction", `Quick,
       test_owner_reads_back_the_tag_used_at_construction);
-    ("owner is None when no tag was supplied", `Quick, test_owner_is_none_when_no_tag_was_supplied);
   ]

@@ -148,8 +148,11 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
    with its own [owner_tag], not just document the convention every real call site already
    follows. Closes the residual gap left open by subtask 4.6/the layer0-followup-hardening plan:
    this function receives an already-built [kv], so [File_kv_store.create]'s own owner-marker
-   guard only protects a caller of THIS function if that caller opted in -- these two tests pin
-   that [create] now enforces it directly, rather than trusting the caller. *)
+   guard only protects a caller of THIS function if that caller opted in -- this test pins that
+   [create] now enforces it directly, rather than trusting the caller. (A companion test used to
+   also cover an untagged [kv] -- [~owner] omitted entirely -- but that state stopped being
+   constructible once [File_kv_store.create]'s own [~owner] became mandatory, so it was removed
+   rather than adapted.) *)
 
 let test_create_rejects_a_kv_tagged_for_a_different_owner () =
   Eio_main.run @@ fun env ->
@@ -162,18 +165,6 @@ let test_create_rejects_a_kv_tagged_for_a_different_owner () =
       Alcotest.check_raises "a kv tagged for a different owner is rejected at construction"
         (Invalid_argument
            (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S" "some-other-owner"
-              Redaction_store.owner_tag))
-        (fun () -> ignore (Redaction_store.create ~kv ~kek)))
-
-let test_create_rejects_an_untagged_kv () =
-  Eio_main.run @@ fun env ->
-  with_tmp_dir (fun dir ->
-      Eio.Switch.run @@ fun sw ->
-      let kv = Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) dir in
-      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
-      Alcotest.check_raises "an untagged kv is rejected at construction"
-        (Invalid_argument
-           (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S" "(none)"
               Redaction_store.owner_tag))
         (fun () -> ignore (Redaction_store.create ~kv ~kek)))
 
@@ -540,7 +531,6 @@ let tests =
     ( "create rejects a kv tagged for a different owner",
       `Quick,
       test_create_rejects_a_kv_tagged_for_a_different_owner );
-    ("create rejects an untagged kv", `Quick, test_create_rejects_an_untagged_kv);
     ("decrypt of tampered ciphertext is None", `Quick, test_decrypt_of_tampered_ciphertext_is_none);
     ("Kek.load reads a well-formed file", `Quick, test_kek_load_reads_a_well_formed_file);
     ("Kek.load on a missing file raises", `Quick, test_kek_load_missing_file_raises);

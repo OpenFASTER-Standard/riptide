@@ -9,11 +9,9 @@ let owner_tag = "redaction-keystore"
 
 let create ~kv ~kek =
   let actual = Riptide_storage.File_kv_store.owner kv in
-  if actual <> Some owner_tag then
+  if actual <> owner_tag then
     invalid_arg
-      (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S"
-         (Option.value actual ~default:"(none)")
-         owner_tag);
+      (Printf.sprintf "Redaction_store.create: kv is owned by %S, expected %S" actual owner_tag);
   { kv; kek }
 
 (* The DEK's raw bytes, encrypted under the KEK with the record's own event_id bound in as GCM

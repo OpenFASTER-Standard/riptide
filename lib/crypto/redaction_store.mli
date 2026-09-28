@@ -81,25 +81,20 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
       [~owner] at all -- before this function returns a usable [t] and before either consumer can
       touch the shared directory's data.
 
-    This still cannot protect a directory that a SECOND consumer -- one that never goes through
-    this function, e.g. a {!Riptide_materialize.Materializer} built directly over the same
-    [dir_path] -- points its own {!Riptide_storage.File_kv_store.create} at without passing
-    [~owner] at all. That call's own [check_or_write_owner_marker] is a no-op for [None]
-    regardless of what marker, if any, already sits on disk from this side (which, after subtask
-    4.8, is now unconditionally [owner_tag]) -- so one missing [~owner] on the OTHER consumer's
-    side, alone, is now enough for the collision to still happen; the redaction-store side no
-    longer needs to cooperate in the omission the way subtask 4.6 alone would have required. The
-    three outcomes below still apply in full to that remaining, narrower case:
+    A later task (following subtask 4.8) closed the one gap that used to remain here: previously,
+    a SECOND consumer -- one that never goes through this function, e.g. a
+    {!Riptide_materialize.Materializer} built directly over the same [dir_path] -- could point its
+    own {!Riptide_storage.File_kv_store.create} at the shared directory without passing [~owner]
+    at all, and that omission alone was enough to defeat the guard regardless of how carefully
+    this side was tagged. {!Riptide_storage.File_kv_store.create}'s [~owner] is now mandatory, not
+    optional, so that state is no longer constructible: any [File_kv_store.create], from any
+    consumer, requires a real owner tag, and a directory can no longer be pointed at without one.
 
     All three consequences below were reproduced live, and were pinned by
     [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) as the
     ordinary, no-[~owner]-on-either-side case; that test now proves subtask 4.6's
-    construction-time rejection for an opted-in pair instead, plus (subtask 4.8) that a
-    correctly-tagged keystore alone is not sufficient -- the residual negative control there keeps
-    the keystore side correctly tagged (this function no longer allows otherwise) and omits
-    [~owner] only on the materializer side, which is why what follows is a description of what
-    still happens when the OTHER side skips [~owner], not something this function's own check can
-    reach:
+    construction-time rejection for an opted-in pair instead. They are retained here as a record of
+    what construction-time rejection replaced, not as a residual gap:
 
     - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
       materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse
