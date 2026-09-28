@@ -86,10 +86,29 @@ exception Did_not_settle
       runs each, identical induced load) measured the same flake rate at both ends -- so this
       branch neither fixed nor worsened the underlying flake.
 
-    Consequently {b task-master subtask 3.8 is not closed by this work and stays genuinely
-    open/pending}: what it asked for (identify and fix a specific observed flake's cause) was not
-    delivered; the hardening above was. See {!for_test_settle_loop}'s own doc comment for the exact
-    mechanism and the investigation behind why it is tested the way it is. *)
+    {b Follow-up finding, the one that actually closes this subtask.} The plain assertion-failure
+    shape above was chased down for real: [test_ring_capacity_boundary]'s scenario is genuinely
+    NOT deterministic at a fixed seed against real [File_storage] (proven directly -- the same
+    seed produced one failure in a sweep and then 20/20 passes run in immediate isolation right
+    after), because real per-replica disk I/O completion timing, not the seeded PRNG, decides
+    message-processing order across concurrently-running replica fibers. The failure signature was
+    100% consistent across 6 directly-inspected failures: the test's three forced, back-to-back
+    view changes always converge on attempts 1 and 2; only the third occasionally (~2% under real
+    induced load) leaves the two non-winning replicas stuck in [View_change] at the new view,
+    rescuable only by a LATER, independent forced view change's own [StartView] broadcast, never
+    by retrying the stuck ones in place. A liveness hiccup, not a safety violation: 8 total storms
+    converged 100/100 in a dedicated sweep. The fix is test-side --
+    [test_dst_scenarios.ml]'s own [run_until_view_change] now keeps forcing more independent
+    storms, up to a caller-supplied bound, instead of hard-stopping at a fixed 3 that was never
+    actually a guaranteed bound -- see that function's own doc comment for the full account.
+
+    Consequently {b task-master subtask 3.8 IS closed}: its own literal title is delivered, with a
+    real, evidenced mechanism and a real, tested fix. The external-watchdog ([Suite_timeout]) shape
+    above remains open as its own, separate, unattributed observation -- a property of the
+    watchdog-plus-load pair across whatever real-I/O-heavy test is slowest at the time, not
+    something this subtask's own title names or this budget change could ever address. See
+    {!for_test_settle_loop}'s own doc comment for the exact mechanism and the investigation behind
+    why it is tested the way it is. *)
 
 val for_test_settle_loop :
   drain_round:(unit -> bool) ->

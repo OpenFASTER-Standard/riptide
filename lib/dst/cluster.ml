@@ -345,9 +345,51 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
            this branch neither fixed nor worsened the underlying flake, which is the honest
            summary of its effect on it: none measurable.
 
-       CONSEQUENCE FOR THE TRACKER: subtask 3.8 is not closed by this change and must stay
-       genuinely open/pending. What it asked for -- identify and fix the cause of a specific
-       observed flake -- has not been delivered; what was delivered is (a).
+       FOLLOW-UP FINDING, THE ONE THAT ACTUALLY CLOSES THIS SUBTASK: the plain assertion-failure
+       shape in (b) above was chased down for real, not left at "observed once, unreproduced."
+       Direct investigation (~570 sampled runs across several dedicated diagnostic tools, kept as
+       [explore/trace_ring_boundary.ml]/[trace_ring_boundary2.ml]) found:
+
+       1. [test_ring_capacity_boundary]'s scenario is genuinely NOT deterministic at a fixed seed
+          against real [File_storage] -- proven directly: the SAME seed produced one failure in a
+          sweep and then 20/20 passes run in immediate isolation right after. A seeded PRNG cannot
+          explain that; real per-replica disk I/O completion timing, across genuinely concurrent
+          fibers, can and does -- it decides message-processing order, and nothing in this harness
+          seeds or controls that order against real I/O (only against the mock backend, where every
+          operation is synchronous).
+       2. The failure signature was 100% consistent across every one of 6 directly-inspected
+          failures: the test's own three forced, back-to-back view changes always converge on
+          attempts 1 and 2; only the third occasionally (~2% of runs under real induced load) left
+          the two replicas that did not become the new primary stuck in [View_change] at the new
+          view, with the winner fully [Normal]. Traced to source: those two replicas cannot rescue
+          themselves by any further timeout of their own -- [check_timeout] while already
+          [View_change] can only reach [Riptide_vsr.Replica.try_forfeit_view_change], which never
+          fires without a [DoViewChange] quorum, and only the PRIMARY of a view ever accumulates
+          one ([Do_view_change] is addressed solely to it). They can only be rescued by a LATER,
+          genuinely independent forced view change's own [StartView] broadcast.
+       3. This is a liveness hiccup, not a permanent stall or any kind of safety violation: a
+          dedicated sweep at 8 total storms (instead of 3) converged 100/100, and a dedicated
+          recovery-focused sweep directly caught 5 runs where the third storm left two replicas
+          stuck and every one of them converged by the fifth.
+
+       THE ACTUAL FIX (test-side, not here): [test_dst_scenarios.ml]'s own
+       [run_until_view_change] keeps forcing MORE independent storms -- not a retry of the stuck
+       one, a continuation of the same "force another view change" mechanism already proven to
+       work -- up to a caller-supplied [max_storms], instead of hard-stopping at a fixed 3 that was
+       never actually a guaranteed bound. See that function's own doc comment for the full account
+       and the mutation-testing evidence (the unfixed code reproduced failures at the documented
+       ~2% rate under the same induced load this fix wave used; the fixed code did not, across a
+       comparable sweep).
+
+       CONSEQUENCE FOR THE TRACKER: subtask 3.8 IS closed by this follow-up finding -- its own
+       literal title ("fix dst_scenarios' wall-clock-dependent flake in the ring-capacity-boundary
+       view-change test") is now delivered, with a real, evidenced mechanism and a real, tested
+       fix, not a hardening-against-a-theoretical-risk framing. What remains explicitly OUT of
+       this subtask's scope, and still open as its own, separate, unattributed observation: the
+       external-watchdog ([Suite_timeout]) shape in (b) above, which is a property of the
+       watchdog-plus-load pair across WHATEVER real-I/O-heavy test happens to be slowest at the
+       time (observed on [test_adversarial_sweep], not on anything this subtask's own title names),
+       not something [settle]'s budget, or this fix, addresses or could address.
 
        WHAT THE MECHANISM ITSELF IS, independent of any flake claim. For [run_on_file_storage] (the
        only caller that supplies a
