@@ -149,6 +149,7 @@ let mat_sink materializer : Batch_commit.materialize_sink =
 let make_materializer ~sw ~fs dir =
   M.create
     ~kv:(File_kv_store.create ~sw ~fs ~owner:"materializer" dir)
+    ~owner:"materializer"
     ~decode:(fun s -> G_set.of_value (Riptide.Value.canonical_decode s))
     ~encode:(fun g -> Riptide.Value.canonical_encode (G_set.to_value g))
 

@@ -1333,6 +1333,7 @@ let make_lww_materializer ~env ~sw dir =
     Lww_materializer.create
       ~kv:
         (Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)
+      ~owner:"materializer"
       ~decode:(fun s -> lww_of_value (Value.canonical_decode s))
       ~encode:(fun w -> Value.canonical_encode (lww_to_value w))
   in

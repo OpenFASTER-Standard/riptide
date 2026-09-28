@@ -87,7 +87,7 @@ let test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal () 
           in
           let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
           let materializer =
-            M.create ~kv
+            M.create ~kv ~owner:"materializer"
               ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
               ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
           in
@@ -159,7 +159,7 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
           in
           let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
           let materializer =
-            M.create ~kv
+            M.create ~kv ~owner:"materializer"
               ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
               ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
           in
@@ -256,7 +256,7 @@ let propose_one_write replica ~idempotency_key ~merge_key ~timestamp ~value_str 
 
 let make_materializer kv_dir env sw =
   let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
-  M.create ~kv
+  M.create ~kv ~owner:"materializer"
     ~decode:(fun s -> lww_of_value (Riptide.Value.canonical_decode s))
     ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
 

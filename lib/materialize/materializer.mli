@@ -3,22 +3,32 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
   (** Incremental, lattice-based accumulator over a durable key-value store. Each [merge_key]
       holds the join of all values ever written to it via {!write}. *)
 
-  val create : kv:KV.t -> decode:(string -> L.t) -> encode:(L.t -> string) -> t
-  (** [create ~kv ~decode ~encode] creates a materializer backed by [kv], with [decode]/[encode]
-      for round-tripping the lattice type [L.t] to/from the store's string value format.
-      Durably folds all future [write] calls to the same [merge_key] into a single, live
-      accumulator — the join of all values ever seen, regardless of call order.
+  val create : kv:KV.t -> owner:string -> decode:(string -> L.t) -> encode:(L.t -> string) -> t
+  (** [create ~kv ~owner ~decode ~encode] creates a materializer backed by [kv], with
+      [decode]/[encode] for round-tripping the lattice type [L.t] to/from the store's string
+      value format. Durably folds all future [write] calls to the same [merge_key] into a single,
+      live accumulator — the join of all values ever seen, regardless of call order.
 
       {b [kv] is received already built, never constructed here.} This functor is generic over
-      {!Riptide_storage.Kv_store_intf.S}, which is deliberately backend-agnostic and carries no
-      notion of directory ownership at all (see that module type's own comment) -- so subtask
-      4.6's construction-time exclusive-ownership guard against a real, confirmed hazard (an
-      accumulator sharing its directory with a {!Riptide_crypto.Redaction_store} keystore
-      silently destroys the keystore's data; see that module's own [.mli] for the full account)
-      lives entirely in {!Riptide_storage.File_kv_store.create}'s [?owner], at the point where
-      the caller builds the [kv] passed in here, not in this function. A caller backing a
-      materializer with {!Riptide_storage.File_kv_store} should pass its own distinct
-      [~owner] tag (e.g. ["materializer"]) to that [create] call to get the protection. *)
+      {!Riptide_storage.Kv_store_intf.S}, which every implementer of that module type gives a real
+      [owner] accessor (backends with no genuine ownership/collision-risk concept of their own
+      return a fixed placeholder) -- so subtask 4.6's construction-time exclusive-ownership guard
+      against a real, confirmed hazard (an accumulator sharing its directory with a
+      {!Riptide_crypto.Redaction_store} keystore silently destroys the keystore's data; see that
+      module's own [.mli] for the full account) starts at the point where the caller builds the
+      [kv] passed in here -- with {!Riptide_storage.File_kv_store.create}'s mandatory [~owner] --
+      and is now also checked by this function itself, mirroring
+      {!Riptide_crypto.Redaction_store.create}'s own check: [create] compares [owner] against
+      [KV.owner kv] and rejects a mismatch before a usable [t] is ever constructed, instead of
+      trusting the caller to have tagged [kv] correctly on faith.
+
+      Unlike {!Riptide_crypto.Redaction_store.owner_tag}, there is no single, project-wide constant
+      for this module's own expected owner: different [Materializer] instances serve different
+      [merge_key] namespaces backed by different directories, so the caller supplies whatever tag
+      it built its own [kv] with (e.g. ["materializer"] is the convention every real caller in this
+      codebase uses today).
+
+      @raise Invalid_argument if [KV.owner kv <> owner]. *)
 
   val write : t -> merge_key:string -> L.t -> unit
   (** [write t ~merge_key value] durably merges [value] into the accumulator at [merge_key]

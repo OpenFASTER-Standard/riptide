@@ -1,7 +1,12 @@
 module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_intf.S) = struct
   type t = { kv : KV.t; decode : string -> L.t; encode : L.t -> string }
 
-  let create ~kv ~decode ~encode = { kv; decode; encode }
+  let create ~kv ~owner ~decode ~encode =
+    let actual = KV.owner kv in
+    if actual <> owner then
+      invalid_arg
+        (Printf.sprintf "Materializer.create: kv is owned by %S, expected %S" actual owner);
+    { kv; decode; encode }
 
   let read t ~merge_key =
     match KV.get t.kv ~key:merge_key with
