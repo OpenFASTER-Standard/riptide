@@ -628,7 +628,7 @@ let test_file_storage_cluster_committed_entries_are_durable () =
 let ops_past_ring = 10
 let small_ring = 8
 
-let run_until_view_change ~env ~dir ~ring_capacity ~max_storms =
+let run_until_view_change ~env ~dir ~ring_capacity =
   let returned_to_normal = ref false and views = ref [] in
   Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3 ~ring_capacity
     (fun ~replicas ~settle ~restart:_ ->
@@ -638,58 +638,27 @@ let run_until_view_change ~env ~dir ~ring_capacity ~max_storms =
         incr next
       done;
       settle ();
-      let converged () = Array.for_all (fun r -> Replica.status r = Replica.Normal) replicas in
-      (* Three UNCONDITIONAL, independent forced view changes -- deliberately not skipped even
-         when the cluster is already converged going in (it always is, at this point): each storm
-         is its own fresh forced episode, one to start, two more genuinely independent ones on
-         top, not retries of a failed one. *)
+      (* Three timeout storms: one to start the view change, two more to give it every chance to
+         complete (and, when it cannot, to forfeit and try newer views). *)
       for _ = 1 to 3 do
         Array.iter (fun r -> Replica.check_timeout r) replicas;
         settle ()
       done;
-      (* SUBTASK 3.8, the real, evidenced root cause (see [lib/dst/cluster.ml]'s own doc history
-         for the full account): even with ZERO injected faults, real [File_storage] makes which
-         replica's own disk I/O completes first -- and hence view-change message-processing order
-         across replicas' genuinely concurrent fibers -- real, expected, seed-independent
-         non-determinism. Proven directly: the SAME seed produced both a failure (in a sweep) and
-         20/20 passes (run in isolation right after) -- if the seeded PRNG controlled the outcome,
-         that would be impossible. Empirically (a dedicated ~570-run investigation): the first two
-         of the three forced storms above always converge on the first attempt; only the LAST one
-         occasionally (~2% of runs under real load, reliably reproduced) leaves the two replicas
-         that didn't win it stuck at the new view in [View_change] -- rescuable only by a LATER
-         forced view change's own broadcast, not by retrying the stuck one in place (calling
-         [check_timeout] again on an already-[View_change] replica is a no-op here: it can only
-         reach [Replica.try_forfeit_view_change], which never fires without a [DoViewChange]
-         quorum, and only the PRIMARY of a view ever accumulates one). This is a genuine liveness
-         hiccup, not a permanent stall or a safety violation: a dedicated sweep at 8 total storms
-         converged 100/100, and a dedicated recovery-focused sweep directly caught 5 runs where
-         storm 3 left 2 replicas stuck and every one of them converged by storm 5. So: keep going,
-         with MORE independent forced storms (not a retry loop, a continuation of the same "force
-         another view change" mechanism already proven to work), up to [max_storms] total. For the
-         small-ring case (which must NEVER converge -- the ring has already destroyed entries no
-         replica can reconstruct), this harmlessly runs to [max_storms] every time, since
-         [converged ()] can never become true; callers pass [max_storms = 3] there, preserving
-         that case's original cost exactly, since it was never the vulnerable one. *)
-      let storms_run = ref 3 in
-      while (not (converged ())) && !storms_run < max_storms do
-        Array.iter (fun r -> Replica.check_timeout r) replicas;
-        settle ();
-        incr storms_run
-      done;
-      returned_to_normal := converged ();
+      returned_to_normal :=
+        Array.for_all (fun r -> Replica.status r = Replica.Normal) replicas;
       views := Array.to_list (Array.map Replica.view_number replicas));
   (!returned_to_normal, !views)
 
 let test_ring_capacity_boundary () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
-      let ok, _ = run_until_view_change ~env ~dir ~ring_capacity:64 ~max_storms:8 in
+      let ok, _ = run_until_view_change ~env ~dir ~ring_capacity:64 in
       Alcotest.(check bool)
         "with a ring bigger than the log, the view change completes and every replica is Normal"
         true ok);
   with_tmp_dir (fun dir ->
       let ok, views =
-        run_until_view_change ~env ~dir ~ring_capacity:small_ring ~max_storms:3
+        run_until_view_change ~env ~dir ~ring_capacity:small_ring
       in
       Alcotest.(check bool)
         (Printf.sprintf
@@ -740,7 +709,7 @@ let test_ring_capacity_boundary_soak () =
   for iteration = 1 to soak_iterations do
     Eio_main.run @@ fun env ->
     with_tmp_dir (fun dir ->
-        let ok, views = run_until_view_change ~env ~dir ~ring_capacity:small_ring ~max_storms:3 in
+        let ok, views = run_until_view_change ~env ~dir ~ring_capacity:small_ring in
         Alcotest.(check bool)
           (Printf.sprintf
              "soak iteration %d/%d: with a log of %d ops in a ring of %d, no view change can ever \
@@ -1192,6 +1161,53 @@ let test_settle_loop_bounds_a_first_round_that_delivers_nothing_while_inflight (
      final round raising before it waits. *)
   Alcotest.(check int) "every round waited exactly once, the last one raising instead" (!waits + 1)
     !rounds
+
+(* SUBTASK 3.8, THE REAL ROOT CAUSE, FOUND BY AN INDEPENDENT REVIEW AFTER THREE ROUNDS OF THIS
+   PLAN'S OWN OVERCLAIMED DIAGNOSES: [drain_round]'s result ([delivered]) and [inflight ()] are
+   both read BEFORE [yield ()] runs. A handler that is still in flight at that moment can complete
+   DURING the yield -- in the very same step both making a new delivery available (e.g. a
+   coordinator's own broadcast, once its own handler finally returns) and dropping [inflight] to
+   0 -- and neither effect is visible to the stale reads already taken. Without a re-check,
+   [cluster.ml]'s own loop used to fall straight to "nothing pending and nothing in flight,
+   genuinely quiesced" on exactly this round, silently leaving a real, already-queued message
+   undelivered. This is not a hypothetical: it is the exact, sole, measured mechanism behind
+   [test_ring_capacity_boundary]'s real-load flake (see [cluster.ml]'s own doc comment at the fix
+   for the full trace), reproduced here with zero real I/O and zero real time.
+
+   The scenario: round 1 delivers nothing while a handler is already "in flight" ([inflight = 1]).
+   [yield] simulates that handler completing mid-yield exactly as described above -- dropping
+   [inflight] to 0 and arming a delivery that only becomes visible on the NEXT [drain_round] call,
+   never on this one. The old code's stale [delivered = false] plus the now-zero [inflight ()]
+   together satisfy "genuinely quiesced" immediately, without the armed delivery ever being drained
+   -- this test's own non-vacuity check ([armed] still [true] at the end) is exactly that failure,
+   caught live: deleting the fix's re-check reproduces it. *)
+let test_settle_loop_redrains_a_delivery_that_becomes_available_during_yield () =
+  let round = ref 0 in
+  let inflight_val = ref 1 in
+  let armed = ref false in
+  let drain_round () =
+    incr round;
+    if !armed then begin
+      armed := false;
+      true
+    end
+    else false
+  in
+  let yield () =
+    if !round = 1 then begin
+      inflight_val := 0;
+      armed := true
+    end
+  in
+  Riptide_dst.Cluster.for_test_settle_loop ~drain_round
+    ~inflight:(fun () -> !inflight_val)
+    ~yield ~wait_io:(fun () -> ())
+    ~deadline_budget:(Some (1.0, fun () -> 0.0))
+    ~delivery_rounds:10;
+  Alcotest.(check bool)
+    "the message that became available during yield -- after inflight had already dropped to 0 -- \
+     was actually re-drained before settle declared quiescence, not silently missed"
+    true (not !armed)
 
 (* ---------------------------------------------------------------------------------------------
    Test 12 (task-master subtask 3.7, Task 6 of the ring-eviction-watermark plan): RESTART RECOVERY
@@ -1676,6 +1692,9 @@ let tests =
     ( "settle's wall-clock budget (final-review finding I3) still bounds a FIRST round that \
        delivers nothing while a handler is in flight", `Quick,
       test_settle_loop_bounds_a_first_round_that_delivers_nothing_while_inflight );
+    ( "subtask 3.8, THE REAL ROOT CAUSE: settle re-drains a delivery that becomes available \
+       during yield, after inflight already read 0, instead of silently missing it", `Quick,
+      test_settle_loop_redrains_a_delivery_that_becomes_available_during_yield );
     ( "subtask 3.7: the ring-eviction materialization watermark survives a real crash-and-come-back \
        with no durable state of its own", `Slow,
       test_restart_recovery_needs_no_new_durable_watermark_state );

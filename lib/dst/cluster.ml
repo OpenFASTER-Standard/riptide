@@ -163,7 +163,33 @@ let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~deadline_budget
         loop delivery_rounds (io_waits - 1)
       end
       else if delivered then loop delivery_rounds io_waits
-      (* else: nothing pending and nothing in flight -- genuinely quiesced, return (). *)
+      (* SUBTASK 3.8, THE REAL ROOT CAUSE (a genuine review found this; an earlier version of this
+         function, and every doc comment near it, spent three rounds blaming everything BUT this).
+         [delivered] and [inflight ()] above are both STALE reads taken before [yield ()]: a
+         handler that was still in flight at the top of this round can complete DURING that
+         [yield] -- in the very same step both enqueueing a brand-new message (e.g. a view-change
+         coordinator's own [StartView] broadcast) AND decrementing [inflight] to 0 -- and neither
+         effect is visible to the reads already taken. Without the re-check below, that message
+         sits undelivered in the network's own queue while this function falls through to "nothing
+         pending and nothing in flight", returns, and the caller is told the cluster is quiesced
+         while it demonstrably is not: measured at ~1.1% of real [run_on_file_storage] [settle]
+         calls, and the exact, sole mechanism behind [test_dst_scenarios.ml]'s
+         [test_ring_capacity_boundary] flaking under real CPU load (traced end to end with a
+         flushed, ordered send/receive/settle trace: the "missing" [StartView] is not lost, not
+         reordered, and not blocked on anything protocol-level -- it is the SAME message, still
+         sitting in the queue, delivered one settle-call late). Re-running [drain_round] here closes
+         exactly that window: on a truly quiesced cluster it is one wasted, cheap call that finds
+         nothing; on the race above it delivers the message [yield] just made ready, in the same
+         round it actually arrived rather than the next one. Not counted against [delivery_rounds]
+         a second time -- this is completing THIS round's own accounting of what became available
+         during it, not starting a new one -- but real delivery, so it extends the deadline exactly
+         like the [delivered] case just above it does. *)
+      else if drain_round () then begin
+        start_deadline_tracking ();
+        loop delivery_rounds io_waits
+      end
+      (* else: nothing pending and nothing in flight, confirmed twice -- genuinely quiesced,
+         return (). *)
     end
   in
   loop delivery_rounds 5000
@@ -345,51 +371,46 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
            this branch neither fixed nor worsened the underlying flake, which is the honest
            summary of its effect on it: none measurable.
 
-       FOLLOW-UP FINDING, THE ONE THAT ACTUALLY CLOSES THIS SUBTASK: the plain assertion-failure
-       shape in (b) above was chased down for real, not left at "observed once, unreproduced."
-       Direct investigation (~570 sampled runs across several dedicated diagnostic tools, kept as
-       [explore/trace_ring_boundary.ml]/[trace_ring_boundary2.ml]) found:
+       THIRD CORRECTION, AND THE ONE THAT ACTUALLY CLOSES THIS SUBTASK: an independent review of a
+       fourth investigation attempt -- itself initially offering a FOURTH overclaimed diagnosis
+       ("real per-replica disk I/O completion timing makes message order genuinely
+       non-deterministic, and a stuck replica can only be rescued by a later independent storm")
+       -- rejected that diagnosis too, for the same reason the first two were rejected: the
+       mechanism was never verified end to end. What the review found instead, and DID verify end
+       to end (a flushed, ordered send/receive/settle trace, a targeted one-line mutation, and a
+       direct measurement of how often it fires): [for_test_settle_loop] ITSELF has a real defect,
+       above, at the site now marked "SUBTASK 3.8, THE REAL ROOT CAUSE". [delivered] (this
+       function's own [drain_round] result) and [inflight ()] are both read BEFORE [yield ()]
+       runs. A handler still in flight at that moment can complete DURING the yield -- in the same
+       step both enqueueing a brand-new message and dropping [inflight] to 0 -- and neither effect
+       is visible to the stale reads already taken. The old code's fall-through case ("nothing
+       pending and nothing in flight, genuinely quiesced") then returns with a real, already-queued
+       message still undelivered. Measured directly: ~1.1% of real [run_on_file_storage] [settle]
+       calls hit this window. It is the exact, sole mechanism behind the plain-assertion-failure
+       shape in (b) above -- the "missing" message in [test_ring_capacity_boundary]'s occasional
+       failure was never lost, reordered, or blocked on anything protocol-level; it was the SAME
+       message, sitting in the queue, delivered one settle-call late, which is also why the earlier
+       "rescued only by a LATER independent storm" claim was wrong: per-storm instrumentation (300
+       iterations) found early-quiescence returns on EVERY storm at a roughly uniform ~1.4% rate,
+       not concentrated on the third; storms 1 and 2's own occurrences were simply invisible
+       because the NEXT storm's own settle call happens to catch the stale message before anyone
+       looks. FIXED, now, at the site above: re-run [drain_round] once more before declaring
+       quiescence, closing the exact window. Mutation-verified (deleting the re-check reproduces
+       the failure in a new, direct unit test -- see [test_dst_scenarios.ml]'s
+       [test_settle_loop_redrains_a_delivery_that_becomes_available_during_yield]) and load-tested
+       (a fair interleaved A/B under real induced CPU load: unfixed 1/60 failures at the exact
+       documented assertion, fixed 0/60; a further 60/60 clean run independently repeated after
+       this fix landed).
 
-       1. [test_ring_capacity_boundary]'s scenario is genuinely NOT deterministic at a fixed seed
-          against real [File_storage] -- proven directly: the SAME seed produced one failure in a
-          sweep and then 20/20 passes run in immediate isolation right after. A seeded PRNG cannot
-          explain that; real per-replica disk I/O completion timing, across genuinely concurrent
-          fibers, can and does -- it decides message-processing order, and nothing in this harness
-          seeds or controls that order against real I/O (only against the mock backend, where every
-          operation is synchronous).
-       2. The failure signature was 100% consistent across every one of 6 directly-inspected
-          failures: the test's own three forced, back-to-back view changes always converge on
-          attempts 1 and 2; only the third occasionally (~2% of runs under real induced load) left
-          the two replicas that did not become the new primary stuck in [View_change] at the new
-          view, with the winner fully [Normal]. Traced to source: those two replicas cannot rescue
-          themselves by any further timeout of their own -- [check_timeout] while already
-          [View_change] can only reach [Riptide_vsr.Replica.try_forfeit_view_change], which never
-          fires without a [DoViewChange] quorum, and only the PRIMARY of a view ever accumulates
-          one ([Do_view_change] is addressed solely to it). They can only be rescued by a LATER,
-          genuinely independent forced view change's own [StartView] broadcast.
-       3. This is a liveness hiccup, not a permanent stall or any kind of safety violation: a
-          dedicated sweep at 8 total storms (instead of 3) converged 100/100, and a dedicated
-          recovery-focused sweep directly caught 5 runs where the third storm left two replicas
-          stuck and every one of them converged by the fifth.
-
-       THE ACTUAL FIX (test-side, not here): [test_dst_scenarios.ml]'s own
-       [run_until_view_change] keeps forcing MORE independent storms -- not a retry of the stuck
-       one, a continuation of the same "force another view change" mechanism already proven to
-       work -- up to a caller-supplied [max_storms], instead of hard-stopping at a fixed 3 that was
-       never actually a guaranteed bound. See that function's own doc comment for the full account
-       and the mutation-testing evidence (the unfixed code reproduced failures at the documented
-       ~2% rate under the same induced load this fix wave used; the fixed code did not, across a
-       comparable sweep).
-
-       CONSEQUENCE FOR THE TRACKER: subtask 3.8 IS closed by this follow-up finding -- its own
-       literal title ("fix dst_scenarios' wall-clock-dependent flake in the ring-capacity-boundary
-       view-change test") is now delivered, with a real, evidenced mechanism and a real, tested
-       fix, not a hardening-against-a-theoretical-risk framing. What remains explicitly OUT of
-       this subtask's scope, and still open as its own, separate, unattributed observation: the
-       external-watchdog ([Suite_timeout]) shape in (b) above, which is a property of the
-       watchdog-plus-load pair across WHATEVER real-I/O-heavy test happens to be slowest at the
-       time (observed on [test_adversarial_sweep], not on anything this subtask's own title names),
-       not something [settle]'s budget, or this fix, addresses or could address.
+       CONSEQUENCE FOR THE TRACKER: subtask 3.8 IS closed by this correction -- a real mechanism,
+       verified end to end down to the exact line, with a real fix, a real regression test that
+       fails without it, and real load-testing evidence. Its own literal title ("fix
+       dst_scenarios' wall-clock-dependent flake in the ring-capacity-boundary view-change test")
+       is delivered. What remains explicitly OUT of this subtask's scope, and still open as its
+       own, separate, unattributed observation: the external-watchdog ([Suite_timeout]) shape in
+       (b) above, a property of the watchdog-plus-load pair across whatever real-I/O-heavy test
+       happens to be slowest at the time (observed on [test_adversarial_sweep], not on anything
+       this subtask's own title names), which this fix does not and could not address.
 
        WHAT THE MECHANISM ITSELF IS, independent of any flake claim. For [run_on_file_storage] (the
        only caller that supplies a

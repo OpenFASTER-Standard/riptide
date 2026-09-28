@@ -5,13 +5,19 @@
 
    USAGE: dune exec explore/trace_ring_boundary.exe -- <seed> <ops_past_ring> <ring_capacity>
    <storms>. Run in a loop under induced CPU load (several busy-loop processes) to reproduce the
-   real, non-deterministic failure this tool exists to characterize -- see lib/dst/cluster.ml's own
-   doc history (search "FOLLOW-UP FINDING") for the full account this tool's output supports:
-   test_ring_capacity_boundary's scenario is not deterministic at a fixed seed against real
-   File_storage (real per-replica disk I/O completion timing, not the seeded PRNG, decides
-   message-processing order), and its third forced storm occasionally (~2% under load) leaves two
-   replicas stuck in View_change -- rescuable only by MORE storms, not by settle() waiting longer.
-   [storms] > 3 demonstrates the rescue directly. *)
+   real failure this tool exists to characterize -- see lib/dst/cluster.ml's own doc history
+   (search "THE REAL ROOT CAUSE") for the full, VERIFIED account.
+
+   CORRECTION: an earlier version of this comment claimed the real mechanism was genuine real-I/O
+   timing non-determinism specific to the third of three forced storms, rescuable only by more
+   independent storms. That was itself an overclaim, caught by independent review: the real defect
+   is in Cluster.for_test_settle_loop itself (a stale-read TOCTOU race that can declare quiescence
+   with a real message still undelivered), occurs at a roughly uniform rate across EVERY forced
+   storm (not concentrated on the third -- storms 1/2's own occurrences were simply invisible,
+   rescued by the next storm's own settle call before anyone looked), and is fixed in cluster.ml
+   directly, not by adding more storms. This tool still reproduces the underlying non-determinism
+   (the same seed can produce different outcomes run to run) faithfully; only the interpretation in
+   this header was wrong, not what the tool itself does. *)
 
 open Riptide
 open Riptide_vsr
