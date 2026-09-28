@@ -63,8 +63,8 @@ exception Did_not_settle
     calling suite's own external per-test watchdog and a real-I/O-heavy [Slow]-tagged test taking
     longer under CPU contention -- and stated it here as settled fact. That is retracted too, for
     the same reason the first diagnosis was: it is not established. {b The mechanism behind the
-    observed flakiness is not identified.} What is actually known, kept separate rather than folded
-    into one causal story:
+    observed flakiness is not identified [-- superseded by the third correction below].} What is
+    actually known, kept separate rather than folded into one causal story:
 
     - This budget change is real, tested hardening against a genuine theoretical risk, directly
       unit-tested via {!for_test_settle_loop}. It is not proven to fix any specific observed flake.
@@ -89,15 +89,17 @@ exception Did_not_settle
     {b Third correction, the one that actually closes this subtask.} An independent review of a
     fourth investigation attempt -- itself initially offering a fourth overclaimed diagnosis --
     rejected that diagnosis too and instead verified, end to end, a real defect in
-    {!for_test_settle_loop} itself: its [delivered]/[inflight ()] reads are both taken BEFORE
-    [yield ()] runs, so a handler still in flight at that moment can complete DURING the yield --
-    in the same step both enqueueing a new message and dropping [inflight] to 0 -- invisibly to
-    those stale reads, and the old code's fall-through case then declared quiescence with a real,
-    already-queued message still undelivered. Measured at ~1.1% of real [run_on_file_storage]
-    [settle] calls; it is the exact, sole mechanism behind [test_ring_capacity_boundary]'s
-    real-load flake (the "missing" message was never lost or reordered, just delivered one
-    settle-call late), occurring at a roughly uniform rate across every forced view change in that
-    test, not concentrated on any one of them as first believed. Fixed by re-running [drain_round]
+    {!for_test_settle_loop} itself: its [delivered] read is STALE, taken BEFORE [yield ()] runs
+    ([inflight ()] is read AFTER and is fresh -- the cluster really is idle the instant it is
+    checked). A handler still in flight at the top of the round can complete DURING the yield --
+    in the same step both enqueueing a new message and dropping [inflight] to 0 -- and that new
+    message is invisible to the already-stale [delivered], so the old code's fall-through case
+    then declared quiescence with a real, already-queued message still undelivered. Measured at
+    ~1.1% of real [run_on_file_storage] [settle] calls; it is the mechanism behind every occurrence
+    traced so far of [test_ring_capacity_boundary]'s real-load flake (the "missing" message was
+    never lost or reordered, just delivered one settle-call late), occurring at a roughly uniform
+    rate across every forced view change in that test, not concentrated on any one of them as
+    first believed. Fixed by re-running [drain_round]
     once more before declaring quiescence; mutation-verified (a new direct unit test fails without
     the fix) and load-tested (a fair interleaved A/B under real induced CPU load moved from 1/60
     failures to 0/60, independently repeated clean at 60/60 after landing).

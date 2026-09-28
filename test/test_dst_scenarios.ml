@@ -1163,16 +1163,17 @@ let test_settle_loop_bounds_a_first_round_that_delivers_nothing_while_inflight (
     !rounds
 
 (* SUBTASK 3.8, THE REAL ROOT CAUSE, FOUND BY AN INDEPENDENT REVIEW AFTER THREE ROUNDS OF THIS
-   PLAN'S OWN OVERCLAIMED DIAGNOSES: [drain_round]'s result ([delivered]) and [inflight ()] are
-   both read BEFORE [yield ()] runs. A handler that is still in flight at that moment can complete
-   DURING the yield -- in the very same step both making a new delivery available (e.g. a
+   PLAN'S OWN OVERCLAIMED DIAGNOSES: [drain_round]'s result ([delivered]) is a STALE read taken
+   BEFORE [yield ()] runs -- [inflight ()] is read AFTER and is fresh, so the cluster really is
+   idle the instant it is checked. A handler that is still in flight at the top of the round can
+   complete DURING the yield -- in the very same step both making a new delivery available (e.g. a
    coordinator's own broadcast, once its own handler finally returns) and dropping [inflight] to
-   0 -- and neither effect is visible to the stale reads already taken. Without a re-check,
+   0 -- and that new delivery is invisible to the already-stale [delivered]. Without a re-check,
    [cluster.ml]'s own loop used to fall straight to "nothing pending and nothing in flight,
    genuinely quiesced" on exactly this round, silently leaving a real, already-queued message
-   undelivered. This is not a hypothetical: it is the exact, sole, measured mechanism behind
-   [test_ring_capacity_boundary]'s real-load flake (see [cluster.ml]'s own doc comment at the fix
-   for the full trace), reproduced here with zero real I/O and zero real time.
+   undelivered. This is not a hypothetical: it is the measured mechanism behind every occurrence
+   traced so far of [test_ring_capacity_boundary]'s real-load flake (see [cluster.ml]'s own doc
+   comment at the fix for the full trace), reproduced here with zero real I/O and zero real time.
 
    The scenario: round 1 delivers nothing while a handler is already "in flight" ([inflight = 1]).
    [yield] simulates that handler completing mid-yield exactly as described above -- dropping

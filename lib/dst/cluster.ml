@@ -163,30 +163,37 @@ let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~deadline_budget
         loop delivery_rounds (io_waits - 1)
       end
       else if delivered then loop delivery_rounds io_waits
-      (* SUBTASK 3.8, THE REAL ROOT CAUSE (a genuine review found this; an earlier version of this
-         function, and every doc comment near it, spent three rounds blaming everything BUT this).
-         [delivered] and [inflight ()] above are both STALE reads taken before [yield ()]: a
-         handler that was still in flight at the top of this round can complete DURING that
-         [yield] -- in the very same step both enqueueing a brand-new message (e.g. a view-change
-         coordinator's own [StartView] broadcast) AND decrementing [inflight] to 0 -- and neither
-         effect is visible to the reads already taken. Without the re-check below, that message
+      (* SUBTASK 3.8, THE REAL ROOT CAUSE (an independent review found this; an earlier version of
+         this function, and every doc comment near it, spent three rounds blaming everything BUT
+         this). [delivered] above is a STALE read taken before [yield ()]: a handler that was
+         still in flight at the top of this round (correctly reflected in the [inflight () > 0]
+         check above, which IS a fresh, post-yield read -- the cluster genuinely is idle right
+         now) can complete DURING that [yield] -- in the very same step both enqueueing a
+         brand-new message (e.g. a view-change coordinator's own [StartView] broadcast) AND
+         decrementing [inflight] to 0 -- and that new message is invisible to [delivered], which
+         was already read before the yield happened. Without the re-check below, that message
          sits undelivered in the network's own queue while this function falls through to "nothing
          pending and nothing in flight", returns, and the caller is told the cluster is quiesced
          while it demonstrably is not: measured at ~1.1% of real [run_on_file_storage] [settle]
-         calls, and the exact, sole mechanism behind [test_dst_scenarios.ml]'s
-         [test_ring_capacity_boundary] flaking under real CPU load (traced end to end with a
-         flushed, ordered send/receive/settle trace: the "missing" [StartView] is not lost, not
-         reordered, and not blocked on anything protocol-level -- it is the SAME message, still
-         sitting in the queue, delivered one settle-call late). Re-running [drain_round] here closes
-         exactly that window: on a truly quiesced cluster it is one wasted, cheap call that finds
-         nothing; on the race above it delivers the message [yield] just made ready, in the same
-         round it actually arrived rather than the next one. Not counted against [delivery_rounds]
-         a second time -- this is completing THIS round's own accounting of what became available
-         during it, not starting a new one -- but real delivery, so it extends the deadline exactly
-         like the [delivered] case just above it does. *)
+         calls, and the mechanism behind every occurrence traced so far of
+         [test_dst_scenarios.ml]'s [test_ring_capacity_boundary] flaking under real CPU load
+         (traced end to end with a flushed, ordered send/receive/settle trace: the "missing"
+         [StartView] is not lost, not reordered, and not blocked on anything protocol-level -- it
+         is the SAME message, still sitting in the queue, delivered one settle-call late).
+         Re-running [drain_round] here closes exactly that window: on a truly quiesced cluster it
+         is one wasted, cheap call that finds nothing; on the race above it delivers the message
+         [yield] just made ready, in the same round it actually arrived rather than the next one.
+         COUNTED against [delivery_rounds], same as the [delivered] case just above it -- a real
+         delivery is a real round, and leaving this path unbudgeted was itself a real defect an
+         earlier version of this fix shipped with: {!Did_not_settle}'s own contract ("a cluster
+         generating messages forever" stays bounded) does not hold for an unbudgeted path, proven
+         live by a direct probe that looped this branch two million times with no exception before
+         being killed, across every [deadline_budget] configuration (the deadline is irrelevant
+         here -- it is only ever consulted inside the [inflight () > 0] branch above, which a
+         self-sustaining chain of "redraining always finds one more message" never re-enters). *)
       else if drain_round () then begin
         start_deadline_tracking ();
-        loop delivery_rounds io_waits
+        loop (delivery_rounds - 1) io_waits
       end
       (* else: nothing pending and nothing in flight, confirmed twice -- genuinely quiesced,
          return (). *)
@@ -380,14 +387,16 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
        to end (a flushed, ordered send/receive/settle trace, a targeted one-line mutation, and a
        direct measurement of how often it fires): [for_test_settle_loop] ITSELF has a real defect,
        above, at the site now marked "SUBTASK 3.8, THE REAL ROOT CAUSE". [delivered] (this
-       function's own [drain_round] result) and [inflight ()] are both read BEFORE [yield ()]
-       runs. A handler still in flight at that moment can complete DURING the yield -- in the same
-       step both enqueueing a brand-new message and dropping [inflight] to 0 -- and neither effect
-       is visible to the stale reads already taken. The old code's fall-through case ("nothing
-       pending and nothing in flight, genuinely quiesced") then returns with a real, already-queued
-       message still undelivered. Measured directly: ~1.1% of real [run_on_file_storage] [settle]
-       calls hit this window. It is the exact, sole mechanism behind the plain-assertion-failure
-       shape in (b) above -- the "missing" message in [test_ring_capacity_boundary]'s occasional
+       function's own [drain_round] result) is a STALE read taken BEFORE [yield ()] runs --
+       [inflight ()] is read AFTER, so it is fresh and correct on its own terms; the cluster really
+       is idle the moment it is checked. A handler still in flight at the top of the round can
+       complete DURING the yield -- in the same step both enqueueing a brand-new message and
+       dropping [inflight] to 0 -- and that new message is invisible to [delivered], already read
+       before the yield happened. The old code's fall-through case ("nothing pending and nothing
+       in flight, genuinely quiesced") then returns with a real, already-queued message still
+       undelivered. Measured directly: ~1.1% of real [run_on_file_storage] [settle] calls hit this
+       window. It is the mechanism behind every occurrence traced so far of the plain-assertion-
+       failure shape in (b) above -- the "missing" message in [test_ring_capacity_boundary]'s occasional
        failure was never lost, reordered, or blocked on anything protocol-level; it was the SAME
        message, sitting in the queue, delivered one settle-call late, which is also why the earlier
        "rescued only by a LATER independent storm" claim was wrong: per-storm instrumentation (300
