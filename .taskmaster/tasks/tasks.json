@@ -305,7 +305,7 @@
         "id": "4",
         "title": "Lattice merge-law contract and incremental materialized state",
         "description": "Define the rule that mergeable types must satisfy join-semilattice laws, and build the incremental-projection mechanism so reads never replay the full log from sequence zero.",
-        "status": "in-progress",
+        "status": "done",
         "priority": "high",
         "dependencies": [
           "3"
@@ -452,8 +452,8 @@
           {
             "id": 8,
             "title": "Require an owner tag at the Materializer.create/Redaction_store.create type level, not just by convention",
-            "description": "Subtask 4.6 closed the real-world hazard (every actual construction site in this repo now passes ~owner to File_kv_store.create, proven by a real, non-vacuous collision test), but neither Materializer.create nor Redaction_store.create enforces this at the constructor level -- a future caller that forgets ~owner gets silently unprotected, and File_kv_store.create itself cannot detect this (a directory with no marker has nothing to compare against).\n\nUPDATE from the 2026-09-25 ring-eviction-watermark-dst-determinism-owner-enforcement plan's own Task 2: the Redaction_store.create half of this subtask is CLOSED. File_kv_store gained an `owner : t -> string option` accessor (reads back the construction-time marker tag); Redaction_store.owner_tag is now an exported constant; Redaction_store.create asserts File_kv_store.owner kv = Some owner_tag as its first statement, raising Invalid_argument immediately at construction (before the record is built) on mismatch or absence -- matching this subtask's own binding requirement that rejection fire before any keystore operation touches the mismatched directory. The Materializer.create half remains deliberately open, per the design spec's own Decision 6 reasoning restated here: Materializer.create takes its kv already built through the backend-agnostic Kv_store_intf.S, which carries no ownership concept at all, so requiring a tag there is a real interface change to that module type, not a small, local fix like the Redaction_store half was. Kept pending as titled (both constructors), since only one of the two named in this subtask's own title is done -- see evidence commit for the Redaction_store half specifically.",
-            "status": "pending",
+            "description": "Subtask 4.6 closed the real-world hazard (every actual construction site in this repo now passes ~owner to File_kv_store.create, proven by a real, non-vacuous collision test), but neither Materializer.create nor Redaction_store.create enforces this at the constructor level -- a future caller that forgets ~owner gets silently unprotected, and File_kv_store.create itself cannot detect this (a directory with no marker has nothing to compare against).\n\nUPDATE from the 2026-09-25 ring-eviction-watermark-dst-determinism-owner-enforcement plan's own Task 2: the Redaction_store.create half of this subtask is CLOSED. File_kv_store gained an `owner : t -> string option` accessor (reads back the construction-time marker tag); Redaction_store.owner_tag is now an exported constant; Redaction_store.create asserts File_kv_store.owner kv = Some owner_tag as its first statement, raising Invalid_argument immediately at construction (before the record is built) on mismatch or absence -- matching this subtask's own binding requirement that rejection fire before any keystore operation touches the mismatched directory. The Materializer.create half remains deliberately open, per the design spec's own Decision 6 reasoning restated here: Materializer.create takes its kv already built through the backend-agnostic Kv_store_intf.S, which carries no ownership concept at all, so requiring a tag there is a real interface change to that module type, not a small, local fix like the Redaction_store half was. Kept pending as titled (both constructors), since only one of the two named in this subtask's own title is done -- see evidence commit for the Redaction_store half specifically.\n\nUPDATE from the 2026-09-28 mandatory-kv-store-ownership plan: BOTH halves are now CLOSED, and the residual gap this subtask's own Redaction_store.create fix left open (a directory pointed at by a bare File_kv_store.create with no ~owner at all was invisible to every existing check) is closed too. Kv_store_intf.S gained a required `owner : t -> string` (every implementer must have one; File_kv_store is the interface's sole real implementer). File_kv_store.create's `?owner` became `owner` -- required, no default -- and File_kv_store.owner's return type simplified from `string option` to plain `string`, since an owner-less File_kv_store.t is no longer constructible anywhere in the stack (verified: abstract t, sole constructor, no reachable owner-less path including ~owner:\"\"). Redaction_store.create's own check simplified to match (drops the `Some`/`Option.value ~default:\"(none)\"` it no longer needs). Materializer.create now takes a required ~owner:string and checks `KV.owner kv <> owner`, raising Invalid_argument before the record is constructed -- mirroring Redaction_store.create's own check exactly, except the expected owner is caller-supplied rather than a fixed exported constant, since different Materializer instances serve different merge_key namespaces (proven distinct from Redaction_store's own shape by a dedicated test using a different tag on both sides, mutation-verified: hardcoding the expected owner to a fixed string breaks that test while leaving everything else green). Four tests that pinned the now-unconstructible \"no owner at all\" state as a disclosed, working-as-designed boundary were retired, each with a commit message stating individually that its scenario is now a compile error, not merely deleted code. No production lib/ caller of Materializer.Make(...).create exists yet (no bin/ entrypoint in this repo), so this whole change landed entirely in test/ plus the two constructors' own .ml/.mli. CLOSING THIS SUBTASK: both constructors named in its own title now enforce ownership at the type level, not by convention.",
+            "status": "done",
             "dependencies": [
               "4"
             ],
@@ -461,7 +461,11 @@
             "testStrategy": "",
             "evidence": {
               "commits": [
-                "da68af2cd7232200f2aadfcc4c0bba5f047a8949"
+                "da68af2cd7232200f2aadfcc4c0bba5f047a8949",
+                "7c97345c16c2e63dd8ec4fa01658c265692e9ba5",
+                "cb4576c04e942852ffa87d52a5513decd4b1fce3",
+                "d886bb95584c0ab9dc770d0d89406ddf1d078a7f",
+                "ae9f75a2f2cd32ca714d5e87e039caa40b3a08ba"
               ],
               "prs": []
             }
@@ -831,9 +835,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-28T12:31:06.000Z",
+      "lastModified": "2026-09-28T17:29:20.000Z",
       "taskCount": 11,
-      "completedCount": 3,
+      "completedCount": 4,
       "tags": [
         "master"
       ]
