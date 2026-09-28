@@ -395,9 +395,10 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
        before the yield happened. The old code's fall-through case ("nothing pending and nothing
        in flight, genuinely quiesced") then returns with a real, already-queued message still
        undelivered. Measured directly: ~1.1% of real [run_on_file_storage] [settle] calls hit this
-       window. It is the mechanism behind every occurrence traced so far of the plain-assertion-
-       failure shape in (b) above -- the "missing" message in [test_ring_capacity_boundary]'s occasional
-       failure was never lost, reordered, or blocked on anything protocol-level; it was the SAME
+       window. It is the mechanism behind every occurrence traced so far of the
+       plain-assertion-failure shape in (b) above -- the "missing" message in
+       [test_ring_capacity_boundary]'s occasional failure was never lost, reordered, or blocked on
+       anything protocol-level; it was the SAME
        message, sitting in the queue, delivered one settle-call late, which is also why the earlier
        "rescued only by a LATER independent storm" claim was wrong: per-storm instrumentation (300
        iterations) found early-quiescence returns on EVERY storm at a roughly uniform ~1.4% rate,

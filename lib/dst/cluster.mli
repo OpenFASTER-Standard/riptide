@@ -63,7 +63,7 @@ exception Did_not_settle
     calling suite's own external per-test watchdog and a real-I/O-heavy [Slow]-tagged test taking
     longer under CPU contention -- and stated it here as settled fact. That is retracted too, for
     the same reason the first diagnosis was: it is not established. {b The mechanism behind the
-    observed flakiness is not identified [-- superseded by the third correction below].} What is
+    observed flakiness is not identified} ({i superseded by the third correction below}). What is
     actually known, kept separate rather than folded into one causal story:
 
     - This budget change is real, tested hardening against a genuine theoretical risk, directly
@@ -99,9 +99,11 @@ exception Did_not_settle
     traced so far of [test_ring_capacity_boundary]'s real-load flake (the "missing" message was
     never lost or reordered, just delivered one settle-call late), occurring at a roughly uniform
     rate across every forced view change in that test, not concentrated on any one of them as
-    first believed. Fixed by re-running [drain_round]
-    once more before declaring quiescence; mutation-verified (a new direct unit test fails without
-    the fix) and load-tested (a fair interleaved A/B under real induced CPU load moved from 1/60
+    first believed. Fixed by re-running [drain_round] once more before declaring quiescence,
+    counted against [delivery_rounds] exactly like any other round that delivered something -- an
+    earlier version of this fix left that path unbudgeted, a real defect in its own right, caught
+    and closed in the same fix round; mutation-verified (a new direct unit test fails without the
+    fix) and load-tested (a fair interleaved A/B under real induced CPU load moved from 1/60
     failures to 0/60, independently repeated clean at 60/60 after landing).
 
     Consequently {b task-master subtask 3.8 IS closed}: a real mechanism, verified end to end down
