@@ -46,12 +46,18 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     per call directly from disk rather than from any in-memory state built at [create] time.
 
     {b [~owner], subtask 4.6's construction-time fix for a confirmed, real data-destruction bug,
-    made mandatory by a later task closing the gap an optional [?owner] left open}: this store's
+    made mandatory by subtask 4.8 to close the gap an optional [?owner] left open}: this store's
     key space is flat and untyped (one file per key, named by the key's own content hash), so
     nothing stops two unrelated consumers from independently pointing [create] at the same
     [dir_path] -- and when that happens, they silently corrupt each other's data (see
-    {!Riptide_crypto.Redaction_store}'s own [.mli] for the exact, previously-pinned three-way
-    reproduction: a keystore and a {!Riptide_materialize.Materializer} sharing one directory).
+    {!Riptide_crypto.Redaction_store}'s own [.mli] for the exact three-way reproduction: a keystore
+    and a {!Riptide_materialize.Materializer} sharing one directory).
+
+    [owner] must be a non-empty string: [~owner:""] raises [Invalid_argument] before anything is
+    created or read. Making [~owner] mandatory removed the syntactic way to express "no owner", and
+    an empty tag is that same escape hatch spelled differently -- a marker declaring nothing, which
+    any other empty-tagged consumer then matches -- so it is rejected at construction rather than
+    accepted as a degenerate tag.
 
     [create] writes a small marker file recording [owner] the first time any caller claims
     [dir_path], and on every later [create] of the same [dir_path], compares the new [owner]
@@ -60,11 +66,23 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     A matching tag (e.g. the same subsystem reopening its own store) succeeds exactly as it
     always did.
 
-    There is no opt-out: every [File_kv_store.t], from every consumer, now has a declared owner,
-    so a directory can no longer be pointed at without one. A directory shared by two consumers
-    that each pass a distinct, real [~owner] is therefore always caught at construction time --
-    the "neither side opts in" and "one side opts out" gaps a previous, optional [?owner] left
-    open are both closed. *)
+    There is no opt-out: every [File_kv_store.t], from every consumer, now has a declared owner
+    (subtask 4.8 made [~owner] mandatory), so a directory can no longer be pointed at without one.
+    A directory shared by two consumers that each pass a distinct, real [~owner] is therefore
+    always caught at construction time -- the "neither side supplies a tag" and "one side omits its
+    tag" gaps a previous, optional [?owner] left open are both closed.
+
+    {b What this does NOT close, and it is a real, still-open gap rather than a hypothetical one:}
+    two unrelated consumers that both pass the SAME [~owner] for the same [dir_path]. The marker
+    matches, so both [create] calls succeed exactly as a legitimate reopen does -- a tag cannot
+    tell "this subsystem reopening its own store" apart from "an unrelated consumer using my tag"
+    -- and the two then share one flat key space and destroy each other's data with nothing raised
+    anywhere, exactly as before this guard existed. See
+    {!Riptide_crypto.Redaction_store.create}'s own doc comment for the full account and for the
+    running test that demonstrates the destruction
+    ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek] in
+    [test/test_lattice_materialize_crypto_scenarios.ml]). Fixing it means changing this marker
+    mechanism itself, which subtask 4.8's design spec lists as an explicit Non-Goal. *)
 
 val owner : t -> string
 (** Restates {!Kv_store_intf.S.owner}'s own spec with this backend's more specific detail below;

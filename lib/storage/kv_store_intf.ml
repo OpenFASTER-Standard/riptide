@@ -6,7 +6,16 @@ module type S = sig
 
   val owner : t -> string
   (** The tag this store was constructed with. Every implementer must have one; a backend with no
-      real ownership/collision-risk concept can return a fixed placeholder. *)
+      real ownership/collision-risk concept can return a fixed placeholder.
+
+      {b That placeholder allowance couples this module type to its consumers, so it is worth
+      stating here rather than leaving it to be discovered by reading two interfaces together:} a
+      consumer whose own constructor checks [owner] against a caller-supplied tag -- as
+      {!Riptide_materialize.Materializer.Make.create} does -- forces every caller building such a
+      consumer over a placeholder-returning backend to pass that exact placeholder string as its
+      [~owner], or the check spuriously rejects an entirely legitimate construction. A backend
+      choosing a placeholder is therefore choosing a string its consumers' callers must know and
+      repeat, not an inert stub. *)
 
   val get : t -> key:string -> string option
   (** [None] if the key was never put, was deleted, or its stored value is

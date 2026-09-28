@@ -226,13 +226,19 @@ let test_put_and_delete_both_fsync_the_directory () =
     "delete still fsyncs the containing directory too" true
     (contains ~needle:"fsync_dir t" delete_body)
 
-(* -- Subtask 4.6: [create]'s [~owner] closes a confirmed, real data-destruction bug -- sharing one
-   [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator silently
-   corrupts data (three distinct ways, pinned by
-   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test). These tests
-   cover: a real mismatch is rejected loudly at construction, and a matching owner reopens exactly
-   as before. Ownership is mandatory (a later task), so there is no "omitting [owner] leaves a
-   caller unaffected" state left to cover -- that state no longer compiles. *)
+(* -- Subtask 4.6: [create]'s [~owner] closes PART of a confirmed, real data-destruction bug --
+   sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
+   silently corrupts data (three distinct ways). What [~owner] catches, and what it does not, is
+   pinned by two tests in [test_lattice_materialize_crypto_scenarios.ml]: a DIFFERENT-tag pair is
+   rejected at construction with the keystore's data intact
+   ([test_a_shared_kv_directory_is_rejected_at_construction]), while a SAME-tag pair constructs
+   cleanly and still destroys a wrapped DEK silently
+   ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]) -- a real,
+   disclosed, still-open residual gap, not a closed one. The earlier omitted-[~owner] reproduction
+   was deleted by subtask 4.8, which made [~owner] mandatory: that state no longer compiles, so
+   there is no "omitting [owner] leaves a caller unaffected" case left to cover here. These tests
+   cover this module's own side: a real mismatch is rejected loudly at construction, a matching
+   owner reopens exactly as before, and an empty tag is refused outright. *)
 
 let test_owner_mismatch_is_rejected_at_construction () =
   Eio_main.run @@ fun env ->
@@ -258,6 +264,23 @@ let test_matching_owner_reopens_cleanly () =
       let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" dir in
       Alcotest.(check (option string)) "the same-owner reopen sees the same data" (Some "v")
         (File_kv_store.get t2 ~key:"k"))
+
+(* An empty tag is the "no owner" escape hatch spelled differently -- mandatory [~owner] removed
+   the syntactic form, and this closes the degenerate one. Rejected before the directory is even
+   created, so the check cannot be mistaken for a marker comparison against an existing claim. *)
+
+let test_an_empty_owner_is_rejected_at_construction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      Alcotest.check_raises "an empty owner tag is refused"
+        (Invalid_argument "File_kv_store.create: ~owner must be a non-empty tag")
+        (fun () -> ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"" dir));
+      (* Non-vacuity: the rejection is about the tag, not about this directory -- a real tag on the
+         very same, still-unclaimed directory succeeds immediately afterwards. *)
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"a-real-tag" dir in
+      Alcotest.(check string) "and a non-empty tag on the same directory still works" "a-real-tag"
+        (File_kv_store.owner t))
 
 (* -- Subtask 4.8's [File_kv_store] half: [owner] must read back the exact construction-time tag
    the marker mechanism above resolved -- not merely echo the argument uninspected, though for
@@ -290,6 +313,8 @@ let tests =
     ("owner mismatch is rejected at construction", `Quick,
       test_owner_mismatch_is_rejected_at_construction);
     ("matching owner reopens cleanly", `Quick, test_matching_owner_reopens_cleanly);
+    ("an empty owner is rejected at construction", `Quick,
+      test_an_empty_owner_is_rejected_at_construction);
     ("owner reads back the tag used at construction", `Quick,
       test_owner_reads_back_the_tag_used_at_construction);
   ]

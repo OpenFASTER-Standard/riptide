@@ -304,9 +304,12 @@ let durable_read t path =
 (* The marker file [check_or_write_owner_marker] reads/writes to enforce exclusive directory
    ownership -- subtask 4.6's construction-time fix for a confirmed, real data-destruction bug:
    sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
-   silently destroys data in three distinct ways (pinned, before this task, by
-   [test_lattice_materialize_crypto_scenarios.ml]'s own collision-reproduction test -- see that
-   test's current form, and [redaction_store.mli]'s own doc comment, for the full history). Named
+   silently destroys data in three distinct ways. It catches a MISMATCHED tag only: a shared
+   directory claimed twice under the SAME tag still destroys data exactly as before, which
+   [test_lattice_materialize_crypto_scenarios.ml] pins as a running negative control
+   ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]) alongside the
+   different-tag rejection this mechanism does catch. See [redaction_store.mli]'s own [create] doc
+   comment for the full account of both. Named
    with a leading dot so [Eio.Path.read_dir] callers (none exist on this store today, but the
    convention is cheap) don't confuse it for a real key file -- real key files are always exactly
    64 lowercase hex characters ([path_for]'s [hash_to_hex] output), which this name can never
@@ -340,7 +343,14 @@ let check_or_write_owner_marker ~fs ~dir_path tag =
    owner-marker check runs strictly after this, since it needs [dir_path] to already exist (an
    [Eio.Path.save] into a nonexistent directory would itself raise [Eio.Io], indistinguishable
    from this module's own "no marker yet" case, if the two were reordered). *)
+(* [~owner] being mandatory (subtask 4.8) makes "no owner" syntactically inexpressible, but
+   [~owner:""] would be the same escape hatch spelled differently: an empty marker file that any
+   other empty-tagged consumer matches, i.e. a tag that declares nothing while passing every check.
+   Rejected at construction, in the same style as this module's owner-mismatch rejection and
+   [Redaction_store.create]'s own. *)
 let create ~sw ~fs ~owner dir_path =
+  if String.length owner = 0 then
+    invalid_arg "File_kv_store.create: ~owner must be a non-empty tag";
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   check_or_write_owner_marker ~fs ~dir_path owner;
   { sw; fs; dir_path; owner }

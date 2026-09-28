@@ -9,18 +9,31 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       value format. Durably folds all future [write] calls to the same [merge_key] into a single,
       live accumulator — the join of all values ever seen, regardless of call order.
 
-      {b [kv] is received already built, never constructed here.} This functor is generic over
+      {b [kv] is received already built, never constructed here}, and {b [~owner] is a
+      self-consistency assertion, NOT a collision guard} -- stated precisely because the
+      distinction is easy to overstate. This functor is generic over
       {!Riptide_storage.Kv_store_intf.S}, and every implementer of that module type gives a real
       [owner] accessor (a backend with no genuine ownership/collision-risk concept of its own may
-      return a fixed placeholder instead) -- which is exactly what lets [create] check ownership
-      itself, directly, rather than leaving the guard to whatever built [kv]: it compares [owner]
-      against [KV.owner kv] and rejects a mismatch before a usable [t] is ever constructed, instead
-      of trusting the caller to have tagged [kv] correctly on faith. This mirrors
-      {!Riptide_crypto.Redaction_store.create}'s own check (see that function's own doc comment for
-      its exact check) and closes the same real, confirmed hazard subtask 4.6 introduced the guard
-      for in the first place: an accumulator sharing its directory with a
-      {!Riptide_crypto.Redaction_store} keystore silently destroys the keystore's data; see that
-      module's own [.mli] for the full account.
+      return a fixed placeholder instead), so [create] compares [owner] against [KV.owner kv] and
+      rejects a mismatch before a usable [t] is ever constructed. But {b the same caller supplies
+      both sides of that comparison} -- [kv]'s tag came from whatever [create] call built [kv], and
+      [owner] comes from this call -- so the check can only ever catch a caller contradicting
+      ITSELF: a typo, or a copy-paste that passes [~owner:"a"] to
+      {!Riptide_storage.File_kv_store.create} and [~owner:"b"] here. A caller that tags both sides
+      consistently always passes, whether or not the tag it chose is the right one for this use:
+      [create ~kv ~owner:(File_kv_store.owner kv) ~decode ~encode] typechecks and succeeds for any
+      [kv] whatsoever. What the check does buy is that a [Materializer]'s namespace is now
+      {e explicitly declared} at its own construction site rather than silently inherited from
+      whatever built [kv].
+
+      {b Whatever real collision protection exists comes entirely from
+      {!Riptide_storage.File_kv_store.create}'s own marker-file mechanism} (subtask 4.6, a
+      different and earlier part of the same work), not from this check -- and even that catches
+      only a MISMATCHED tag on a shared directory, so an accumulator and a
+      {!Riptide_crypto.Redaction_store} keystore sharing one directory under the SAME tag still
+      silently destroy each other's data. That residual gap is real and still open; see
+      {!Riptide_crypto.Redaction_store.create}'s own doc comment for the full account and for the
+      running tests on both sides of it.
 
       Unlike {!Riptide_crypto.Redaction_store.owner_tag}, there is no single, project-wide constant
       for this module's own expected owner: different [Materializer] instances serve different

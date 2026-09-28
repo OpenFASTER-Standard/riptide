@@ -146,13 +146,21 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
 
 (* -- Subtask 4.8's [Redaction_store] half: [create] must itself verify [kv] was actually built
    with its own [owner_tag], not just document the convention every real call site already
-   follows. Closes the residual gap left open by subtask 4.6/the layer0-followup-hardening plan:
-   this function receives an already-built [kv], so [File_kv_store.create]'s own owner-marker
-   guard only protects a caller of THIS function if that caller opted in -- this test pins that
-   [create] now enforces it directly, rather than trusting the caller. (A companion test used to
-   also cover an untagged [kv] -- [~owner] omitted entirely -- but that state stopped being
-   constructible once [File_kv_store.create]'s own [~owner] became mandatory, so it was removed
-   rather than adapted.) *)
+   follows. Closes ONE gap left open by subtask 4.6/the layer0-followup-hardening plan: this
+   function receives an already-built [kv], so [File_kv_store.create]'s own owner-marker guard used
+   to protect a caller of THIS function only if that caller had tagged [kv] at all, and nothing here
+   could tell whether it had -- this test pins that [create] now enforces the tag directly, rather
+   than trusting the caller. (A companion test used to also cover an untagged [kv] -- [~owner]
+   omitted entirely -- but that state stopped being constructible once [File_kv_store.create]'s own
+   [~owner] became mandatory, so it was removed rather than adapted.)
+
+   What this check does NOT close, and it is disclosed rather than fixed: a [kv] tagged with exactly
+   [Redaction_store.owner_tag] is accepted, which is correct for this keystore's own store but is
+   equally accepted when an unrelated consumer shares that directory under the same tag -- the pair
+   then destroys each other's data silently. See
+   [test_lattice_materialize_crypto_scenarios.ml]'s
+   [test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek] for the running proof,
+   and redaction_store.mli's own [create] doc for why closing it is out of scope here. *)
 
 let test_create_rejects_a_kv_tagged_for_a_different_owner () =
   Eio_main.run @@ fun env ->

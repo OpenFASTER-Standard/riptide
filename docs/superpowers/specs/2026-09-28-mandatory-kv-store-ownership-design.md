@@ -82,12 +82,16 @@ propagates through its one real consumer.
 No production code is affected — `Materializer.Make(...).create` has zero non-test callers today
 (no `bin/` entrypoint exists yet). All effect is in `test/`:
 
-- **~15 bare `File_kv_store.create` call sites** (mostly `test_file_kv_store.ml`'s basic CRUD
+- **Nine bare `File_kv_store.create` call sites** (all in `test_file_kv_store.ml`'s basic CRUD
   tests, unrelated to the collision hazard) need a one-line `~owner:"..."` addition to keep
-  compiling.
-- **Three tests are retired, not repurposed**, because the state they exist to pin becomes
+  compiling. (Counted from the real diff after the fact; the first draft of this section estimated
+  "~15", which included the two further bare call sites belonging to the retired tests below — those
+  were deleted rather than migrated, so they are not part of this count.)
+- **Four tests are retired, not repurposed**, because the state they exist to pin becomes
   unconstructible rather than merely harder to reach:
-  - `test_file_kv_store.ml`: `"no owner supplied is unaffected (backward compatibility)"`.
+  - `test_file_kv_store.ml`: `test_no_owner_supplied_is_unaffected` (`"no owner supplied is
+    unaffected (backward compatibility)"`) and `test_owner_is_none_when_no_tag_was_supplied` — both
+    pin a `File_kv_store.create` call with no `~owner` at all.
   - `test_redaction.ml`: `test_create_rejects_an_untagged_kv`.
   - `test_lattice_materialize_crypto_scenarios.ml`:
     `test_omitting_owner_on_the_materializer_side_alone_still_destroys_a_wrapped_dek`.
@@ -96,8 +100,13 @@ No production code is affected — `Materializer.Make(...).create` has zero non-
   reconstructed version of the old call is the running-code proof `CLAUDE.md` requires for a
   compile-time guarantee, since OCaml has no runtime way to assert "this does not typecheck."
 - `Redaction_store.mli`'s own doc comment (the paragraph naming the residual gap this design
-  closes) gets rewritten to say so, rather than continuing to name an open gap that no longer
-  exists.
+  closes) gets rewritten to say which gap it closes — **and, per this branch's final review, to
+  disclose plainly the one it does not**: the marker mechanism compares two tags, so two consumers
+  sharing one directory under the SAME `~owner` still destroy each other's data silently. That is a
+  real, still-open limitation of this design (consistent with the Non-Goal "No change to the
+  marker-file mechanism"), pinned by its own running negative control
+  (`test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek`), not something this
+  change closes.
 
 ## New tests
 

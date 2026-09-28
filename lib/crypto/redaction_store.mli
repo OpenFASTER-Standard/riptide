@@ -67,13 +67,15 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     against exactly this}: build the [kv] you pass here with [~owner:owner_tag], and a second,
     differently-tagged {!Riptide_storage.File_kv_store.create} aimed at the same directory now
     raises [Invalid_argument] immediately, before either consumer can touch the shared directory's
-    data at all -- turning the three silent outcomes below into a loud rejection at construction.
+    data at all -- turning the three silent outcomes below into a loud rejection at construction
+    {e for that differently-tagged pair}, and only for it (see the residual gap below, which is
+    real and still open).
 
-    {b Subtask 4.8 closes the one residual gap that left open}: [create] above used to receive an
+    {b Subtask 4.8 closes one gap the 4.6 guard left open}: [create] above used to receive an
     already-built [kv] on faith -- there was no [File_kv_store.create] call inside this module for
-    an owner tag to attach to, so the subtask 4.6 guard only ever worked if the caller building
-    [kv] happened to opt in, and nothing here could tell whether it had. [create] now checks
-    {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap.
+    an owner tag to attach to, so the 4.6 guard only ever fired if the caller building [kv] had
+    tagged it (then an optional argument), and nothing here could tell whether it had. [create] now
+    checks {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap.
 
     @raise Invalid_argument if [kv]'s own owner (as {!Riptide_storage.File_kv_store.owner} reports
       it) is not [owner_tag] -- i.e. [kv] was built with a different [~owner] -- before this
@@ -86,20 +88,45 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     function does (see that function's own doc comment for its exact check, which mirrors this
     one).
 
-    A later task (following subtask 4.8) closed the one gap that used to remain here: previously,
-    a SECOND consumer -- one that never goes through this function, e.g. a
+    The same subtask (4.8, this branch's own work -- not a later, still-pending task) also made
+    {!Riptide_storage.File_kv_store.create}'s [~owner] mandatory rather than optional, closing one
+    further gap: previously, a SECOND consumer -- one that never goes through this function, e.g. a
     {!Riptide_materialize.Materializer} built directly over the same [dir_path] -- could point its
     own {!Riptide_storage.File_kv_store.create} at the shared directory without passing [~owner]
     at all, and that omission alone was enough to defeat the guard regardless of how carefully
-    this side was tagged. {!Riptide_storage.File_kv_store.create}'s [~owner] is now mandatory, not
-    optional, so that state is no longer constructible: any [File_kv_store.create], from any
-    consumer, requires a real owner tag, and a directory can no longer be pointed at without one.
+    this side was tagged. That state is no longer constructible: any [File_kv_store.create], from
+    any consumer, requires a real owner tag, and a directory can no longer be pointed at without
+    one.
 
-    All three consequences below were reproduced live, and were pinned by
-    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof) as the
-    ordinary, no-[~owner]-on-either-side case; that test now proves subtask 4.6's
-    construction-time rejection for an opted-in pair instead. They are retained here as a record of
-    what construction-time rejection replaced, not as a residual gap:
+    {b A REAL, STILL-OPEN RESIDUAL GAP, stated plainly rather than claimed closed.} Every check
+    described above catches only a MISMATCHED tag. Two consumers sharing one directory under the
+    SAME owner tag -- this keystore and a {!Riptide_materialize.Materializer} both built with
+    [~owner:owner_tag], whether through copy-paste, a refactor, or a caller talked into agreeing on
+    one tag -- pass every check this codebase performs: the marker file matches, so
+    {!Riptide_storage.File_kv_store.create} succeeds for both, and each consumer's own
+    construction-time owner check ([create] above, and
+    {!Riptide_materialize.Materializer.Make.create}) sees the tag it expects. Both [t]s then come
+    into existence over one shared, flat key space and destroy each other's data exactly as
+    silently and exactly as completely as before any of these guards existed. So the three
+    consequences below are a live description of what such a pair still does today -- not a
+    historical record of something construction-time rejection replaced.
+
+    This is a disclosed, deliberately out-of-scope limitation of subtask 4.8 rather than an
+    oversight (the design spec's own Non-Goals: "No change to the marker-file mechanism"). A single
+    per-directory owner tag structurally cannot distinguish "my own store reopening" from "an
+    unrelated consumer that happens to use my tag"; closing it needs a different mechanism --
+    per-consumer key prefixes, or directory exclusivity enforced somewhere other than a tag both
+    sides supply -- and is not attempted here.
+
+    Both sides of that boundary are backed by running code in
+    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof): a
+    DIFFERENT-tag pair is rejected at construction with this keystore's data provably intact
+    ([test_a_shared_kv_directory_is_rejected_at_construction]), while a SAME-tag pair constructs
+    cleanly on both sides and then silently destroys a wrapped DEK
+    ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek], which pins the
+    first and third consequences below -- both silent directions). The second consequence is the
+    same collision with a partial [decode] and is described here without a dedicated test of its
+    own, since it differs only in the caller-supplied [decode] the first bullet already varies:
 
     - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
       materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse
