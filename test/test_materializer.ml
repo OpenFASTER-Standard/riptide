@@ -35,9 +35,9 @@ let with_materializer f =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
-      (* [~owner:"materializer"] on every real materializer-backing store in this repo, per
-         materializer.mli's own instruction to the caller building the [kv]: the guard added in
-         subtask 4.6 only protects a directory that its consumers actually claim. *)
+      (* [~owner:"materializer"] on every real materializer-backing store in this repo: [M.create]
+         below now requires [kv]'s own tag (as {!File_kv_store.owner} reports it) to match its
+         [~owner] argument exactly, or construction raises. *)
       let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir in
       f (M.create ~kv ~owner:"materializer" ~decode ~encode))
 
@@ -74,8 +74,31 @@ let test_create_rejects_a_kv_tagged_for_a_different_owner () =
               "materializer"))
         (fun () -> ignore (M.create ~kv ~owner:"materializer" ~decode ~encode)))
 
+(* The property that distinguishes THIS task's check from {!Riptide_crypto.Redaction_store.create}'s:
+   the expected owner is a caller-supplied parameter, not one fixed project-wide constant --
+   different [Materializer] instances serve different [merge_key] namespaces backed by different
+   directories. Proven here with an owner tag no other test or real call site in this repo uses
+   ("some-other-namespace" rather than "materializer"), on both sides, so a mutation that hardcoded
+   the one string every current call site happens to use (e.g. [if actual <> "materializer" then])
+   would make THIS test fail while leaving it silent everywhere else. Asserted positively, not just
+   "did not raise": the resulting materializer is exercised with a real write-then-read round trip,
+   so the check is that the thing genuinely works, not merely that construction was silent. *)
+let test_create_accepts_a_kv_tagged_for_a_matching_caller_supplied_owner () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"some-other-namespace" dir in
+      let m = M.create ~kv ~owner:"some-other-namespace" ~decode ~encode in
+      let w = { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String "x"); timestamp = 1L } in
+      M.write m ~merge_key:"k" w;
+      Alcotest.(check bool) "a materializer built with a matching caller-supplied owner is usable" true
+        (M.read m ~merge_key:"k" = w))
+
 let tests =
   [ ("convergence regardless of fold order", `Quick, test_convergence_regardless_of_fold_order);
     ( "create rejects a kv tagged for a different owner",
       `Quick,
-      test_create_rejects_a_kv_tagged_for_a_different_owner ) ]
+      test_create_rejects_a_kv_tagged_for_a_different_owner );
+    ( "create accepts a kv tagged for a matching caller-supplied owner",
+      `Quick,
+      test_create_accepts_a_kv_tagged_for_a_matching_caller_supplied_owner ) ]

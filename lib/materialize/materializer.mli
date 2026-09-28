@@ -10,23 +10,23 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       live accumulator — the join of all values ever seen, regardless of call order.
 
       {b [kv] is received already built, never constructed here.} This functor is generic over
-      {!Riptide_storage.Kv_store_intf.S}, which every implementer of that module type gives a real
-      [owner] accessor (backends with no genuine ownership/collision-risk concept of their own
-      return a fixed placeholder) -- so subtask 4.6's construction-time exclusive-ownership guard
-      against a real, confirmed hazard (an accumulator sharing its directory with a
+      {!Riptide_storage.Kv_store_intf.S}, and every implementer of that module type gives a real
+      [owner] accessor (a backend with no genuine ownership/collision-risk concept of its own may
+      return a fixed placeholder instead) -- which is exactly what lets [create] check ownership
+      itself, directly, rather than leaving the guard to whatever built [kv]: it compares [owner]
+      against [KV.owner kv] and rejects a mismatch before a usable [t] is ever constructed, instead
+      of trusting the caller to have tagged [kv] correctly on faith. This mirrors
+      {!Riptide_crypto.Redaction_store.create}'s own check (see that function's own doc comment for
+      its exact check) and closes the same real, confirmed hazard subtask 4.6 introduced the guard
+      for in the first place: an accumulator sharing its directory with a
       {!Riptide_crypto.Redaction_store} keystore silently destroys the keystore's data; see that
-      module's own [.mli] for the full account) starts at the point where the caller builds the
-      [kv] passed in here -- with {!Riptide_storage.File_kv_store.create}'s mandatory [~owner] --
-      and is now also checked by this function itself, mirroring
-      {!Riptide_crypto.Redaction_store.create}'s own check: [create] compares [owner] against
-      [KV.owner kv] and rejects a mismatch before a usable [t] is ever constructed, instead of
-      trusting the caller to have tagged [kv] correctly on faith.
+      module's own [.mli] for the full account.
 
       Unlike {!Riptide_crypto.Redaction_store.owner_tag}, there is no single, project-wide constant
       for this module's own expected owner: different [Materializer] instances serve different
       [merge_key] namespaces backed by different directories, so the caller supplies whatever tag
       it built its own [kv] with (e.g. ["materializer"] is the convention every real caller in this
-      codebase uses today).
+      codebase's tests uses today -- this module has no non-test callers yet).
 
       @raise Invalid_argument if [KV.owner kv <> owner]. *)
 

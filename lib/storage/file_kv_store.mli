@@ -84,4 +84,6 @@ val owner : t -> string
     {!Riptide_crypto.Redaction_store.create} (subtask 4.8) is the first such caller: it receives an
     already-built [t] rather than constructing one itself, so [create] above's own owner-marker
     guard cannot protect it unless it checks this function's result against its own expected
-    tag. *)
+    tag. {!Riptide_materialize.Materializer.Make.create}, via the generic [KV.owner] any
+    {!Kv_store_intf.S} implementer provides, is a second such caller when applied to this module --
+    so "first" names an example, not an exhaustive list. *)

@@ -140,10 +140,11 @@ let mat_sink materializer : Batch_commit.materialize_sink =
 
 (* THE materializer constructor for this file -- every materializer below is built through it, and
    it is the shape any real caller would follow, since {!Riptide_materialize.Materializer.create}
-   takes its [kv] already built and materializer.mli's own doc tells the caller building that [kv]
-   to pass [~owner:"materializer"]. It is tagged here rather than at each call site precisely so
-   the collision test below can exercise the guard against the REAL construction path instead of a
-   bare, test-only [File_kv_store.create ~owner:"materializer"] written just to make the guard
+   takes its [kv] already built and now itself REQUIRES [~owner:"materializer"] to match the tag
+   [kv] was built with: a differently-tagged [kv] is rejected outright at construction, not merely
+   discouraged by doc-comment convention. It is tagged here rather than at each call site precisely
+   so the collision test below can exercise the guard against the REAL construction path instead of
+   a bare, test-only [File_kv_store.create ~owner:"materializer"] written just to make the guard
    fire (which is what it did before: an artificial call that proved the guard existed but not
    that anything in this repo actually opted into it). *)
 let make_materializer ~sw ~fs dir =

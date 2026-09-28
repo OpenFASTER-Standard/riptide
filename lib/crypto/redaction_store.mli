@@ -73,17 +73,18 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     already-built [kv] on faith -- there was no [File_kv_store.create] call inside this module for
     an owner tag to attach to, so the subtask 4.6 guard only ever worked if the caller building
     [kv] happened to opt in, and nothing here could tell whether it had. [create] now checks
-    {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap; the other half of the
-    same subtask does the identical thing to
-    {!Riptide_materialize.Materializer.Make.create}, which now also checks its own [kv]'s owner
-    against a caller-supplied [~owner] before constructing a usable [t], the same way this
-    function does (see that function's own doc comment for its exact check, which mirrors this
-    one):
+    {!Riptide_storage.File_kv_store.owner}[ kv] itself, closing that gap.
 
     @raise Invalid_argument if [kv]'s own owner (as {!Riptide_storage.File_kv_store.owner} reports
       it) is not [owner_tag] -- i.e. [kv] was built with a different [~owner] -- before this
       function returns a usable [t] and before either consumer can touch the shared directory's
       data.
+
+    The other half of the same subtask does the identical thing to
+    {!Riptide_materialize.Materializer.Make.create}, which now also checks its own [kv]'s owner
+    against a caller-supplied [~owner] before constructing a usable [t], the same way this
+    function does (see that function's own doc comment for its exact check, which mirrors this
+    one).
 
     A later task (following subtask 4.8) closed the one gap that used to remain here: previously,
     a SECOND consumer -- one that never goes through this function, e.g. a
