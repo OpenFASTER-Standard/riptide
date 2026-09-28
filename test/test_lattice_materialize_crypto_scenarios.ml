@@ -1889,7 +1889,9 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
     (List.mem "tiny" (G_set.elements (M.read materializer ~merge_key:"mk")))
 
 (* ---------------------------------------------------------------------------------------------
-   A THIRD FINDING, ONCE PINNED RATHER THAN FIXED, NOW CLOSED AT CONSTRUCTION TIME (subtask 4.6):
+   A THIRD FINDING, ONCE PINNED RATHER THAN FIXED, CLOSED AT CONSTRUCTION TIME FOR A
+   DIFFERENTLY-TAGGED PAIR ONLY (subtask 4.6) -- see "What it does NOT buy" below for the
+   same-tag pair this does not close:
    one {!Riptide_storage.File_kv_store} directory shared between a {!Riptide_crypto.Redaction_store}
    keystore and a {!Riptide_materialize.Materializer} accumulator store used to let an ORDINARY
    materialized write destroy an encrypted record's wrapped DEK, with no error anywhere and nothing
@@ -2101,7 +2103,7 @@ let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () 
     (after_bytes <> accumulator_bytes);
   Alcotest.(check bool) "...while that record itself decrypts perfectly well" true
     (Redaction_store.decrypt_value store ~event_id:colliding_key
-       (List.assoc "2:k2#0" (Batch_commit.committed_envelopes_keyed replica))
+       (List.assoc colliding_key (Batch_commit.committed_envelopes_keyed replica))
          .Riptide.Envelope.payload
     <> None)
 
