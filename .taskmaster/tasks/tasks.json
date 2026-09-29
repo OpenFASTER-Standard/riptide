@@ -1007,11 +1007,20 @@
             "id": 10,
             "title": "[3.2] A real filesystem-level lock on create",
             "description": "A real filesystem-level lock on create",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "File_storage.create and File_kv_store.create each take an flock(LOCK_EX | LOCK_NB) on a .riptide-lock file in the target directory, held for the handle's lifetime. A second create against an already-locked directory raises immediately.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "36cee72f3680ba974c8fd52351a04d3b5c162b85",
+                "21555759c12a74f348578145e25705de5ce486a3",
+                "55e3dc315d123647c0b7c820ce74f1232b9c9de6",
+                "2103724647c339e8e8e0c0a4ea386b47c6ac7ead"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 11,
