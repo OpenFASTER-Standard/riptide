@@ -358,6 +358,46 @@ let recover_highest_op_number t =
   done;
   !best
 
+(* Task 13 fix round (review finding 2): the SAME scan as [recover_highest_op_number] above, minus
+   the data check -- the highest op-number whose slot HEADER verifies and whose own [op_number] maps
+   back to this slot, whether or not that slot's DATA still checksums.
+   [superblock_rebuild_from_wal] uses THIS one, and the difference is a safety property rather than a
+   detail:
+
+   Requiring the data to verify too UNDER-reports the durable op-number whenever the topmost slot is
+   durable-but-corrupt -- which is an entirely ordinary outcome of a crash (a header write that
+   landed, a data write that did not). A replica whose superblock says [op_number = n - 1] over a WAL
+   that really reached [n] does not merely forget op [n]: it PROVES op [n] absent, via
+   {!Riptide_vsr.Replica}'s [sender_proves_absent] [o > n] disjunct, and f+1 such proofs truncate a
+   committed value cluster-wide. That is exactly the "corrupt -> absent" one-word mutation
+   spec/tla/VSR.tla:111-150 records TLC refuting against [NoCommittedOpProvablyAbsent], and
+   [replica.ml]'s [adopt_durable_log] ("CRASH ORDERING") already states the general rule this follows:
+   OVER-reporting [op_number] is the conservative direction, because a replica "cannot nack an op it
+   might still have been holding". Over-reporting costs only liveness -- the slot reads back as
+   [None], i.e. VSR.tla's "corrupt", so the replica declines new Prepares until a StartView repairs
+   it, which is precisely the behaviour [Replica.restart] is already written to handle.
+
+   WHY [create]'s OWN [highest_op_number] KEEPS THE STRICTER RULE. [create] is not making a durable
+   claim about anything: [Replica.restart] takes its [op_number] from the SUPERBLOCK, never from
+   [wal_highest_op_number], and uses the latter only to decide whether a crash left unacknowledged
+   entries ABOVE the superblock's op-number to discard. Under-reporting there can only cause that
+   truncate to be skipped, never to discard something the superblock still accounts for -- so the
+   dangerous direction genuinely does not exist on that path, and [recover_highest_op_number]'s
+   tighter "this entry is fully readable" meaning is the right one for the field {!wal_read} is
+   checked against. The two scans are kept as two functions, each used at exactly one place, rather
+   than one parameterized scan: the choice between them IS the safety argument above, and a boolean
+   flag at a call site is a poor place to keep an argument. *)
+let recover_highest_durable_op_number t =
+  let best = ref 0 in
+  for slot = 0 to t.ring_capacity - 1 do
+    match read_header t ~slot with
+    | None -> ()
+    | Some header ->
+      if header.op_number > 0 && (header.op_number - 1) mod t.ring_capacity = slot then
+        best := max !best header.op_number
+  done;
+  !best
+
 (* [~ring_capacity] is REQUIRED, deliberately -- it used to default to 8 (final-review finding
    I4). Pairing "silently destroys committed, acknowledged data past this bound" (see
    [test_dst_scenarios.ml]'s own ring-capacity boundary test, which reproduces the total
@@ -579,37 +619,28 @@ let superblock_read t =
 
 (* Task 13 (audit-remediation): the repair action for {!Riptide_vsr.Replica.restart}'s own
    fail-stop guard -- see [storage_intf.ml]'s own doc comment on [superblock_rebuild_from_wal] for
-   the full contract and the field-by-field reasoning behind what gets reconstructed. Two
+   the full contract, including (and this is the load-bearing part, not a footnote) why the three
+   view/commit values are the CALLER's to supply and what supplying wrong ones costs. Three
    implementation notes specific to THIS backend:
 
-   - The WAL scan is [recover_highest_op_number] itself, called fresh here rather than trusting
-     [t.highest_op_number] -- that field should already agree (nothing touches the ring between a
-     lost superblock and this call), but a fresh scan costs nothing extra and does not depend on
-     that agreement continuing to hold.
-   - The reconstructed bytes are encoded with the exact field names and shapes
-     {!Riptide_vsr.Replica}'s own [superblock_encode] uses ([commit_number], [last_normal_view],
-     [op_number], [view_number], each a [Value.Int]), via {!Riptide.Value.canonical_encode} --
-     DUPLICATED here, not shared, because [riptide_storage] cannot depend on [riptide_vsr] (the
-     real dependency runs the other way: [riptide_vsr] depends on [riptide_storage]). If
-     [Replica]'s own superblock schema ever changes, this encoding must change with it by hand;
-     nothing enforces that mechanically beyond [test_vsr_replica_recovery.ml]'s own end-to-end
-     test, which drives the result of this exact function through a real
-     {!Riptide_vsr.Replica.restart} rather than merely checking that [superblock_read] returns
-     [Some]. *)
-let superblock_rebuild_from_wal t =
-  if superblock_read t <> None then
-    invalid_arg
-      "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over an \
-       already-usable superblock";
-  let op_number = recover_highest_op_number t in
-  let int_field name i = (name, Riptide.Value.Scalar (Riptide.Value.Int (Int64.of_int i))) in
-  let data =
-    Riptide.Value.canonical_encode
-      (Riptide.Value.Record
-         [ int_field "commit_number" 0;
-           int_field "last_normal_view" 0;
-           int_field "op_number" op_number;
-           int_field "view_number" 0
-         ])
-  in
-  superblock_write t data
+   - The WAL scan is [recover_highest_durable_op_number], NOT [recover_highest_op_number] -- the
+     header-only, over-reporting variant. See that function's own comment for why the difference is
+     a safety property (review finding 2). It is called fresh here rather than trusting
+     [t.highest_op_number]: that field should already agree, but it carries the stricter
+     fully-readable meaning, which is the wrong one for a durable claim.
+   - The record is encoded by {!Riptide_storage.Superblock_record}, the ONE definition of that
+     schema in this repo -- the same one {!Riptide_vsr.Replica}'s own [superblock_encode] now
+     delegates to (review finding 5). It used to be typed out independently here, in
+     [memory_storage.ml], and in [replica.ml], on the reasoning that [riptide_storage] cannot depend
+     on [riptide_vsr]; the dependency direction is real, but the conclusion did not follow -- the
+     schema simply belongs in the LOWER library, where both can share it.
+   - The precondition is {!Riptide_storage.Superblock_record.check_rebuild_precondition}, also
+     shared with the other backends rather than re-typed here (review finding M10), and it now
+     covers the empty-WAL case too (finding M8). *)
+let superblock_rebuild_from_wal t ~view_number ~last_normal_view ~commit_number =
+  let op_number = recover_highest_durable_op_number t in
+  Superblock_record.check_rebuild_precondition ~superblock_read:(superblock_read t)
+    ~durable_op_number:op_number;
+  Superblock_record.check_rebuild_values ~view_number ~last_normal_view ~op_number ~commit_number;
+  superblock_write t
+    (Superblock_record.encode { view_number; last_normal_view; op_number; commit_number })

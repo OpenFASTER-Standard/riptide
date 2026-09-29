@@ -10,6 +10,23 @@
     implementation had to diverge from that precedent (and from this task's own brief, which
     predates it) and why. *)
 
+type superblock_repair = {
+  view_number : int;
+  last_normal_view : int;
+  commit_number : int;
+}
+(** The three values {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal} requires a caller
+    to supply, bundled so [restart]'s own [?repair_superblock] can carry them as one optional
+    argument (Task 13 fix round).
+
+    {b These are an OPERATOR's out-of-band knowledge, and a scenario using them must model that
+    honestly.} Read that function's own doc comment before using this: the values must be the
+    repaired replica's REAL durable view/commit state, and supplying ones that are merely
+    well-formed — zeros, in particular — silently destroys committed, acknowledged operations
+    cluster-wide. In a DST scenario the faithful way to obtain them is from a LIVE, still-running
+    peer of the same cluster ([Riptide_vsr.Replica.view_number]/[last_normal_view]/[commit_number] of
+    a replica that never crashed), which is exactly what a real operator would query. *)
+
 exception Did_not_settle
 (** Raised by the [settle] function passed to a [run]/{!run_on_file_storage} body if the cluster
     has not quiesced within a generous, bounded number of rounds -- signals likely non-termination
@@ -174,7 +191,7 @@ val run :
   ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
   (replicas:Riptide_vsr.Replica.t array ->
    settle:(unit -> unit) ->
-   restart:(?lose_superblock:bool -> int -> bool) ->
+   restart:(?lose_superblock:bool -> ?repair_superblock:superblock_repair -> int -> bool) ->
    unit) ->
   unit
 (** [run ~seed ~replica_count ?svc_limit ?net_fault_config ?storage_fault_config body] stands up
@@ -275,6 +292,23 @@ val run :
     {!Riptide_storage.File_storage}'s 3 sequential, non-atomic superblock copy writes produces
     exactly it, with no injected fault needed in production.
 
+    [?repair_superblock] (Task 13 fix round) applies
+    {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal} to this replica's own backend, with
+    the supplied values, BEFORE attempting the restart — the operator repair step that gets a replica
+    out of exactly the state [?lose_superblock:true] puts it into. Without it this harness could
+    represent the permanent-down failure mode but not its recovery, so no scenario could show a
+    repaired replica rejoining a live cluster (or show what happens when the supplied values are
+    wrong, which is the same thing from the other side). It is a separate argument from
+    [?lose_superblock] rather than being implied by it because the two belong to different events: a
+    crash, and a human intervening afterwards. Passing both in one call models "crashed with a torn
+    superblock, repaired, brought back" as one step, which is convenient but hides the intermediate
+    refusal; passing [?lose_superblock:true] alone first (observing [false]) and then
+    [?repair_superblock] alone is the sequence that shows the whole story, and is what
+    [test/test_dst_scenarios.ml]'s own repair scenario does. The repair itself raises
+    [Invalid_argument] — it is NOT converted to a [false] return — if its own preconditions do not
+    hold (no lost superblock to repair, an empty WAL, or ill-formed values): that is a bug in the
+    scenario, not a machine that will not boot.
+
     {b Returns [false] when the replica refuses to come back}, which since finding C1's fix is
     precisely what {!Riptide_vsr.Replica.restart} does for a lost superblock over a non-empty WAL.
     A refused replica is left DOWN: it is never handed another message, and its array slot keeps
@@ -356,7 +390,7 @@ val run_on_file_storage :
   ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
   (replicas:Riptide_vsr.Replica.t array ->
    settle:(unit -> unit) ->
-   restart:(?lose_superblock:bool -> int -> bool) ->
+   restart:(?lose_superblock:bool -> ?repair_superblock:superblock_repair -> int -> bool) ->
    unit) ->
   unit
 (** Task 11. Exactly {!run}, with exactly the same seed splitting, view pin, [settle], Task 10

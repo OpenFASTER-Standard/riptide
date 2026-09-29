@@ -80,6 +80,64 @@ module Make_storage_tests (S : Storage_intf.S) = struct
         Alcotest.(check (option string))
           "superblock read back" (Some "view=3,commit=7") (S.superblock_read t))
 
+  (* TASK 13 FIX ROUND (review finding 6): the CONTRACT of
+     [Storage_intf.S.superblock_rebuild_from_wal], exercised uniformly against every conforming
+     backend. Its absence is exactly what let the [Fault_injecting_storage] bug (finding 3 -- a
+     rebuild that raised [Invalid_argument] unconditionally, in the one state it exists to repair)
+     ship behind a fully green suite: that backend had no rebuild test of its own, and the two
+     backend-specific ones that did exist could not have caught it.
+
+     Four clauses, all of them implementation-independent -- exactly what a shared body can assert:
+     (1) the precondition refuses on a virgin backend (finding M8); (2) over a populated WAL with no
+     superblock, the rebuild succeeds; (3) what it writes DECODES, as a record carrying the
+     operator-supplied values verbatim and an [op_number] matching the durable WAL -- decoded through
+     [Superblock_record], the single shared schema definition [Riptide_vsr.Replica]'s own
+     [superblock_decode] now delegates to (finding 5), so this really does assert "a replica could
+     restart on this"; (4) the precondition then refuses a SECOND rebuild, since there is now a
+     perfectly good superblock to protect.
+
+     Deliberately NON-ZERO, mutually distinct values for the three supplied fields -- [(view_number,
+     last_normal_view, commit_number) = (4, 3, 1)], with [last_normal_view < view_number] so the
+     record also describes a genuine mid-view-change state rather than the easy [Normal] case. Zeros
+     would pass clause (3) against an implementation that ignored its arguments entirely and
+     hardcoded them, which is precisely the defect finding 1 is about; distinct values also catch a
+     transposed pair, which equal ones cannot. *)
+  let test_superblock_rebuild_from_wal_contract (with_storage : (S.t -> unit) -> unit) () =
+    with_storage (fun t ->
+        let refused f =
+          try
+            f ();
+            false
+          with Invalid_argument _ -> true
+        in
+        Alcotest.(check bool)
+          "an empty backend is FIRST BOOT, not a lost superblock: the rebuild refuses" true
+          (refused (fun () ->
+               S.superblock_rebuild_from_wal t ~view_number:0 ~last_normal_view:0 ~commit_number:0));
+        S.wal_append t ~op_number:1 "one";
+        S.wal_append t ~op_number:2 "two";
+        S.wal_append t ~op_number:3 "three";
+        Alcotest.(check (option string)) "precondition: no superblock over a populated WAL" None
+          (S.superblock_read t);
+        S.superblock_rebuild_from_wal t ~view_number:4 ~last_normal_view:3 ~commit_number:1;
+        Alcotest.(check bool) "the rebuild wrote something" true
+          (S.superblock_read t <> None);
+        Alcotest.(check bool)
+          "and it decodes as the exact record a Replica.restart would recover: op_number from the \
+           WAL, the other three supplied verbatim"
+          true
+          (Option.bind (S.superblock_read t) Superblock_record.decode
+          = Some
+              { Superblock_record.view_number = 4;
+                last_normal_view = 3;
+                op_number = 3;
+                commit_number = 1
+              });
+        Alcotest.(check bool)
+          "a second rebuild now refuses -- there is a perfectly good superblock to protect" true
+          (refused (fun () ->
+               S.superblock_rebuild_from_wal t ~view_number:4 ~last_normal_view:3 ~commit_number:1)))
+
   let shared_tests (with_storage : (S.t -> unit) -> unit) =
     [ ("append and read", `Quick, test_append_and_read with_storage);
       ("read of never-written op_number is None", `Quick, test_read_never_written_is_none with_storage);
@@ -88,7 +146,9 @@ module Make_storage_tests (S : Storage_intf.S) = struct
       ("out-of-order append rejected", `Quick, test_out_of_order_append_rejected with_storage);
       ( "wal_truncate_after discards later entries, then allows re-append", `Quick,
         test_truncate_after with_storage );
-      ("superblock write then read (round trip)", `Quick, test_superblock_round_trip with_storage)
+      ("superblock write then read (round trip)", `Quick, test_superblock_round_trip with_storage);
+      ( "Task 13 fix (finding 6): superblock_rebuild_from_wal's contract", `Quick,
+        test_superblock_rebuild_from_wal_contract with_storage )
     ]
 end
 

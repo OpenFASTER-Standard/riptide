@@ -295,10 +295,22 @@ val restart :
     Choosing between those is an operator/deployment decision this constructor deliberately does
     not make on its caller's behalf. {b The former is now a real, callable entry point} (Task 13,
     audit-remediation): {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal} (concretely
-    {!Riptide_storage.File_storage.superblock_rebuild_from_wal}) reconstructs a fresh, usable
-    superblock from the same backend's own WAL and durably writes it — call it on the SAME
-    backend this constructor was just given, then retry {!restart}. See its own doc comment for
-    exactly what gets reconstructed and why.
+    {!Riptide_storage.File_storage.superblock_rebuild_from_wal}) writes a fresh, usable superblock
+    over the lost one — call it on the SAME backend this constructor was just given, then retry
+    {!restart}.
+
+    {b That repair is a tool of last resort run by a human, not an automatic self-heal, and it takes
+    three REQUIRED arguments it cannot derive} (Task 13 fix round): [~view_number],
+    [~last_normal_view] and [~commit_number] must be this replica's real durable view/commit state,
+    obtained out of band from a live, trusted, surviving peer of the same cluster. Only [op_number]
+    comes from the WAL. Supplying zeros — which the repair's first cut silently did on its own —
+    reintroduces exactly the cluster-wide committed-data loss this guard exists to prevent, by a
+    different route than the [n = 0] one above: a replica rebuilt with [last_normal_view] lower than
+    the truth loses view-change log selection (highest [last_normal_view] wins) to a peer that
+    honestly reports a higher one over a SHORTER log, so the new view's log is reconstructed without
+    the committed op. Pinned by a running three-replica trace test, both directions — see that
+    function's own doc comment for the trace, the per-field reasoning, and the limitations it
+    discloses (including which shape of unusable superblock it cannot repair at all).
 
     {b DURABLE, recovered here} (VSR.tla:592-596): the log (from the WAL), [op_number],
     [commit_number], [view_number], [last_normal_view]. The last two are Decision 4's whole point

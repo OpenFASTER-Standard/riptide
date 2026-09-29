@@ -261,14 +261,54 @@ let for_test_lose_superblock (T r) =
   U.superblock_write r.value torn_superblock_marker;
   r.superblock_lost <- true
 
-(* Task 13: delegates straight to the wrapped backend's own implementation, including its own
-   precondition guard -- see [storage_intf.ml]'s doc comment on [superblock_rebuild_from_wal] for
-   the full contract. Clearing [superblock_lost] afterward keeps this wrapper's own masking in
-   sync with reality: [U]'s call either raised (leaving both sides exactly as they were) or
-   succeeded, in which case the wrapped backend is readable again for real and this wrapper must
-   stop masking it -- the same "an untorn write repairs a previously torn one" property
-   [superblock_write] above already documents. *)
-let superblock_rebuild_from_wal (T r) =
-  let module U = (val r.module_) in
-  U.superblock_rebuild_from_wal r.value;
-  r.superblock_lost <- false
+(* Task 13, REWRITTEN in that task's fix round (review finding 3) -- see [storage_intf.ml]'s doc
+   comment on [superblock_rebuild_from_wal] for the contract this implements, and read the rest of
+   this comment before "simplifying" it back into a delegation.
+
+   WHY IT CANNOT DELEGATE TO [U.superblock_rebuild_from_wal], which is exactly what the first cut
+   did. The torn/lost-superblock fault is modelled in TWO halves (see [superblock_write] and
+   [for_test_lose_superblock] above): this wrapper masks its OWN [superblock_read] to [None], AND the
+   wrapped backend's own superblock record is durably replaced with [torn_superblock_marker]. Those
+   halves are asymmetric on purpose -- and the consequence is that from DOWN THERE,
+   [U.superblock_read r.value] is [Some torn_superblock_marker], not [None]. The wrapped backend's own
+   precondition guard requires [None]. So the delegating version raised [Invalid_argument]
+   unconditionally, in the one and only state it exists to repair
+   ([Riptide_dst.Cluster.restart ~lose_superblock:true]) -- the repair could never actually run
+   through this wrapper at all. Pinned now by [test_fault_injecting_storage.ml]'s own rebuild tests
+   and by [test_dst_scenarios.ml]'s cluster-level repair scenario, neither of which existed when
+   that version shipped.
+
+   WHAT IT DOES INSTEAD. The precondition is checked against THIS wrapper's masked view (which is the
+   externally-observable truth about this [t], and correctly [None] in the torn state), and the freshly
+   rebuilt record is written straight to the wrapped backend, clearing the marker for real. Writing via
+   [U.superblock_write] rather than this module's own [superblock_write] follows
+   [for_test_corrupt_entry]'s already-established precedent and reasoning: going through this module's
+   own operation would subject the REPAIR ITSELF to the probabilistic tear fault, so a scenario's
+   repair step could silently fail for an unrelated reason. This function maintains the wrapper's own
+   bookkeeping ([superblock_lost <- false]) itself, in the one place it changes -- the same "an untorn
+   write repairs a previously torn one" property [superblock_write] above already documents.
+
+   THE OP-NUMBER DERIVATION is [U.wal_highest_op_number], and the choice is worth stating because the
+   masking asymmetry above also blocks the obvious alternative (asking the wrapped backend for its own
+   rebuild derivation -- there is no entry point for that short of the guarded rebuild itself). This is
+   the right value here rather than merely an available one: for {!Memory_storage} it IS that backend's
+   own rebuild derivation exactly (see its own comment), and for {!File_storage} it is that backend's
+   live append counter, which differs from its header-only rebuild scan only for a [t] produced by a
+   FRESH [create] over a crashed ring -- a thing this wrapper explicitly does not model (its own [.mli]
+   states that its fault state does not survive re-wrapping, i.e. a re-opened backend is outside its
+   model, and no harness in this repo re-[create]s a wrapped backend across a simulated restart; they
+   reuse the same live [t], which is what makes the crash a loss of VOLATILE state only). Deliberately
+   NOT masked by [corrupted_slots]/[dropped_slots]: a slot this wrapper has faulted must keep counting
+   toward the durable op-number, since lowering it is precisely the "corrupt -> absent" mutation the
+   whole nack-soundness argument forbids. *)
+let superblock_rebuild_from_wal t ~view_number ~last_normal_view ~commit_number =
+  match t with
+  | T r ->
+    let module U = (val r.module_) in
+    let op_number = U.wal_highest_op_number r.value in
+    Superblock_record.check_rebuild_precondition ~superblock_read:(superblock_read t)
+      ~durable_op_number:op_number;
+    Superblock_record.check_rebuild_values ~view_number ~last_normal_view ~op_number ~commit_number;
+    U.superblock_write r.value
+      (Superblock_record.encode { view_number; last_normal_view; op_number; commit_number });
+    r.superblock_lost <- false

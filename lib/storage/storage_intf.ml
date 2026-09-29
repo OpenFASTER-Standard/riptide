@@ -72,41 +72,118 @@ module type S = sig
       of copies agree (see Task 3). *)
   val superblock_read : t -> string option
 
-  (** [superblock_rebuild_from_wal t] reconstructs a fresh, usable superblock purely from
-      whatever this backend can still determine about its own WAL, and durably writes it via
-      {!superblock_write} -- the repair action for the state
-      {!Riptide_vsr.Replica.restart}'s own fail-stop guard exists to catch (audit-remediation
-      Task 13): a superblock unreadable (fewer than a majority of copies verify and agree, or the
-      record does not decode) over a WAL that is otherwise completely intact. A torn superblock
-      write never touches the WAL itself, so nothing durable is actually lost in that state --
-      only the small, separately-stored record a restart needs before it can trust the rest.
+  (** [superblock_rebuild_from_wal t ~view_number ~last_normal_view ~commit_number] durably writes a
+      fresh superblock over a lost one, combining the ONE field this backend can determine for
+      itself ([op_number], from its own WAL) with the three an operator must supply. It is the
+      repair action for the state {!Riptide_vsr.Replica.restart}'s own fail-stop guard exists to
+      catch (audit-remediation Task 13): a superblock unreadable (fewer than a majority of copies
+      verify and agree, or the record does not decode) over a WAL that is otherwise completely
+      intact. A torn superblock write never touches the WAL itself, so the durable log is still all
+      there -- only the small, separately-stored record a restart needs before it can trust the rest
+      is gone.
 
-      {b Precondition: only callable when [superblock_read t = None].}
-      @raise Invalid_argument if [superblock_read t] already returns [Some] -- this function
-        exists to REPAIR a lost superblock, never to silently overwrite one that is still
-        perfectly good.
+      {b READ THIS BEFORE CALLING IT. This is a tool of last resort operated by a human with
+      out-of-band knowledge, NOT a safe automatic self-heal, and it cannot be made into one.} The
+      three supplied values must be the replica's REAL durable view/commit state, obtained from a
+      live, trusted, surviving peer of the same cluster (its [view_number], its
+      [last_normal_view], and this replica's own commit-number as that peer understands it).
+      Supplying values this storage layer could have invented on its own -- in particular ZEROS,
+      which is what the first cut of this function silently wrote -- converts VSR's own safe
+      permanent-stall failure mode into SILENT, CLUSTER-WIDE LOSS of a committed,
+      client-acknowledged operation. That is not a theoretical concern; it is a concrete
+      three-replica trace, and it is pinned by a real running test
+      ([test/test_vsr_replica_recovery.ml]'s
+      [test_a_rebuild_with_zeroed_values_destroys_a_committed_op_through_a_view_change],
+      [test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it] and
+      [test_a_rebuild_with_correct_values_preserves_that_same_committed_op] -- three runs of the SAME
+      scenario function, differing in nothing but these three arguments):
+
+      - A 3-replica cluster commits and acknowledges op 1 in view 1. Replicas 1 and 2 hold it
+        durably; replica 3 never saw it. Replica 1 is then lost for good, and replica 2 comes back
+        from a crash with a torn superblock -- so the ONLY surviving durable copy of the
+        acknowledged op is replica 2's.
+      - Rebuilt with [last_normal_view = 0], replica 2's DoViewChange loses view-change log
+        selection to replica 3's (which honestly reports [last_normal_view = 1] over an EMPTY log),
+        because [WinningDVC] (VSR.tla:432) picks the highest [last_normal_view]. The new view's log
+        is reconstructed from the winner, i.e. as empty, and the committed op is truncated on every
+        replica at once with no error anywhere.
+      - Rebuilt with the true [last_normal_view = 1], the two DVCs tie on [last_normal_view] and
+        selection falls to the longer log -- replica 2's -- so the committed op survives, is
+        re-replicated, and the cluster continues correctly.
+
+      The same reasoning applies to each field separately, so none of the three is optional or
+      "probably fine at 0":
+      - [last_normal_view] too LOW loses view-change log selection to a replica holding a shorter
+        log, as traced above.
+      - [commit_number] too LOW removes this replica's own protection against truncating a prefix it
+        knows to be committed ([truncate_wal]'s [~committed] guard), so a later view change can
+        discard it locally.
+      - [view_number] too LOW makes the replica accept as current a view the cluster has already
+        abandoned. Note also (review finding M9) that [view_number] must be ACCURATE, not merely
+        non-zero: if the supplied view is one this replica is itself the primary of, the rebuilt
+        replica comes back as a [Normal] PRIMARY and will accept [propose] calls, durably appending
+        entries no peer may ever accept.
+
+      {b Why the caller has to supply them at all -- this is inherent, not an unfinished
+      implementation.} The WAL is the only durable state this layer has left, and it records op
+      bytes, not view/commit bookkeeping. No value for [view_number], [last_normal_view] or
+      [commit_number] is DERIVABLE from it, by any rule, and the honest consequence is that a
+      single replica in this state genuinely cannot recover itself from local evidence alone.
+      Recovering it from CROSS-REPLICA evidence is VSR's classical Recovery sub-protocol, which is
+      real Layer-0 consensus-protocol scope (its own messages, its own quorum argument, its own
+      TLA+ verification under this repo's own governance rules) and deliberately out of this
+      function's scope. What this function is, precisely, is the mechanical last step of that
+      recovery once a human has obtained the values some other way -- which is strictly better than
+      the alternative it replaced (a replica permanently down with a fully intact log and no
+      supported way to bring it back), and strictly worse than a real Recovery protocol.
+
+      {b Preconditions}, both of them exactly {!Riptide_vsr.Replica.restart}'s own fail-stop
+      condition, so this function is callable precisely in the state that guard refuses in:
+      @raise Invalid_argument if [superblock_read t <> None] -- this function REPAIRS a lost
+        superblock, it never overwrites one that is still perfectly good.
+      @raise Invalid_argument if [wal_highest_op_number t = 0] (review finding M8) -- an empty
+        backend is FIRST BOOT, not a lost superblock, and writing a degenerate superblock there
+        repairs nothing while permanently foreclosing {!Riptide_vsr.Replica.create} (which refuses
+        if any superblock already exists).
+      @raise Invalid_argument if the supplied values are not well-formed on their face: any of them
+        negative, [commit_number > op_number]
+        ([CommitNumberNeverHigherThanOpNumber], VSR.tla:721-722), or
+        [last_normal_view > view_number]. See {!Riptide_storage.Superblock_record.check_rebuild_values}
+        -- and note that passing these checks says nothing at all about whether the values are TRUE.
 
       {b Postcondition: [superblock_read t] returns [Some] afterward}, of a record
-      {!Riptide_vsr.Replica.restart} can actually decode and use -- not merely "some bytes".
+      {!Riptide_vsr.Replica.restart} can actually decode and use -- not merely "some bytes". The
+      schema is {!Riptide_storage.Superblock_record}'s, the same single definition
+      {!Riptide_vsr.Replica}'s own durable writes go through, so the two cannot drift.
 
-      {b What gets reconstructed, and why each field is what it is} (this is the one place this
-      contract has to say something about {!Riptide_vsr.Replica}'s own superblock schema, even
-      though this library has no code dependency on [riptide_vsr] -- see
-      {!Riptide_storage.File_storage}'s own [.ml], "Task 13", for the full reasoning and why the
-      encoding is necessarily duplicated rather than shared). The durable WAL is the only source
-      of truth a rebuild has, and it can only speak to [op_number] -- the highest op-number whose
-      header and data both still verify, exactly what a fresh {!Riptide_storage.File_storage.create}
-      already recovers by scanning the same WAL. Every OTHER field a real VSR superblock carries
-      ([view_number], [last_normal_view], [commit_number]) is NOT recoverable from the WAL at all,
-      and guessing wrong at any of them is worse than an honest admission of ignorance -- so each
-      is set to the same conservative value {!Riptide_vsr.Replica.create}'s own [Init] uses, [0],
-      never invented. [commit_number = 0 <= op_number] always holds, so the reconstructed record
-      is unconditionally well-formed; [view_number = last_normal_view = 0] reconstructs as
-      {!Riptide_vsr.Replica.Normal} status, same as first boot. A replica recovered this way is
-      behind on view/commit bookkeeping exactly the way a freshly-caught-up backup is -- it
-      relearns both from the ordinary protocol (a later, higher-view [Start_view], and the normal
-      commit path) -- but it is never WRONG in a direction that could cost safety: it never claims
-      to know a view or a commit it cannot independently prove, and it never discards an
-      op-number it can still verify. *)
-  val superblock_rebuild_from_wal : t -> unit
+      {b [op_number] is derived in the OVER-reporting direction, deliberately} (review finding 2). A
+      backend derives it as the highest op-number whose slot HEADER still verifies and sits at the
+      ring position that op-number belongs to -- {b regardless of whether that slot's DATA also
+      verifies}. Requiring the data to verify too would UNDER-report, which is the one direction
+      that is unsound: [Riptide_vsr.Replica]'s own [adopt_durable_log] ("CRASH ORDERING") spells out
+      why over-reporting is the safe side -- a replica that reports an op-number it cannot fully
+      read presents those slots as VSR.tla's "corrupt" (in range, unreadable, never shipped and
+      never nacked), whereas one that reports a LOWER op-number proves them ABSENT via
+      [sender_proves_absent]'s [o > n] disjunct, which is precisely the "corrupt -> absent" mutation
+      TLC refuted against [NoCommittedOpProvablyAbsent] (VSR.tla:111-150). Over-reporting costs
+      liveness (the replica declines new Prepares until a StartView repairs the unreadable slots);
+      under-reporting costs committed data.
+
+      {b Residual gap this repair does NOT cover, stated plainly} (review finding 4).
+      {!Riptide_vsr.Replica.restart} refuses on either of TWO shapes of unusable superblock:
+      [superblock_read = None], and [superblock_read = Some bytes] where those bytes do not decode
+      as a superblock record. This function's precondition only admits the FIRST. A backend that
+      still hands back bytes -- a majority of copies agreeing on a record that is nonetheless
+      garbage -- cannot be repaired by this function; it raises [Invalid_argument] instead, and that
+      failure mode has no repair tool in this codebase. The reason is a layering constraint, not an
+      oversight: deciding "present but garbage" from "present and fine" means DECODING a
+      VSR-shaped record and judging its fields, and while
+      {!Riptide_storage.Superblock_record.decode} now makes the decode itself available down here,
+      judging whether a decodable record is the RIGHT one is a protocol question this layer has no
+      standing to answer -- a superblock that decodes cleanly but describes the wrong state is
+      exactly what a caller must NOT have silently overwritten out from under it. In practice such a
+      backend is recovered the way this contract's own text describes for the un-repairable case:
+      wipe it and let it rejoin as an empty replica. *)
+  val superblock_rebuild_from_wal :
+    t -> view_number:int -> last_normal_view:int -> commit_number:int -> unit
 end

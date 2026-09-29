@@ -992,6 +992,98 @@ let test_a_crash_with_a_torn_superblock_refuses_to_come_back () =
   fail_on_violations ~what:"torn-superblock crash scenario" c.violations
 
 (* ---------------------------------------------------------------------------------------------
+   Test 8b (Task 13 fix round): the OTHER half of test 8 -- getting those two permanently-down
+   replicas back.
+   ---------------------------------------------------------------------------------------------
+
+   Test 8 above proves the fail-stop refusal is right, and stops there, because when it was written
+   there was nothing to do next: a replica that refused stayed down forever with a fully intact log.
+   Task 13 added the repair; this fix round made it take real operator-supplied values (review
+   finding 1) and made it actually work through the fault-injection wrapper the whole DST harness
+   runs on (review finding 3 -- it previously raised [Invalid_argument] unconditionally in exactly
+   this state, so the scenario below could not have been written at all).
+
+   Same crash as test 8, then the recovery an operator would actually perform: read the real
+   view/commit state off the ONE replica that never crashed, hand those values to the repair, and
+   restart. WHAT MUST HAPPEN: both replicas come back for real, the committed value is still durably
+   on every disk, every safety check still passes, and the cluster keeps serving -- a further
+   proposal commits normally.
+
+   This is deliberately the OPERATIONALLY FAITHFUL sequence rather than the convenient one:
+   [restart ~lose_superblock:true] alone first (asserting the [false] refusal), and only then
+   [restart ~repair_superblock:...] as a separate act. Folding both into one call would hide the
+   refusal that is the whole reason the repair exists. *)
+let test_the_superblock_repair_brings_a_refusing_replica_back () =
+  let replica_count = 3 in
+  let c = make_checker ~seed:101 ~replica_count in
+  let refusals = ref [] and recoveries = ref [] and durable_after = ref [] in
+  let committed_again = ref false in
+  Riptide_dst.Cluster.run ~seed:101 ~replica_count (fun ~replicas ~settle ~restart ->
+      Replica.propose replicas.(0) (v "committed-before-the-crash");
+      settle ();
+      Alcotest.(check int) "precondition: the value really is committed at the primary" 1
+        (Replica.commit_number replicas.(0));
+      check c ~phase:"before-the-crash" replicas;
+      (* THE OPERATOR'S OUT-OF-BAND KNOWLEDGE, read off the replica that is about to survive -- this
+         is the step that has no analogue inside the storage layer, and the reason the repair cannot
+         be an automatic self-heal: replica 1 (index 0) never crashes here, so its live view/commit
+         state IS the cluster's, exactly as a real operator would query a surviving peer for it. *)
+      let truth =
+        { Riptide_dst.Cluster.view_number = Replica.view_number replicas.(0);
+          last_normal_view = Replica.last_normal_view replicas.(0);
+          commit_number = 0
+          (* The backups' OWN commit_number, which is what their own superblock must carry: neither
+             backup ever learned the commit (no later Prepare carried the raised [k] to them before
+             the crash), so supplying the primary's 1 would be inventing durable state this replica
+             never had -- and [commit_number <= op_number] is checked, not assumed. Asserted rather
+             than hardcoded, just below. *)
+        }
+      in
+      Alcotest.(check int) "the backups' own commit_number really is 0, not the primary's 1" 0
+        (Replica.commit_number replicas.(1));
+      (* THE CRASH, exactly test 8's: two replicas go down with torn superblocks. Both must refuse. *)
+      List.iter
+        (fun i ->
+          let came_back = restart ~lose_superblock:true i in
+          if not came_back then c.down.(i) <- true;
+          c.restarted.(i) <- true;
+          refusals := (i, came_back) :: !refusals)
+        [ 1; 2 ];
+      settle ();
+      check c ~phase:"after-the-crash" replicas;
+      (* THE REPAIR, as a separate operator act. *)
+      List.iter
+        (fun i ->
+          let came_back = restart ~repair_superblock:truth i in
+          if came_back then c.down.(i) <- false;
+          recoveries := (i, came_back) :: !recoveries)
+        [ 1; 2 ];
+      settle ();
+      check c ~phase:"after-the-repair" replicas;
+      (* AND THE CLUSTER STILL WORKS: a further proposal commits normally through the repaired
+         replicas, which is what makes this a recovery rather than merely three processes running. *)
+      Replica.propose replicas.(0) (v "committed-after-the-repair");
+      settle ();
+      committed_again := Replica.is_committed replicas.(0) (v "committed-after-the-repair");
+      check c ~phase:"after-committing-again" replicas;
+      durable_after :=
+        Array.to_list (Array.map (fun r -> Replica.for_test_wal_read r ~op_number:1) replicas));
+  Alcotest.(check (list (pair int bool)))
+    "precondition: both replicas REFUSED to come back before the repair"
+    [ (1, false); (2, false) ]
+    (List.sort compare !refusals);
+  Alcotest.(check (list (pair int bool)))
+    "THE POINT: the repair brings both of them back for real"
+    [ (1, true); (2, true) ]
+    (List.sort compare !recoveries);
+  Alcotest.(check bool) "and the cluster commits a new value afterwards" true !committed_again;
+  Alcotest.(check (list (option string)))
+    "the originally committed value is still durably readable on all three disks"
+    (List.init replica_count (fun _ -> Some "committed-before-the-crash"))
+    (List.map (Option.map (function Value.Scalar (Value.String x) -> x | _ -> "?")) !durable_after);
+  fail_on_violations ~what:"torn-superblock repair scenario" c.violations
+
+(* ---------------------------------------------------------------------------------------------
    REGRESSION TESTS, subtask 3.8: [Cluster.for_test_settle_loop] itself, exercised directly with a
    FAKE round-delivery/clock rather than through a real cluster.
 
@@ -1703,4 +1795,7 @@ let tests =
     ( "subtask 3.7, fix round 1 (finding C1): once the ring has WRAPPED, restart recovery cannot \
        recover a still-unmaterialized entry -- the real, narrower boundary of that claim", `Slow,
       test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry );
+    ( "Task 13 fix round: the superblock repair brings a refusing replica back, with real \
+       operator-supplied values read off a surviving peer", `Quick,
+      test_the_superblock_repair_brings_a_refusing_replica_back );
   ]

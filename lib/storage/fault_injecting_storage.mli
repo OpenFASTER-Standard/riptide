@@ -201,7 +201,17 @@ val for_test_lose_superblock : t -> unit
     state an ordinary crash partway through a 3-copy [superblock_write] produces on its own.
 
     Repaired by any later untorn [superblock_write], like the probabilistic version. Not subject to
-    [faults_max] — see [superblock_loss_probability] for why. *)
+    [faults_max] — see [superblock_loss_probability] for why.
+
+    {b Also repaired by {!superblock_rebuild_from_wal}}, which is the operator action the state this
+    hook produces actually calls for (Task 13). This wrapper's own implementation of it is NOT a
+    delegation to the wrapped backend's — it cannot be, and that was a real bug (Task 13 fix round,
+    review finding 3): the two halves above are asymmetric, so from the wrapped backend's own point of
+    view its superblock is [Some marker], not [None], and its own precondition guard therefore refused
+    unconditionally in exactly this state. This wrapper checks its OWN masked view as the
+    precondition and writes the rebuilt record straight to the wrapped backend, clearing the marker.
+    See this module's [.ml] at that function for the full reasoning, including why the write
+    deliberately bypasses this wrapper's own (tearable) [superblock_write]. *)
 
 val set_fault_config : t -> fault_config -> unit
 (** Replaces [t]'s fault config for every subsequent [wal_append], without touching any

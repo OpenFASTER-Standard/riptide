@@ -456,7 +456,18 @@ let test_superblock_none_without_majority () =
    review finding C1). Matches [test_superblock_none_without_majority]'s own direct-file-
    corruption pattern above, but tears all 3 copies (not just 2) to put beyond doubt that
    [superblock_read] genuinely returns [None] before the rebuild is attempted, not merely "no
-   majority from a lucky surviving pair". *)
+   majority from a lucky surviving pair".
+
+   TASK 13 FIX ROUND. Two changes here, both real:
+   - The three non-WAL-derivable fields are now SUPPLIED (review finding 1), and this test supplies
+     plausible real ones -- what an operator would have read off a surviving peer of a cluster that
+     had committed 4 of its 5 durable ops in view 3 -- not the zeros the first cut invented.
+   - The assertion DECODES the rebuilt record and checks every field (review finding M11). Asserting
+     only [Option.is_some] would pass for any bytes at all, including bytes no
+     [Riptide_vsr.Replica.restart] could ever use, which is precisely what this repair has to
+     produce. Decoded through {!Riptide_storage.Superblock_record}, which since finding 5 is the SAME
+     definition [Riptide_vsr.Replica]'s own [superblock_decode] delegates to -- so this really is
+     "the replica could use this", not a lookalike decoder written for the test. *)
 let test_superblock_rebuild_recovers_from_an_unreadable_superblock_over_an_intact_wal () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -480,9 +491,83 @@ let test_superblock_rebuild_recovers_from_an_unreadable_superblock_over_an_intac
         (File_storage.wal_highest_op_number t2);
       Alcotest.(check (option string)) "precondition: the superblock really is gone" None
         (File_storage.superblock_read t2);
-      File_storage.superblock_rebuild_from_wal t2;
+      File_storage.superblock_rebuild_from_wal t2 ~view_number:3 ~last_normal_view:3
+        ~commit_number:4;
       Alcotest.(check bool) "superblock_read now returns Some" true
-        (Option.is_some (File_storage.superblock_read t2)))
+        (Option.is_some (File_storage.superblock_read t2));
+      let decoded =
+        Option.bind (File_storage.superblock_read t2) Riptide_storage.Superblock_record.decode
+      in
+      Alcotest.(check bool) "and the bytes really decode as a usable superblock record" true
+        (decoded <> None);
+      match decoded with
+      | None -> ()
+      | Some r ->
+        Alcotest.(check int) "op_number reconstructed from the WAL, in full" 5
+          r.Riptide_storage.Superblock_record.op_number;
+        Alcotest.(check int) "commit_number is exactly what the operator supplied" 4
+          r.Riptide_storage.Superblock_record.commit_number;
+        Alcotest.(check int) "view_number is exactly what the operator supplied" 3
+          r.Riptide_storage.Superblock_record.view_number;
+        Alcotest.(check int) "last_normal_view is exactly what the operator supplied" 3
+          r.Riptide_storage.Superblock_record.last_normal_view)
+
+(* TASK 13 FIX ROUND (review finding 2): the op-number derivation must OVER-report, never under-.
+   A crash between a slot's header write and its data write -- two separate, non-atomic 4096-byte
+   writes inside one [wal_append] -- leaves the topmost slot durable-but-corrupt: its header
+   verifies and maps back to its own slot, its data does not checksum. Simulated here by zeroing
+   the top entry's DATA region directly on disk, leaving its header intact.
+
+   The rebuilt superblock must still claim that op-number. Under-reporting it (which is what
+   [recover_highest_op_number], the scan [create] uses for the stricter "fully readable" meaning,
+   would have given) turns a slot the replica really did durably hold into one it PROVES absent via
+   [sender_proves_absent]'s [o > n] disjunct -- the one-word "corrupt -> absent" mutation
+   spec/tla/VSR.tla:111-150 records TLC refuting, reintroduced through the repair tool. *)
+let test_superblock_rebuild_over_reports_an_op_whose_data_no_longer_verifies () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+       for op = 1 to 3 do
+         File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
+       done);
+      (* Slot layout (see file_storage.ml's own top comment): [ring_capacity] header slots of 4096
+         bytes each, then [ring_capacity] data slots of 4096 bytes each. Op 3 lives in slot 2, so
+         its data slot starts at [(ring_capacity + 2) * 4096]. Zeroing it leaves the header (which
+         carries op_number/length/checksum) completely untouched. *)
+      let ring = Filename.concat dir "ring" in
+      let fd = Unix.openfile ring [ Unix.O_RDWR ] 0o600 in
+      ignore (Unix.lseek fd ((ring_capacity + 2) * 4096) Unix.SEEK_SET);
+      ignore (Unix.write fd (Bytes.make 4096 '\000') 0 4096);
+      Unix.close fd;
+      (* And the superblock goes too, the ordinary way. *)
+      List.iter
+        (fun i ->
+          let oc = open_out_bin (Filename.concat dir (Printf.sprintf "superblock-%d" i)) in
+          output_string oc "garbage, wrong length and checksum"; close_out oc)
+        [ 0; 1; 2 ];
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      (* [create]'s own scan DOES require the data to verify, so it honestly reports 2 -- that is
+         the value whose meaning is "fully readable", and it is unchanged by this fix. *)
+      Alcotest.(check int) "precondition: op 3's data no longer verifies, so wal_read cannot see it"
+        2 (File_storage.wal_highest_op_number t2);
+      Alcotest.(check (option string)) "precondition: and op 3 really is unreadable" None
+        (File_storage.wal_read t2 ~op_number:3);
+      Alcotest.(check bool) "precondition: op 2 next to it is fine" true
+        (File_storage.wal_read t2 ~op_number:2 = Some "entry-2");
+      File_storage.superblock_rebuild_from_wal t2 ~view_number:1 ~last_normal_view:1
+        ~commit_number:2;
+      let decoded =
+        Option.bind (File_storage.superblock_read t2) Riptide_storage.Superblock_record.decode
+      in
+      match decoded with
+      | None -> Alcotest.fail "the rebuilt superblock must decode"
+      | Some r ->
+        Alcotest.(check int)
+          "THE POINT: the rebuild claims op 3 -- header-verified, data-corrupt is CORRUPT, never \
+           ABSENT"
+          3 r.Riptide_storage.Superblock_record.op_number)
 
 (* The precondition guard: rebuilding must never be allowed to clobber a superblock that is
    already perfectly readable -- this function exists to REPAIR a lost superblock, never to
@@ -493,10 +578,89 @@ let test_superblock_rebuild_refuses_when_superblock_is_already_readable () =
       Eio.Switch.run @@ fun sw ->
       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
       File_storage.superblock_write t "a perfectly good superblock";
+      (* The expected message is the SHARED constant, not a hand-typed copy of it (review finding
+         M10): the implementation and this assertion can no longer drift apart. *)
       Alcotest.check_raises "refuses to rebuild over an already-usable superblock"
-        (Invalid_argument
-           "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over \
-            an already-usable superblock") (fun () -> File_storage.superblock_rebuild_from_wal t))
+        (Invalid_argument Riptide_storage.Superblock_record.refusal_superblock_already_readable)
+        (fun () ->
+          File_storage.superblock_rebuild_from_wal t ~view_number:1 ~last_normal_view:1
+            ~commit_number:0))
+
+(* TASK 13 FIX ROUND (review finding M8): the OTHER half of the precondition. A backend with no
+   superblock AND no WAL is FIRST BOOT, not a lost superblock -- and
+   [Riptide_vsr.Replica.restart]'s own guard says so, by being conditioned on
+   [wal_highest_op_number > 0] and not on the superblock alone. Rebuilding here repairs nothing and
+   does real harm: [Riptide_vsr.Replica.create] refuses if ANY superblock exists, so a degenerate
+   one written over a virgin backend permanently forecloses the only constructor that was still
+   legitimate for it. *)
+let test_superblock_rebuild_refuses_on_a_genuinely_empty_backend () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      Alcotest.(check (option string)) "precondition: no superblock" None
+        (File_storage.superblock_read t);
+      Alcotest.(check int) "precondition: and an empty WAL" 0 (File_storage.wal_highest_op_number t);
+      Alcotest.check_raises "refuses: there is nothing to repair on a virgin backend"
+        (Invalid_argument Riptide_storage.Superblock_record.refusal_empty_wal) (fun () ->
+          File_storage.superblock_rebuild_from_wal t ~view_number:0 ~last_normal_view:0
+            ~commit_number:0);
+      Alcotest.(check (option string)) "and nothing was written -- the refusal is a total no-op" None
+        (File_storage.superblock_read t))
+
+(* TASK 13 FIX ROUND (review finding 1, the validation half): the supplied values are checked for
+   well-formedness on their face. These checks catch a transposed argument or a typo and nothing
+   more -- they cannot check that the values are TRUE, which is the hazard the doc comment on
+   [superblock_rebuild_from_wal] is actually about, and which the three-replica trace test in
+   test_vsr_replica_recovery.ml is what pins. Both directions of the [commit_number <= op_number]
+   and [last_normal_view <= view_number] rules are exercised. *)
+let test_superblock_rebuild_rejects_ill_formed_supplied_values () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+       File_storage.wal_append t ~op_number:1 "one";
+       File_storage.wal_append t ~op_number:2 "two");
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      (* [~naming] is the distinctive part of the expected message, so each case is pinned to its OWN
+         rejection rather than to "some Invalid_argument" -- three guards that all raise the same
+         exception type are exactly where a copy-paste mistake hides. *)
+      let raises what ~naming f =
+        let msg = try (f (); "no exception was raised at all") with Invalid_argument m -> m in
+        let contains needle =
+          let n = String.length needle and h = String.length msg in
+          let rec loop i = i + n <= h && (String.sub msg i n = needle || loop (i + 1)) in
+          loop 0
+        in
+        Alcotest.(check bool) what true
+          (String.starts_with ~prefix:"superblock_rebuild_from_wal: " msg && contains naming)
+      in
+      raises "a negative commit_number is rejected" ~naming:"must all be >= 0" (fun () ->
+          File_storage.superblock_rebuild_from_wal t ~view_number:1 ~last_normal_view:1
+            ~commit_number:(-1));
+      raises "a commit_number above the WAL's own op_number is rejected"
+        ~naming:"commit_number 3 exceeds the op_number 2" (fun () ->
+          File_storage.superblock_rebuild_from_wal t ~view_number:1 ~last_normal_view:1
+            ~commit_number:3);
+      raises "a last_normal_view ahead of view_number is rejected"
+        ~naming:"last_normal_view 2 exceeds view_number 1" (fun () ->
+          File_storage.superblock_rebuild_from_wal t ~view_number:1 ~last_normal_view:2
+            ~commit_number:1);
+      Alcotest.(check (option string))
+        "every rejection is a total no-op -- no half-written superblock" None
+        (File_storage.superblock_read t);
+      (* And the well-formed boundary case really is accepted: commit_number exactly equal to the
+         WAL's own op_number, last_normal_view exactly equal to view_number. *)
+      File_storage.superblock_rebuild_from_wal t ~view_number:7 ~last_normal_view:7 ~commit_number:2;
+      Alcotest.(check bool) "the boundary-legal values are accepted" true
+        (Option.bind (File_storage.superblock_read t) Riptide_storage.Superblock_record.decode
+        = Some
+            { Riptide_storage.Superblock_record.view_number = 7;
+              last_normal_view = 7;
+              op_number = 2;
+              commit_number = 2
+            }))
 
 (* ============================================================================================
    SUBTASK 3.7: the [?may_evict] eviction gate.
@@ -894,6 +1058,16 @@ let tests =
     ( "Task 13: superblock_rebuild_from_wal refuses when the superblock is already readable",
       `Quick,
       test_superblock_rebuild_refuses_when_superblock_is_already_readable );
+    ( "Task 13 fix (finding 2): superblock_rebuild_from_wal over-reports an op whose data no longer \
+       verifies",
+      `Quick,
+      test_superblock_rebuild_over_reports_an_op_whose_data_no_longer_verifies );
+    ( "Task 13 fix (finding M8): superblock_rebuild_from_wal refuses on a genuinely empty backend",
+      `Quick,
+      test_superblock_rebuild_refuses_on_a_genuinely_empty_backend );
+    ( "Task 13 fix (finding 1): superblock_rebuild_from_wal rejects ill-formed supplied values",
+      `Quick,
+      test_superblock_rebuild_rejects_ill_formed_supplied_values );
     ( "3.7: ?may_evict refuses a genuine eviction, raising the classifiable message",
       `Quick,
       test_may_evict_blocks_a_genuine_eviction );

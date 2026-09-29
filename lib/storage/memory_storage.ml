@@ -46,31 +46,28 @@ let wal_highest_op_number t = t.highest
 let superblock_write t data = t.superblock <- Some data
 let superblock_read t = t.superblock
 
-(* Task 13: the same repair action as [File_storage.superblock_rebuild_from_wal] -- see that
-   module's own comment, and [storage_intf.ml]'s shared doc comment on
-   [superblock_rebuild_from_wal], for the full field-by-field contract and reasoning. Trivial
-   here, by construction: this backend keeps [t.highest] as a live in-memory counter already
-   (there is no separate on-disk WAL to re-scan), and it has no torn-superblock-write failure mode
-   of its own -- the only way [t.superblock] is ever [None] with a non-empty WAL here is the
-   [for_test_lose_superblock] hook below. Same precondition, same conservative-zero fields, same
-   postcondition as [File_storage]'s version: [superblock_read] returns [Some] of a record
-   {!Riptide_vsr.Replica.restart} can actually use afterward. *)
-let superblock_rebuild_from_wal t =
-  if superblock_read t <> None then
-    invalid_arg
-      "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over an \
-       already-usable superblock";
-  let int_field name i = (name, Riptide.Value.Scalar (Riptide.Value.Int (Int64.of_int i))) in
-  let data =
-    Riptide.Value.canonical_encode
-      (Riptide.Value.Record
-         [ int_field "commit_number" 0;
-           int_field "last_normal_view" 0;
-           int_field "op_number" t.highest;
-           int_field "view_number" 0
-         ])
-  in
-  superblock_write t data
+(* Task 13: the same repair action as [File_storage.superblock_rebuild_from_wal] -- see
+   [storage_intf.ml]'s shared doc comment on [superblock_rebuild_from_wal] for the full contract,
+   including why [~view_number]/[~last_normal_view]/[~commit_number] are the CALLER's to supply and
+   what supplying wrong ones costs. Trivial here, by construction, in exactly one respect: the
+   over-reporting op-number derivation [File_storage] needs a header-only ring scan for (see its own
+   comment, review finding 2) is ALREADY what [t.highest] is here -- [for_test_corrupt] deliberately
+   never lowers it, precisely because a corrupt slot must stay inside the WAL's op-number range
+   rather than become provably absent (see [corrupt]'s own field comment above). So this backend's
+   [wal_highest_op_number] and its rebuild derivation genuinely coincide, rather than coinciding by
+   accident.
+
+   Everything else -- the precondition, the well-formedness checks on the supplied values, the record
+   schema -- is {!Riptide_storage.Superblock_record}'s, shared with every other backend rather than
+   re-typed here (review findings 5 and M10). *)
+let superblock_rebuild_from_wal t ~view_number ~last_normal_view ~commit_number =
+  Superblock_record.check_rebuild_precondition ~superblock_read:(superblock_read t)
+    ~durable_op_number:t.highest;
+  Superblock_record.check_rebuild_values ~view_number ~last_normal_view ~op_number:t.highest
+    ~commit_number;
+  superblock_write t
+    (Superblock_record.encode
+       { view_number; last_normal_view; op_number = t.highest; commit_number })
 
 let for_test_corrupt t ~op_number =
   if op_number >= 1 && op_number <= t.highest then Hashtbl.replace t.corrupt op_number ()

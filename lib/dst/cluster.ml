@@ -25,6 +25,13 @@
    cluster, so no amount of adversarial sweeping could ever have reached a restart-time defect. See
    [restart] below and [cluster.mli]'s own paragraph on it. *)
 
+(* Task 13 fix round -- see [cluster.mli] for what these are and the hazard attached to them. *)
+type superblock_repair = {
+  view_number : int;
+  last_normal_view : int;
+  commit_number : int;
+}
+
 exception Did_not_settle
 
 exception Cluster_test_done
@@ -471,11 +478,22 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
      in practice even though it is written broadly: [my_id]/[replica_count]/[svc_limit] are the same
      values [Replica.create] already accepted for this replica moments earlier, so the only
      precondition left for [restart] to fail is the superblock one. *)
-  let restart ?(lose_superblock = false) i =
+  let restart ?(lose_superblock = false) ?repair_superblock i =
     if i < 0 || i >= replica_count then
       invalid_arg "Cluster.restart: replica index out of range (they are 0-based, like [replicas])";
     if lose_superblock then
       Riptide_storage.Fault_injecting_storage.for_test_lose_superblock fault_storages.(i);
+    (* TASK 13 FIX ROUND: the operator repair step, before the restart attempt -- see [cluster.mli]'s
+       own doc comment on [?repair_superblock] and, for what these three values MEAN and what
+       supplying wrong ones costs, {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s.
+       Deliberately NOT wrapped in the [Invalid_argument] catch below: that catch exists to turn "this
+       machine will not boot" into a [false] return, and a repair whose own preconditions do not hold
+       is a mistake in the scenario, which must not be laundered into the same signal. *)
+    Option.iter
+      (fun { view_number; last_normal_view; commit_number } ->
+        Riptide_storage.Fault_injecting_storage.superblock_rebuild_from_wal fault_storages.(i)
+          ~view_number ~last_normal_view ~commit_number)
+      repair_superblock;
     match
       Riptide_vsr.Replica.restart ~storage:storages.(i) ~my_id:(i + 1) ~replica_count ~svc_limit
         ~send:(send_for i) ()
@@ -558,7 +576,7 @@ let run ~seed ~replica_count ?(svc_limit = default_svc_limit)
     (body :
       replicas:Riptide_vsr.Replica.t array ->
       settle:(unit -> unit) ->
-      restart:(?lose_superblock:bool -> int -> bool) ->
+      restart:(?lose_superblock:bool -> ?repair_superblock:superblock_repair -> int -> bool) ->
       unit) =
   (* Task 10's pre-flight must reject BEFORE [Eio_mock.Backend.run] is entered, not just before any
      replica is built: [test_dst_cluster.ml]'s own test asserts the [Invalid_argument] escapes to
@@ -587,7 +605,7 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
     (body :
       replicas:Riptide_vsr.Replica.t array ->
       settle:(unit -> unit) ->
-      restart:(?lose_superblock:bool -> int -> bool) ->
+      restart:(?lose_superblock:bool -> ?repair_superblock:superblock_repair -> int -> bool) ->
       unit) =
   check_storage_fault_config ~replica_count
     ~faults_max:((replica_count - 1) / 2)

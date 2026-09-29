@@ -352,6 +352,75 @@ let test_for_test_lose_superblock_is_deterministic_and_leaves_the_wal_alone () =
       Alcotest.(check (option string)) "the WAL is untouched: op 2" (Some "entry two")
         (Fault_injecting_storage.wal_read t ~op_number:2))
 
+(* TASK 13 FIX ROUND, review finding 3 -- the regression test for a bug that made this wrapper's
+   [superblock_rebuild_from_wal] raise [Invalid_argument] in the one and only state it exists to
+   repair, so the repair could never run through a fault-injected backend at all.
+
+   THE BUG. The torn/lost-superblock fault is modelled in two asymmetric halves: this wrapper masks
+   its OWN [superblock_read] to [None], and the WRAPPED backend's superblock is durably overwritten
+   with an unusable marker record. The first cut of [superblock_rebuild_from_wal] simply delegated to
+   the wrapped backend's own implementation -- whose precondition requires ITS own [superblock_read]
+   to be [None], while what it actually sees is [Some marker]. So it refused, always, exactly here.
+
+   Structurally invisible to every test that existed at the time: this file had no rebuild test, the
+   two that did exist were [File_storage]-only, and the shared conformance suite had no rebuild case
+   (that gap is review finding 6, now closed in test_storage_shared.ml). This test plus the
+   three-replica trace in test_vsr_replica_recovery.ml are what keep it closed. *)
+let test_superblock_rebuild_works_through_the_fault_injection_wrapper () =
+  with_wrapped_pair ~replication_quorum:3 ~seed:15 (fun t underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "entry one";
+      Fault_injecting_storage.wal_append t ~op_number:2 "entry two";
+      Fault_injecting_storage.superblock_write t "a perfectly good superblock";
+      Fault_injecting_storage.for_test_lose_superblock t;
+      Alcotest.(check (option string)) "precondition: the superblock is gone through the wrapper" None
+        (Fault_injecting_storage.superblock_read t);
+      (* THE ASYMMETRY THAT CAUSED THE BUG, asserted rather than described: the WRAPPED backend still
+         hands back bytes (the torn marker), so its own precondition guard would refuse -- which is
+         why this wrapper must check its own masked view and write the record itself. *)
+      Alcotest.(check bool)
+        "and the WRAPPED backend still reports Some (the torn marker) -- the asymmetry that broke \
+         the delegating version"
+        true
+        (File_storage.superblock_read underlying <> None);
+      Fault_injecting_storage.superblock_rebuild_from_wal t ~view_number:5 ~last_normal_view:5
+        ~commit_number:1;
+      Alcotest.(check bool) "the repair ran: the wrapper stops masking" true
+        (Fault_injecting_storage.superblock_read t <> None);
+      Alcotest.(check bool)
+        "and the torn marker is really gone from the wrapped backend, replaced by a decodable record"
+        true
+        (Option.bind (File_storage.superblock_read underlying) Superblock_record.decode
+        = Some
+            { Superblock_record.view_number = 5;
+              last_normal_view = 5;
+              op_number = 2;
+              commit_number = 1
+            });
+      Alcotest.(check bool) "the wrapper and the wrapped backend agree afterwards" true
+        (Fault_injecting_storage.superblock_read t = File_storage.superblock_read underlying);
+      Alcotest.(check int) "and the WAL was never touched by any of it" 2
+        (Fault_injecting_storage.wal_highest_op_number t))
+
+(* The repair must not be able to CLOBBER a superblock this wrapper can still read -- the same
+   precondition every backend enforces, checked here against the wrapper's own masked view rather than
+   the wrapped backend's. *)
+let test_superblock_rebuild_refuses_through_the_wrapper_when_not_lost () =
+  with_wrapped_pair ~replication_quorum:3 ~seed:16 (fun t _underlying ->
+      Fault_injecting_storage.wal_append t ~op_number:1 "entry one";
+      Fault_injecting_storage.superblock_write t "a perfectly good superblock";
+      let raised =
+        try
+          Fault_injecting_storage.superblock_rebuild_from_wal t ~view_number:1 ~last_normal_view:1
+            ~commit_number:1;
+          false
+        with Invalid_argument _ -> true
+      in
+      Alcotest.(check bool) "refuses over a superblock the wrapper can still read" true raised;
+      Alcotest.(check (option string))
+        "and it is a total no-op -- the good superblock is untouched"
+        (Some "a perfectly good superblock")
+        (Fault_injecting_storage.superblock_read t))
+
 let tests =
   [ ( "corrupt_probability = 1.0 really corrupts (wal_read returns None)", `Quick,
       test_corrupt_probability_one_makes_read_return_none );
@@ -378,5 +447,10 @@ let tests =
     ( "I1: for_test_lose_superblock is deterministic and leaves the WAL alone", `Quick,
       test_for_test_lose_superblock_is_deterministic_and_leaves_the_wal_alone );
     ( "a for_test_corrupt_entry slot's bookkeeping is cleared by a truncate, so a repair is visible",
-      `Quick, test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate )
+      `Quick, test_for_test_corrupt_entry_bookkeeping_is_cleared_by_truncate );
+    ( "Task 13 fix (finding 3): superblock_rebuild_from_wal actually works through this wrapper in \
+       the lost-superblock state",
+      `Quick, test_superblock_rebuild_works_through_the_fault_injection_wrapper );
+    ( "Task 13 fix (finding 3): and still refuses over a superblock the wrapper can read",
+      `Quick, test_superblock_rebuild_refuses_through_the_wrapper_when_not_lost )
   ]

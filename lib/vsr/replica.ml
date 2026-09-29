@@ -419,45 +419,39 @@ type t = {
    durable pair buys.
 
    Encoded with {!Riptide.Value.canonical_encode}, the same primitive {!Message} uses, rather than
-   a second hand-rolled format. *)
+   a second hand-rolled format.
+
+   TASK 13 FIX ROUND (review finding 5): the encode/decode pair below no longer OWNS that schema --
+   it DELEGATES to {!Riptide_storage.Superblock_record}, the single definition of it in this repo.
+   The four field names and shapes used to be typed out independently here, in
+   [lib/storage/file_storage.ml] and in [lib/storage/memory_storage.ml], because
+   [riptide_storage] cannot depend on [riptide_vsr]. The dependency direction is real (see either
+   [dune]), but the conclusion did not follow: BOTH layers need this schema, so the one place it can
+   live once is the LOWER one, and a field rename can no longer leave a rebuild silently producing
+   records this decoder rejects. What stays here is what is genuinely protocol knowledge -- which
+   fields VSR's own [CrashRestart] considers durable, and why [rep_status] is not among them.
+
+   Kept as named functions in this module rather than having every call site reach into
+   [Superblock_record] directly: [replica.mli] documents these two by name, and the tuple shape
+   below ([restart] destructures it positionally) is this module's own convenience, not part of the
+   shared schema. *)
 let superblock_encode ~view_number ~last_normal_view ~op_number ~commit_number =
-  let int_field name i = (name, Value.Scalar (Value.Int (Int64.of_int i))) in
-  Value.canonical_encode
-    (Value.Record
-       [
-         int_field "commit_number" commit_number;
-         int_field "last_normal_view" last_normal_view;
-         int_field "op_number" op_number;
-         int_field "view_number" view_number;
-       ])
+  Riptide_storage.Superblock_record.encode
+    { Riptide_storage.Superblock_record.view_number; last_normal_view; op_number; commit_number }
 
 (* Tolerant by construction: anything that does not decode as the exact record shape above yields
    [None], i.e. "this replica has no usable durable state", never an exception. A superblock that
    fails to read back is the storage layer's own already-documented failure mode
    ({!Riptide_storage.Storage_intf.S.superblock_read} returns [None] when fewer than a majority of
-   its copies agree), and a partially-decodable one is no more trustworthy than a missing one. *)
+   its copies agree), and a partially-decodable one is no more trustworthy than a missing one. The
+   [commit_number <= op_number] clause ([CommitNumberNeverHigherThanOpNumber], VSR.tla:721-722,
+   applied to durable state as it is READ BACK and not merely as it is written) is part of
+   {!Riptide_storage.Superblock_record.decode} itself, which is where that rule now lives. *)
 let superblock_decode (bytes : string) =
-  match Value.canonical_decode bytes with
-  | exception Invalid_argument _ -> None
-  | Value.Record fields ->
-    let int_field name =
-      match List.assoc_opt name fields with
-      | Some (Value.Scalar (Value.Int i)) ->
-        let i = Int64.to_int i in
-        if i < 0 then None else Some i
-      | _ -> None
-    in
-    (match
-       (int_field "view_number", int_field "last_normal_view", int_field "op_number", int_field "commit_number")
-     with
-    | Some view_number, Some last_normal_view, Some op_number, Some commit_number
-      when commit_number <= op_number ->
-      (* [CommitNumberNeverHigherThanOpNumber] (VSR.tla:721-722) applied to durable state as it is
-         read back, not merely as it is written: a superblock that violates it would put this
-         replica into a state no reachable execution can produce, so it is discarded whole. *)
-      Some (view_number, last_normal_view, op_number, commit_number)
-    | _ -> None)
-  | _ -> None
+  Option.map
+    (fun (r : Riptide_storage.Superblock_record.t) ->
+      (r.view_number, r.last_normal_view, r.op_number, r.commit_number))
+    (Riptide_storage.Superblock_record.decode bytes)
 
 let persist_superblock t =
   t.storage.superblock_write
@@ -924,6 +918,27 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    names it by name for exactly this reason -- an operator hitting this state in a log should not
    have to go spelunking through this comment to learn what to run.
 
+   TASK 13 FIX ROUND (review finding 1): that repair is NOT, and cannot be, an automatic self-heal,
+   and the message below says so rather than reading like "just run this function". Its first cut
+   took no arguments and silently wrote [view_number = last_normal_view = commit_number = 0], on the
+   reasoning that under-claiming costs only liveness. That reasoning is wrong, and the counterexample
+   is a concrete three-replica trace now pinned by a running test (see
+   [test/test_vsr_replica_recovery.ml]'s
+   [test_a_rebuild_with_zeroed_values_destroys_a_committed_op_through_a_view_change],
+   [test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it] and
+   [test_a_rebuild_with_correct_values_preserves_that_same_committed_op]): a replica rebuilt with
+   [last_normal_view = 0] loses
+   [WinningDVC]'s log selection (:1300, highest [last_normal_view] wins) to a peer that honestly
+   reports a HIGHER one over a SHORTER log, and the new view's log is then reconstructed without the
+   committed op -- cluster-wide, silently. Under-claiming is not automatically the conservative
+   direction; it is only conservative for a value NOBODY ELSE compares against, and
+   [last_normal_view] is precisely a value other replicas rank this one by. So the three
+   non-WAL-derivable fields are the caller's to supply, from a live surviving peer, and this guard's
+   message says exactly that. See
+   {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s own doc comment for the full trace
+   and for why a real VSR Recovery sub-protocol -- the classical mechanism for this situation -- is
+   deliberately out of scope here.
+
    The guard is conditioned on the WAL, not on the superblock alone, and that is load-bearing:
    an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
    still yield exactly [create]'s [Init] state -- otherwise [restart] stops being usable as a
@@ -937,10 +952,19 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
        refusing to start. Coming up with op_number = 0 over a WAL that still holds entries would \
        make this replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack \
        quorum turns into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is \
-       intact and untouched; recovering this replica needs the superblock rebuilt (Task 13: call \
-       this backend's own Storage_intf.S.superblock_rebuild_from_wal, e.g. \
-       Riptide_storage.File_storage.superblock_rebuild_from_wal, then retry Replica.restart) or \
-       the backend discarded wholesale, neither of which restart can decide on its own.";
+       intact and untouched; recovering this replica needs either the superblock rebuilt or the \
+       backend discarded wholesale, neither of which restart can decide on its own. TO REBUILD \
+       (Task 13): call this backend's own Storage_intf.S.superblock_rebuild_from_wal ~view_number \
+       ~last_normal_view ~commit_number (e.g. \
+       Riptide_storage.File_storage.superblock_rebuild_from_wal), then retry Replica.restart. THOSE \
+       THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED: none of them is derivable from this \
+       replica's own WAL, and supplying a last_normal_view or commit_number LOWER than the cluster's \
+       real state makes this replica lose view-change log selection to a peer holding a SHORTER log, \
+       which silently destroys a committed op cluster-wide -- the exact loss this refusal exists to \
+       prevent, reintroduced by the repair. Obtain them out of band from a live, trusted, surviving \
+       peer of this cluster (its view_number and last_normal_view, and this replica's own \
+       commit_number as that peer understands it); see that function's own doc comment for the full \
+       trace and for the limitations it discloses.";
   let view_number, last_normal_view, op_number, commit_number =
     match durable with
     | Some (v, lnv, n, k) -> (v, lnv, n, k)
