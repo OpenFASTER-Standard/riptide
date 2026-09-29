@@ -883,11 +883,17 @@
             "id": 3,
             "title": "[1.3] Prepare/Start_view gain a real sender field; Replica.handle_message cross-checks it",
             "description": "Prepare/Start_view gain a real sender field; Replica.handle_message cross-checks it",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Add source : int to Prepare and Start_view on the wire. Replica.handle_message takes the transport-authenticated sender alongside payload bytes and rejects any message whose claimed sender (i or source) disagrees with it, via Invalid_argument (counted, total no-op).",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "2dd96e247e4bad0188126eace8d61badd5b49fe5"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 4,
