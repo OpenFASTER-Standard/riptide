@@ -1134,11 +1134,18 @@
             "id": 17,
             "title": "[3.9] File_kv_store shards its flat directory",
             "description": "File_kv_store shards its flat directory",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "path_for gains a two-level directory prefix from the key's content hash, bounding any single directory's entry count. file_kv_store.mli documents the remaining space/inode cost ceilings explicitly.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "6d6ffd3f465bf0f6ad19dde830931844d592875b",
+                "66a4e900f26b795638c0ed7d4e2dce8a1789a92c"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 18,
