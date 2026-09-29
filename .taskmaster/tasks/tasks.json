@@ -837,7 +837,7 @@
         "id": "12",
         "title": "Harden Layer 0 against adversarial real-world conditions (deep audit remediation)",
         "description": "Close every finding from the 2026-09-29 five-track adversarial audit of the value codec, VSR consensus/replication, storage, materializer/lattice, and transport/crypto layers -- six Critical, live-reproduced. See docs/superpowers/specs/2026-09-29-audit-remediation-design.md for the full design.",
-        "status": "pending",
+        "status": "in-progress",
         "priority": "high",
         "dependencies": [
           "4"
@@ -849,11 +849,18 @@
             "id": 1,
             "title": "[1.1] Transport_intf.S.receive returns the authenticated sender",
             "description": "Transport_intf.S.receive returns the authenticated sender",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Change receive : t -> string to t -> string * int. Tcp binds the returned id to the TLS certificate actually presented (decoded from the verified peer cert's SAN, per ca.ml:164), not the unverified handshake preamble. Sim_transport returns each simulated peer's already-known id verbatim.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "c602ffb80a4b2e774a7060e1e21ca30da7d19ee2",
+                "88d60048bd8ddca1fccc99718ec21e6e91035a53"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 2,
