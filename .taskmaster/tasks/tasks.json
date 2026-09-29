@@ -972,11 +972,17 @@
             "id": 8,
             "title": "[2.4] Doc corrections: canonicality claim, envelope domain-separation, dead reference",
             "description": "Doc corrections: canonicality claim, envelope domain-separation, dead reference",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Simplify value.mli:36-39's now-unconditionally-true claim; correct envelope.ml/envelope.mli/test_envelope.ml's overclaimed 'can never collide, even under adversarial construction' wording to state the real, narrower property; replace the dead L4/final-review.md reference in test_value.ml with a pointer to this spec.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "915602915eef78170cb8a96b4c7a236c16d01720"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 9,
