@@ -351,8 +351,9 @@ let malformed_input_tests =
     expect_invalid_argument "invalid bool byte" (fun () -> Value.canonical_decode ("\x00" ^ "\x02"));
     expect_invalid_argument "trailing garbage inside a map key blob" (fun () ->
         (* The key blob claims to hold one extra byte beyond a complete
-           encoded value - decode_value_exact must reject this even though
-           the outer stream's own bookkeeping stays consistent. *)
+           encoded value - decode_value's Map case must reject this (the
+           nested, bounded decode of the key lands short of kblob_end) even
+           though the outer stream's own bookkeeping stays consistent. *)
         let key_encoded_plus_garbage = raw_string "k" ^ "\xff" in
         Value.canonical_decode ("\x08" ^ u64_be 1 ^ len_prefixed key_encoded_plus_garbage ^ raw_int 7L))
   ]
