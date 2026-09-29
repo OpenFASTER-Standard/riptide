@@ -312,6 +312,29 @@ let fsync_dir ~dir_path =
   let fd = Unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
   Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
 
+(* [fsync_dir] above makes a directory ENTRY durable; this makes a FILE's own CONTENT durable --
+   needed specifically for [check_or_write_owner_marker]'s marker write (Task 15 review, Finding
+   1), because that write goes through plain [Eio.Path.save] rather than this module's own
+   [O_DIRECT]+[O_DSYNC] write path ([open_file_handle_write]/[perform_write]). Confirmed against
+   the installed Eio 0.12's [path.ml]: [save] is a plain buffered write (opens via
+   [open_out]/[output_string]), with no [O_SYNC]/[O_DSYNC] flag and no fsync call anywhere in it --
+   unlike [durable_write] above, whose temp file's content is already durable by construction
+   before its own [Eio.Path.rename] (every [perform_write] onto that temp file goes through
+   [O_DIRECT]+[O_DSYNC], falling back to [O_DSYNC] alone -- see [open_flags_write] above).
+
+   Without this, a crash after [check_or_write_owner_marker]'s [rename] and [fsync_dir] have both
+   completed (directory entry durable) but before the temp file's own data blocks reached disk
+   could leave the marker holding stale or truncated bytes on recovery, on a filesystem that does
+   not order data before metadata (e.g. [data=writeback] mode, or certain overlayfs
+   configurations -- see this file's own top comment). Unlike a 0-byte marker, a non-empty-but-
+   wrong marker does NOT self-heal (Task 15's own fix only treats an exactly-0-byte marker as
+   unclaimed), so a missing fsync here would reintroduce the exact bug class Task 15 exists to
+   close, through a narrower window. Same plain-blocking-[Unix] rationale as [fsync_dir] itself: no
+   fsync exists on [Eio.Path]/[Eio_linux.Low_level] in the installed Eio 0.12. *)
+let fsync_file ~path =
+  let fd = Unix.openfile path [ Unix.O_WRONLY ] 0 in
+  Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
+
 (* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
    first, then data, into [path ^ tmp_suffix] -- the same "header always written first"
    ordering [File_storage.wal_append] uses, so a crash between the two *temp*-file writes
@@ -392,8 +415,13 @@ let owner_marker_name = ".riptide-kv-owner"
    [durable_write] above uses for per-key records, applied here to the marker instead. Fixed, not
    randomized, for the same reason [tmp_suffix] above is: [Dir_lock] already serializes every
    [create] over one [dir_path] that could otherwise race for this name (see [create]'s own Task
-   11 comment), so this only needs to survive a crash mid-write, not race a second writer. *)
-let owner_marker_tmp_suffix = ".owner.tmp"
+   11 comment), so this only needs to survive a crash mid-write, not race a second writer.
+
+   Just [".tmp"], matching [tmp_suffix]'s own convention above (per-key temp files end in
+   [".put.tmp"], not [".<key-hash>.put.tmp"]) -- an earlier version of this suffix was
+   [".owner.tmp"], which produced [".riptide-kv-owner.owner.tmp"] once appended to
+   [owner_marker_name]: "owner" twice, redundantly (Task 15 review, Minor finding M7). *)
+let owner_marker_tmp_suffix = ".tmp"
 
 (* Enforces that at most one distinct [owner] tag ever claims [dir_path], across every [create] of
    it for the lifetime of the directory. [owner] is mandatory (see this file's [.mli] on
@@ -423,12 +451,15 @@ let owner_marker_tmp_suffix = ".owner.tmp"
    The fix: treat "marker exists but its content has zero length" the same as "marker does not
    exist" -- both mean no real claim has actually landed yet, so (re)write [tag] now, exactly as
    the first-ever [create] of a fresh directory would. And write it durably this time: stage
-   [tag] in a private temp file first ([owner_marker_tmp_suffix]), then [Eio.Path.rename] that
-   temp file onto [owner_marker_name] in one atomic step, then fsync the directory (matching
-   [durable_write]'s own reasoning above for why the rename's directory-entry update needs its
-   own fsync, not just the file's data) -- so a crash during THIS write can, at worst, leave
-   behind an ignorable stray temp file or reproduce the same self-healing 0-byte-or-missing state
-   again, never a half-written marker holding a truncated, wrong tag. *)
+   [tag] in a private temp file first ([owner_marker_tmp_suffix]), [fsync_file] that temp file's
+   own content (Task 15 review, Finding 1 -- [Eio.Path.save] alone does no fsync at all, so
+   without this the temp file's bytes are not actually durable before the rename that publishes
+   them), then [Eio.Path.rename] the temp file onto [owner_marker_name] in one atomic step, then
+   fsync the directory (matching [durable_write]'s own reasoning above for why the rename's
+   directory-entry update needs its own fsync, not just the file's data) -- so a crash during THIS
+   write can, at worst, leave behind an ignorable stray temp file or reproduce the same
+   self-healing 0-byte-or-missing state again, never a half-written marker holding a truncated,
+   wrong tag. *)
 let check_or_write_owner_marker ~fs ~dir_path tag =
   let marker_path = Eio.Path.(fs / dir_path / owner_marker_name) in
   let existing =
@@ -440,8 +471,10 @@ let check_or_write_owner_marker ~fs ~dir_path tag =
       invalid_arg
         (Printf.sprintf "File_kv_store.create: %s is owned by %S, not %S" dir_path existing tag)
   | Some _ (* a 0-byte marker: a crash left this behind, treat it like [None] below *) | None ->
-    let tmp_path = Eio.Path.(fs / dir_path / (owner_marker_name ^ owner_marker_tmp_suffix)) in
+    let tmp_path_str = Filename.concat dir_path (owner_marker_name ^ owner_marker_tmp_suffix) in
+    let tmp_path = Eio.Path.(fs / tmp_path_str) in
     Eio.Path.save ~create:(`Or_truncate 0o600) tmp_path tag;
+    fsync_file ~path:tmp_path_str;
     Eio.Path.rename tmp_path marker_path;
     fsync_dir ~dir_path
 
@@ -476,9 +509,17 @@ let create ~sw ~fs ~owner dir_path =
            directory), so restoring this diagnosability matters. Reading the marker here, on the
            failure path only, does not weaken "reject before touching anything else this module
            manages": [acquire] is already about to raise, there is nothing left to protect by not
-           reading it. *)
-        try Some (Eio.Path.load Eio.Path.(fs / dir_path / owner_marker_name))
-        with Eio.Io _ -> None)
+           reading it.
+
+           Task 15 review, Minor finding M4: a 0-byte marker (the same "crash left an empty file
+           behind" case [check_or_write_owner_marker] itself now self-heals from) must not be
+           reported here as a real claim by the empty-string owner -- map it to [None] ("no owner
+           readable yet") too, for consistency with that rule, even though this is purely a
+           diagnostic message and does not change the lock decision itself. *)
+        match Eio.Path.load Eio.Path.(fs / dir_path / owner_marker_name) with
+        | "" -> None
+        | existing -> Some existing
+        | exception Eio.Io _ -> None)
       dir_path
   in
   (* Task 11 review (finding I1, and re-review finding 1): the lock's lifetime must track the

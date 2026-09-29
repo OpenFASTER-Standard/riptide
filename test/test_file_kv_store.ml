@@ -395,18 +395,99 @@ let test_owner_reads_back_the_tag_used_at_construction () =
    ([test_put_overwrite_leaves_no_leftover_tmp_file] does the same for [".put.tmp"]). *)
 let owner_marker_name = ".riptide-kv-owner"
 
+(* Review finding M6 (Task 15 review): [O_TRUNC] added -- without it, this only genuinely
+   produces a 0-byte file when [owner_marker_name] does not already exist at [dir] (an [O_CREAT]
+   with no existing file opens at length 0 either way). Harmless as originally written, since every
+   call site uses a fresh [with_tmp_dir] directory with no marker yet, but a latent trap if this
+   helper is ever reused after a real marker already exists -- [O_TRUNC] makes it unconditionally
+   produce a 0-byte file regardless of what, if anything, was there before. *)
 let write_a_zero_byte_marker_directly dir =
-  let fd = Unix.openfile (Filename.concat dir owner_marker_name) [ Unix.O_WRONLY; Unix.O_CREAT ] 0o600 in
+  let fd =
+    Unix.openfile (Filename.concat dir owner_marker_name)
+      [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600
+  in
   Unix.close fd
 
 let test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       write_a_zero_byte_marker_directly dir;
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-store" dir in
+       Alcotest.(check string) "the directory is now claimed by the real owner" "redaction-store"
+         (File_kv_store.owner t));
+      (* Review finding 2 (Task 15 review): [owner t] alone only proves the constructor remembered
+         the argument it was handed -- it is [t.owner], not anything read back from disk -- so a
+         regression that correctly treats a 0-byte marker as unclaimed but silently DROPS the
+         actual write (e.g. removing the [save]/[rename] pair while leaving [fsync_dir] in place)
+         would still pass that assertion alone, leaving the directory permanently unclaimed with no
+         real marker ever written. Reopening under a DIFFERENT tag, after the first handle's switch
+         (and therefore its lock) has fully released, is the stronger check: it only raises if a
+         genuine, non-empty marker holding "redaction-store" is really sitting on disk for the
+         mismatch comparison to find. *)
       Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-store" dir in
-      Alcotest.(check string) "the directory is now claimed by the real owner" "redaction-store"
-        (File_kv_store.owner t))
+      Alcotest.check_raises
+        "a real marker was actually written to disk -- a differently-tagged reopen now conflicts"
+        (Invalid_argument
+           (Printf.sprintf
+              "File_kv_store.create: %s is owned by \"redaction-store\", not \"different-owner\""
+              dir))
+        (fun () ->
+          ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"different-owner" dir)))
+
+(* Review finding 3 (Task 15 review): the atomic-write property itself
+   (temp-then-rename-then-fsync) for the owner marker had zero test coverage -- unlike
+   [durable_write]'s equivalent, which [test_put_and_delete_both_fsync_the_directory] above already
+   guards at the source level. Right now, replacing the whole Task 15 fix with a single
+   non-atomic [Eio.Path.save ~create:(`Or_truncate 0o600) marker_path tag] (no temp file, no
+   rename, no fsync) would leave every other test in this file green -- silently reverting the fix.
+   Same source-level-guard technique as [test_put_and_delete_both_fsync_the_directory] (see that
+   test's own comment for why this is deliberately not trying to observe the fsync's effect, only
+   its presence and ordering in the source). *)
+let owner_marker_tmp_suffix = ".tmp"
+let owner_tmp_path_for dir = Filename.concat dir (owner_marker_name ^ owner_marker_tmp_suffix)
+
+let test_check_or_write_owner_marker_is_atomic_via_temp_then_rename_then_fsync () =
+  let source = read_file file_kv_store_source_path in
+  let body = top_level_binding_body source "check_or_write_owner_marker" in
+  Alcotest.(check bool)
+    "check_or_write_owner_marker still publishes via Eio.Path.rename" true
+    (contains ~needle:"Eio.Path.rename" body);
+  Alcotest.(check bool)
+    "check_or_write_owner_marker fsyncs the containing directory (Finding 3 regression guard)" true
+    (contains ~needle:"fsync_dir ~dir_path" body);
+  (match
+     (index_of ~needle:"Eio.Path.save" body, index_of ~needle:"Eio.Path.rename" body)
+   with
+  | Some save_at, Some rename_at ->
+    Alcotest.(check bool) "the temp file is staged (Eio.Path.save) before the rename, not after"
+      true (rename_at > save_at)
+  | _ ->
+    Alcotest.fail
+      "expected both Eio.Path.save and Eio.Path.rename in check_or_write_owner_marker's body");
+  (match
+     (index_of ~needle:"Eio.Path.rename" body, index_of ~needle:"fsync_dir ~dir_path" body)
+   with
+  | Some rename_at, Some fsync_at ->
+    Alcotest.(check bool) "the fsync_dir comes AFTER the rename, not before" true
+      (fsync_at > rename_at)
+  | _ ->
+    Alcotest.fail
+      "expected both Eio.Path.rename and fsync_dir ~dir_path in check_or_write_owner_marker's body")
+
+let test_owner_marker_write_leaves_no_leftover_tmp_file () =
+  (* Mirrors [test_put_overwrite_leaves_no_leftover_tmp_file] above, for the owner marker's own
+     temp file instead of a per-key one: a successful self-heal's staged temp file must be gone
+     (renamed away, not merely written and left behind) once [create] returns. *)
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      write_a_zero_byte_marker_directly dir;
+      Eio.Switch.run @@ fun sw ->
+      let (_ : File_kv_store.t) =
+        File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-store" dir
+      in
+      Alcotest.(check bool) "no leftover owner-marker temp file after rename" false
+        (Sys.file_exists (owner_tmp_path_for dir)))
 
 (* Task 11: the PHYSICAL guard -- see [Test_file_storage]'s own copy of this comment (identical
    rationale, [File_kv_store.create] instead of [File_storage.create]) for the full account of the
@@ -579,6 +660,13 @@ let tests =
        permanently bricking the directory",
       `Quick,
       test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string );
+    ( "Task 15 review (Finding 3): check_or_write_owner_marker is atomic via \
+       temp-then-rename-then-fsync",
+      `Quick,
+      test_check_or_write_owner_marker_is_atomic_via_temp_then_rename_then_fsync );
+    ( "Task 15 review (Finding 3): the owner-marker write leaves no leftover temp file",
+      `Quick,
+      test_owner_marker_write_leaves_no_leftover_tmp_file );
     ( "Task 11: a second create on an already-locked directory is refused immediately",
       `Quick,
       test_a_second_create_on_a_locked_directory_is_refused );

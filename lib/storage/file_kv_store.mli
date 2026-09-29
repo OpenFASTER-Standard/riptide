@@ -79,6 +79,15 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     A matching tag (e.g. the same subsystem reopening its own store) succeeds exactly as it
     always did.
 
+    {b Task 15:} a marker that reads back as exactly zero bytes -- what a crash (or kill) between
+    the marker file's creation and its write completing can leave behind -- counts as {e no claim
+    yet}, not as a claim by the empty-string owner: [create] writes [owner] into it and proceeds,
+    the same as it would for a directory with no marker at all, rather than raising
+    [Invalid_argument] against an owner no real caller ever asked for. This is caller-observable:
+    a second [create] with a different, genuine tag now SUCCEEDS against a directory left in this
+    state, where it previously raised permanently with no way back out short of deleting the
+    marker file outside this module entirely.
+
     There is no opt-out: every [File_kv_store.t], from every consumer, now has a declared owner
     (subtask 4.8 made [~owner] mandatory), so a directory can no longer be pointed at without one.
     A directory shared by two consumers that each pass a distinct, real [~owner] is therefore
