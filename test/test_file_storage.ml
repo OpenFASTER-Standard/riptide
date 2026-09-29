@@ -60,7 +60,21 @@ let count_self_maps () =
    to distinguish "flat" from "linear in op count": the pre-fix implementation leaks ~4 VMAs
    per op, so even a few hundred cycles would already blow past the [< 100] threshold below;
    3,000 gives a wide safety margin on the detection side while leaving a wide safety margin on
-   the timing side too. *)
+   the timing side too.
+
+   {b RED/GREEN evidence, actually observed against these exact 3,000 ops (Task 10 review,
+   Finding 1)} -- the original TDD evidence for this test was for a discarded 20,000-op version,
+   and even that failed only via the suite's watchdog timeout, never via this assertion, so this
+   exact test had never actually been run against unfixed code before. Confirmed properly by
+   temporarily reverting [file_storage.ml]'s [perform_write_from_string]/[perform_read] to call a
+   fresh per-I/O [mmap] directly (bypassing {!Riptide_storage.Aligned_buffer_pool} entirely,
+   mirroring the pre-Task-10 implementation this task replaced) and running this exact test,
+   unmodified, both ways:
+   - {b RED} (reverted to per-I/O [mmap]): FAILED via the assertion itself, in 6.78s (well inside
+     the 15s watchdog) -- [before=54 after=5802 delta=5748], nowhere close to the [< 100]
+     threshold below.
+   - {b GREEN} (the real, committed buffer-pool implementation): [before=46 after=46 delta=0] --
+     not merely "under 100", genuinely flat. *)
 let op_count = 3_000
 
 let test_repeated_io_does_not_grow_the_process_map_count () =
@@ -614,7 +628,12 @@ let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
-      `Quick,
+      (* `Slow`, not `Quick` (M10, Task 10 review): this and its `File_kv_store` counterpart
+         roughly doubled this suite's runtime (~17s -> ~29s) driving thousands of real
+         [O_DIRECT]+[O_DSYNC] I/O cycles against actual disk. `Slow` lets a fast inner loop
+         (`--quick-tests`/`ALCOTEST_QUICK_TESTS=true`) skip them while a full/CI `dune test`
+         still exercises them. *)
+      `Slow,
       test_repeated_io_does_not_grow_the_process_map_count );
     ("write then read, same handle", `Quick, test_write_then_read_same_handle);
     ("write then read, after reopen (real durability)", `Quick, test_write_then_read_after_reopen);

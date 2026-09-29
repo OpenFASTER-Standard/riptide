@@ -1,0 +1,60 @@
+(* See this file's own [.mli] for the module-level contract. This [.ml]'s comments cover only the
+   mechanism itself; see {!Riptide_storage.File_storage}'s top comment for the full bug history
+   ("Task 10") and {!Riptide_storage.File_storage}/{!Riptide_storage.File_kv_store}'s own
+   [create]/pool-construction call sites for why each picks the [~buffer_count] it does. *)
+
+type t = { pool : Cstruct.t Eio.Stream.t; slot_size : int }
+
+(* [Unix.map_file] is required (POSIX [mmap(2)]) to return a page-aligned address when mapping
+   starts at file offset 0, unlike a plain [Bigarray.Array1.create]'s [malloc] -- see
+   [file_storage.ml]'s own top comment for the full story of why this, and not the shared
+   [eio_linux] buffer pool, is what makes [O_DIRECT] actually work for either of this module's two
+   callers. The backing file is purely a vehicle for getting a real [mmap(2)] call; it is created,
+   sized, mapped [~shared:false] (so nothing written into the returned buffer ever touches disk
+   through it), and then closed + unlinked immediately -- the mapping itself stays valid (a
+   standard, portable POSIX property) for as long as the returned [Cstruct.t] is reachable.
+
+   Called exactly [buffer_count] times total, by [create] below, at pool-construction time --
+   never again for the rest of that pool's lifetime. That call-frequency change (once per buffer
+   instead of once per I/O) is the entire fix Task 10 made; this function's own body is otherwise
+   unchanged from the original per-I/O version. *)
+let alloc_one_aligned_buffer n =
+  let path = Filename.temp_file "riptide_aligned_buffer" "" in
+  let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.close fd;
+      try Unix.unlink path with Unix.Unix_error _ -> ())
+    (fun () ->
+      Unix.ftruncate fd n;
+      let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
+      Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
+
+let create ~buffer_count ~slot_size () =
+  let pool = Eio.Stream.create buffer_count in
+  for _ = 1 to buffer_count do
+    Eio.Stream.add pool (alloc_one_aligned_buffer slot_size)
+  done;
+  { pool; slot_size }
+
+let with_buffer ?(zero = true) t n f =
+  if n < 0 then
+    invalid_arg (Printf.sprintf "Aligned_buffer_pool.with_buffer: n (%d) is negative" n)
+  else if n > t.slot_size then
+    invalid_arg
+      (Printf.sprintf "Aligned_buffer_pool.with_buffer: n (%d) exceeds this pool's fixed buffer \
+                        size of %d"
+         n t.slot_size);
+  let buf = Eio.Stream.take t.pool in
+  Fun.protect
+    ~finally:(fun () -> Eio.Stream.add t.pool buf)
+    (fun () ->
+      if zero then Cstruct.memset buf 0;
+      (* Every real call site in this codebase, as of this writing, always passes exactly
+         [t.slot_size] (see [file_storage.ml]/[file_kv_store.ml]: every header/data write and
+         read uses a fixed [header_slot_size]/[data_slot_size], both equal to their own
+         [slot_alignment]), so the [Cstruct.sub] branch below is currently unreached. Kept anyway,
+         deliberately: this module is meant to be reusable by any future caller with a genuinely
+         variable-length need, and narrowing to a real sub-view for [n < t.slot_size] is the
+         correct general behavior, not defensive dead code to prune. *)
+      f (if n = t.slot_size then buf else Cstruct.sub buf 0 n))

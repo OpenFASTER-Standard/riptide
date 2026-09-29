@@ -3,12 +3,19 @@
    WAL, which has no notion of an arbitrary number of independently-deletable keys. Reuses
    [File_storage]'s own already-proven [O_DIRECT]+[O_DSYNC] durable I/O technique verbatim
    (transcribed, not imported -- [File_storage]'s [.mli] deliberately exposes only
-   [Storage_intf.S] plus its own [create], so [alloc_one_aligned_buffer]/the buffer pool/
-   [perform_write]/[perform_read]/the header-then-data record shape are re-derived here rather
-   than reused as library code). See [file_storage.ml] for the original this is transcribed
-   from ([alloc_one_aligned_buffer], the buffer pool, [open_file_handle],
+   [Storage_intf.S] plus its own [create], so [perform_write]/[perform_read]/the
+   header-then-data record shape are re-derived here rather than reused as library code). See
+   [file_storage.ml] for the original this is transcribed from ([open_file_handle],
    [downgrade_to_dsync_only], [perform_write], [perform_read] -- line numbers deliberately not
    pinned here any more, having gone stale once already across Task 10's refactor).
+
+   {b The buffer pool itself is NOT transcribed} -- unlike the rest of this list, it now lives in
+   one place, {!Riptide_storage.Aligned_buffer_pool}, shared by this module and [File_storage]
+   both (Task 10 review, Finding 2: the two copies had already cosmetically diverged, which is
+   exactly the drift risk that motivated extracting a shared module rather than leaving two
+   near-identical copies to keep in sync by hand). See that module's own [.mli] for the pool
+   mechanism; this file's own [pool_size]/[create]/[with_buffer] call sites below cover only this
+   store's own sizing/concurrency rationale.
 
    {b Departure from the brief's own code sketch, deliberately, per the task's own instruction
    to prefer [file_storage.ml]'s real technique over the sketch where they conflict}: the
@@ -83,12 +90,13 @@ type t = {
   fs : Eio.Fs.dir_ty Eio.Path.t;
   dir_path : string;
   owner : string;
-  pool : Cstruct.t Eio.Stream.t;
-      (* Task 10's buffer pool, transcribed from [file_storage.ml] (see that file's top comment,
-         "Task 10: the [mmap] call above now happens once per pool buffer, not once per I/O", and
-         its [pool_size]/[create_buffer_pool]/[with_pooled_buffer] below for the full rationale
-         and the concurrency model that sizes it). Every buffer in it is exactly [slot_alignment]
-         bytes, [mmap]-backed, allocated once by [create_buffer_pool] at [create] time. *)
+  pool : Aligned_buffer_pool.t;
+      (* Task 10's buffer pool, built through the same shared
+         {!Riptide_storage.Aligned_buffer_pool} module [file_storage.ml] uses (see that file's
+         top comment, "Task 10: the [mmap] call above now happens once per pool buffer, not once
+         per I/O", and this file's own [pool_size] below for the sizing/concurrency rationale).
+         Every buffer in it is exactly [slot_alignment] bytes, [mmap]-backed, allocated once at
+         [create] time. *)
 }
 
 (* Same single alignment used uniformly for both header and data regions as [File_storage]
@@ -105,58 +113,35 @@ let open_flags_write = Uring.Open_flags.(dsync + creat + direct)
 let open_flags_write_fallback = Uring.Open_flags.(dsync + creat)
 let open_flags_read = Uring.Open_flags.empty
 
-(* Transcribed verbatim from [file_storage.ml] ([alloc_one_aligned_buffer]): [Unix.map_file]
-   is required (POSIX [mmap(2)]) to return a page-aligned address when mapping starts at file
-   offset 0, unlike a plain [Bigarray.Array1.create]'s [malloc] -- see that file's own top
-   comment for the full story of why this, and not the shared [eio_linux] buffer pool, is what
-   makes [O_DIRECT] actually work here.
+(* [pool_size] buffers of exactly [slot_alignment] bytes each, built through the shared
+   {!Riptide_storage.Aligned_buffer_pool} module (see that module's own [.mli] for the pool
+   mechanism itself, and [file_storage.ml]'s top comment, "Task 10", for the VMA-leak bug both
+   this file and that one used to have independently before sharing that module).
 
-   Task 10: called exactly [pool_size] times total, by [create_buffer_pool] below at [create]
-   time -- never again per read/write. See [file_storage.ml]'s top comment ("Task 10") for the
-   VMA-leak bug this closes: this module's own [alloc_aligned_buffer] used to run once per
-   read/write here too, exactly mirroring [File_storage]'s bug (this module transcribes that
-   one's I/O technique verbatim, per this file's own top comment, so it inherited the bug
-   verbatim as well). *)
-let alloc_one_aligned_buffer n =
-  let path = Filename.temp_file "riptide_kv_aligned" "" in
-  let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
-  Fun.protect
-    ~finally:(fun () ->
-      Unix.close fd;
-      try Unix.unlink path with Unix.Unix_error _ -> ())
-    (fun () ->
-      Unix.ftruncate fd n;
-      let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
-      Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
+   {b Sizing/concurrency rationale, this store's own} (corrected -- Task 10 review, Finding M3:
+   the previous version of this comment claimed {!Riptide_crypto.Redaction_store} as the relevant
+   consumer, driven from a single replica's own dispatch fiber; that was wrong on two counts.
+   First, [Redaction_store] never calls [File_kv_store.create] itself --
+   {!Riptide_crypto.Redaction_store.create} takes an already-built [kv] on faith (see that
+   module's own [.mli]), so it has no [create] call site of its own to reason about here at all.
+   Second, this store's actual live consumer today,
+   confirmed by grepping every real (non-[.mli]) call to [File_kv_store.create] in this repo, is
+   test-only: [test/test_dst_scenarios.ml]'s [Lww_materializer], built once per test via
+   [make_lww_materializer] and driven through {!Riptide_batch_commit.Batch_commit.materialize_up_to}
+   from the DST test driver's own top-level fiber -- as ONE handle shared across the whole
+   simulated cluster (every replica's committed writes fold into the same materializer), not one
+   per replica.
 
-(* Transcribed from [file_storage.ml]'s own buffer pool (see that file's comment on [pool_size]
-   for the full sizing/concurrency rationale -- this store's own concurrency model is the same
-   one-Eio-fiber-per-replica shape, since its first real consumer, [Riptide_crypto.Redaction_store],
-   is itself only ever driven from within a single replica's own dispatch fiber). *)
+   The conclusion is unchanged despite the wrong reasoning: access into this store is still
+   strictly sequential in practice, just for a different reason than [file_storage.ml]'s own
+   one-fiber-per-replica argument -- the DST driver fiber runs one test step to completion (one
+   [materialize_up_to] call, or one [propose]/[settle]/[restart]) before starting the next, so
+   there is never more than one [get]/[put]/[delete] against a given [t] in flight at once in
+   today's only real usage. [pool_size = 4] gives the same headroom [file_storage.ml] gives
+   itself for anything this module's signature doesn't itself forbid from being concurrent (a
+   future stress test, a future non-test consumer), without needing a bigger pool for real usage
+   as it exists today.) *)
 let pool_size = 4
-
-let create_buffer_pool () =
-  let pool = Eio.Stream.create pool_size in
-  for _ = 1 to pool_size do
-    Eio.Stream.add pool (alloc_one_aligned_buffer slot_alignment)
-  done;
-  pool
-
-(* Transcribed from [file_storage.ml]'s [with_pooled_buffer] -- see that file's comment for why
-   every acquire zeroes the buffer (a pooled buffer, unlike a freshly [ftruncate]d one, is not
-   already zero-filled, and [durable_write] below relies on the tail past its data's own length
-   being zero). *)
-let with_pooled_buffer pool n f =
-  if n < 0 || n > slot_alignment then
-    invalid_arg
-      (Printf.sprintf "with_pooled_buffer: %d exceeds this pool's fixed buffer size of %d" n
-         slot_alignment);
-  let buf = Eio.Stream.take pool in
-  Fun.protect
-    ~finally:(fun () -> Eio.Stream.add pool buf)
-    (fun () ->
-      Cstruct.memset buf 0;
-      f (if n = slot_alignment then buf else Cstruct.sub buf 0 n))
 
 let encode_header ~length ~checksum =
   let buf = Bytes.make header_slot_size '\000' in
@@ -222,27 +207,38 @@ let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   go ()
 
 (* Transcribed from [file_storage.ml] ([perform_write_from_string]): acquires a pooled buffer,
-   blits [data] into it (zero-padded out to [n] by [with_pooled_buffer]'s own
-   fresh-zero-on-acquire), writes it, and releases the buffer -- all before returning. *)
+   blits [data] into it (zero-padded out to [n] by
+   {!Riptide_storage.Aligned_buffer_pool.with_buffer}'s own fresh-zero-on-acquire), writes it, and
+   releases the buffer -- all before returning. *)
 let perform_write_from_string ~pool ~sw (h : file_handle) ~offset ~n data =
-  with_pooled_buffer pool n (fun buf ->
+  Aligned_buffer_pool.with_buffer pool n (fun buf ->
       Cstruct.blit_from_string data 0 buf 0 (String.length data);
       perform_write ~sw h ~offset buf)
 
-(* Transcribed from [file_storage.ml] ([perform_read]). [None] means "nothing durable
-   at this offset" -- a short/empty read (e.g. a torn write). Returns a [string], not a
-   [Cstruct.t] (Task 10): the pooled buffer must be released back to [with_pooled_buffer]'s
-   pool before this function returns, so nothing that outlives the call may still reference
-   it. *)
-let perform_read ~pool ~sw (h : file_handle) ~offset ~len =
-  with_pooled_buffer pool len (fun buf ->
+(* Transcribed from [file_storage.ml] ([perform_read]), including that file's own M8 fix
+   (Task 10 review): [len] is the full [slot_alignment]-sized amount actually issued to [readv]
+   ([O_DIRECT]'s length-alignment requirement leaves no choice there), while [want] is however
+   many of those bytes the caller actually needs back -- narrowing via [Cstruct.to_string]'s own
+   [~len] here means only one right-sized string is ever allocated, instead of a full
+   [slot_alignment]-byte string that every caller below then [String.sub]s down again. [None]
+   means "nothing durable at this offset" -- a short/empty read (e.g. a torn write). Returns a
+   [string], not a [Cstruct.t] (Task 10): the pooled buffer must be released back to
+   {!Riptide_storage.Aligned_buffer_pool.with_buffer}'s pool before this function returns, so
+   nothing that outlives the call may still reference it.
+
+   [~zero:false]: both call sites below only ever read INTO [buf] and return [None] (without ever
+   converting [buf] to output) on anything short of a full [len]-byte read, so there is no way to
+   observe a stale tail left by a prior use of this pooled buffer -- see
+   {!Riptide_storage.Aligned_buffer_pool}'s own [.mli] for the general rule this follows. *)
+let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
+  Aligned_buffer_pool.with_buffer ~zero:false pool len (fun buf ->
       let rec go () =
         match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
         | exception End_of_file -> None
         | exception Eio.Io _ when h.direct_capable ->
           downgrade_to_dsync_only ~sw h;
           go ()
-        | n -> if n = len then Some (Cstruct.to_string buf) else None
+        | n -> if n = len then Some (Cstruct.to_string ~len:want buf) else None
       in
       go ())
 
@@ -342,7 +338,10 @@ let durable_read t path =
     Fun.protect
       ~finally:(fun () -> ignore (Eio_unix.Fd.close h.fd))
       (fun () ->
-        match perform_read ~pool:t.pool ~sw:t.sw h ~offset:0 ~len:header_slot_size with
+        match
+          perform_read ~pool:t.pool ~sw:t.sw h ~offset:0 ~len:header_slot_size
+            ~want:header_record_size
+        with
         | None -> None
         | Some header_s -> (
           let length, checksum = decode_header header_s in
@@ -350,11 +349,10 @@ let durable_read t path =
           else
             match
               perform_read ~pool:t.pool ~sw:t.sw h ~offset:header_slot_size ~len:data_slot_size
+                ~want:length
             with
             | None -> None
-            | Some data_s ->
-              let data = String.sub data_s 0 length in
-              if checksum_of data = checksum then Some data else None))
+            | Some data -> if checksum_of data = checksum then Some data else None))
 
 (* The marker file [check_or_write_owner_marker] reads/writes to enforce exclusive directory
    ownership -- subtask 4.6's construction-time fix for a confirmed, real data-destruction bug:
@@ -408,7 +406,13 @@ let create ~sw ~fs ~owner dir_path =
     invalid_arg "File_kv_store.create: ~owner must be a non-empty tag";
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   check_or_write_owner_marker ~fs ~dir_path owner;
-  { sw; fs; dir_path; owner; pool = create_buffer_pool () }
+  {
+    sw;
+    fs;
+    dir_path;
+    owner;
+    pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment ();
+  }
 
 (* [check_or_write_owner_marker] above either confirms [owner] against the existing on-disk marker
    or writes a fresh one holding exactly [owner] -- it never resolves or hands back a tag of its

@@ -49,7 +49,8 @@
 
    {b Task 10: the [mmap] call above now happens once per pool buffer, not once per I/O.} The
    very first version of this technique (Task 2) called [alloc_aligned_buffer] (since renamed to
-   {!alloc_one_aligned_buffer} by this very task, see below) -- open a fresh
+   {!Riptide_storage.Aligned_buffer_pool}'s own [alloc_one_aligned_buffer], not exposed by that
+   module's [.mli] -- see its [.ml] instead) -- open a fresh
    temp file, [ftruncate], [mmap], then close+unlink the temp file, keeping only the mapping --
    on EVERY single read and write, relying on the OCaml GC to eventually finalize and [munmap]
    the returned [Bigarray]/[Cstruct.t]. The audit that produced this task's own plan measured
@@ -62,15 +63,18 @@
    scoped to one [t]: enough WAL ops through any single replica's storage eventually starves
    every other allocation in the same process.
 
-   The fix (the buffer pool below, see [pool_size]/{!create_buffer_pool}/{!with_pooled_buffer})
-   keeps the exact same [mmap]-backed technique -- it is still the
+   The fix (see [pool_size] below and {!Riptide_storage.Aligned_buffer_pool}, which this file
+   builds its pool through) keeps the exact same [mmap]-backed technique -- it is still the
    simplest way to get a guaranteed page-aligned address on this runtime, and switching to
    [Bigarray.Array1.create] with manual alignment would trade one proven-safe primitive for an
    unproven one for no real benefit -- but calls it exactly [pool_size] times, once each, when
    [t] is created, and never again for that [t]'s entire lifetime. Every read/write acquires one
    of those pre-allocated buffers from the pool and releases it explicitly ([Fun.protect], not
    GC finalization) the moment it is done with it, whether the I/O succeeded or raised. See
-   [pool_size]'s own comment below for sizing and the concurrency model that justifies it.
+   [pool_size]'s own comment below for sizing and the concurrency model that justifies it, and
+   {!Riptide_storage.Aligned_buffer_pool}'s own [.mli] for the pool mechanism itself (extracted
+   out of this file, Task 10 review Finding 2, once {!Riptide_storage.File_kv_store} turned out
+   to need a byte-for-byte identical copy of this same pool logic).
 
    {b Real evidence, not a guess:} a standalone probe performing this exact
    allocate-aligned-buffer-then-[O_DIRECT]-write-then-read cycle was run 5 times x 500
@@ -120,12 +124,11 @@ type t = {
   ring : file_handle;
   ring_capacity : int;
   mutable highest_op_number : int;
-  pool : Cstruct.t Eio.Stream.t;
+  pool : Aligned_buffer_pool.t;
       (* Task 10's buffer pool -- see this file's top comment ("Task 10: the [mmap] call above
          now happens once per pool buffer, not once per I/O") for why this exists, and
-         {!with_pooled_buffer} below for how it's used. Every buffer in it is exactly
-         [slot_alignment] bytes, [mmap]-backed, allocated once by {!create_buffer_pool} at
-         [create] time. *)
+         {!Riptide_storage.Aligned_buffer_pool.with_buffer} for how it's used. Every buffer in it
+         is exactly [slot_alignment] bytes, [mmap]-backed, allocated once at [create] time. *)
   superblocks : file_handle array;
       (* [superblock_copies] (3) independent files -- see this file's own top comment,
          "Task 3: the superblock", for the on-disk layout and quorum this backs. *)
@@ -160,37 +163,15 @@ let max_entry_size = data_slot_size
 let open_flags_direct = Uring.Open_flags.(dsync + creat + direct)
 let open_flags_dsync_only = Uring.Open_flags.(dsync + creat)
 
-(* {!Unix.map_file} is required (POSIX [mmap(2)]) to return a page-aligned address when
-   mapping starts at file offset 0, unlike a plain [Bigarray.Array1.create]'s [malloc] -- see
-   this file's own top comment for why that distinction is exactly what makes [O_DIRECT] work
-   here where Task 1's shared-pool version couldn't. The backing file is purely a vehicle for
-   getting a real [mmap(2)] call; it is created, sized, mapped [~shared:false] (so nothing
-   written into the returned buffer ever touches disk through it), and then closed + unlinked
-   immediately -- the mapping itself stays valid (a standard, portable POSIX property) for as
-   long as the returned [Cstruct.t] is reachable.
-
-   Task 10: this is now called exactly [pool_size] times total, by {!create_buffer_pool} at
-   [create] time -- never again per read/write. Kept as its own function (rather than inlined
-   into {!create_buffer_pool}) because it is still, on its own, the thing that makes [O_DIRECT]
-   work at all; only its CALL FREQUENCY changed, not what it does or why. *)
-let alloc_one_aligned_buffer n =
-  let path = Filename.temp_file "riptide_storage_aligned" "" in
-  let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
-  Fun.protect
-    ~finally:(fun () ->
-      Unix.close fd;
-      try Unix.unlink path with Unix.Unix_error _ -> ())
-    (fun () ->
-      Unix.ftruncate fd n;
-      let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
-      Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
-
 (* Small, fixed-size pool of page-aligned buffers, owned by [t] and allocated once at [create]
-   time -- see this file's top comment ("Task 10") for the bug this closes.
+   time via {!Riptide_storage.Aligned_buffer_pool} -- see this file's top comment ("Task 10") for
+   the bug this closes, and that module's own [.mli] for the pool mechanism itself (the
+   allocation primitive, the blocking-acquisition design, and the no-reentrancy precondition).
+   This comment covers only this file's own sizing decision.
 
    {b Sizing.} [pool_size] buffers of exactly [slot_alignment] bytes each. Every call site in
    this file that ever needs an aligned buffer asks for exactly [header_slot_size] or
-   [data_slot_size] bytes, both always equal to [slot_alignment] (see their definitions below),
+   [data_slot_size] bytes, both always equal to [slot_alignment] (see their definitions above),
    so one uniform buffer size covers every caller with no waste and no per-request variance to
    plan for.
 
@@ -203,50 +184,8 @@ let alloc_one_aligned_buffer n =
    for anything this module's signature doesn't itself forbid from being concurrent (a test
    driving a handle from multiple fibers at once, e.g. a future stress test, or superblock's own
    3 sequential-but-not-required-to-stay-sequential copy writes) without needing a bigger pool
-   for real usage.
-
-   {b What happens when more I/Os are genuinely in flight than [pool_size]}: {!with_pooled_buffer}
-   BLOCKS the calling fiber (via {!Eio.Stream.take}, a real cooperative suspend, never a busy
-   spin) until a buffer is released, rather than growing the pool to match. Deliberate: an
-   unbounded pool turns a burst of concurrent I/O into unbounded memory/VMA growth, exactly the
-   failure mode this whole task exists to remove, just moved one level up. A bounded pool with
-   blocking acquisition instead turns that burst into ordinary backpressure -- indistinguishable,
-   from a caller's perspective, from the I/O itself just taking longer, which is what it would do
-   anyway on a real disk under contention. *)
+   for real usage. *)
 let pool_size = 4
-
-let create_buffer_pool () =
-  let pool = Eio.Stream.create pool_size in
-  for _ = 1 to pool_size do
-    Eio.Stream.add pool (alloc_one_aligned_buffer slot_alignment)
-  done;
-  pool
-
-(* Acquires one buffer from [pool] (blocking if none is free), zeroes it, hands [f] a
-   [n]-byte view onto it, and unconditionally returns the (full-size) buffer to the pool
-   afterwards -- on success or on an exception raised by [f], via [Fun.protect], so a failed
-   I/O can never leak a buffer out of the pool.
-
-   {b Why zero on every acquire, not just once at pool-creation time.} The very first version of
-   this technique relied on each buffer's backing temp file having just been freshly
-   [ftruncate]d -- which the kernel zero-fills -- so a write of fewer than [slot_alignment]
-   bytes (e.g. {!write_data} writing an entry shorter than one data slot) could skip explicitly
-   padding the rest and still write a correctly-zero-padded slot. A POOLED buffer is reused
-   across many writes, so without a fresh zero on each acquire, a later short write would leave
-   whatever a PRIOR write happened to leave behind in the tail of the slot rather than zeros --
-   a real correctness regression this refactor must not introduce. The [Cstruct.memset] this
-   costs is one page (4096 bytes) per acquire, negligible next to the I/O it accompanies. *)
-let with_pooled_buffer pool n f =
-  if n < 0 || n > slot_alignment then
-    invalid_arg
-      (Printf.sprintf "with_pooled_buffer: %d exceeds this pool's fixed buffer size of %d" n
-         slot_alignment);
-  let buf = Eio.Stream.take pool in
-  Fun.protect
-    ~finally:(fun () -> Eio.Stream.add pool buf)
-    (fun () ->
-      Cstruct.memset buf 0;
-      f (if n = slot_alignment then buf else Cstruct.sub buf 0 n))
 
 let header_offset ~slot = slot * header_slot_size
 let header_region_size t = t.ring_capacity * header_slot_size
@@ -314,28 +253,44 @@ let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
    data, each superblock copy's header and data) does exactly this same
    acquire-blit-write-release sequence, differing only in [data]/[n]/[offset]. *)
 let perform_write_from_string ~pool ~sw (h : file_handle) ~offset ~n data =
-  with_pooled_buffer pool n (fun buf ->
+  Aligned_buffer_pool.with_buffer pool n (fun buf ->
       Cstruct.blit_from_string data 0 buf 0 (String.length data);
       perform_write ~sw h ~offset buf)
 
 (* [None] means "nothing durable at this offset yet" (a short/empty read -- i.e. this part of
    the file has never been written, whether because it's fresh or because [t]'s [ring_capacity]
    differs from a previous run and this slot is past the old high-water mark). Any other outcome
-   either returns exactly the [len] bytes requested or raises.
+   either returns exactly the [want] bytes requested or raises.
 
    Returns a [string], not a [Cstruct.t] (a signature change from the pre-Task-10 version): the
-   pooled buffer must be released back to {!with_pooled_buffer}'s pool before this function
-   returns, so nothing that outlives the call may still reference it -- converting to an
-   owned [string] while still inside the pool's scope is what makes that safe. *)
-let perform_read ~pool ~sw (h : file_handle) ~offset ~len =
-  with_pooled_buffer pool len (fun buf ->
+   pooled buffer must be released back to {!Riptide_storage.Aligned_buffer_pool.with_buffer}'s
+   pool before this function returns, so nothing that outlives the call may still reference it --
+   converting to an owned [string] while still inside the pool's scope is what makes that safe.
+
+   [len] and [want] are deliberately separate (M8, Task 10 review): [len] is the full,
+   [slot_alignment]-sized amount actually issued to [readv] -- [O_DIRECT]'s length-alignment
+   requirement leaves no choice there -- while [want] is however many of those bytes the CALLER
+   actually needs back, always [<= len] and known to every call site below before it ever calls
+   this function (a header's own fixed [header_record_size], or a data slot's real, already-known
+   entry length). Narrowing to [want] here, via [Cstruct.to_string]'s own [~len], means only one
+   right-sized string is ever allocated -- the pre-fix version always materialized a full
+   [slot_alignment]-byte string first and left every caller to [String.sub] it down again
+   afterwards, a second allocation for no reason once the caller already knows how much it wants.
+
+   [~zero:false]: every call site of this function only ever reads INTO [buf] and, on anything
+   short of a full [len]-byte read, returns [None] without ever converting [buf] to output (see
+   the [go] loop below) -- so there is no way for a caller to observe stale bytes left over from a
+   PRIOR use of this pooled buffer, and the zero-fill {!Riptide_storage.Aligned_buffer_pool}'s
+   default protects writers against (see that module's own [.mli]) has nothing to do here. *)
+let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
+  Aligned_buffer_pool.with_buffer ~zero:false pool len (fun buf ->
       let rec go () =
         match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
         | exception End_of_file -> None
         | exception Eio.Io _ when h.direct_capable ->
           downgrade_to_dsync_only ~sw h;
           go ()
-        | n -> if n = len then Some (Cstruct.to_string buf) else None
+        | n -> if n = len then Some (Cstruct.to_string ~len:want buf) else None
       in
       go ())
 
@@ -347,6 +302,7 @@ let write_header t ~slot ~op_number ~length ~checksum =
 let read_header t ~slot =
   match
     perform_read ~pool:t.pool ~sw:t.sw t.ring ~offset:(header_offset ~slot) ~len:header_slot_size
+      ~want:header_record_size
   with
   | None -> None
   | Some s -> Some (decode_header s)
@@ -358,11 +314,8 @@ let write_data t ~slot data =
 let read_data t ~slot ~length =
   if length < 0 || length > data_slot_size then None
   else
-    match
-      perform_read ~pool:t.pool ~sw:t.sw t.ring ~offset:(data_offset t ~slot) ~len:data_slot_size
-    with
-    | None -> None
-    | Some s -> Some (String.sub s 0 length)
+    perform_read ~pool:t.pool ~sw:t.sw t.ring ~offset:(data_offset t ~slot) ~len:data_slot_size
+      ~want:length
 
 let checksum_of data =
   Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String data))
@@ -402,7 +355,7 @@ let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
     Array.init superblock_copies (fun i ->
         open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
   in
-  let pool = create_buffer_pool () in
+  let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
   let t = { sw; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
   t.highest_op_number <- recover_highest_op_number t;
   t
@@ -552,6 +505,7 @@ let write_superblock_copy t (h : file_handle) data =
 let read_superblock_copy t (h : file_handle) =
   match
     perform_read ~pool:t.pool ~sw:t.sw h ~offset:superblock_header_offset ~len:header_slot_size
+      ~want:header_record_size
   with
   | None -> None
   | Some header_s -> (
@@ -560,11 +514,10 @@ let read_superblock_copy t (h : file_handle) =
     else
       match
         perform_read ~pool:t.pool ~sw:t.sw h ~offset:superblock_data_offset ~len:data_slot_size
+          ~want:header.length
       with
       | None -> None
-      | Some data_s ->
-        let data = String.sub data_s 0 header.length in
-        if checksum_of data = header.checksum then Some data else None)
+      | Some data -> if checksum_of data = header.checksum then Some data else None)
 
 (* Write is the strict side of the flexible quorum (Decision 6): all 3 copies must durably
    succeed, or this raises (via [perform_write]'s own propagation, same as [wal_append] never

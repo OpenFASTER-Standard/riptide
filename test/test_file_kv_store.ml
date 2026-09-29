@@ -58,7 +58,18 @@ let count_self_maps () =
    of [File_storage]'s own rate. 1,000 cycles (~5.5s at the measured rate) keeps this well
    inside this suite's 15s per-test watchdog with a wide safety margin, while remaining
    massively larger than the ~25 cycles it would take the pre-fix implementation to blow past
-   the [< 100] map-growth threshold below. *)
+   the [< 100] map-growth threshold below.
+
+   {b RED/GREEN evidence, actually observed against these exact 1,000 ops (Task 10 review,
+   Finding 1)} -- same methodology as [Test_file_storage]'s own equivalent comment: temporarily
+   reverted [file_kv_store.ml]'s [perform_write_from_string]/[perform_read] to call a fresh
+   per-I/O [mmap] directly (bypassing {!Riptide_storage.Aligned_buffer_pool}, mirroring the
+   pre-Task-10 implementation), then ran this exact test, unmodified, both ways:
+   - {b RED} (reverted to per-I/O [mmap]): FAILED via the assertion itself, in 6.55s (well inside
+     the 15s watchdog) -- [before=46 after=2598 delta=2552], nowhere close to the [< 100]
+     threshold below.
+   - {b GREEN} (the real, committed buffer-pool implementation): [before=46 after=46 delta=0] --
+     not merely "under 100", genuinely flat. *)
 let op_count = 1_000
 
 let test_repeated_io_does_not_grow_the_process_map_count () =
@@ -350,7 +361,9 @@ let test_owner_reads_back_the_tag_used_at_construction () =
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
-      `Quick,
+      (* `Slow`, not `Quick` (M10, Task 10 review) -- see this test's own comment above and
+         [Test_file_storage]'s equivalent for the full rationale. *)
+      `Slow,
       test_repeated_io_does_not_grow_the_process_map_count );
     ("put then get", `Quick, test_put_then_get);
     ("get of never-put key is None", `Quick, test_get_of_never_put_key_is_none);
