@@ -979,8 +979,10 @@ val append_refusals : t -> (string * int) list
       {!Riptide_storage.File_storage.wal_append} writes a slot's header, then its data, as two
       separate, non-atomic writes; a [storage_fault] raised between them can leave the ring slot's
       PRIOR occupant permanently unreadable ([Corrupt], per [wal_read]) — including an entry a
-      [?may_evict] watermark had just refused to let be evicted — even though the append that
-      triggered it was correctly refused. This is a real, disclosed limitation of a two-write
+      [?may_evict] watermark had refused to let be evicted moments earlier, on an earlier call that
+      relented before this one was attempted (the predicate, when it refuses, always fires before
+      either write within one [wal_append] call, so it is never the occupant that specific call is
+      in the middle of overwriting). This is a real, disclosed limitation of a two-write
       update, not a bug: whichever write order a backend uses, a fault between the two writes
       always risks losing the OTHER one.
 

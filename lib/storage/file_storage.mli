@@ -97,8 +97,11 @@ val create :
       {!Riptide_vsr.Replica.durable_append} classifies as [storage_fault]).} [wal_append] below
       writes a slot's header, then its data, as two SEPARATE, non-atomic writes (see the [.ml]'s own
       comment above [write_header]/[write_data]); an I/O failure raised between them can leave the
-      ring slot's PRIOR occupant permanently unreadable ([Corrupt], per [wal_read]) — even one a
-      [?may_evict] predicate had just refused to let be evicted — regardless of which of the two
+      ring slot's PRIOR occupant permanently unreadable ([Corrupt], per [wal_read]) — including one
+      a [?may_evict] predicate had refused to let be evicted moments earlier, on an EARLIER call
+      that relented before this one was attempted (within a single [wal_append] call the predicate,
+      if it refuses, always fires before either write, so it is never the occupant this specific
+      call is in the middle of overwriting) — regardless of which of the two
       writes the failure landed between. This is an inherent property of a two-write update to a
       fixed slot, not a bug in either write's ordering: whichever write happens first, a fault
       before the second one always risks losing whatever the first one just overwrote.
