@@ -952,11 +952,17 @@
             "id": 7,
             "title": "[2.3] Bounded decode depth and an output-size budget",
             "description": "Bounded decode depth and an output-size budget",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Add an explicit nesting-depth counter (raise past 1000) to decode_value/encode_into, and a total-node-count budget to canonical_decode scaled to tcp.ml's max_message_size. Update value.mli to document these as real, not aspirational, limits.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "955f80db64347284e5a7492e6dea355a24efac21"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 8,
