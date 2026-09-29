@@ -114,9 +114,11 @@ val canonical_encode : value -> string
 
     - {b Nesting depth}: rejected past 1000 levels of [Record]/[Sum]/[Sequence]/[Map]
       nesting, the same cap {!canonical_encode} enforces (see its own doc
-      comment) - without it, a chain nested a few hundred thousand levels
-      deep costs an attacker only a few KB of wire bytes but can drive this
-      function's own recursion arbitrarily deep, exhausting the call stack.
+      comment) - without it, a wire payload that grows only linearly with depth
+      (as little as ~9 bytes per extra nesting level via the cheapest shape, a
+      single-element [Sequence]) can drive this function's own recursion
+      arbitrarily deep, exhausting the call stack for single-digit-MB of wire
+      bytes - orders of magnitude cheaper than the stack space it consumes.
 
     - {b Total decoded node count}: rejected once the number of decoded
       nodes (every [Scalar]/[Record]/[Sum]/[Sequence]/[Map] counts as one,

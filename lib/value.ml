@@ -176,10 +176,15 @@ let sort_and_reject_duplicate_keys ~what compare_key entries =
 
    Two independent reasons this needs to be on BOTH sides, not just decode:
 
-   1. [decode_value] itself: an unbounded-depth input lets an attacker who controls only a
-      few KB of wire bytes (a deeply nested chain needs very few bytes per level - see
-      [build_nested_map_key_wire_bytes] in test_value.ml) drive OCaml's own call stack
-      arbitrarily deep, i.e. a cheap-to-construct stack-exhaustion DoS with no ceiling at
+   1. [decode_value] itself: an unbounded-depth input lets an attacker drive OCaml's own
+      call stack arbitrarily deep for a wire payload that grows only linearly - not
+      exponentially - with depth: as little as ~9 bytes per extra level of nesting via the
+      cheapest shape (a single-element [Sequence]: 1 tag byte + an 8-byte count), or ~19
+      bytes/level for the single-entry-Map-key-chain shape
+      [build_nested_map_key_wire_bytes] in test_value.ml builds - so a chain deep enough to
+      exhaust a real stack (order 10^5-10^6 native frames, depending on stack size and this
+      function's own frame size) costs an attacker on the order of single-digit MB of wire
+      bytes, not gigabytes - a cheap-to-construct stack-exhaustion DoS with no ceiling at
       all before this cap existed.
 
    2. [encode_into]'s [Map] case, for a [value] with 2+ Map entries at every nesting level:
