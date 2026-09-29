@@ -413,8 +413,8 @@ exception Duplicate_id_test_done
 
 let test_second_connection_claiming_already_connected_id_is_refused () =
   let receiver_id = 2 in
-  let peer_specs = [ (receiver_id, "127.0.0.1", 19382) ] in
   let duplicate_id = 1 in
+  let peer_specs = [ (duplicate_id, "127.0.0.1", 19381); (receiver_id, "127.0.0.1", 19382) ] in
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
@@ -430,69 +430,91 @@ let test_second_connection_claiming_already_connected_id_is_refused () =
     | Ok s -> s
     | Error `Timeout -> "<test bug or regression: timed out waiting for a frame>"
   in
-  let rec send_once_registered ~deadline t ~to_ msg =
-    match Tcp.send t ~to_ msg with
-    | () -> ()
-    | exception Invalid_argument _ ->
-      if Eio.Time.now clock > deadline then
-        Alcotest.fail "Tcp.send: peer never registered a writer within the retry budget"
-      else begin
-        Eio.Time.sleep clock 0.02;
-        send_once_registered ~deadline t ~to_ msg
-      end
-  in
   try
     Eio.Switch.run (fun sw ->
-        let receiver =
-          Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
-            ~tls:(peer_identity receiver_id)
-        in
-        let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19382) in
-        let dial_as_duplicate_id () =
-          let flow = Eio.Net.connect ~sw net addr in
-          let tls =
-            Tls_eio.client_of_flow
-              (Tls_identity.client_config
-                 (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" duplicate_id)))
-              flow
-          in
-          Eio.Flow.copy_string (be8 duplicate_id) tls;
-          (tls, Eio.Buf_read.of_flow tls ~max_size:4096)
-        in
+        let receiver = ref None in
+        Eio.Fiber.both
+          (fun () ->
+            (* Create the receiver, which will wait for peer 1's connection *)
+            receiver := Some (Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
+              ~tls:(peer_identity receiver_id)))
+          (fun () ->
+            (* Meanwhile, manually create the connections from peer 1 *)
+            let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19382) in
+            let dial_as_duplicate_id () =
+              let flow = Eio.Net.connect ~sw net addr in
+              let tls =
+                Tls_eio.client_of_flow
+                  (Tls_identity.client_config
+                     (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" duplicate_id)))
+                  flow
+              in
+              Eio.Flow.copy_string (be8 duplicate_id) tls;
+              (tls, Eio.Buf_read.of_flow tls ~max_size:4096)
+            in
 
-        (* Connection 1 claims id 1 and completes its handshake + preamble. *)
-        let _tls1, r1 = dial_as_duplicate_id () in
+            (* Add a small delay to ensure the receiver's listener is up before we try to connect *)
+            Eio.Time.sleep clock 0.1;
 
-        (* Prove connection 1 is really the live, routed entry for id 1 *before* the duplicate
-           attempt exists at all: send a real message from the receiver to id 1 and read it back
-           off connection 1's own raw socket. *)
-        let deadline = Eio.Time.now clock +. 3.0 in
-        send_once_registered ~deadline receiver ~to_:duplicate_id "before";
-        Alcotest.(check string)
-          "a message sent to id 1 before the duplicate attempt arrives on connection 1" "before"
-          (read_frame_with_timeout r1);
+            (* Connection 1 claims id 1 and completes its handshake + preamble. *)
+            let _tls1, r1 = dial_as_duplicate_id () in
 
-        (* Connection 2 also claims id 1 while connection 1 is still live -- this must be refused,
-           not silently swapped in for connection 1. *)
-        let _tls2, r2 = dial_as_duplicate_id () in
-        let connection_2_was_refused =
-          match Eio.Time.with_timeout clock 3.0 (fun () -> Ok (Eio.Buf_read.take 1 r2)) with
-          | Ok _got_a_byte -> false
-          | Error `Timeout -> false
-          | exception (End_of_file | Eio.Io _ | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _) -> true
-        in
-        Alcotest.(check bool)
-          "a second connection claiming the same, still-live id is refused (its socket is closed \
-           rather than ever receiving a frame)"
-          true connection_2_was_refused;
+            (* Now wait for the receiver to be created *)
+            let deadline = Eio.Time.now clock +. 5.0 in
+            let rec wait_for_receiver () =
+              match !receiver with
+              | Some r -> r
+              | None ->
+                if Eio.Time.now clock > deadline then
+                  Alcotest.fail "Receiver creation took too long"
+                else begin
+                  Eio.Time.sleep clock 0.01;
+                  wait_for_receiver ()
+                end
+            in
+            let rcv = wait_for_receiver () in
 
-        (* The rejected duplicate must not have touched connection 1's table entry: the receiver
-           can still reach id 1, and still reaches it via connection 1 specifically. *)
-        Tcp.send receiver ~to_:duplicate_id "after";
-        Alcotest.(check string)
-          "the first connection can still send/receive normally after the rejected duplicate \
-           attempt -- its table entry was never touched"
-          "after" (read_frame_with_timeout r1);
+            (* Prove connection 1 is really the live, routed entry for id 1 *before* the duplicate
+               attempt exists at all: send a real message from the receiver to id 1 and read it back
+               off connection 1's own raw socket. *)
+            let deadline = Eio.Time.now clock +. 3.0 in
+            let rec send_once_registered msg =
+              match Tcp.send rcv ~to_:duplicate_id msg with
+              | () -> ()
+              | exception Invalid_argument _ ->
+                if Eio.Time.now clock > deadline then
+                  Alcotest.fail "Tcp.send: peer never registered a writer within the retry budget"
+                else begin
+                  Eio.Time.sleep clock 0.02;
+                  send_once_registered msg
+                end
+            in
+            send_once_registered "before";
+            Alcotest.(check string)
+              "a message sent to id 1 before the duplicate attempt arrives on connection 1" "before"
+              (read_frame_with_timeout r1);
+
+            (* Connection 2 also claims id 1 while connection 1 is still live -- this must be refused,
+               not silently swapped in for connection 1. *)
+            let _tls2, r2 = dial_as_duplicate_id () in
+            let connection_2_was_refused =
+              match Eio.Time.with_timeout clock 3.0 (fun () -> Ok (Eio.Buf_read.take 1 r2)) with
+              | Ok _got_a_byte -> false
+              | Error `Timeout -> false
+              | exception (End_of_file | Eio.Io _ | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _) -> true
+            in
+            Alcotest.(check bool)
+              "a second connection claiming the same, still-live id is refused (its socket is closed \
+               rather than ever receiving a frame)"
+              true connection_2_was_refused;
+
+            (* The rejected duplicate must not have touched connection 1's table entry: the receiver
+               can still reach id 1, and still reaches it via connection 1 specifically. *)
+            send_once_registered "after";
+            Alcotest.(check string)
+              "the first connection can still send/receive normally after the rejected duplicate \
+               attempt -- its table entry was never touched"
+              "after" (read_frame_with_timeout r1));
 
         Eio.Switch.fail sw Duplicate_id_test_done)
   with Duplicate_id_test_done -> ()
@@ -849,6 +871,14 @@ let test_dial_side_tls_handshake_has_a_bounded_timeout () =
     true
     (contains "TLS handshake" msg && contains "peer 2" msg)
 
+let test_send_refuses_an_id_outside_the_configured_membership () =
+  let peer_specs = [ (0, "127.0.0.1", 19381) ] in
+  with_mesh peer_specs (fun handles ->
+      let t = Hashtbl.find handles 0 in
+      Alcotest.check_raises "send to a non-member id is refused"
+        (Invalid_argument "Tcp.send: no connection to peer 99")
+        (fun () -> Tcp.send t ~to_:99 "x"))
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
@@ -877,5 +907,7 @@ let tests =
     ("mTLS identity: a certificate the trust anchor did not issue is rejected at construction",
       `Quick, test_identity_rejects_a_certificate_its_trust_anchor_did_not_issue);
     ("mTLS: the dial-side TLS handshake has a bounded timeout, not an unbounded hang", `Quick,
-      test_dial_side_tls_handshake_has_a_bounded_timeout)
+      test_dial_side_tls_handshake_has_a_bounded_timeout);
+    ("send refuses an id outside the configured membership", `Quick,
+      test_send_refuses_an_id_outside_the_configured_membership)
   ]

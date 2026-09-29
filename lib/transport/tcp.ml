@@ -127,6 +127,11 @@ type t = {
      below) decoded from the certificate actually presented on the connection the message arrived
      on -- never the handshake preamble's claim. [reader_body] is the only producer. *)
   inbox : (string * int) Eio.Stream.t;
+  (* The set of peer ids in the cluster membership that was passed to [create]. Used by [send] to
+     validate that [to_] is a known cluster member before consulting the live connection table
+     ([writers]). This is the real membership table, distinct from the routing decision made by the
+     handshake preamble (see [writers]'s own comment, below). *)
+  membership_ids : int list;
   (* One entry per live connection, keyed by the *remote* peer's id: the [Eio.Buf_write.t] to
      write framed messages to in order to reach that peer. Populated by both the dialing path
      (connect_to) and the accepting path (handle_accepted) as connections come up, via
@@ -590,6 +595,7 @@ let create ~sw ~net ~clock ~my_id ~peers ~tls =
     { my_id;
       tls;
       inbox = Eio.Stream.create max_int;
+      membership_ids = List.map (fun (id, _, _) -> id) peers;
       writers = Hashtbl.create (List.length peers);
       writer_added = Eio.Condition.create ();
     }
@@ -651,6 +657,8 @@ let send t ~to_ bytes =
     invalid_arg
       (Printf.sprintf "Tcp.send: message of %d bytes exceeds max_message_size (%d bytes)"
          (String.length bytes) max_message_size)
+  else if not (List.mem to_ t.membership_ids) then
+    invalid_arg (Printf.sprintf "Tcp.send: no connection to peer %d" to_)
   else
     match Hashtbl.find_opt t.writers to_ with
     | Some w when not (Eio.Buf_write.is_closed w) -> write_frame w bytes
