@@ -479,7 +479,8 @@
         "status": "pending",
         "priority": "high",
         "dependencies": [
-          "4"
+          "4",
+          "12"
         ],
         "details": "This is 'the boundary' category from the mechanism/policy analysis: a trusted, frozen CHECK-POINT whose CONTENT is pluggable. WASM Components are genuinely production-mature (2025-2026, WASI 0.3 shipped native async I/O). Isolation must be UNIFORM strong (SFI baseline everywhere, since it needs no hardware virtualization and is proven down to Cortex-M0 microcontrollers; hardware-virtualization microVM as an optional stronger tier where available) - NEVER tiered by trust level, per the corrected finding: AWS Lambda's real production philosophy is one strong boundary for everyone, and Cloudflare's trust-tiered Workers model had a real demonstrated Spectre leak as the direct cost of that shortcut.",
         "testStrategy": "See subtask-level test strategy; each subtask must ship with real, running, tested code in the same cycle as any formal rule it implements \u2014 never spec-only.",
@@ -831,12 +832,356 @@
             "parentId": "undefined"
           }
         ]
+      },
+      {
+        "id": "12",
+        "title": "Harden Layer 0 against adversarial real-world conditions (deep audit remediation)",
+        "description": "Close every finding from the 2026-09-29 five-track adversarial audit of the value codec, VSR consensus/replication, storage, materializer/lattice, and transport/crypto layers -- six Critical, live-reproduced. See docs/superpowers/specs/2026-09-29-audit-remediation-design.md for the full design.",
+        "status": "pending",
+        "priority": "high",
+        "dependencies": [
+          "4"
+        ],
+        "details": "Layer 0 hardening, not new Layer 0 scope -- Tasks 1-4 are done and their documented/tested behavior is unchanged; this task closes gaps the audit found between that documented behavior and adversarial reality. Sequenced as a prerequisite to Task 5 (defining the Layer 0/Layer 2 boundary is not worth doing precisely on top of a Layer 0 with known Critical safety gaps).",
+        "testStrategy": "Each subtask ships with real, running tests per the design spec -- reproduction-turned-regression tests for every fixed finding, never prose-only.",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "[1.1] Transport_intf.S.receive returns the authenticated sender",
+            "description": "Transport_intf.S.receive returns the authenticated sender",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Change receive : t -> string to t -> string * int. Tcp binds the returned id to the TLS certificate actually presented (decoded from the verified peer cert's SAN, per ca.ml:164), not the unverified handshake preamble. Sim_transport returns each simulated peer's already-known id verbatim.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 2,
+            "title": "[1.2] Tcp rejects a second connection claiming an already-connected id",
+            "description": "Tcp rejects a second connection claiming an already-connected id",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Replace the current silent Hashtbl.replace eviction (tcp.ml:159) with an outright refusal (close, log, leave the existing entry untouched) when a new connection is authenticated as an id already present.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 3,
+            "title": "[1.3] Prepare/Start_view gain a real sender field; Replica.handle_message cross-checks it",
+            "description": "Prepare/Start_view gain a real sender field; Replica.handle_message cross-checks it",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Add source : int to Prepare and Start_view on the wire. Replica.handle_message takes the transport-authenticated sender alongside payload bytes and rejects any message whose claimed sender (i or source) disagrees with it, via Invalid_argument (counted, total no-op).",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 4,
+            "title": "[1.4] Tcp.send validates against the membership table it was given",
+            "description": "Tcp.send validates against the membership table it was given",
+            "status": "pending",
+            "dependencies": [],
+            "details": "send currently accepts any id with a live connection table entry. Add a check against the real membership create was given, matching tcp.mli:147's existing documented (but unenforced) contract.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 5,
+            "title": "[2.1] Decode a Map key in place; drop the String.sub copy",
+            "description": "Decode a Map key in place; drop the String.sub copy",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Replace value.ml:238-240's quadratic copy-then-recurse with in-place decoding against the outer buffer, bounded by an expected-consumption offset. Mirror in encode_into's Map case.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 6,
+            "title": "[2.2] canonical_decode enforces strict canonical ordering and rejects duplicates",
+            "description": "canonical_decode enforces strict canonical ordering and rejects duplicates",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Record fields and Map entries must decode in strictly increasing key order; a duplicate or out-of-order key raises Invalid_argument. canonical_encode gains a matching duplicate check for in-memory-constructed values.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 7,
+            "title": "[2.3] Bounded decode depth and an output-size budget",
+            "description": "Bounded decode depth and an output-size budget",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Add an explicit nesting-depth counter (raise past 1000) to decode_value/encode_into, and a total-node-count budget to canonical_decode scaled to tcp.ml's max_message_size. Update value.mli to document these as real, not aspirational, limits.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 8,
+            "title": "[2.4] Doc corrections: canonicality claim, envelope domain-separation, dead reference",
+            "description": "Doc corrections: canonicality claim, envelope domain-separation, dead reference",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Simplify value.mli:36-39's now-unconditionally-true claim; correct envelope.ml/envelope.mli/test_envelope.ml's overclaimed 'can never collide, even under adversarial construction' wording to state the real, narrower property; replace the dead L4/final-review.md reference in test_value.ml with a pointer to this spec.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 9,
+            "title": "[3.1] Replace per-I/O mmap with a reusable aligned-buffer pool",
+            "description": "Replace per-I/O mmap with a reusable aligned-buffer pool",
+            "status": "pending",
+            "dependencies": [],
+            "details": "alloc_aligned_buffer (file_storage.ml:141-151, file_kv_store.ml:106-116) allocates a throwaway-file mmap per I/O with no explicit release. Replace with a small fixed pool of aligned buffers owned by t, acquired/released explicitly.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 10,
+            "title": "[3.2] A real filesystem-level lock on create",
+            "description": "A real filesystem-level lock on create",
+            "status": "pending",
+            "dependencies": [],
+            "details": "File_storage.create and File_kv_store.create each take an flock(LOCK_EX | LOCK_NB) on a .riptide-lock file in the target directory, held for the handle's lifetime. A second create against an already-locked directory raises immediately.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 11,
+            "title": "[3.3] Classify real I/O failures the same way guard-failures already are",
+            "description": "Classify real I/O failures the same way guard-failures already are",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Extend append_refusals with a storage_fault bucket populated when wal_append raises Eio.Io/Sys_error/Out_of_memory. durable_append catches these, counts them, returns false -- no more unclassified escapes.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 12,
+            "title": "[3.4] A superblock-rebuild entry point",
+            "description": "A superblock-rebuild entry point",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Add Storage_intf.S.superblock_rebuild_from_wal : t -> unit, callable when superblock_read returns None over a non-empty WAL, reconstructing a fresh superblock from the WAL's own recoverable state.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 13,
+            "title": "[3.5] Validate ring_capacity >= 1 at create",
+            "description": "Validate ring_capacity >= 1 at create",
+            "status": "pending",
+            "dependencies": [],
+            "details": "File_storage.create raises Invalid_argument for ring_capacity <= 0, closing the Division_by_zero/negative-offset escapes at configuration time instead of first-request time.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 14,
+            "title": "[3.6] Atomic owner-marker writes; a 0-byte marker is treated as unclaimed",
+            "description": "Atomic owner-marker writes; a 0-byte marker is treated as unclaimed",
+            "status": "pending",
+            "dependencies": [],
+            "details": "check_or_write_owner_marker moves from create-then-write to write-temp-then-rename. A marker read as exactly 0 bytes is treated as absent rather than a claimed empty-string owner.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 15,
+            "title": "[3.7] Randomize File_kv_store's temp-file suffix per call",
+            "description": "Randomize File_kv_store's temp-file suffix per call",
+            "status": "pending",
+            "dependencies": [],
+            "details": "tmp_suffix becomes unique per call instead of the fixed '.put.tmp', so concurrent same-key writers can no longer interleave writes into one shared temp file and produce a torn record.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 16,
+            "title": "[3.8] Temp files live in the target directory, not TMPDIR",
+            "description": "Temp files live in the target directory, not TMPDIR",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Move alloc_aligned_buffer's and File_kv_store's put-path temp-file creation into the target storage directory itself, removing the hard cross-filesystem TMPDIR dependency and a latent rename-atomicity risk.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 17,
+            "title": "[3.9] File_kv_store shards its flat directory",
+            "description": "File_kv_store shards its flat directory",
+            "status": "pending",
+            "dependencies": [],
+            "details": "path_for gains a two-level directory prefix from the key's content hash, bounding any single directory's entry count. file_kv_store.mli documents the remaining space/inode cost ceilings explicitly.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 18,
+            "title": "[3.10] Minor bundle: O_DIRECT misdetection, use-after-close, startup cost doc",
+            "description": "Minor bundle: O_DIRECT misdetection, use-after-close, startup cost doc",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Narrow the blanket Eio.Io catch to real O_DIRECT-unsupported errno shapes; set direct_capable <- false before attempting reopen in downgrade_to_dsync_only; document recover_highest_op_number's O(ring_capacity) startup cost next to the sizing guidance.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 19,
+            "title": "[4.1] Per-merge_key serialization inside Materializer",
+            "description": "Per-merge_key serialization inside Materializer",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Wrap Materializer.write's read-join-put in an in-process lock keyed by merge_key, closing the deterministic lost-update finding for the realistic one-Materializer-per-replica-process deployment shape.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 20,
+            "title": "[4.2] Per-write materialization failure no longer aborts the whole batch or replay",
+            "description": "Per-write materialization failure no longer aborts the whole batch or replay",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Batch_commit.propose's write loop and materialize_up_to's replay loop both catch and count a raising write instead of aborting all subsequent writes -- fixes the restart-divergence and batch-atomicity findings via one shared fix.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 21,
+            "title": "[4.3] A useful error message names the merge_key",
+            "description": "A useful error message names the merge_key",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Materializer.write's overflow Invalid_argument includes the merge_key, not just byte counts, making the one existing signal actionable.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 22,
+            "title": "[4.4] Promote Lattice_conformance to an installable library",
+            "description": "Promote Lattice_conformance to an installable library",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Move test/lattice_conformance.ml into a real library so a caller implementing their own Lattice_intf.S can actually run the law-checking property tests lattice_intf.ml's own doc already points them to.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 23,
+            "title": "[5.1] Retract the keystore-backup recommendation; state the real guarantee precisely",
+            "description": "Retract the keystore-backup recommendation; state the real guarantee precisely",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Remove redaction_store.mli's recommendation to back up the keystore directory; state plainly that redaction has no effect on any pre-redaction copy. Add test_a_pre_redaction_keystore_backup_defeats_redaction pinning the real, disclosed behavior.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 24,
+            "title": "[5.2] Kv_store_intf.S gains enumeration; Redaction_store gains KEK rotation",
+            "description": "Kv_store_intf.S gains enumeration; Redaction_store gains KEK rotation",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Add val fold to Kv_store_intf.S. Store each wrapped-DEK record's plaintext event_id alongside the wrapped bytes. Add Redaction_store.rotate_kek, folding over the keystore, unwrapping under the old KEK and rewrapping under the new one, per-entry-atomic.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 25,
+            "title": "[5.3] require_encryption becomes a construction-time policy, not a per-call flag",
+            "description": "require_encryption becomes a construction-time policy, not a per-call flag",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Batch_commit's constructor gains ?require_encryption (default false), stored on the handle; propose's own ?require_encryption, if supplied, overrides it per-call. Closes the same-call-site-forgets-both-flags finding.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 26,
+            "title": "[6.1] A configurable cap on concurrent accepted connections",
+            "description": "A configurable cap on concurrent accepted connections",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Tcp.create gains ?max_connections; the accept loop refuses any connection beyond the cap before any handshake is attempted.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 27,
+            "title": "[6.2] EMFILE on accept is not counted toward the fatal error budget",
+            "description": "EMFILE on accept is not counted toward the fatal error budget",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Exclude EMFILE from accept_max_consecutive_errors's counter; log and back off briefly instead of eventually re-raising fatally and killing the listener process.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 28,
+            "title": "[6.3] A bounded inbox and a read-idle timeout on established connections",
+            "description": "A bounded inbox and a read-idle timeout on established connections",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Eio.Stream.create max_int becomes a finite, configurable capacity (real backpressure via a full inbox blocking the sender). Add a read-idle timeout on established connections, reusing the shape of the existing handshake/preamble timeouts.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 29,
+            "title": "[7.1] Ring-wedge early warning, and a documented, tested resize-before-wedge procedure",
+            "description": "Ring-wedge early warning, and a documented, tested resize-before-wedge procedure",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Add Storage_intf.S.ring_margin. Wire ?may_evict through every real File_storage.create call site so eviction_blocked actually increments. Add a test demonstrating copying live entries into a freshly created, larger-capacity File_storage before a wedge occurs; document this as the supported resize procedure.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 30,
+            "title": "[7.2] A stranded replica keeps retrying its view-change broadcast",
+            "description": "A stranded replica keeps retrying its view-change broadcast",
+            "status": "pending",
+            "dependencies": [],
+            "details": "try_forfeit_view_change/check_timeout re-broadcast StartViewChange on each timeout while below quorum, bounded by the existing svc_limit. Fix svc_count not incrementing on the below-quorum path in the same change.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 31,
+            "title": "[7.3] Content-check the committed prefix, not just its length",
+            "description": "Content-check the committed prefix, not just its length",
+            "status": "pending",
+            "dependencies": [],
+            "details": "truncate_wal and handle_start_view's guards additionally check that the incoming log's entries covering [1, local commit_number] match the locally held committed entries' content hashes exactly, refusing wholesale on mismatch.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 32,
+            "title": "[7.4] A generic event hook for observability, plus peer_op_number exposure",
+            "description": "A generic event hook for observability, plus peer_op_number exposure",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Replica.create/restart gain ?on_event, mirroring the existing ?on_commit_advanced pattern, covering guard rejections, status transitions, and commit_number decreases (not filtered out, unlike the existing hook). Add a real peer_op_number accessor.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          },
+          {
+            "id": 33,
+            "title": "[7.5] Doc corrections: stale retry/backoff claim, missing svc_count accessor",
+            "description": "Doc corrections: stale retry/backoff claim, missing svc_count accessor",
+            "status": "pending",
+            "dependencies": [],
+            "details": "Correct 2026-09-24-layer0-followup-hardening-design.md's still-present claim about unshipped disk-full retry/backoff behavior to point forward to Decision 3.3. Add the svc_count accessor replica.mli:538 already references but that doesn't exist.",
+            "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
+            "parentId": "undefined"
+          }
+        ]
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-28T17:29:20.000Z",
-      "taskCount": 11,
+      "lastModified": "2026-09-29T00:00:00.000Z",
+      "taskCount": 12,
       "completedCount": 4,
       "tags": [
         "master"
