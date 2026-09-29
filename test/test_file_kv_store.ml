@@ -273,19 +273,19 @@ let test_put_and_delete_both_fsync_the_directory () =
     (contains ~needle:"Eio.Path.rename" durable_write);
   Alcotest.(check bool)
     "durable_write fsyncs the containing directory (Finding 1 regression guard)" true
-    (contains ~needle:"fsync_dir t" durable_write);
+    (contains ~needle:"fsync_dir ~dir_path:t.dir_path" durable_write);
   (* Ordering matters, not just presence: syncing the directory before the rename would sync a
      state that does not yet contain the new entry, which is no guarantee at all. *)
   (match
-     (index_of ~needle:"Eio.Path.rename" durable_write, index_of ~needle:"fsync_dir t" durable_write)
+     (index_of ~needle:"Eio.Path.rename" durable_write, index_of ~needle:"fsync_dir ~dir_path:t.dir_path" durable_write)
    with
   | Some rename_at, Some fsync_at ->
     Alcotest.(check bool) "the fsync_dir comes AFTER the rename, not before" true (fsync_at > rename_at)
-  | _ -> Alcotest.fail "expected both Eio.Path.rename and fsync_dir t in durable_write's body");
+  | _ -> Alcotest.fail "expected both Eio.Path.rename and fsync_dir ~dir_path:t.dir_path in durable_write's body");
   let delete_body = top_level_binding_body source "delete" in
   Alcotest.(check bool)
     "delete still fsyncs the containing directory too" true
-    (contains ~needle:"fsync_dir t" delete_body)
+    (contains ~needle:"fsync_dir ~dir_path:t.dir_path" delete_body)
 
 (* -- Subtask 4.6: [create]'s [~owner] closes PART of a confirmed, real data-destruction bug --
    sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
@@ -373,6 +373,39 @@ let test_owner_reads_back_the_tag_used_at_construction () =
       Eio.Switch.run @@ fun sw ->
       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"a-real-tag" dir in
       Alcotest.(check string) "owner reads back the construction-time tag" "a-real-tag"
+        (File_kv_store.owner t))
+
+(* Task 15: a 0-byte marker is what the OLD create-then-write scheme
+   ([Eio.Path.save ~create:(`Exclusive ...)]) leaves behind when a process crashes (or is killed)
+   between the file's creation and its write completing -- the create half of that pair is its own
+   separate syscall from the write, so a crash between them is a real, reachable window, not a
+   theoretical one. [Eio.Path.load] on a 0-byte file succeeds and returns [""], which the old code
+   read as "this directory is owned by the empty string" -- a claim NO real tag can ever match
+   again (["" <> tag] for every non-empty [tag], and [~owner:""] is itself rejected at
+   construction elsewhere in this module), permanently bricking the directory. The fix must treat
+   a 0-byte marker exactly like a missing one: "no real claim yet, write [tag] now".
+
+   Writes the 0-byte marker directly via plain [Unix], bypassing [File_kv_store] entirely, to
+   simulate exactly the crash window above -- not via any [File_kv_store] call, since no call this
+   module exposes can itself leave a 0-byte marker on a still-passing run (that's the whole bug:
+   today there is no code path back OUT of "owned by \"\"" once it happens). The marker's own file
+   name, [".riptide-kv-owner"], is private to [file_kv_store.ml] (not exposed by its [.mli]) --
+   duplicated here as a literal rather than exported solely for this test, matching this suite's
+   existing practice of exercising private on-disk layout details by literal path
+   ([test_put_overwrite_leaves_no_leftover_tmp_file] does the same for [".put.tmp"]). *)
+let owner_marker_name = ".riptide-kv-owner"
+
+let write_a_zero_byte_marker_directly dir =
+  let fd = Unix.openfile (Filename.concat dir owner_marker_name) [ Unix.O_WRONLY; Unix.O_CREAT ] 0o600 in
+  Unix.close fd
+
+let test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      write_a_zero_byte_marker_directly dir;
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-store" dir in
+      Alcotest.(check string) "the directory is now claimed by the real owner" "redaction-store"
         (File_kv_store.owner t))
 
 (* Task 11: the PHYSICAL guard -- see [Test_file_storage]'s own copy of this comment (identical
@@ -542,6 +575,10 @@ let tests =
       test_an_empty_owner_is_rejected_at_construction);
     ("owner reads back the tag used at construction", `Quick,
       test_owner_reads_back_the_tag_used_at_construction);
+    ( "Task 15: a 0-byte marker (crash between create and write) self-heals instead of \
+       permanently bricking the directory",
+      `Quick,
+      test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string );
     ( "Task 11: a second create on an already-locked directory is refused immediately",
       `Quick,
       test_a_second_create_on_a_locked_directory_is_refused );

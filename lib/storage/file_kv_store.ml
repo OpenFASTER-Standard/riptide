@@ -308,8 +308,8 @@ let tmp_suffix = ".put.tmp"
    either way.) Errors deliberately propagate rather than being swallowed, matching
    [delete]'s narrow catch: a caller must be able to trust that a returning [put] or [delete] means
    the key really, durably is (or is not) there. *)
-let fsync_dir t =
-  let fd = Unix.openfile t.dir_path [ Unix.O_RDONLY ] 0 in
+let fsync_dir ~dir_path =
+  let fd = Unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
   Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
 
 (* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
@@ -338,7 +338,7 @@ let durable_write t path data =
       perform_write_from_string ~pool:t.pool ~sw:t.sw h ~offset:header_slot_size
         ~n:data_slot_size data);
   Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path);
-  fsync_dir t
+  fsync_dir ~dir_path:t.dir_path
 
 (* [None] for every way this can fail to verify: the file doesn't exist (never put, or
    deleted -- caught as [Eio.Io] from the open itself), a short/missing header or data read, a
@@ -387,6 +387,14 @@ let durable_read t path =
    collide with. *)
 let owner_marker_name = ".riptide-kv-owner"
 
+(* Suffix for the owner marker's own temp file, written by [check_or_write_owner_marker] before
+   it atomically [rename]s onto [owner_marker_name] -- the same write-temp-then-rename shape
+   [durable_write] above uses for per-key records, applied here to the marker instead. Fixed, not
+   randomized, for the same reason [tmp_suffix] above is: [Dir_lock] already serializes every
+   [create] over one [dir_path] that could otherwise race for this name (see [create]'s own Task
+   11 comment), so this only needs to survive a crash mid-write, not race a second writer. *)
+let owner_marker_tmp_suffix = ".owner.tmp"
+
 (* Enforces that at most one distinct [owner] tag ever claims [dir_path], across every [create] of
    it for the lifetime of the directory. [owner] is mandatory (see this file's [.mli] on
    [create]'s [~owner]), so every call here has a real tag to check or write.
@@ -397,17 +405,45 @@ let owner_marker_name = ".riptide-kv-owner"
    raises [Eio.Io] (confirmed against [path.ml]'s own [load], which opens via [open_in] --
    the same backend open every other existence check in this file already relies on raising
    [Eio.Io] for ENOENT), read here as "no owner has claimed this directory yet, this call is the
-   first". [Eio.Path.load]/[Eio.Path.save] themselves are both confirmed real, current functions
-   in the installed Eio 0.12 ([path.mli]) -- [save ~create:(`Exclusive perm)] confirmed via
-   [fs.ml]'s own [type create] variant. *)
+   first". [Eio.Path.load]/[Eio.Path.save]/[Eio.Path.rename] are all confirmed real, current
+   functions in the installed Eio 0.12 ([path.mli]) -- [save ~create:(`Or_truncate perm)]
+   confirmed via [fs.ml]'s own [type create] variant.
+
+   {b Task 15: a 0-byte marker reads back identically to a missing one}, not as a claimed
+   [~owner:""]. The OLD scheme wrote the marker via [Eio.Path.save ~create:(`Exclusive 0o600)]
+   directly onto [owner_marker_name] -- a create-then-write pair that is not atomic: a crash (or
+   kill) between the file's creation and its write completing leaves a real, 0-byte file on disk.
+   [Eio.Path.load] on that file succeeds (it exists) and returns [""], which the old code
+   compared against [tag] like any other existing marker -- and [""] never equals any real,
+   non-empty [tag] (empty tags are themselves rejected at construction, see [create] below), so
+   every later [create] of that directory, by anyone, permanently raised the owner-mismatch
+   error. There was no code path back out of that state short of manually deleting the marker
+   file outside this module entirely.
+
+   The fix: treat "marker exists but its content has zero length" the same as "marker does not
+   exist" -- both mean no real claim has actually landed yet, so (re)write [tag] now, exactly as
+   the first-ever [create] of a fresh directory would. And write it durably this time: stage
+   [tag] in a private temp file first ([owner_marker_tmp_suffix]), then [Eio.Path.rename] that
+   temp file onto [owner_marker_name] in one atomic step, then fsync the directory (matching
+   [durable_write]'s own reasoning above for why the rename's directory-entry update needs its
+   own fsync, not just the file's data) -- so a crash during THIS write can, at worst, leave
+   behind an ignorable stray temp file or reproduce the same self-healing 0-byte-or-missing state
+   again, never a half-written marker holding a truncated, wrong tag. *)
 let check_or_write_owner_marker ~fs ~dir_path tag =
   let marker_path = Eio.Path.(fs / dir_path / owner_marker_name) in
-  match Eio.Path.load marker_path with
-  | existing ->
+  let existing =
+    match Eio.Path.load marker_path with existing -> Some existing | exception Eio.Io _ -> None
+  in
+  match existing with
+  | Some existing when String.length existing > 0 ->
     if not (String.equal existing tag) then
       invalid_arg
         (Printf.sprintf "File_kv_store.create: %s is owned by %S, not %S" dir_path existing tag)
-  | exception Eio.Io _ -> Eio.Path.save ~create:(`Exclusive 0o600) marker_path tag
+  | Some _ (* a 0-byte marker: a crash left this behind, treat it like [None] below *) | None ->
+    let tmp_path = Eio.Path.(fs / dir_path / (owner_marker_name ^ owner_marker_tmp_suffix)) in
+    Eio.Path.save ~create:(`Or_truncate 0o600) tmp_path tag;
+    Eio.Path.rename tmp_path marker_path;
+    fsync_dir ~dir_path
 
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
    top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
@@ -494,4 +530,4 @@ let delete t ~key =
   (try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key) with
   | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
     () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *));
-  fsync_dir t
+  fsync_dir ~dir_path:t.dir_path
