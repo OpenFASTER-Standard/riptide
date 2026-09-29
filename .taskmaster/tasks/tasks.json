@@ -900,11 +900,17 @@
             "id": 4,
             "title": "[1.4] Tcp.send validates against the membership table it was given",
             "description": "Tcp.send validates against the membership table it was given",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "send currently accepts any id with a live connection table entry. Add a check against the real membership create was given, matching tcp.mli:147's existing documented (but unenforced) contract.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "51037f474701f5e880f9295ecacbf1809c7fe334"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 5,
