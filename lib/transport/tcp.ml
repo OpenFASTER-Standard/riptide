@@ -91,10 +91,15 @@ exception Frame_too_large of int
    the wrong place. Never escapes this module: [create] converts it to the documented [Failure]. *)
 exception Tls_handshake_failed of exn
 
-(* Raised by [register_writer] when a connection attempts to claim a peer id already present
-   in the writers table -- see [register_writer] below. Never escapes this module: [writer_body]
-   catches it and closes the connection, so this exists as a named exception purely so a
-   [Tcp: connection error] log line can say *why* a connection was dropped rather than looking
+(* Raised by [register_writer] when a connection attempts to claim a peer id whose entry in the
+   writers table is still LIVE -- see [register_writer] below. A dead entry (its [Eio.Buf_write.t]
+   already closed, the same liveness check [send] itself uses) does not raise this: the table only
+   ever drops an entry once both the reader and writer fibers of the connection that installed it
+   have confirmed it is done (see the [writers] field's own doc comment on [t] above), so a real
+   reconnect from the same peer can otherwise still find a stale, not-yet-cleaned-up entry here and
+   must be let through rather than wrongly rejected as a duplicate. Never escapes this module:
+   [writer_body] catches it and closes the connection, so this exists as a named exception purely
+   so a [Tcp: connection error] log line can say *why* a connection was dropped rather than looking
    identical to an ordinary disconnect, the same discipline as [Frame_too_large] and
    [Unauthenticated_peer] above. *)
 exception Duplicate_connection_id of int
@@ -137,12 +142,15 @@ type t = {
      decides which live connection a given outbound peer id resolves to, and that decision is
      still keyed by the preamble, so a cluster member can still cause a peer's OWN outbound
      messages to route to a connection the attacker holds (rather than forging what the receiving
-     side believes about a message it receives), and a second connection claiming an id already
-     present here still silently replaces the first via [Hashtbl.replace]. See tcp.mli's
-     "Authentication" section for the precise boundary. An entry is removed by [run_connection]
-     once that connection's reader and writer fibers have BOTH confirmed the connection is dead --
-     see [run_connection] for why cleanup only happens there, coupled, rather than independently
-     in whichever of the reader/writer notices death first. *)
+     side believes about a message it receives). A second connection claiming an id whose entry
+     here is still LIVE is refused rather than replacing it (see [register_writer] and
+     [Duplicate_connection_id]); one claiming an id whose entry is already dead (the old holder's
+     [Eio.Buf_write.t] closed, but not yet removed -- see below) is let through, the same as the
+     old plain-[Hashtbl.replace] behavior, so a legitimate reconnect is never wrongly rejected. See
+     tcp.mli's "Authentication" section for the precise boundary. An entry is removed by
+     [run_connection] once that connection's reader and writer fibers have BOTH confirmed the
+     connection is dead -- see [run_connection] for why cleanup only happens there, coupled,
+     rather than independently in whichever of the reader/writer notices death first. *)
   writers : (int, Eio.Buf_write.t) Hashtbl.t;
   (* Broadcast every time an entry is added to [writers], so [create] can block until the whole
      mesh implied by [peers] is up without busy-polling [writers]'s length. *)
@@ -249,8 +257,8 @@ let authenticated_peer_id flow =
 
 let register_writer t peer_id w =
   match Hashtbl.find_opt t.writers peer_id with
-  | Some _ -> raise (Duplicate_connection_id peer_id)
-  | None ->
+  | Some existing when not (Eio.Buf_write.is_closed existing) -> raise (Duplicate_connection_id peer_id)
+  | Some _ | None ->
     Hashtbl.replace t.writers peer_id w;
     Eio.Condition.broadcast t.writer_added
 
@@ -297,9 +305,8 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
   | End_of_file -> ()
   | Eio.Io _ -> ()
   | Failure _ -> ()
-  | Duplicate_connection_id peer_id ->
-    Eio.traceln "Tcp: connection error: %s; dropping connection"
-      (describe_exn (Duplicate_connection_id peer_id))
+  | Duplicate_connection_id _ as exn ->
+    Eio.traceln "Tcp: connection error: %s; dropping connection" (describe_exn exn)
   | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> ()
 
 (* The read side of one connection's lifetime: decodes the connection's own authenticated sender
@@ -382,9 +389,11 @@ let reader_body t flow r =
    - remove this connection's [t.writers] entry, but only if the table's current entry for
      [peer_id] is still the exact writer THIS connection itself installed (via [writer_cell]) --
      otherwise a slow-to-notice OLDER connection's cleanup could evict a NEWER connection's live
-     entry for the same id, which is reachable in principle since [register_writer] uses
-     [Hashtbl.replace] and this module does not prevent a second connection from claiming an
-     already-known id (see the [writers] field's own doc comment above);
+     entry for the same id, which is reachable in principle because [register_writer] still lets a
+     second connection claim an already-known id once the OLD entry is dead (a legitimate
+     reconnect -- see the [writers] field's own doc comment above and [register_writer]'s own
+     liveness check), so an old connection's belated cleanup racing a new, already-registered
+     replacement for the same id is a real case, not a hypothetical one;
    - close the flow ITSELF, but only if [owns_flow] -- true for a dialed connection (whose flow is
      owned by the long-lived outer [sw] and would otherwise never be closed at all), false for an
      accepted connection (whose flow [accept_fork] itself closes exactly once, automatically, the

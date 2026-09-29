@@ -36,11 +36,14 @@
     see the {!create} implementation's [writers] field for the precise, current boundary. So a
     cluster member can still cause its {e own} outbound traffic to be routed onto a connection an
     attacker holds (a routing-table poisoning, not a message-attribution forgery). A second
-    connection claiming an id already routed is now {b rejected} rather than silently replacing the
-    first: the new connection's writer fiber exits with a logged "connection error" and the first
-    connection's entry in the routing table remains untouched. The gap {!receive}'s fix closes is
-    the one that mattered most for message provenance: an arbitrary party on the network can no
-    longer inject, read, tamper with, or (as of this fix) falsely attribute cluster traffic. What
+    connection claiming an id already routed to a still-LIVE connection is now {b rejected} rather
+    than silently replacing the first: the new connection's writer fiber exits with a logged
+    "connection error" and the first connection's entry in the routing table remains untouched. A
+    second connection claiming an id whose routed entry is already dead is still let through (the
+    same as always), so a legitimate reconnect from the same peer is never wrongly refused. The gap
+    {!receive}'s fix closes is the one that mattered most for message provenance: an arbitrary
+    party on the network can no longer inject, read, tamper with, or (as of this fix) falsely
+    attribute cluster traffic. What
     remains is narrower, and is a separate, later fix.
 
     {2 Wire format}
@@ -64,8 +67,10 @@
       connection's entry in the OUTBOUND routing table ({!send}'s target lookup), but no longer
       decides what {!receive} reports a delivered message's sender as -- that is decoded
       independently, straight from the certificate. A second connection claiming an id already
-      present in this peer's connection table silently replaces the first one (an implementation
-      detail of [Hashtbl.replace], not a validated "reconnect" feature).
+      present and LIVE in this peer's connection table is rejected rather than replacing the
+      first one -- see the "Authentication" section above. One claiming an id whose table entry
+      is already dead (the prior connection gone, but not yet cleaned up) is let through, the same
+      as it always was, so a legitimate reconnect is never wrongly refused.
 
       The accepting side's waits are bounded, at both layers and for the same reason: ~10s for the
       TLS handshake to complete, then ~10s for the preamble. A connection that is accepted but

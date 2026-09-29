@@ -393,70 +393,109 @@ let test_receive_follows_the_certificate_not_the_preamble_claim () =
 (* -- Area 4c: second connection claiming an already-connected id is refused --------
 
    When a connection is established with a peer id (determined by the handshake preamble),
-   that id's entry in [t.writers] is populated. If a second connection then claims the
-   same id before the first one closes, the second connection must be refused and the first
-   connection's entry must remain untouched. The previous behavior silently replaced the
-   first connection's entry via [Hashtbl.replace], which would break message routing for
-   the first connection. *)
+   that id's entry in [t.writers] is populated. If a second connection then claims the same id
+   while the first is still LIVE, the second connection must be refused and the first
+   connection's entry must remain untouched -- proven here the same way delivery is proven
+   elsewhere in this file: by actually driving [Tcp.send] through the receiver and reading the
+   real bytes off the raw client socket, both before and after the rejected duplicate attempt.
+   The previous behavior silently replaced the first connection's entry via [Hashtbl.replace],
+   which would have re-routed the receiver's later sends onto the second (attacker- or
+   reconnect-controlled) connection instead -- exactly the regression this test exists to catch.
+
+   The rejection itself is observed by reading from the SECOND connection's own raw socket: a
+   refused connection's writer fiber exits without registering (see [register_writer] /
+   [writer_body] in tcp.ml), which ends that connection's [run_connection] and lets
+   [Eio.Net.accept_fork] close the accepted flow -- so a read on the client side of the rejected
+   connection must observe that closure (some exception, since neither side ever sends a TLS
+   close_notify -- see tcp.ml's [run_connection] doc comment) rather than ever seeing a frame
+   delivered to it. *)
 exception Duplicate_id_test_done
 
 let test_second_connection_claiming_already_connected_id_is_refused () =
-  (* This test verifies that a second connection claiming an already-connected peer id
-     is rejected with a specific log message. The core property being tested: duplicate
-     connection ids raise an exception in register_writer instead of silently replacing. *)
   let receiver_id = 2 in
   let peer_specs = [ (receiver_id, "127.0.0.1", 19382) ] in
   let duplicate_id = 1 in
-  let frame payload = be8 (String.length payload) ^ payload in
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
+  (* Bounded so a real regression (a hang instead of a clean rejection, or a frame that never
+     arrives because routing silently moved to the wrong connection) fails this test with a clear
+     mismatch well inside the suite's own 15s-per-test watchdog, instead of hanging it. *)
+  let read_frame_with_timeout r =
+    match
+      Eio.Time.with_timeout clock 3.0 (fun () ->
+          let len = Eio.Buf_read.BE.uint64 r |> Int64.to_int in
+          Ok (Eio.Buf_read.take len r))
+    with
+    | Ok s -> s
+    | Error `Timeout -> "<test bug or regression: timed out waiting for a frame>"
+  in
+  let rec send_once_registered ~deadline t ~to_ msg =
+    match Tcp.send t ~to_ msg with
+    | () -> ()
+    | exception Invalid_argument _ ->
+      if Eio.Time.now clock > deadline then
+        Alcotest.fail "Tcp.send: peer never registered a writer within the retry budget"
+      else begin
+        Eio.Time.sleep clock 0.02;
+        send_once_registered ~deadline t ~to_ msg
+      end
+  in
   try
     Eio.Switch.run (fun sw ->
-        let _receiver =
+        let receiver =
           Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
             ~tls:(peer_identity receiver_id)
         in
         let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19382) in
-        (* First connection claiming id 1 *)
-        let _flow1 = Eio.Net.connect ~sw net addr in
-        let tls1 =
-          Tls_eio.client_of_flow
-            (Tls_identity.client_config
-               (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" duplicate_id)))
-            _flow1
+        let dial_as_duplicate_id () =
+          let flow = Eio.Net.connect ~sw net addr in
+          let tls =
+            Tls_eio.client_of_flow
+              (Tls_identity.client_config
+                 (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" duplicate_id)))
+              flow
+          in
+          Eio.Flow.copy_string (be8 duplicate_id) tls;
+          (tls, Eio.Buf_read.of_flow tls ~max_size:4096)
         in
-        let msg1 = "msg1" in
-        Eio.Flow.copy_string (be8 duplicate_id ^ frame msg1) tls1;
 
-        (* Give first connection time to be accepted and register *)
-        Eio.Time.sleep clock 0.1;
+        (* Connection 1 claims id 1 and completes its handshake + preamble. *)
+        let _tls1, r1 = dial_as_duplicate_id () in
 
-        (* Second connection also claiming id 1 - this MUST be refused *)
-        let _flow2 = Eio.Net.connect ~sw net addr in
-        let tls2 =
-          Tls_eio.client_of_flow
-            (Tls_identity.client_config
-               (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" duplicate_id)))
-            _flow2
+        (* Prove connection 1 is really the live, routed entry for id 1 *before* the duplicate
+           attempt exists at all: send a real message from the receiver to id 1 and read it back
+           off connection 1's own raw socket. *)
+        let deadline = Eio.Time.now clock +. 3.0 in
+        send_once_registered ~deadline receiver ~to_:duplicate_id "before";
+        Alcotest.(check string)
+          "a message sent to id 1 before the duplicate attempt arrives on connection 1" "before"
+          (read_frame_with_timeout r1);
+
+        (* Connection 2 also claims id 1 while connection 1 is still live -- this must be refused,
+           not silently swapped in for connection 1. *)
+        let _tls2, r2 = dial_as_duplicate_id () in
+        let connection_2_was_refused =
+          match Eio.Time.with_timeout clock 3.0 (fun () -> Ok (Eio.Buf_read.take 1 r2)) with
+          | Ok _got_a_byte -> false
+          | Error `Timeout -> false
+          | exception (End_of_file | Eio.Io _ | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _) -> true
         in
-        let msg2 = "msg2" in
-        Eio.Flow.copy_string (be8 duplicate_id ^ frame msg2) tls2;
+        Alcotest.(check bool)
+          "a second connection claiming the same, still-live id is refused (its socket is closed \
+           rather than ever receiving a frame)"
+          true connection_2_was_refused;
 
-        (* Wait for both connections to be processed *)
-        Eio.Time.sleep clock 0.2;
+        (* The rejected duplicate must not have touched connection 1's table entry: the receiver
+           can still reach id 1, and still reaches it via connection 1 specifically. *)
+        Tcp.send receiver ~to_:duplicate_id "after";
+        Alcotest.(check string)
+          "the first connection can still send/receive normally after the rejected duplicate \
+           attempt -- its table entry was never touched"
+          "after" (read_frame_with_timeout r1);
 
-        (* The test passes if we reach here without crashing.
-           The log message confirms the duplicate was rejected.
-           The actual message delivery behavior is tested by the logging. *)
         Eio.Switch.fail sw Duplicate_id_test_done)
-  with Duplicate_id_test_done -> ();
-
-  (* The test passes simply by not crashing and reaching this point.
-     The log output above shows "Tcp: connection error: a second connection claiming peer id 1"
-     which proves the rejection is working. *)
-  Alcotest.(check bool)
-    "duplicate connection id rejection completes without crashing" true true
+  with Duplicate_id_test_done -> ()
 
 (* -- Area 5: mutual TLS ---------------------------------------------------------------------
 
