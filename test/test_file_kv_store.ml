@@ -456,6 +456,12 @@ let test_check_or_write_owner_marker_is_atomic_via_temp_then_rename_then_fsync (
   Alcotest.(check bool)
     "check_or_write_owner_marker fsyncs the containing directory (Finding 3 regression guard)" true
     (contains ~needle:"fsync_dir ~dir_path" body);
+  Alcotest.(check bool)
+    "check_or_write_owner_marker fsyncs the temp file's own content before publishing it (Finding \
+     1 regression guard -- deleting just this call must fail this test, not only Finding 1's own \
+     since-retired RED/GREEN trace)"
+    true
+    (contains ~needle:"fsync_file" body);
   (match
      (index_of ~needle:"Eio.Path.save" body, index_of ~needle:"Eio.Path.rename" body)
    with
@@ -465,6 +471,17 @@ let test_check_or_write_owner_marker_is_atomic_via_temp_then_rename_then_fsync (
   | _ ->
     Alcotest.fail
       "expected both Eio.Path.save and Eio.Path.rename in check_or_write_owner_marker's body");
+  (match (index_of ~needle:"Eio.Path.save" body, index_of ~needle:"fsync_file" body) with
+  | Some save_at, Some fsync_file_at ->
+    Alcotest.(check bool) "fsync_file runs AFTER the temp file is staged, not before" true
+      (fsync_file_at > save_at)
+  | _ -> Alcotest.fail "expected both Eio.Path.save and fsync_file in check_or_write_owner_marker's body");
+  (match (index_of ~needle:"fsync_file" body, index_of ~needle:"Eio.Path.rename" body) with
+  | Some fsync_file_at, Some rename_at ->
+    Alcotest.(check bool) "fsync_file runs BEFORE the rename that publishes the temp file, not after"
+      true (rename_at > fsync_file_at)
+  | _ ->
+    Alcotest.fail "expected both fsync_file and Eio.Path.rename in check_or_write_owner_marker's body");
   (match
      (index_of ~needle:"Eio.Path.rename" body, index_of ~needle:"fsync_dir ~dir_path" body)
    with
@@ -517,6 +534,28 @@ let test_a_second_create_on_a_locked_directory_is_refused () =
         "a second create on the same directory, while the first handle is still live, is refused \
          immediately regardless of the owner tag it passes"
         (expected_lock_message ~caller:"File_kv_store.create" ~owner:"redaction-keystore" dir)
+        (fun () ->
+          ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)))
+
+(* Task 15 review, Minor finding M4, dedicated regression test (out-of-scope observation raised
+   by that same review's own re-review, closed here): a 0-byte owner marker must be reported as
+   "no owner readable yet" ([None], i.e. omitted from the message) in the LOCK's conflict
+   diagnostic, not as a real claim by the empty-string owner ([Some ""]) -- consistent with
+   [check_or_write_owner_marker]'s own self-healing treatment of a 0-byte marker as unclaimed
+   (see [test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string] above). Held
+   the lock directly via [Dir_lock.acquire] (bypassing [File_kv_store.create] entirely) so the
+   marker on disk can be pinned at exactly 0 bytes for the whole window the second [create]
+   attempt observes it -- going through a real first [File_kv_store.create] would always leave a
+   real, non-empty tag written by the time any second attempt could run. *)
+let test_a_locked_directory_with_a_zero_byte_marker_omits_the_owner_hint () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      write_a_zero_byte_marker_directly dir;
+      Eio.Switch.run @@ fun sw ->
+      let (_ : Eio_unix.Fd.t) = Dir_lock.acquire ~sw ~caller:"probe" dir in
+      Alcotest.check_raises
+        "a 0-byte marker is reported as no owner readable yet, not as owner \"\""
+        (expected_lock_message ~caller:"File_kv_store.create" dir)
         (fun () ->
           ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)))
 
@@ -670,6 +709,9 @@ let tests =
     ( "Task 11: a second create on an already-locked directory is refused immediately",
       `Quick,
       test_a_second_create_on_a_locked_directory_is_refused );
+    ( "Task 15 review (M4): a locked directory with a 0-byte marker omits the owner hint",
+      `Quick,
+      test_a_locked_directory_with_a_zero_byte_marker_omits_the_owner_hint );
     ( "Task 11: a create is refused while a REAL second OS process holds the real flock",
       `Quick,
       test_a_real_second_os_process_holding_the_lock_is_refused );

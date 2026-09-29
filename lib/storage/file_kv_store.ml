@@ -317,7 +317,8 @@ let fsync_dir ~dir_path =
    1), because that write goes through plain [Eio.Path.save] rather than this module's own
    [O_DIRECT]+[O_DSYNC] write path ([open_file_handle_write]/[perform_write]). Confirmed against
    the installed Eio 0.12's [path.ml]: [save] is a plain buffered write (opens via
-   [open_out]/[output_string]), with no [O_SYNC]/[O_DSYNC] flag and no fsync call anywhere in it --
+   [with_open_out] and writes via [Flow.copy_string]), with no [O_SYNC]/[O_DSYNC] flag and no
+   fsync call anywhere in it --
    unlike [durable_write] above, whose temp file's content is already durable by construction
    before its own [Eio.Path.rename] (every [perform_write] onto that temp file goes through
    [O_DIRECT]+[O_DSYNC], falling back to [O_DSYNC] alone -- see [open_flags_write] above).
