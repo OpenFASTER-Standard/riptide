@@ -28,6 +28,56 @@ let with_tmp_dir f =
     ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
     (fun () -> f dir)
 
+(* Task 10 regression, transcribed from [test_file_storage.ml]'s own (see that file's comment
+   for the full rationale): counts this process's own [/proc/self/maps] lines, matching the
+   audit's own measurement method for the [alloc_aligned_buffer]-per-I/O VMA leak. *)
+let count_self_maps () =
+  let ic = open_in "/proc/self/maps" in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () ->
+      let n = ref 0 in
+      (try
+         while true do
+           ignore (input_line ic);
+           incr n
+         done
+       with End_of_file -> ());
+      !n)
+
+(* Task 10: the [File_kv_store] half of the same regression -- put+get cycles (against a
+   single key, reused every iteration, so this measures the per-call buffer lifecycle rather than
+   directory growth) against a real [File_kv_store], asserting the map count stays flat rather
+   than growing ~4 VMAs per op the way the per-I/O-[mmap] implementation this task replaces did.
+
+   {b [op_count] is 1,000, smaller than [Test_file_storage]'s own 3,000} (see that file's own
+   comment on its [op_count] for the full "why not the audit's 20,000" rationale, which applies
+   here too) -- this store's [put] does substantially more per call than a bare WAL append
+   (open, write header, write data, [rename], then a real directory [fsync]), measured (a
+   standalone probe against this exact fixed implementation) at ~185 cycles/s, roughly a third
+   of [File_storage]'s own rate. 1,000 cycles (~5.5s at the measured rate) keeps this well
+   inside this suite's 15s per-test watchdog with a wide safety margin, while remaining
+   massively larger than the ~25 cycles it would take the pre-fix implementation to blow past
+   the [< 100] map-growth threshold below. *)
+let op_count = 1_000
+
+let test_repeated_io_does_not_grow_the_process_map_count () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      let before = count_self_maps () in
+      for i = 1 to op_count do
+        File_kv_store.put t ~key:"k" (Printf.sprintf "task 10 regression entry %d" i);
+        ignore (File_kv_store.get t ~key:"k")
+      done;
+      let after = count_self_maps () in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "map count stays flat, not linear in op count (before=%d after=%d delta=%d)" before
+           after (after - before))
+        true (after - before < 100))
+
 let test_put_then_get () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -299,6 +349,9 @@ let test_owner_reads_back_the_tag_used_at_construction () =
 
 let tests =
   [
+    ( "Task 10: repeated I/O does not grow the process's kernel map count",
+      `Quick,
+      test_repeated_io_does_not_grow_the_process_map_count );
     ("put then get", `Quick, test_put_then_get);
     ("get of never-put key is None", `Quick, test_get_of_never_put_key_is_none);
     ("delete is durable across reopen", `Quick, test_delete_is_durable_across_reopen);

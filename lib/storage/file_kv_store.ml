@@ -3,11 +3,12 @@
    WAL, which has no notion of an arbitrary number of independently-deletable keys. Reuses
    [File_storage]'s own already-proven [O_DIRECT]+[O_DSYNC] durable I/O technique verbatim
    (transcribed, not imported -- [File_storage]'s [.mli] deliberately exposes only
-   [Storage_intf.S] plus its own [create], so [alloc_aligned_buffer]/[perform_write]/
-   [perform_read]/the header-then-data record shape are re-derived here rather than reused as
-   library code). See [file_storage.ml] lines 108-243 for the original this is transcribed
-   from ([alloc_aligned_buffer]: 132-142; [open_file_handle]: 166-178;
-   [downgrade_to_dsync_only]: 186-193; [perform_write]: 195-202; [perform_read]: 208-218).
+   [Storage_intf.S] plus its own [create], so [alloc_one_aligned_buffer]/the buffer pool/
+   [perform_write]/[perform_read]/the header-then-data record shape are re-derived here rather
+   than reused as library code). See [file_storage.ml] for the original this is transcribed
+   from ([alloc_one_aligned_buffer], the buffer pool, [open_file_handle],
+   [downgrade_to_dsync_only], [perform_write], [perform_read] -- line numbers deliberately not
+   pinned here any more, having gone stale once already across Task 10's refactor).
 
    {b Departure from the brief's own code sketch, deliberately, per the task's own instruction
    to prefer [file_storage.ml]'s real technique over the sketch where they conflict}: the
@@ -82,6 +83,12 @@ type t = {
   fs : Eio.Fs.dir_ty Eio.Path.t;
   dir_path : string;
   owner : string;
+  pool : Cstruct.t Eio.Stream.t;
+      (* Task 10's buffer pool, transcribed from [file_storage.ml] (see that file's top comment,
+         "Task 10: the [mmap] call above now happens once per pool buffer, not once per I/O", and
+         its [pool_size]/[create_buffer_pool]/[with_pooled_buffer] below for the full rationale
+         and the concurrency model that sizes it). Every buffer in it is exactly [slot_alignment]
+         bytes, [mmap]-backed, allocated once by [create_buffer_pool] at [create] time. *)
 }
 
 (* Same single alignment used uniformly for both header and data regions as [File_storage]
@@ -98,12 +105,19 @@ let open_flags_write = Uring.Open_flags.(dsync + creat + direct)
 let open_flags_write_fallback = Uring.Open_flags.(dsync + creat)
 let open_flags_read = Uring.Open_flags.empty
 
-(* Transcribed verbatim from [file_storage.ml:132-142] ([alloc_aligned_buffer]): [Unix.map_file]
+(* Transcribed verbatim from [file_storage.ml] ([alloc_one_aligned_buffer]): [Unix.map_file]
    is required (POSIX [mmap(2)]) to return a page-aligned address when mapping starts at file
    offset 0, unlike a plain [Bigarray.Array1.create]'s [malloc] -- see that file's own top
    comment for the full story of why this, and not the shared [eio_linux] buffer pool, is what
-   makes [O_DIRECT] actually work here. *)
-let alloc_aligned_buffer n =
+   makes [O_DIRECT] actually work here.
+
+   Task 10: called exactly [pool_size] times total, by [create_buffer_pool] below at [create]
+   time -- never again per read/write. See [file_storage.ml]'s top comment ("Task 10") for the
+   VMA-leak bug this closes: this module's own [alloc_aligned_buffer] used to run once per
+   read/write here too, exactly mirroring [File_storage]'s bug (this module transcribes that
+   one's I/O technique verbatim, per this file's own top comment, so it inherited the bug
+   verbatim as well). *)
+let alloc_one_aligned_buffer n =
   let path = Filename.temp_file "riptide_kv_aligned" "" in
   let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
   Fun.protect
@@ -114,6 +128,35 @@ let alloc_aligned_buffer n =
       Unix.ftruncate fd n;
       let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
       Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
+
+(* Transcribed from [file_storage.ml]'s own buffer pool (see that file's comment on [pool_size]
+   for the full sizing/concurrency rationale -- this store's own concurrency model is the same
+   one-Eio-fiber-per-replica shape, since its first real consumer, [Riptide_crypto.Redaction_store],
+   is itself only ever driven from within a single replica's own dispatch fiber). *)
+let pool_size = 4
+
+let create_buffer_pool () =
+  let pool = Eio.Stream.create pool_size in
+  for _ = 1 to pool_size do
+    Eio.Stream.add pool (alloc_one_aligned_buffer slot_alignment)
+  done;
+  pool
+
+(* Transcribed from [file_storage.ml]'s [with_pooled_buffer] -- see that file's comment for why
+   every acquire zeroes the buffer (a pooled buffer, unlike a freshly [ftruncate]d one, is not
+   already zero-filled, and [durable_write] below relies on the tail past its data's own length
+   being zero). *)
+let with_pooled_buffer pool n f =
+  if n < 0 || n > slot_alignment then
+    invalid_arg
+      (Printf.sprintf "with_pooled_buffer: %d exceeds this pool's fixed buffer size of %d" n
+         slot_alignment);
+  let buf = Eio.Stream.take pool in
+  Fun.protect
+    ~finally:(fun () -> Eio.Stream.add pool buf)
+    (fun () ->
+      Cstruct.memset buf 0;
+      f (if n = slot_alignment then buf else Cstruct.sub buf 0 n))
 
 let encode_header ~length ~checksum =
   let buf = Bytes.make header_slot_size '\000' in
@@ -127,8 +170,8 @@ let decode_header s =
 
 let checksum_of data = Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String data))
 
-(* Open-with-O_DIRECT-fallback for writes, transcribed from [file_storage.ml:166-178]
-   ([open_file_handle]). [~perm:0o600] since [creat] is always set here. *)
+(* Open-with-O_DIRECT-fallback for writes, transcribed from [file_storage.ml]'s
+   [open_file_handle]. [~perm:0o600] since [creat] is always set here. *)
 let open_file_handle_write ~sw path =
   try
     let fd =
@@ -155,7 +198,7 @@ let open_file_handle_read ~sw path =
   in
   { path; fd; direct_capable = false }
 
-(* Transcribed from [file_storage.ml:186-193] ([downgrade_to_dsync_only]): permanent for the
+(* Transcribed from [file_storage.ml]'s [downgrade_to_dsync_only]: permanent for the
    rest of this handle's lifetime once a real [O_DIRECT] failure is hit. Never triggered for a
    read handle ([direct_capable] is always [false] there), so it's only ever reached from a
    write handle's [perform_write]/[perform_read] retry. *)
@@ -168,7 +211,7 @@ let downgrade_to_dsync_only ~sw (h : file_handle) =
     h.direct_capable <- false
   end
 
-(* Transcribed from [file_storage.ml:195-202] ([perform_write]). *)
+(* Transcribed from [file_storage.ml] ([perform_write]). *)
 let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   let rec go () =
     try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ]
@@ -178,19 +221,30 @@ let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   in
   go ()
 
-(* Transcribed from [file_storage.ml:208-218] ([perform_read]). [None] means "nothing durable
-   at this offset" -- a short/empty read (e.g. a torn write). *)
-let perform_read ~sw (h : file_handle) ~offset ~len =
-  let buf = alloc_aligned_buffer len in
-  let rec go () =
-    match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
-    | exception End_of_file -> None
-    | exception Eio.Io _ when h.direct_capable ->
-      downgrade_to_dsync_only ~sw h;
-      go ()
-    | n -> if n = len then Some buf else None
-  in
-  go ()
+(* Transcribed from [file_storage.ml] ([perform_write_from_string]): acquires a pooled buffer,
+   blits [data] into it (zero-padded out to [n] by [with_pooled_buffer]'s own
+   fresh-zero-on-acquire), writes it, and releases the buffer -- all before returning. *)
+let perform_write_from_string ~pool ~sw (h : file_handle) ~offset ~n data =
+  with_pooled_buffer pool n (fun buf ->
+      Cstruct.blit_from_string data 0 buf 0 (String.length data);
+      perform_write ~sw h ~offset buf)
+
+(* Transcribed from [file_storage.ml] ([perform_read]). [None] means "nothing durable
+   at this offset" -- a short/empty read (e.g. a torn write). Returns a [string], not a
+   [Cstruct.t] (Task 10): the pooled buffer must be released back to [with_pooled_buffer]'s
+   pool before this function returns, so nothing that outlives the call may still reference
+   it. *)
+let perform_read ~pool ~sw (h : file_handle) ~offset ~len =
+  with_pooled_buffer pool len (fun buf ->
+      let rec go () =
+        match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
+        | exception End_of_file -> None
+        | exception Eio.Io _ when h.direct_capable ->
+          downgrade_to_dsync_only ~sw h;
+          go ()
+        | n -> if n = len then Some (Cstruct.to_string buf) else None
+      in
+      go ())
 
 let path_for t ~key =
   Filename.concat t.dir_path
@@ -237,8 +291,11 @@ let tmp_suffix = ".put.tmp"
    helper here (this module's own [open_file_handle_read]/[open_file_handle_write] both set
    [~seekable:true] and read/write records) and the installed Eio 0.12 exposes no fsync at all, on
    a path or an fd. Blocking briefly in a fiber is already this module's established practice --
-   [alloc_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously on every
-   single read and write. Errors deliberately propagate rather than being swallowed, matching
+   [alloc_one_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously, same as
+   this. (Before Task 10, that call happened synchronously on every single read and write; now it
+   happens only [pool_size] times, once each, at [create] -- the blocking-in-a-fiber precedent
+   this sentence leans on still holds either way.) Errors deliberately propagate rather than
+   being swallowed, matching
    [delete]'s narrow catch: a caller must be able to trust that a returning [put] or [delete] means
    the key really, durably is (or is not) there. *)
 let fsync_dir t =
@@ -266,14 +323,10 @@ let durable_write t path data =
     ~finally:(fun () -> ignore (Eio_unix.Fd.close h.fd))
     (fun () ->
       let checksum = checksum_of data in
-      let header_buf = alloc_aligned_buffer header_slot_size in
-      Cstruct.blit_from_string
-        (encode_header ~length:(String.length data) ~checksum)
-        0 header_buf 0 header_slot_size;
-      perform_write ~sw:t.sw h ~offset:0 header_buf;
-      let data_buf = alloc_aligned_buffer data_slot_size in
-      Cstruct.blit_from_string data 0 data_buf 0 (String.length data);
-      perform_write ~sw:t.sw h ~offset:header_slot_size data_buf);
+      perform_write_from_string ~pool:t.pool ~sw:t.sw h ~offset:0 ~n:header_slot_size
+        (encode_header ~length:(String.length data) ~checksum);
+      perform_write_from_string ~pool:t.pool ~sw:t.sw h ~offset:header_slot_size
+        ~n:data_slot_size data);
   Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path);
   fsync_dir t
 
@@ -289,16 +342,18 @@ let durable_read t path =
     Fun.protect
       ~finally:(fun () -> ignore (Eio_unix.Fd.close h.fd))
       (fun () ->
-        match perform_read ~sw:t.sw h ~offset:0 ~len:header_slot_size with
+        match perform_read ~pool:t.pool ~sw:t.sw h ~offset:0 ~len:header_slot_size with
         | None -> None
-        | Some header_buf -> (
-          let length, checksum = decode_header (Cstruct.to_string header_buf) in
+        | Some header_s -> (
+          let length, checksum = decode_header header_s in
           if length < 0 || length > data_slot_size then None
           else
-            match perform_read ~sw:t.sw h ~offset:header_slot_size ~len:data_slot_size with
+            match
+              perform_read ~pool:t.pool ~sw:t.sw h ~offset:header_slot_size ~len:data_slot_size
+            with
             | None -> None
-            | Some data_buf ->
-              let data = Cstruct.to_string ~len:length data_buf in
+            | Some data_s ->
+              let data = String.sub data_s 0 length in
               if checksum_of data = checksum then Some data else None))
 
 (* The marker file [check_or_write_owner_marker] reads/writes to enforce exclusive directory
@@ -353,7 +408,7 @@ let create ~sw ~fs ~owner dir_path =
     invalid_arg "File_kv_store.create: ~owner must be a non-empty tag";
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   check_or_write_owner_marker ~fs ~dir_path owner;
-  { sw; fs; dir_path; owner }
+  { sw; fs; dir_path; owner; pool = create_buffer_pool () }
 
 (* [check_or_write_owner_marker] above either confirms [owner] against the existing on-disk marker
    or writes a fresh one holding exactly [owner] -- it never resolves or hands back a tag of its

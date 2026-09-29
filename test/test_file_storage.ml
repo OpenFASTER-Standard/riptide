@@ -21,6 +21,65 @@ let with_tmp_dir f =
     ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
     (fun () -> f dir)
 
+(* Task 10 regression: counts this process's own [/proc/self/maps] lines, matching the audit's
+   own measurement method for the [alloc_aligned_buffer]-per-I/O VMA leak (one line per distinct
+   kernel mapping, so an unreleased [mmap] shows up here permanently until the process exits,
+   regardless of what the OCaml GC later decides about the [Cstruct.t]/[Bigarray.t] wrapping it). *)
+let count_self_maps () =
+  let ic = open_in "/proc/self/maps" in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () ->
+      let n = ref 0 in
+      (try
+         while true do
+           ignore (input_line ic);
+           incr n
+         done
+       with End_of_file -> ());
+      !n)
+
+(* Task 10: reproduces the audit's own live measurement -- ~4 leaked VMAs per WAL op (one
+   [alloc_aligned_buffer] mmap each for [write_header]/[write_data]/[read_header]/[read_data])
+   under the PER-I/O-[mmap] implementation this task replaces. Against the buffer-pool
+   implementation, the only real [mmap] calls happen once, when the pool's own fixed
+   [pool_size] buffers are allocated inside [File_storage.create] -- before [before] is even
+   sampled below -- so the map count should stay flat across the whole loop, not grow linearly
+   with op count.
+
+   {b [op_count] is 3,000, not the audit's own 20,000}, deliberately: this suite's own
+   per-test wall-clock watchdog ([test_riptide.ml]'s [timeout_seconds], 15s, re-armed per test
+   -- see its own "TASK 11 CORRECTION" comment for why it is per-test and how high it is
+   calibrated) is a real budget this test must fit inside, not a number to work around. A real
+   [O_DIRECT]+[O_DSYNC] append+read cycle against this box's actual disk is measured (a
+   standalone probe against this exact fixed implementation, 2,000-5,000 cycle runs) at
+   ~500-570 cycles/s -- i.e. dominated by genuine disk-durability latency, not by anything this
+   task's fix touches -- so 20,000 cycles would take ~35-40s and blow the watchdog on its own,
+   independent of whether the leak itself is fixed. 3,000 cycles (~6s at the measured rate,
+   comfortable margin under 15s even on a slower/loaded machine) is still overwhelmingly enough
+   to distinguish "flat" from "linear in op count": the pre-fix implementation leaks ~4 VMAs
+   per op, so even a few hundred cycles would already blow past the [< 100] threshold below;
+   3,000 gives a wide safety margin on the detection side while leaving a wide safety margin on
+   the timing side too. *)
+let op_count = 3_000
+
+let test_repeated_io_does_not_grow_the_process_map_count () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      let before = count_self_maps () in
+      for i = 1 to op_count do
+        File_storage.wal_append t ~op_number:i "task 10: repeated I/O leak regression entry";
+        ignore (File_storage.wal_read t ~op_number:i)
+      done;
+      let after = count_self_maps () in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "map count stays flat, not linear in op count (before=%d after=%d delta=%d)" before
+           after (after - before))
+        true (after - before < 100))
+
 let test_write_then_read_same_handle () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -554,6 +613,9 @@ let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
 
 let tests =
   [
+    ( "Task 10: repeated I/O does not grow the process's kernel map count",
+      `Quick,
+      test_repeated_io_does_not_grow_the_process_map_count );
     ("write then read, same handle", `Quick, test_write_then_read_same_handle);
     ("write then read, after reopen (real durability)", `Quick, test_write_then_read_after_reopen);
     ("out-of-order append rejected", `Quick, test_out_of_order_append_rejected);
