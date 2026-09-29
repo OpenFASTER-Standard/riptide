@@ -866,11 +866,18 @@
             "id": 2,
             "title": "[1.2] Tcp rejects a second connection claiming an already-connected id",
             "description": "Tcp rejects a second connection claiming an already-connected id",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Replace the current silent Hashtbl.replace eviction (tcp.ml:159) with an outright refusal (close, log, leave the existing entry untouched) when a new connection is authenticated as an id already present.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "92e462fac8cc70f55b75d8b4a8dcf280a4864860",
+                "caad2fa93257fe51679af7596ddadc56071f6f76"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 3,
