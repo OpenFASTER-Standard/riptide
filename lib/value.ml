@@ -237,12 +237,21 @@ let depth_exceeded_error ~what =
    docs/superpowers/specs/2026-09-29-audit-remediation-design.md, Decision 2.3): derive the
    budget from [lib/transport/tcp.ml]'s [max_message_size] (currently 64 MiB) as an ABSOLUTE
    ceiling, applied regardless of any particular input's own declared length - not a
-   per-input-scaled one. [lib/value.ml] (the [riptide] library) cannot depend on
-   [lib/transport] ([riptide_transport] depends on [riptide], not the other way around - see
-   the dune files), so the constant is mirrored here, with this comment as the mechanism that
-   keeps it in sync - the same way test/test_value.ml already mirrors this module's own
-   internal constants for its budget-boundary test. If [Tcp.max_message_size] ever changes,
-   update [mirrored_transport_max_message_size] below to match in the same change.
+   per-input-scaled one. [lib/value.ml] (the [riptide] library) cannot reference
+   [Tcp.max_message_size] directly - NOT because of a circular dependency (there is none in
+   either direction: [lib/transport/dune]'s [libraries] line lists only [eio eio.unix tls
+   tls-eio x509 ptime ptime.clock.os domain-name mirage-crypto-rng.unix fmt], no [riptide] at
+   all, and [lib/transport/transport_intf.ml]'s own doc comment states explicitly it has "no
+   dependency on anything beyond stdlib: no [Value.t], [Envelope.t]...") - but because of
+   LAYERING: a Layer 0 value codec must not pull in transport-layer dependencies ([eio]/[tls]/
+   [x509], heavy and orthogonal to what a codec needs) just to read one constant. So the
+   constant is mirrored here instead, with this comment as the mechanism that keeps it in sync
+   - the same way test/test_value.ml already mirrors this module's own internal constants for
+   its budget-boundary test. If [Tcp.max_message_size] ever changes, update
+   [mirrored_transport_max_message_size] below to match in the same change (this is also now
+   mechanically checked - see [test_mirrored_transport_max_message_size_matches_real_constant]
+   in test/test_value.ml, which links both [riptide] and [riptide_transport] and asserts the
+   two constants are equal).
 
    Why a budget at all, given [read_len_prefix]'s existing "claimed count can't exceed
    remaining bytes" check already makes it impossible to claim more nodes than the input could
@@ -270,9 +279,12 @@ let depth_exceeded_error ~what =
    (not scaled down for a smaller input) still gives the identical worst-case memory-safety
    guarantee as before: the cheapest possible attack shape (a flat, all-Bool [Sequence]) still
    hits this ceiling after decoding only ~2 MiB of wire input (at 2 wire-bytes/node), at an
-   estimated ~55 MB of live heap (1,048,576 nodes x ~55 bytes/node) - three orders of magnitude
-   below the audit's observed ~9 GB - regardless of what byte length the attacker declares for
-   the frame. What changes is that a smaller, legitimate, node-DENSE frame (this codebase's
+   estimated ~55 MB of live heap (1,048,576 nodes x ~55 bytes/node) - roughly 164x, a bit over
+   two orders of magnitude, below the audit's observed ~9 GB (accounting for [decode_value]'s
+   own [List.rev] transiently doubling each level's own list, per the caveat above, the
+   realistic peak is nearer ~117 MB, roughly 77x - still comfortably under two orders of
+   magnitude) - regardless of what byte length the attacker declares for the frame. What
+   changes is that a smaller, legitimate, node-DENSE frame (this codebase's
    real payloads run at roughly 2-30 wire bytes/node, not 64) is no longer punished for being
    byte-compact: a 293 KB [Start_view] over 1,000 log entries, or a 2 MiB frame of 2,000
    ordinary batch writes, both stay far under 1,048,576 nodes and decode successfully, exactly

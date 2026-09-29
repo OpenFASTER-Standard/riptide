@@ -621,7 +621,13 @@ let test_encode_rejects_excessive_nesting_depth () =
    real one can never silently drift apart without a comment update on both sides. Also
    mirrors [lib/transport/tcp.ml]'s own [max_message_size] (64 MiB) for the same reason - see
    [lib/value.ml]'s own doc comment on [max_node_count] for why [lib/value.ml] can't just
-   reference [Tcp.max_message_size] directly instead of duplicating it. *)
+   reference [Tcp.max_message_size] directly instead of duplicating it - it's a LAYERING
+   concern (a Layer 0 value codec must not pull in [eio]/[tls]/[x509] just to read one
+   constant), not a circular-dependency one; there is no dependency between [riptide] and
+   [riptide_transport] in either direction today. The values duplicated here are also now
+   mechanically checked against the real ones by
+   [test_mirrored_transport_max_message_size_matches_real_constant] below, rather than relying
+   on this comment alone to catch drift. *)
 let mirrored_transport_max_message_size = 64 * 1024 * 1024
 let bytes_per_node_budget = 64
 let expected_max_node_count = mirrored_transport_max_message_size / bytes_per_node_budget
@@ -725,21 +731,77 @@ let build_log_entry ~i =
       ("payload", Value.Scalar (Value.Bytes (String.make 16 '\x00')))
     ]
 
+(* Counts nodes the same way [lib/value.ml]'s own [encode_into]/[decode_value] do: every call -
+   Scalar leaf or Record/Sum/Sequence/Map container alike, including a Map's key sub-values -
+   counts as exactly one node (see [lib/value.ml]'s own doc comment on [max_node_count]). Used
+   below to pin the exact node count Finding 3's own comment claims, rather than leaving it as
+   prose only. *)
+let rec count_nodes (v : Value.value) : int =
+  1
+  +
+  match v with
+  | Value.Scalar _ -> 0
+  | Value.Record fields -> List.fold_left (fun acc (_, v) -> acc + count_nodes v) 0 fields
+  | Value.Sum (_, v) -> count_nodes v
+  | Value.Sequence items -> List.fold_left (fun acc v -> acc + count_nodes v) 0 items
+  | Value.Map entries -> List.fold_left (fun acc (k, v) -> acc + count_nodes k + count_nodes v) 0 entries
+
+(* Finding 3 (audit-remediation review round-2 fix): mirrors the OLD, now-replaced
+   per-input-scaled formula's own floor ([max 10_000 (input_len / 64)], see the doc comment
+   above [test_decode_rejects_a_node_count_over_budget] and [lib/value.ml]'s own doc comment on
+   [max_node_count] for the full history) - named here (rather than left as the magic number
+   1024*1024) because it's the actual bound this test needs: the OLD formula's scaled term
+   ([input_len / bytes_per_node_budget]) only ever exceeds its 10,000-node floor once
+   [input_len] exceeds [old_formula_min_node_floor * bytes_per_node_budget] = 640,000 bytes. A
+   looser bound (e.g. the old 1 MiB check) would stop proving what this test claims to prove: a
+   future edit to [build_log_entry] that grows the encoded size past 640,000 bytes but still
+   under 1 MiB would keep this test passing while silently making it stop being evidence that
+   the OLD formula was wrong (past 640,000 bytes, the OLD formula's own scaled term could have
+   exceeded 10,000 nodes on its own, meaning the OLD formula might have accepted this frame too). *)
+let old_formula_min_node_floor = 10_000
+
+let old_formula_wire_bytes_where_scaled_term_first_exceeds_floor = old_formula_min_node_floor * bytes_per_node_budget
+
 let test_decode_accepts_a_realistic_node_dense_legitimate_frame () =
   let entry_count = 2000 in
   let v = Value.Sequence (List.init entry_count (fun i -> build_log_entry ~i)) in
+  (* Pin the exact node count Finding 3's own comment claims (12,001 = 1 top-level [Sequence] +
+     2,000 x (1 [Record] + 5 field-value [Scalar]s)), not just prose. *)
+  Alcotest.(check int) "the frame has exactly the node count this test's own comment claims" 12_001 (count_nodes v);
   let encoded = Value.canonical_encode v in
-  (* Sanity check on the claim above: comfortably node-dense (well past the old 10,000-node
-     floor - 12,001 nodes) but still a small, ordinary wire size, nowhere near the 64 MiB
-     transport limit. *)
-  Alcotest.(check bool) "wire size stays small despite a node count that used to be rejected"
-    true (String.length encoded < 1024 * 1024);
+  (* The real property this test needs to witness: this frame's wire size stays under the exact
+     size at which the OLD formula's scaled term could have exceeded its own 10,000-node floor
+     on its own - not merely "under some loose, unrelated size like 1 MiB". *)
+  Alcotest.(check bool)
+    "wire size stays under the exact bound at which the OLD formula's scaled term could have \
+     matched or exceeded its own 10,000-node floor"
+    true
+    (String.length encoded < old_formula_wire_bytes_where_scaled_term_first_exceeds_floor);
   match Value.canonical_decode encoded with
   | decoded ->
     Alcotest.(check string) "a realistic, node-dense legitimate frame decodes and re-encodes to the same bytes"
       encoded (Value.canonical_encode decoded)
   | exception Invalid_argument msg ->
     Alcotest.failf "a realistic, node-dense legitimate frame must decode successfully, but raised: %s" msg
+
+(* Finding 4 (audit-remediation review round-2 fix): a real, running, mechanical guard against
+   [lib/value.ml]'s [mirrored_transport_max_message_size] silently drifting out of sync with
+   the real [Riptide_transport.Tcp.max_message_size] it's meant to mirror - previously only a
+   code comment asked whoever raises [Tcp.max_message_size] to remember to update the mirror
+   too, with nothing to catch it if they forgot (quietly reintroducing this task's own Critical
+   finding: a node-count budget too tight for frames the transport now happily accepts). This
+   test links both [riptide] (via [Value.mirrored_transport_max_message_size], exposed in
+   [value.mli] specifically for this) and [riptide_transport] (via
+   [Riptide_transport.Tcp.max_message_size] directly, the real constant, no duplication) - a
+   link [lib/value.ml] itself must not take (see [value.mli]'s own doc comment on
+   [mirrored_transport_max_message_size] for why: a Layer 0 value codec must not pull in
+   [eio]/[tls]/[x509] just to read one constant) but its own test suite is free to. *)
+let test_mirrored_transport_max_message_size_matches_real_constant () =
+  Alcotest.(check int)
+    "lib/value.ml's mirrored copy of Tcp.max_message_size must stay in sync with the real \
+     constant, or the node-count budget silently drifts out of calibration with the transport \
+     layer it's derived from"
+    Riptide_transport.Tcp.max_message_size Value.mirrored_transport_max_message_size
 
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
@@ -938,6 +1000,9 @@ let tests =
     ( "decode accepts a realistic node-dense legitimate frame",
       `Quick,
       test_decode_accepts_a_realistic_node_dense_legitimate_frame );
+    ( "mirrored transport max_message_size matches the real constant",
+      `Quick,
+      test_mirrored_transport_max_message_size_matches_real_constant );
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;

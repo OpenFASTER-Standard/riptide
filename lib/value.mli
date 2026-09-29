@@ -222,3 +222,20 @@ val content_hash : value -> hash
     [Invalid_argument] if [h] is not exactly 32 bytes (the shape any real
     {!content_hash} always has). *)
 val hash_to_hex : hash -> string
+
+(** This module's own hand-mirrored copy of [lib/transport/tcp.ml]'s
+    [Tcp.max_message_size] (64 MiB), used to derive {!canonical_decode}/
+    {!canonical_encode}'s total-node-count budget (see {!canonical_decode}'s
+    own doc comment). [lib/value.ml] (library [riptide], Layer 0) cannot
+    reference [Tcp.max_message_size] directly - not because of a circular
+    dependency (there is none between [riptide] and [riptide_transport] in
+    either direction), but because a Layer 0 value codec must not pull in
+    transport-layer dependencies ([eio]/[tls]/[x509]) just to read one
+    constant - so the value is duplicated here by hand instead, with this
+    comment as the mechanism documenting that. Exposed (only) so that
+    [test/test_value.ml] - which, unlike this library, can link both
+    [riptide] and [riptide_transport] - can mechanically assert this mirror
+    still equals the real [Tcp.max_message_size], rather than relying on a
+    comment alone to catch the two silently drifting apart if
+    [Tcp.max_message_size] is ever changed without a matching update here. *)
+val mirrored_transport_max_message_size : int
