@@ -97,12 +97,35 @@ let volatile_storage () = storage_of_module (module Riptide_storage.Memory_stora
    function asks a different question, and the strict reading is SOUND for it -- because of the [max
    t.op_number]. [CanNack] (VSR.tla:157) is exactly [o > rep_op_number[r]], so nacking an op above
    this replica's own durable [op_number] is precisely what the spec licenses: such an op was never
-   acknowledged (the PREPAREOK is sent only after both the WAL and the superblock write), and
-   [restart] now physically discards those slots anyway. Using the durable reading here would be
-   strictly MORE conservative (a header-only slot above [op_number] would read [Corrupt] and never be
-   nacked) but it is not needed for soundness, and it would change the DVC nack set -- a protocol
-   observable -- for no safety gain, which is why it was deliberately left alone rather than swept
-   along with the guards. *)
+   acknowledged (the PREPAREOK is sent only after both the WAL and the superblock write).
+
+   AND THE REASON THE CHOICE IS SAFE IS NOT THE ONE THIS COMMENT USED TO GIVE -- review finding M4. It
+   claimed that switching to the durable reading "would change the DVC nack set -- a protocol
+   observable". That is FALSE, and worth correcting rather than leaving as a plausible-sounding
+   justification someone later builds on. The [nacks] field of a DoViewChange comes from
+   [provable_nacks], whose scan horizon is itself [max t.op_number (wal_highest_op_number ())] -- i.e.
+   exactly this function's own [Absent] threshold under the strict reading. So no op in the scanned
+   range can read [Absent], and the set is EMPTY. Switching this function to the durable reading only
+   RAISES that threshold, so the scanned range stays entirely below it and the set is still empty. The
+   nack set is unchanged either way; there is no protocol observable here to preserve.
+
+   The DECISION to keep the strict reading stands on its own, for two real reasons. First, the
+   [Corrupt]/[Absent] boundary is unobservable today at every OTHER call site too (the empty nack set
+   over exactly such a leftover slot is asserted on a real DoViewChange by
+   [test_a_header_only_slot_above_the_superblock_is_not_discarded_and_is_never_nacked]):
+   [readable_entries],
+   [adopt_durable_log]'s prefix check, [restart]'s [readable_prefix], [primary_execute_op]'s readability
+   check and [for_test_wal_read] all match [Corrupt] and [Absent] in ONE arm, so [provable_nacks] is
+   the only reader that can tell them apart at all -- and it provably cannot, per the paragraph above.
+   (A future reader that DOES need the distinction has to re-derive this argument; it is a property of
+   today's call sites, not a law.) Second, and this is why strict is
+   the right default rather than a coin flip: the [Some]/[None] split at the top of this function comes
+   from [wal_read], which is specified against the strict reading, so pairing the tri-state's own
+   boundary with the same reading keeps ONE notion of "readable" inside one function instead of mixing
+   two. The durable reading would be strictly more conservative (a header-only slot above [op_number]
+   would read [Corrupt] rather than [Absent]) and would be equally correct; it simply buys nothing that
+   is observable, at the cost of making this function answer with two different accessors' notions of
+   the durable range at once. *)
 type slot_state = Present of Value.value | Corrupt | Absent
 
 (* ---- I2: the genuinely different reasons a durable append can be refused ----
@@ -706,6 +729,13 @@ let readable_entries t =
    this function returns [[]] today, always. It is written as a real scan rather than hard-coded
    to [[]] so the structural reason stays legible next to the code that depends on it.
 
+   NOTE, because [slot_state]'s own type-declaration comment now leans on this (review finding M4):
+   the emptiness does NOT depend on which op-number reading [slot_state] uses. The horizon below is
+   [max t.op_number (wal_highest_op_number ())], which is exactly [slot_state]'s [Absent] threshold
+   under the STRICT reading; under the durable reading that threshold can only be HIGHER, so the
+   scanned range stays entirely below it either way and the set stays empty. Whatever else changing
+   that reading would do, it cannot move this function's result.
+
    DO NOT read that as "a drop-in extension point the receiver already supports". It is not. The
    receiving side REJECTS in-range nack evidence: [nacks_wellformed] (:1405) drops any DVC
    carrying a nack at or below the sender's own [n] WHOLESALE -- the entire message is discarded
@@ -969,8 +999,18 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    values for operations clients were already told had succeeded. Pinned by
    [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data] and its fixed
    counterpart. There is no known safe GENERAL procedure for sourcing these values externally; the
-   only safe triple is this replica's OWN true prior state, and if no independent out-of-band record
-   of it exists, the repair cannot be used safely at all. See
+   only safe triple is this replica's OWN true prior state.
+
+   AND ROUND 3 (finding 1) RETRACTED THE ONE EXAMPLE OF SUCH A SOURCE THIS COMMENT USED TO OFFER: an
+   external monitor of this replica's own traffic does NOT qualify, because DURABILITY PRECEDES
+   OBSERVABILITY at every site in this file that moves any of the three fields -- [check_timeout],
+   [handle_start_view_change]'s higher-view branch, [try_forfeit_view_change] and [try_send_sv] all
+   [persist_superblock] and only THEN send, and [handle_start_view] raises
+   [view_number]/[last_normal_view] and sends nothing at all. An observed triple is therefore at best
+   a lower bound and at worst wrong in either direction. The only source that qualifies is one
+   SYNCHRONOUSLY COUPLED to the durable write (a mirrored copy of the RECORD, not of the messages);
+   none exists here, so the honest status is that this repair has no practical safe-sourcing
+   mechanism at all today. See
    {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s own doc comment for both traces,
    for that disclosed limitation, and for why a real VSR Recovery sub-protocol -- the classical
    mechanism for this situation -- is deliberately out of scope here.
@@ -1011,10 +1051,15 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
        CURRENT last_normal_view gives you whenever this replica had fallen behind that peer on view \
        transitions, something nobody can rule out once THIS replica's own superblock is gone -- \
        makes this replica WIN that selection with a stale log and silently REPLACE the cluster's \
-       real, already-acknowledged committed values with its own. Supply the triple only from an \
-       independent, out-of-band record of THIS replica's own view/commit history, captured while it \
-       was still running (e.g. external monitoring); if no such record exists, this repair CANNOT be \
-       used safely and the backend must be discarded wholesale instead. See \
+       real, already-acknowledged committed values with its own. THE ONLY SOURCE THAT QUALIFIES is \
+       one SYNCHRONOUSLY COUPLED to this replica's own durable superblock write -- a copy of the \
+       RECORD that became durable with it, not a record of the messages this replica sent. An \
+       external monitor watching this replica's traffic does NOT qualify, and an earlier version of \
+       this message wrongly offered it as an example: every durable write here happens strictly \
+       BEFORE the message that announces it, and a backup adopting a new view (ReceiveSV) announces \
+       nothing at all, so an observed triple can be wrong in EITHER catastrophic direction. As of \
+       Task 13 no such synchronously-coupled source exists in this codebase, so in practice this \
+       repair CANNOT be used safely and the backend must be discarded wholesale instead. See \
        Storage_intf.S.superblock_rebuild_from_wal's own doc comment for both traces and for the full \
        disclosed limitation.";
   let view_number, last_normal_view, op_number, commit_number =
@@ -1030,12 +1075,42 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
       ~status:(if view_number > last_normal_view then View_change else Normal)
       ~on_commit_advanced
   in
-  (* Also the DURABLE reading (Task 13 re-review finding 2), so a slot whose header survived the
-     crash above the superblock's own [op_number] is physically discarded here rather than left
-     behind to read back [Absent] later. Sound for the same reason the strict version was: every
-     entry above the superblock's [op_number] was never acknowledged (the PREPAREOK that would have
-     exposed it is sent only after BOTH writes), and [truncate_wal]'s own [~committed] guard is what
-     checks that rather than this comment. *)
+  (* Also the DURABLE reading (Task 13 re-review finding 2), so this condition cannot read FALSE for
+     a backend that is in fact still holding something above the superblock's own [op_number].
+
+     WHAT THE CONDITION ACTUALLY DOES, stated accurately -- review finding M3. The previous version of
+     this comment claimed "a slot whose header survived the crash above the superblock's own
+     [op_number] is physically discarded here", and that is NOT what happens:
+
+     - When the entries above [op_number] are FULLY readable -- the ordinary case, a crash between
+       [durable_append] and [persist_superblock] -- BOTH readings exceed [op_number], the truncate
+       fires for real, and those entries are physically discarded. That is the case this guard exists
+       for, and [test_restart_discards_wal_entries_the_superblock_never_saw] pins it.
+     - When only a HEADER survived above [op_number] (exactly the case the durable reading was
+       introduced for), the two readings differ and this condition is what makes the call happen at
+       all -- but the call is then a NO-OP:
+       {!Riptide_storage.File_storage.wal_truncate_after}, the only backend that can BE in this state
+       (Memory_storage's two readings coincide by construction, and Fault_injecting_storage
+       delegates), gates its body on the STRICT [op_number < highest_op_number], which is false here.
+       Nothing is discarded; the header-only slot stays where it is. Pinned by
+       [test_a_header_only_slot_above_the_superblock_is_not_discarded_and_is_never_nacked] in
+       test_vsr_replica_recovery.ml, so this correction cannot silently stop matching the code.
+
+     WHY THAT LEFTOVER SLOT IS HARMLESS, which is why this is a comment correction rather than a code
+     change. It reads back [Absent] through [slot_state], whose horizon is
+     [max t.op_number (wal_highest_op_number ())] -- exactly [op_number] here -- and proving it absent
+     is precisely what [CanNack] (VSR.tla:157) licenses: it was never acknowledged, because the
+     PREPAREOK that would have exposed it is sent only after BOTH the WAL and the superblock write.
+     The only other trace it leaves is a permanently inflated
+     {!Riptide_storage.Storage_intf.S.wal_highest_durable_op_number}, and that is the conservative
+     direction for both guards that read it (more likely to fail-stop, more likely to refuse a backend
+     as non-virgin -- never less).
+
+     The durable reading is still the right one HERE, for a forward-looking reason rather than the
+     retracted one: a backend whose [wal_truncate_after] did physically discard header-only slots would
+     make this call do real work, and the condition would have to be true for it to be reached at all.
+     [truncate_wal]'s own [~committed] guard, not this comment, is what checks that nothing committed is
+     discarded on the occasions the call does fire. *)
   if storage.wal_highest_durable_op_number () > op_number then
     truncate_wal t ~op_number ~committed:commit_number ~resulting_length:op_number;
   let rec readable_prefix o acc =

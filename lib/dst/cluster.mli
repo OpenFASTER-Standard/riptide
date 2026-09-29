@@ -34,8 +34,12 @@ type superblock_repair = {
     values with its own (traced and pinned in [test/test_vsr_replica_recovery.ml]'s
     [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data]). A scenario models
     the operator honestly only by supplying the crashed replica's OWN prior state — which a scenario,
-    unlike a real operator, can simply read off that replica before crashing it, standing in for the
-    independent out-of-band record a real operator would need to have. Reading it off a peer is
+    unlike a real operator, can simply read off that replica before crashing it. {b That is a
+    privilege only a scenario has}: round 3's finding 1 established that a real operator has no
+    practical way to obtain the same triple — a source that merely observes the replica is on the
+    wrong side of the durable write at every view-raising site, and the only qualifying source (one
+    synchronously coupled to that write) does not exist in this codebase. So this field models an
+    operator's knowledge, it does not demonstrate that such knowledge is obtainable. Reading it off a peer is
     acceptable ONLY where the scenario itself establishes that the two replicas' durable
     view/commit state genuinely coincided at the moment of the crash, and such a scenario should say
     so where it does it. *)

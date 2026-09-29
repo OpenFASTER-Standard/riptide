@@ -327,10 +327,20 @@ val restart :
     once this replica's own superblock is gone — and an OVER-claimed [last_normal_view] makes this
     replica win log selection with a STALE log, silently replacing the cluster's real,
     already-acknowledged committed values with its own. Both directions are catastrophic, by
-    different mechanisms, and both are pinned by running multi-replica trace tests. The only safe
-    triple is an independent, out-of-band record of THIS replica's own view/commit history captured
-    while it was still running; absent one, this repair cannot be used safely and the backend must be
-    discarded wholesale instead. See that function's own doc comment for both traces, the per-field
+    different mechanisms, and both are pinned by running multi-replica trace tests.
+
+    {b RETRACTED A SECOND TIME (Task 13 re-review round 3, finding 1): nor is "an external
+    monitoring/audit trail that recorded this replica's own view transitions" a safe source.} Every
+    site in this module that moves [view_number]/[last_normal_view]/[commit_number] persists the
+    superblock STRICTLY BEFORE the message that announces the change ([check_timeout],
+    [handle_start_view_change]'s higher-view branch, [try_forfeit_view_change], [try_send_sv]), and
+    [handle_start_view] — the backup side of a view change — persists a raised
+    [view_number]/[last_normal_view] while sending NOTHING at all. So a source that merely OBSERVES
+    this replica is reading one side or the other of that window and can be wrong in either
+    catastrophic direction. The only source that qualifies is one SYNCHRONOUSLY COUPLED to the
+    durable write itself (a mirrored copy of the RECORD, not of the messages), and no such source
+    exists in this codebase as of Task 13 — so in practice this repair cannot be used safely and the
+    backend must be discarded wholesale instead. See that function's own doc comment for both traces, the per-field
     reasoning in both directions, and the limitations it discloses (including which shape of unusable
     superblock it cannot repair at all).
 

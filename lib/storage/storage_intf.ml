@@ -90,11 +90,13 @@ module type S = sig
         "corrupt -> absent" one-word mutation spec/tla/VSR.tla:111-150 records TLC refuting against
         [NoCommittedOpProvablyAbsent].
 
-      The three callers that must use THIS one, all for that reason: {!Riptide_vsr.Replica.restart}'s
-      fail-stop guard and {!Riptide_vsr.Replica.create}'s
+      The FOUR callers that must use THIS one (review finding M3 corrected the count from three; the
+      fourth was always there, it was simply not listed), all for that reason:
+      {!Riptide_vsr.Replica.restart}'s fail-stop guard and {!Riptide_vsr.Replica.create}'s
       backend-is-not-virgin guard (both of which decide whether a backend is EMPTY -- and a backend
-      holding one header-only slot is not), and {!superblock_rebuild_from_wal}'s own [op_number]
-      derivation. *)
+      holding one header-only slot is not), {!Riptide_vsr.Replica.restart}'s own post-recovery
+      truncate condition (which decides whether the backend might still be holding anything ABOVE the
+      superblock's [op_number]), and {!superblock_rebuild_from_wal}'s own [op_number] derivation. *)
   val wal_highest_durable_op_number : t -> int
 
   (** Durably overwrites the single superblock record. *)
@@ -179,7 +181,9 @@ module type S = sig
         [n] -- and replica 1 WINS with [n = 5] against the survivors' [n = 3]. [FillValue] prefers
         the winner's own entries, so ops 2 and 3 are rebuilt from replica 1's STALE view-1 values,
         while [HighestCommitNumber] (a separate maximum, VSR.tla:257-260) independently carries
-        [k = 3] forward. The [StartView] then installs that log on every LIVE replica (replica 3,
+        [k = 3] forward -- {b from the SURVIVOR's own honest [k], not from anything the repaired
+        replica supplied}; see the [commit_number] bullet in the per-field list below, and the
+        narrowed arm it cites, for why that distinction is load-bearing rather than pedantic. The [StartView] then installs that log on every LIVE replica (replica 3,
         whose own last act started this view change, is permanently gone by then -- tolerating the
         loss of one replica out of 2f+1 is exactly what VSR is for, so an unreachable machine's disk
         is not a copy the protocol can ever use). Two committed, client-acknowledged operations have
@@ -205,8 +209,18 @@ module type S = sig
       - [commit_number] too LOW removes this replica's own protection against truncating a prefix it
         knows to be committed ([truncate_wal]'s [~committed] guard), so a later view change can
         discard it locally. Too HIGH makes this replica assert, through its own DVC's [k] and into
-        [HighestCommitNumber], that ops it merely holds are COMMITTED -- which is how the second
-        trace's stale ops 2 and 3 end up marked committed cluster-wide.
+        [HighestCommitNumber], that ops it merely holds are COMMITTED -- which bites in a quorum where
+        THIS replica's [k] is the maximum.
+        {b CORRECTION (review finding 2): that is NOT what marks the second trace's stale ops 2 and 3
+        committed, and this comment used to claim it was.} [HighestCommitNumber] is an INDEPENDENT
+        maximum over the whole DVC quorum's own [k] values (VSR.tla:257-260) and does not consult the
+        repaired replica's supplied [commit_number] on that path at all -- the SURVIVING peer's own
+        honest [k = 3] is what carries the commit-number forward there. Pinned by the narrowed arm
+        [test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_still_replaces_committed_data]:
+        supplying the TRUE [commit_number] ([1]) alongside the SAME over-claimed
+        [view_number]/[last_normal_view] pair ([3], [3]) reproduces the replacement outcome UNCHANGED,
+        assertion for assertion. So the over-claimed field the second trace actually hangs on is
+        [last_normal_view] -- which is what wins log selection -- and not [commit_number].
       - [view_number] too LOW makes the replica accept as current a view the cluster has already
         abandoned. Too HIGH makes it reject the real current primary's traffic and refuse every
         [StartView] from the view actually in progress. Note also (review finding M9) that
@@ -224,25 +238,81 @@ module type S = sig
       TLA+ verification under this repo's own governance rules) and deliberately out of this
       function's scope.
 
-      {b WHEN THIS TOOL IS HONESTLY SAFE TO USE -- and the disclosed limitation when it is not.}
+      {b WHAT WOULD MAKE THIS TOOL SAFE TO USE, AND WHY NOTHING AVAILABLE TODAY IS IT.}
       There is no known safe GENERAL procedure for externally sourcing these three values, and in
       particular no procedure that queries other replicas: any peer's present state describes a
-      DIFFERENT replica's progress, not this one's. This function is therefore safe to call in
-      exactly one situation: {b the operator has independent, out-of-band certainty of THIS
-      replica's own prior durable state} -- for example an external monitoring/audit trail that
-      recorded this replica's own view transitions and commit progress in real time, BEFORE it
-      crashed, so the triple is read back from a record of this replica's own history rather than
-      inferred from anything currently live. If no such independent record exists, {b this tool
-      cannot be used safely, and there is no substitute for it in this codebase.} That is a real,
-      disclosed limitation of the feature, stated here rather than papered over with a procedure
-      that looks actionable and is not: a replica in this state with no trustworthy record of its
-      own prior view/commit state must be discarded wholesale and rejoin as an empty replica (which
-      costs its uniquely-held data, but cannot corrupt anyone else's), or wait for a real Recovery
-      sub-protocol. What this function is, precisely, is the mechanical last step of a recovery
-      whose EVIDENCE came from somewhere this layer cannot see -- strictly better than the
-      alternative it replaced (a replica permanently down with a fully intact log and no supported
-      way to bring it back) for an operator who has that evidence, and strictly worse than a real
-      Recovery protocol for one who does not.
+      DIFFERENT replica's progress, not this one's. What a safe source must be is stated positively
+      below, and then the honest conclusion is stated too: {b in this codebase, as of Task 13, no
+      such source exists and there is no currently-practical way for an operator to build one.}
+
+      {b SECOND RETRACTION (review finding 1): "an external monitoring/audit trail that recorded
+      this replica's own view transitions in real time" does NOT qualify, and that example is
+      withdrawn.} An earlier version of this comment offered it as the one situation in which the
+      tool is safe. It is not, and the reason is structural rather than a matter of how carefully
+      such a monitor is built: {b in this codebase the durable superblock write ALWAYS happens
+      strictly BEFORE the corresponding externally-observable event, at every site that moves any
+      of these three fields}, so anything that OBSERVES this replica cannot be reading its durable
+      state -- it is reading one side or the other of that window.
+      - [Riptide_vsr.Replica.check_timeout] (TimerSendSVC) raises [view_number], calls
+        [persist_superblock], and only THEN broadcasts [StartViewChange].
+      - [handle_start_view_change]'s ReceiveHigherSVC adopts the higher view, calls
+        [persist_superblock], and only then reaches [try_send_dvc].
+      - [try_forfeit_view_change] (ForfeitViewChange) does the same before its own
+        [StartViewChange] broadcast.
+      - [try_send_sv] (SendSV) writes the new log, raises [last_normal_view]/[commit_number],
+        calls [persist_superblock], and only then broadcasts [StartView].
+      - [handle_start_view] (ReceiveSV, the BACKUP side of a view change) is worse still: it raises
+        [view_number] and [last_normal_view] and calls [persist_superblock] while sending {b nothing
+        at all}.
+
+      A crash in any of the first four windows leaves an observer of this replica's outbound traffic
+      with a triple that is too LOW -- exactly the under-claiming direction whose trace above
+      truncates this replica's own uniquely-held committed data. So such a source can only ever give
+      a LOWER BOUND on the true durable triple, never the triple. And the fifth site means it is not
+      even reliably a lower bound: a wire-observing monitor cannot tell from any message whether THIS
+      replica adopted a given view, because adopting one emits nothing. If it infers adoption from
+      the [StartView] it saw go by, it can be too HIGH (the over-claiming direction, which REPLACES
+      the cluster's committed data); if it conservatively assumes non-adoption, it is too low again.
+      It can therefore err in either catastrophic direction, and from outside there is no way to tell
+      which.
+
+      Nor does going in-process help by itself. The one observation hook
+      {!Riptide_vsr.Replica}'s [create]/[restart] expose, [?on_commit_advanced], is on the WRONG side
+      of the write too, in the OTHER direction: it fires inside [advance_commit_number], strictly
+      before the [persist_superblock] that follows it, so it is an UPPER bound -- and it covers only
+      [commit_number], saying nothing about either view field.
+
+      {b The only thing that genuinely qualifies} is a source {b synchronously coupled to the
+      durable write itself}: a copy of this replica's own superblock RECORD that becomes durable in
+      the same critical section as the real one, on independently-failing media -- not a record of
+      the messages this replica sent, and not anything derived from watching its outputs after the
+      fact. Only such a source can be read back and known to describe the last state that actually
+      reached disk.
+
+      {b And that is the disclosed limitation: nothing in this codebase provides one, and an
+      operator cannot practically supply one either.} The argument is short and worth stating so
+      nobody re-invents the retracted advice from a different direction. Any mechanism tightly
+      enough coupled to the durable write to be trustworthy {b is, by construction, another durable
+      copy of the superblock} -- and a durable copy of the superblock belongs behind
+      {!superblock_write}/{!superblock_read} (more copies, or a superblock HISTORY), where
+      {!superblock_read} would simply find it and this function would never be reached at all.
+      Conversely, any mechanism loose enough to be genuinely out-of-band is derived from
+      observables, which the paragraphs above show cannot be trusted in either direction. There is
+      no third category. So the honest status of this function today is: {b a mechanical last step
+      with no supported way to obtain its inputs.} It is strictly better than the state it replaced
+      (a replica permanently down with a fully intact log and no supported way to bring it back)
+      only for an operator who already has evidence this codebase can neither help them produce nor
+      validate, and strictly worse than a real recovery mechanism for everyone else.
+
+      {b What to do instead, today}: a replica in this state must be discarded wholesale and rejoin
+      as an empty replica -- which costs its uniquely-held data, but cannot corrupt anyone else's.
+      {b What would close this for real}, neither of which is in this task's scope: VSR's classical
+      Recovery sub-protocol (see the paragraph above on why that is real consensus-protocol work),
+      or a durable superblock HISTORY in this layer -- keeping the previous record(s) alongside the
+      current one, so a torn write leaves the prior triple readable and the repair becomes DERIVABLE
+      rather than operator-supplied. The second is the smaller of the two and is the one that would
+      retire this function's three arguments entirely; it is recorded here as the shape of the fix,
+      not as a promise that it exists.
 
       {b Preconditions}, both of them exactly {!Riptide_vsr.Replica.restart}'s own fail-stop
       condition, so this function is callable precisely in the state that guard refuses in:

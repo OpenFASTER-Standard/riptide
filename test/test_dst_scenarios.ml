@@ -1047,8 +1047,13 @@ let test_the_superblock_repair_brings_a_refusing_replica_back () =
              than hardcoded, just below. *)
         }
       in
-      Alcotest.(check int) "the backups' own commit_number really is 0, not the primary's 1" 0
+      (* BOTH crashing replicas, not just one (review finding M6): the SAME [truth] record is applied
+         to replicas 1 and 2 alike, so the proof that it is really THEIR own state has to cover both
+         of them for every field it carries -- otherwise the assertion pair below proves the view
+         pair symmetrically while the commit-number rests on a single replica's value. *)
+      Alcotest.(check int) "crashing replica 2's own commit_number really is 0, not the primary's 1" 0
         (Replica.commit_number replicas.(1));
+      Alcotest.(check int) "and crashing replica 3's is too" 0 (Replica.commit_number replicas.(2));
       (* The proof the view pair really may be read off replicas.(0) here: no view change has
          happened, so the crashing replicas' OWN view/last_normal_view are identical to it. If a
          future edit to this scenario introduces a view change, these assertions fail and the

@@ -536,9 +536,19 @@ let wal_highest_op_number t = t.highest_op_number
 (* {!Storage_intf.S.wal_highest_durable_op_number} (Task 13 re-review finding 2): the header-only
    scan, exported. A fresh scan rather than a cached field on purpose -- [t.highest_op_number] is the
    STRICT value maintained across appends/truncates, and the whole point here is the case where the
-   two disagree. It is called at most once per restart, so the cost of re-walking the ring is
-   irrelevant next to the property it buys. See [recover_highest_durable_op_number]'s own comment for
-   the full safety argument and for what the previous, false version of that comment claimed. *)
+   two disagree.
+
+   HOW OFTEN IT IS ACTUALLY CALLED (corrected, review finding M5 -- this comment previously claimed
+   "at most once per restart", which is wrong): a bounded, small number of times per replica
+   LIFECYCLE, never once per append. {!Riptide_vsr.Replica.restart} reads it TWICE -- once in its
+   fail-stop guard and once more in its post-recovery truncate condition -- {!Riptide_vsr.Replica.create}
+   reads it once in its backend-is-not-virgin guard, and {!superblock_rebuild_from_wal} derives its
+   [op_number] from the same scan once per repair. Four call sites, each on a cold path, so the cost
+   of re-walking the ring is still irrelevant next to the property it buys; the point of the
+   correction is only that "once" was a claim someone could build on and it was not true.
+
+   See [recover_highest_durable_op_number]'s own comment for the full safety argument and for what the
+   previous, false version of THAT comment claimed. *)
 let wal_highest_durable_op_number t = recover_highest_durable_op_number t
 
 (* DURABLE, not merely a counter decrement (final-review finding I3).
