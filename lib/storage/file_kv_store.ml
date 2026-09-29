@@ -526,14 +526,11 @@ let sweep_stale_temp_files ~fs ~dir_path =
           nl = 0 || go 0
         in
         let is_stale_temp_file =
-          (* Must contain ".put." and end with ".tmp" -- these patterns uniquely identify temp files *)
+          (* Must contain ".put." and end with ".tmp" -- these patterns uniquely identify temp files.
+             Owner marker and lock file start with "." but don't contain ".put.", so checking for
+             ".put." + ".tmp" suffix is sufficient to distinguish temp files from private files. *)
           contains_substring basename ".put." &&
-          String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp" &&
-          (* Exclude owner marker and lock file (which start with ".") *)
-          (String.length basename = 0 || String.sub basename 0 1 <> "." ||
-           (* But DO include files that start with "." only if they match the .put. pattern
-              (the owner marker and lock don't have .put., so this distinguishes them) *)
-           contains_substring basename ".put.")
+          String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp"
         in
         if is_stale_temp_file then
           try Eio.Path.unlink Eio.Path.(fs / dir_path / basename)
@@ -585,11 +582,6 @@ let create ~sw ~fs ~owner dir_path =
         | exception Eio.Io _ -> None)
       dir_path
   in
-  (* Task 16: now that we hold the exclusive [flock(2)], sweep any stale temp files left behind
-     by crashed writers. This runs before the owner-marker check, safe to do anywhere after the
-     lock is acquired and before the record is constructed (order relative to owner-marker doesn't
-     matter functionally, but this placement keeps all post-lock setup together). *)
-  sweep_stale_temp_files ~fs ~dir_path;
   (* Task 11 review (finding I1, and re-review finding 1): the lock's lifetime must track the
      SUCCESSFULLY CONSTRUCTED handle's, not the "flock succeeded" attempt's -- and that means
      EVERY step between [Dir_lock.acquire] succeeding and [t] actually being returned has to sit
@@ -613,8 +605,14 @@ let create ~sw ~fs ~owner dir_path =
      fail, confirming the leak, restoring) rather than left as a permanent test, since
      [Aligned_buffer_pool.create]'s buffer count/slot size aren't parameters a test can control
      from this module's own public surface -- see this task's own review-round-2 report for the
-     exact commands and output. *)
+     exact commands and output. Task 16 re-review (Important finding): [sweep_stale_temp_files]
+     moved inside this same scrutinee to inherit the lock-release guarantee structurally. *)
   match
+    (* Task 16: sweep any stale temp files left behind by crashed writers, now that we hold the
+       exclusive [flock(2)]. This runs as the first statement inside the protected scrutinee,
+       before the owner-marker check, to ensure any exception raised by the sweep is caught by
+       the [exception exn -> ...] handler below and the lock is properly closed. *)
+    sweep_stale_temp_files ~fs ~dir_path;
     check_or_write_owner_marker ~fs ~dir_path owner;
     let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
     { sw; lock; fs; dir_path; owner; pool }

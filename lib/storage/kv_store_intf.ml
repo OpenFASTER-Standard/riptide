@@ -30,12 +30,12 @@ module type S = sig
 
       {b Task 16: concurrent writers to the same key are handled per-backend.} For backends that
       support concurrent same-key writes (e.g., {!Riptide_storage.File_kv_store}, which uses
-      unique-per-call temp files under {!Riptide_storage.Dir_lock}'s protection), concurrent
-      [put] calls to the same key produce an undefined winner (whichever writer finishes last is
-      observed), but never a torn mix or phantom [None]. For backends that do not support
-      concurrent same-key writes, concurrent [put]s to the same key are undefined (reading the
-      backend's own [.mli] or code comments is required to determine which backends make
-      concurrency guarantees). *)
+      unique-per-call temp-file naming plus atomic [Eio.Path.rename] to ensure each writer uses
+      a distinct temp path), concurrent [put] calls to the same key produce an undefined winner
+      (whichever writer finishes last is observed), but never a torn mix or phantom [None]. For
+      backends that do not support concurrent same-key writes, concurrent [put]s to the same key
+      are undefined (reading the backend's own [.mli] or code comments is required to determine
+      which backends make concurrency guarantees). *)
 
   val delete : t -> key:string -> unit
   (** Durably removes [key]. Durable across a reopen — a deleted key must
