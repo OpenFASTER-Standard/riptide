@@ -1324,9 +1324,10 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
           (refusal_count r "eviction_blocked"))
     ctx.wm_replicas;
   (* And no OTHER refusal shape anywhere: no fault injector in this scenario, no oversized entry,
-     and (because a refusal stops this follower appending rather than leaving a rewritten hole) no
-     out-of-sequence append either. A non-zero count in any of these would mean this scenario is
-     measuring something other than eviction. *)
+     (because a refusal stops this follower appending rather than leaving a rewritten hole) no
+     out-of-sequence append either, and (Task 12) no real I/O failure -- this scenario's storage is
+     never faulted at the backend level, only backpressured via [?may_evict]. A non-zero count in
+     any of these would mean this scenario is measuring something other than eviction. *)
   Array.iteri
     (fun i r ->
       List.iter
@@ -1334,7 +1335,7 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
           Alcotest.(check int)
             (Printf.sprintf "replica %d recorded no %s refusal" (i + 1) name)
             0 (refusal_count r name))
-        [ "fault_injection_cap"; "entry_rejected"; "out_of_sequence" ])
+        [ "fault_injection_cap"; "entry_rejected"; "out_of_sequence"; "storage_fault" ])
     ctx.wm_replicas;
 
   (* ASSERTION 4(a), first half: NOTHING WAS LOST. The entry the refusal protected (op 9, a

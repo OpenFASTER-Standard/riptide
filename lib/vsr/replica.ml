@@ -126,28 +126,49 @@ type slot_state = Present of Value.value | Corrupt | Absent
        signal that materialization has fallen behind the log -- which is why it must not be
        flattened into [Entry_rejected]'s "this entry can never be durable here".
 
-   All four still mean "not durable" to the protocol, and the protocol still behaves identically
+   TASK 12 (audit-remediation Decision 3.3, closing Storage-Important-1) adds a fifth, and the
+   first that is not an [Invalid_argument] at all:
+
+     [Storage_fault] -- a REAL I/O failure out of the backend: [Eio.Io], [Sys_error] (the shape
+       OCaml's own channel-based I/O raises for a genuine ENOSPC), or [Out_of_memory]. Before this
+       task, none of these matched [classify_append_refusal] (which only ever looks at an
+       [Invalid_argument]'s message), so they propagated straight out of [durable_append] as an
+       unhandled exception -- a disk filling up under a live [File_storage] could kill the whole
+       replica process instead of being refused like every other kind of append failure. It is
+       caught by its OWN arm in [durable_append], after (not instead of) the [Invalid_argument]
+       classification below, precisely so it stays a distinct signal rather than being folded into
+       [Entry_rejected]'s "this entry can never be durable here" -- a transient ENOSPC, unlike a
+       too-large entry, may well succeed on retry once space frees up.
+
+   All five still mean "not durable" to the protocol, and the protocol still behaves identically
    -- the replica declines to acknowledge. What changes is that they are told apart and COUNTED
    (see [append_refusals]), so a harness -- or, since subtask 3.7, a real caller -- can assert on
-   them, and that an Invalid_argument matching NONE of them now propagates instead of being
-   swallowed: an unrecognized exception out of a backend is not a documented storage refusal, and
-   treating it as one is the very conflation this finding names. *)
-type append_refusal = Fault_injection_cap | Entry_rejected | Out_of_sequence | Eviction_blocked
+   them, and that an Invalid_argument matching NONE of the first four now propagates instead of
+   being swallowed: an unrecognized [Invalid_argument] out of a backend is not a documented storage
+   refusal, and treating it as one is the very conflation this finding names. *)
+type append_refusal =
+  | Fault_injection_cap
+  | Entry_rejected
+  | Out_of_sequence
+  | Eviction_blocked
+  | Storage_fault
 
 let append_refusal_kinds =
-  [ Fault_injection_cap; Entry_rejected; Out_of_sequence; Eviction_blocked ]
+  [ Fault_injection_cap; Entry_rejected; Out_of_sequence; Eviction_blocked; Storage_fault ]
 
 let append_refusal_index = function
   | Fault_injection_cap -> 0
   | Entry_rejected -> 1
   | Out_of_sequence -> 2
   | Eviction_blocked -> 3
+  | Storage_fault -> 4
 
 let append_refusal_name = function
   | Fault_injection_cap -> "fault_injection_cap"
   | Entry_rejected -> "entry_rejected"
   | Out_of_sequence -> "out_of_sequence"
   | Eviction_blocked -> "eviction_blocked"
+  | Storage_fault -> "storage_fault"
 
 (* Matched on the message, because [Storage_intf.S] has no dedicated exception for any of these
    and giving it one is a contract change to every backend and every conformance test -- out of
@@ -716,7 +737,16 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
 
    [Value.canonical_encode] is evaluated OUTSIDE the handler on purpose: it has its own
    [Invalid_argument] failure modes, and catching those here would put an encoding bug in the
-   value layer into a storage-refusal bucket -- the same conflation at one remove. *)
+   value layer into a storage-refusal bucket -- the same conflation at one remove.
+
+   TASK 12 (Decision 3.3): the [Eio.Io _ | Sys_error _ | Out_of_memory] arm below sits AFTER the
+   [Invalid_argument] classification, deliberately -- it catches only what that classification
+   cannot: a REAL I/O failure out of the backend (a genuine ENOSPC, an [Eio.Io] from a failed
+   syscall, an allocation failure), never a guard the backend itself raises as [Invalid_argument]
+   to say "this call was malformed". Ordering the two this way keeps every existing
+   [Invalid_argument] shape -- including the propagating [None] case above, which must stay an
+   [Invalid_argument] escape, not get laundered into [Storage_fault] -- completely unaffected by
+   this addition. *)
 let durable_append t ~op_number (v : Value.value) =
   let bytes = Value.canonical_encode v in
   match t.storage.wal_append ~op_number bytes with
@@ -728,6 +758,10 @@ let durable_append t ~op_number (v : Value.value) =
       t.append_refusals.(i) <- t.append_refusals.(i) + 1;
       false
     | None -> invalid_arg msg)
+  | exception (Eio.Io _ | Sys_error _ | Out_of_memory) ->
+    let i = append_refusal_index Storage_fault in
+    t.append_refusals.(i) <- t.append_refusals.(i) + 1;
+    false
 
 (* The durable half of [SendSV]/[ReceiveSV]'s wholesale log replacement, and of VSR.tla's
    [rep_storage' = FreshStorage(L)] (VSR.tla:509, :573): after this returns [true], op-numbers

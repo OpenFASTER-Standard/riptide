@@ -659,7 +659,7 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
   Alcotest.(check (list (pair string int)))
     "counted as fault_injection_cap, and as nothing else"
     [ ("fault_injection_cap", 1); ("entry_rejected", 0); ("out_of_sequence", 0);
-      ("eviction_blocked", 0) ]
+      ("eviction_blocked", 0); ("storage_fault", 0) ]
     (refusals t);
   (* The protocol effect is unchanged by the classification: not durable, so not acknowledged. *)
   Alcotest.(check int) "the op was NOT taken on" 0 (Replica.op_number t);
@@ -680,7 +680,7 @@ let test_refusal_out_of_sequence_is_counted_as_its_own_shape () =
   Alcotest.(check (list (pair string int)))
     "counted as out_of_sequence, and as nothing else"
     [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 1);
-      ("eviction_blocked", 0) ]
+      ("eviction_blocked", 0); ("storage_fault", 0) ]
     (refusals t);
   Alcotest.(check int) "the op was NOT taken on" 2 (Replica.op_number t)
 
@@ -709,7 +709,7 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       Alcotest.(check (list (pair string int)))
         "counted as entry_rejected, and as nothing else"
         [ ("fault_injection_cap", 0); ("entry_rejected", 1); ("out_of_sequence", 0);
-          ("eviction_blocked", 0) ]
+          ("eviction_blocked", 0); ("storage_fault", 0) ]
         (refusals t);
       Alcotest.(check int) "the oversized op was NOT taken on" 0 (Replica.op_number t);
       Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = []);
@@ -756,14 +756,14 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
       Alcotest.(check (list (pair string int)))
         "and refused nothing on the way"
         [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
-          ("eviction_blocked", 0) ]
+          ("eviction_blocked", 0); ("storage_fault", 0) ]
         (refusals t);
       let before = decoded_sent sent in
       Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0; source = 3 }));
       Alcotest.(check (list (pair string int)))
         "counted as eviction_blocked, and as nothing else"
         [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
-          ("eviction_blocked", 1) ]
+          ("eviction_blocked", 1); ("storage_fault", 0) ]
         (refusals t);
       (* The protocol effect is the same as every other refusal: not durable, so not acknowledged.
          Nothing new went out on the wire beyond what the first two Prepares already produced. *)
@@ -787,7 +787,7 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
       Alcotest.(check (list (pair string int)))
         "the identical op_number is refused no further times once eviction is permitted"
         [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
-          ("eviction_blocked", 1) ]
+          ("eviction_blocked", 1); ("storage_fault", 0) ]
         (refusals t);
       Alcotest.(check int) "and it is taken on" 3 (Replica.op_number t);
       Alcotest.(check bool) "the retried entry is durably readable" true
@@ -821,7 +821,7 @@ let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed 
   Alcotest.(check (list (pair string int)))
     "and it is not counted as any known refusal shape either"
     [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
-      ("eviction_blocked", 0) ]
+      ("eviction_blocked", 0); ("storage_fault", 0) ]
     (refusals t)
 
 (* ============================================================================================

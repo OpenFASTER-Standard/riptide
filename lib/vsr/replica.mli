@@ -898,9 +898,10 @@ val handle_message : t -> sender:int -> string -> unit
 val append_refusals : t -> (string * int) list
 (** [append_refusals t] is how many durable WAL appends this replica has had REFUSED over
     its lifetime, broken down by the reason, as [(name, count)] pairs in a fixed order:
-    [fault_injection_cap], [entry_rejected], [out_of_sequence], [eviction_blocked].
+    [fault_injection_cap], [entry_rejected], [out_of_sequence], [eviction_blocked],
+    [storage_fault].
 
-    {b Not protocol, but no longer test-only} — nothing in this module reads it, and all four
+    {b Not protocol, but no longer test-only} — nothing in this module reads it, and all five
     refusals have exactly the same protocol effect (the entry is not durable, so it is not
     acknowledged). It was introduced as [for_test_append_refusals] because they used to be
     indistinguishable, which is final-review finding I2: one blanket [Invalid_argument] catch
@@ -939,10 +940,20 @@ val append_refusals : t -> (string * int) list
       once the predicate relents, so this is backpressure rather than a defect. Flattening it into
       [entry_rejected] would say the exact opposite of what it means — that the entry can never be
       durable here — and would make this counter useless for the lag signal described above.
+    - [storage_fault] (Task 12, audit-remediation Decision 3.3) — a REAL I/O failure out of the
+      backend: {!Eio.Io}, {!Sys_error} (the shape OCaml's own channel-based I/O raises for a
+      genuine ENOSPC), or {!Out_of_memory}. Before this bucket existed, none of these were
+      [Invalid_argument] at all, so they matched nothing below and propagated straight out of
+      {!durable_append} as an unhandled exception instead of being refused like every other kind
+      of append failure — closing Storage-Important-1 (a disk filling up under a live
+      {!Riptide_storage.File_storage} could kill the whole replica process). {b The only shape here
+      that is not an [Invalid_argument]}, and — like [eviction_blocked] — potentially transient: an
+      ENOSPC condition may clear and a later retry of the same op_number may succeed, unlike
+      [entry_rejected]'s permanent "too large for this backend".
 
-    An [Invalid_argument] matching none of the four is NOT counted and NOT swallowed: it
-    propagates, because an unrecognized exception out of a backend is a contract violation rather
-    than a documented storage refusal. *)
+    An [Invalid_argument] matching none of the first four is NOT counted and NOT swallowed: it
+    propagates, because an unrecognized [Invalid_argument] out of a backend is a contract violation
+    rather than a documented storage refusal. *)
 
 (** {2 Test-support surface}
 
