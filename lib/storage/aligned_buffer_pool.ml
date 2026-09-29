@@ -52,6 +52,18 @@ let temp_backing_file_name () =
    [~dir_path] (Task 17): the backing file now lives inside the CALLER's own storage directory
    instead of [Filename.temp_file]'s [TMPDIR]-rooted one -- see [temp_backing_file_name] above.
 
+   {b Disclosed residual gap (Task 17 review):} a process killed between [Unix.openfile]/
+   [ftruncate]/[map_file] succeeding and the [Fun.protect] finally's [Unix.unlink] running (e.g.
+   [SIGKILL], a handful of syscalls wide) leaves this throwaway file behind permanently in
+   [dir_path] -- nothing in this codebase sweeps it (it matches neither
+   [File_kv_store.sweep_stale_temp_files]'s [".put."]-based pattern nor anything [File_storage]
+   scans for). Before this task, the same crash left the same kind of debris in [TMPDIR] instead,
+   where it was usually someone else's problem to reap (systemd-tmpfiles, a reboot); now it is
+   permanent, un-swept debris inside the real data directory. Judged proportionate to disclose
+   rather than build a dedicated sweep for: the window is a handful of non-blocking syscalls (no
+   I/O wait, no fsync), several orders of magnitude narrower than the crash windows this plan's
+   other tasks (e.g. Task 15/16's own multi-step durable writes) build real sweeps for.
+
    Called exactly [buffer_count] times total, by [create] below, at pool-construction time --
    never again for the rest of that pool's lifetime. That call-frequency change (once per buffer
    instead of once per I/O) is the entire fix Task 10 made; this function's own body is otherwise
