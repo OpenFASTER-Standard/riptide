@@ -66,34 +66,72 @@ type value =
     enforces the same rule from the wire-bytes side).
 
     Also raises [Invalid_argument] if [v] nests [Record]/[Sum]/[Sequence]/[Map]
-    more than 1000 levels deep - a real, enforced limit, not aspirational
-    language: this codebase's own real payloads never come close to it (the
-    deepest, an [Envelope], is a handful of levels), and it exists
-    specifically to keep a [Map] with 2+ entries at every nesting level -
-    still algorithmically quadratic in depth (see [encode_into]'s own doc
-    comment in the implementation) - cheap regardless of how deep a [value]
-    built directly in memory happens to be, not just one that arrived via
-    {!canonical_decode} (which enforces the identical cap from the wire-bytes
-    side, for a different reason - see there). *)
+    past a hard depth limit, or if it contains more than a hard total-node-count
+    limit - both real, enforced limits, not aspirational language, and both
+    enforced identically by {!canonical_decode} (see its own doc comment for
+    the full reasoning behind each and why they must be symmetric):
+
+    - {b Nesting depth}: the outermost [v] is depth 0; each level of
+      [Record]/[Sum]/[Sequence]/[Map] nesting inside it increases depth by 1.
+      Raises as soon as encoding would need to process a node at depth 1001 or
+      deeper - so a [v] nested exactly 1001 levels deep is still accepted, as
+      long as that innermost (1001st) level is itself empty (an empty
+      [Record]/[Sequence]/[Map], or a [Scalar]) and so has no child of its own
+      needing to be processed at depth 1001. This codebase's own real payloads
+      never come close to this limit (the deepest, an [Envelope], is a handful
+      of levels), and it exists specifically to keep a [Map] with 2+ entries at
+      every nesting level - still algorithmically quadratic in depth (see
+      [encode_into]'s own doc comment in the implementation) - cheap regardless
+      of how deep a [value] built directly in memory happens to be, not just
+      one that arrived via {!canonical_decode} (which enforces the identical
+      cap from the wire-bytes side, for a different reason - see there).
+
+    - {b Total node count}: rejected once the number of nodes processed while
+      encoding (every [Scalar]/[Record]/[Sum]/[Sequence]/[Map] counts as one,
+      at any depth) exceeds the same fixed budget {!canonical_decode} enforces
+      on the way back in - see its own doc comment for the exact figure and the
+      reasoning behind it. Without this, a [value] built directly in memory
+      (never round-tripped through {!canonical_decode}) could encode
+      successfully past the budget {!canonical_decode} would reject the
+      resulting bytes at, breaking the round-trip relationship documented
+      below and, concretely, creating a silent data-loss path for any caller
+      that authenticates-then-stores encoded bytes and treats "fails to
+      decode" as "never stored" (see [Riptide_crypto.Redaction_store]'s own
+      doc comment for a real instance of exactly that shape). *)
 val canonical_encode : value -> string
 
 (** The structural inverse of {!canonical_encode}: decodes a [value] from
     its canonical byte encoding.
 
-    Round-trip relationship: for any [v] with no duplicate-keyed [Record] or
-    [Map] anywhere in it (a [v] that does have one makes {!canonical_encode}
-    itself raise [Invalid_argument] - see that function's own doc comment
-    above - so [canonical_decode] is never even reached for such a [v]),
+    Round-trip relationship: for any [v] for which {!canonical_encode} itself
+    succeeds (i.e. [v] has no duplicate-keyed [Record] or [Map] anywhere in
+    it, and is within both the nesting-depth and total-node-count limits
+    documented on {!canonical_encode} above - a [v] that violates any of
+    those makes {!canonical_encode} itself raise [Invalid_argument], so
+    [canonical_decode] is never even reached for such a [v]),
     [canonical_decode (canonical_encode v)] reproduces [v]'s logical
     content, but {b not necessarily its exact OCaml representation} —
     decoding re-encodes [Record] fields and [Map] entries into the same
     canonical (sorted) order {!canonical_encode} would have chosen, which is
     not necessarily the order the original value was constructed with if
     that value's fields/entries were out of sorted order to begin with. The
-    property that actually holds for any such duplicate-key-free [v] is
-    [canonical_encode (canonical_decode (canonical_encode v)) =
-    canonical_encode v] - i.e. round-tripping through decode is a no-op once
-    a value has already been through one canonical encoding.
+    property that actually holds for any such [v] (i.e. any [v] for which
+    {!canonical_encode} itself succeeds) is [canonical_encode (canonical_decode
+    (canonical_encode v)) = canonical_encode v] - i.e. round-tripping through
+    decode is a no-op once a value has already been through one canonical
+    encoding. This holds unconditionally for such a [v] specifically because
+    {!canonical_encode} and {!canonical_decode} enforce the identical
+    nesting-depth and total-node-count limits (see both functions' own doc
+    comments): [canonical_encode v] succeeding already guarantees the wire
+    bytes it produced describe a structure - same shape, same depth, same
+    total node count - that stays within {!canonical_decode}'s own budget for
+    those same bytes, so [canonical_decode (canonical_encode v)] can never
+    itself raise on either bound. Before this was made symmetric,
+    {!canonical_encode} had no such limits of its own, so this property could
+    be false for a [v] whose encoded node count exceeded {!canonical_decode}'s
+    budget: [canonical_encode v] would succeed, but [canonical_decode
+    (canonical_encode v)] would then raise instead of reproducing [v], not
+    merely be a partial no-op.
 
     Raises [Invalid_argument] if: the input is empty; an unknown tag byte is
     encountered; any length or count prefix - a string/bytes length, or a
@@ -112,32 +150,54 @@ val canonical_encode : value -> string
     both independently necessary, since they guard against two different
     resources an adversarial input can exhaust:
 
-    - {b Nesting depth}: rejected past 1000 levels of [Record]/[Sum]/[Sequence]/[Map]
-      nesting, the same cap {!canonical_encode} enforces (see its own doc
-      comment) - without it, a wire payload that grows only linearly with depth
-      (as little as ~9 bytes per extra nesting level via the cheapest shape, a
-      single-element [Sequence]) can drive this function's own recursion
-      arbitrarily deep, exhausting the call stack for single-digit-MB of wire
-      bytes - orders of magnitude cheaper than the stack space it consumes.
+    - {b Nesting depth}: the outermost decoded value is depth 0; each level
+      of [Record]/[Sum]/[Sequence]/[Map] nesting inside it increases depth by
+      1. Rejected as soon as decoding would need to process a node at depth
+      1001 or deeper - so input encoding a value nested exactly 1001 levels
+      deep still decodes successfully, as long as that innermost (1001st)
+      level is itself empty and so has no child of its own needing to be
+      decoded at depth 1001. This is the same cap {!canonical_encode}
+      enforces (see its own doc comment) - without it, a wire payload that
+      grows only linearly with depth (as little as ~9 bytes per extra
+      nesting level via the cheapest shape, a single-element [Sequence]) can
+      drive this function's own recursion arbitrarily deep, exhausting the
+      call stack for single-digit-MB of wire bytes - orders of magnitude
+      cheaper than the stack space it consumes.
 
     - {b Total decoded node count}: rejected once the number of decoded
       nodes (every [Scalar]/[Record]/[Sum]/[Sequence]/[Map] counts as one,
-      at any depth) exceeds a budget scaled to the input's own byte length -
-      [max 10_000 (String.length input / 64)], i.e. at most one decoded node
-      per 64 bytes of input, floored at 10,000 nodes so small, legitimate
-      inputs are never affected. Without this, a compact wire encoding
-      (e.g. a flat [Sequence] of cheap [Bool] elements, needing only 2 wire
-      bytes each) can still expand into a live in-memory tree tens of times
-      larger than its own byte size, purely from OCaml's own per-node heap
-      overhead (measured: ~55 bytes of live heap per [Bool] node, a ~27x
-      amplification over its 2-byte wire cost) - a 64 MiB frame shaped this
-      way was measured reaching ~9 GB live memory with no other protection
-      in place (docs/superpowers/specs/2026-09-29-audit-remediation-design.md,
+      at any depth) exceeds a fixed budget of 1,048,576 nodes (64 MiB /
+      64 bytes-per-node, derived from [lib/transport/tcp.ml]'s
+      [max_message_size], the largest frame this codebase will ever hand to
+      this function - see the implementation's own doc comment on
+      [max_node_count] for the exact derivation). This is an ABSOLUTE
+      ceiling, applied regardless of the particular input's own declared
+      byte length - {b not} a budget scaled down for a smaller input. (An
+      earlier version of this bound was scaled per-input -
+      [max 10_000 (String.length input / 64)] - which, in practice, collapsed
+      to a flat 10,000-node ceiling for every shape this codebase actually
+      produces, since none of them are anywhere near 64 wire bytes/node; that
+      made ordinary, legitimate traffic - e.g. a replicated log grown past
+      ~1,000 entries, wrapped in a [Value.Sequence] for a view-change message
+      - permanently undecodable well before any real size limit was
+      approached. The fixed, absolute ceiling here closes that regression
+      while keeping the identical worst-case memory bound.) Without any such
+      budget, a compact wire encoding (e.g. a flat [Sequence] of cheap
+      [Bool] elements, needing only 2 wire bytes each) can still expand into
+      a live in-memory tree tens of times larger than its own byte size,
+      purely from OCaml's own per-node heap overhead (measured: ~55 bytes of
+      live heap per [Bool] node, a ~27x amplification over its 2-byte wire
+      cost) - a 64 MiB frame shaped this way was measured reaching ~9 GB
+      live memory with no other protection in place
+      (docs/superpowers/specs/2026-09-29-audit-remediation-design.md,
       Decision 2.3), which the existing "claimed count can't exceed
       remaining bytes" check alone does not prevent, since that check only
       rules out claiming *more nodes than the input could physically
       contain* - it says nothing about the memory cost of the nodes the
-      input genuinely does contain.
+      input genuinely does contain. The same fixed budget is enforced
+      identically by {!canonical_encode} (see its own doc comment) - see
+      the round-trip relationship documented above for why that symmetry
+      matters.
 
     Also raises [Invalid_argument] if a [Record]'s fields, or a [Map]'s
     entries, are not encoded in strict canonical order - each field name

@@ -375,76 +375,103 @@ let build_nested_map_key_value ~depth =
    the test would not have caught a reintroduction of the exact bug it
    exists to prevent.
 
-   Fix: widen the span to 4x (compare t(4D) against t(D) instead of t(2D)
-   against t(D)). At a 4x span the two hypotheses separate widely: linear
-   cost gives a ~4x ratio (with noise), quadratic gives a ~16x ratio - a
-   16x/4x = 4x gap between the two nominal ratios, vs. only a 4x/2x = 2x
-   gap at the old 2x span. asserting the 4x-depth time stays within an 8x
-   bound (plus a small additive floor to stay non-flaky when both
-   measurements are too fast for the ratio itself to be meaningful) gives
-   real margin on both sides: comfortably above a linear algorithm's noisy
-   ~4x, comfortably below a quadratic algorithm's ~16x. Verified directly
-   (see the fix-round report): the reconstructed quadratic decoder measures
-   ~15-16x at this span and FAILS an 8x bound; the current linear
-   implementation measures ~2.3-2.6x and passes with a wide margin. *)
-let scaling_bound ~t_d ~factor ~floor = (t_d *. factor) +. floor
+   Fix: widen the span to 4x (compare cost(4D) against cost(D) instead of
+   cost(2D) against cost(D)). At a 4x span the two hypotheses separate widely:
+   linear cost gives a ~4x ratio (with noise), quadratic gives a ~16x ratio -
+   a 16x/4x = 4x gap between the two nominal ratios, vs. only a 4x/2x = 2x gap
+   at the old 2x span. Asserting the 4x-depth cost stays within an 8x bound
+   gives real margin on both sides: comfortably above a linear algorithm's
+   noisy ~4x, comfortably below a quadratic algorithm's ~16x.
 
-(* Task 8 update: canonical_encode/canonical_decode now enforce a hard 1000-level
-   nesting-depth cap (lib/value.ml's [max_nesting_depth]), so depth 20,000 - the original
-   audit reproduction size these two tests and the correctness cross-check below used to
-   run at - is no longer even a legal input: both would now raise [Invalid_argument]
-   outright (depth-exceeded) rather than run to completion at all. Depths lowered to
-   200/800 (still a 4x span, so the linear-vs-quadratic discrimination reasoning above is
-   unchanged) so these three tests keep exercising genuine, still-decodable inputs under
-   the new cap. The property under test here - Task 5's O(depth) fix for a single-entry
-   Map-key chain - is a different, already-closed finding from Task 8's own 2+-entries
-   residual (see [test_two_entries_per_level_deep_map_encode_hash_residual_bounded] below)
-   and is unaffected by the depth cap itself; only the specific depth these tests can
-   legally probe changed. *)
+   Finding 3 (audit-remediation review fix round on Task 8): when Task 8's
+   1000-level depth cap forced these two tests' depths down from the
+   original 20,000/80,000 span, they were first shrunk to 200/800 with a
+   small additive floor (0.1s) carried over from the wall-clock metric this
+   comment originally described, to stay non-flaky when both measurements
+   were too fast for the ratio itself to be individually meaningful. At
+   200/800, that floor actively dominated: even the reconstructed quadratic
+   decoder's own absolute wall-clock cost at that depth was small enough to
+   be swamped by 0.1s, so the resulting bound passed regardless of whether
+   the underlying algorithm was linear or quadratic - the tests no longer
+   discriminated the property they exist to catch a regression of. (A prior
+   version of this comment claimed the 200/800 span was "still a 4x span, so
+   the linear-vs-quadratic discrimination reasoning above is unchanged" -
+   that was false: the discrimination depends on the measured *ratio* being
+   resolvable above noise, not merely on the ratio of depths, and an
+   additive floor makes small measured costs indistinguishable from each
+   other regardless of the depth ratio behind them.)
+
+   Fixed by measuring actual heap ALLOCATION ([Gc.allocated_bytes], a
+   monotonically increasing, cumulative byte counter - unaffected by CPU
+   speed, GC pause timing, or this box's own CPU-quota throttling, see
+   /work/CLAUDE.md's "cpu.max" note) instead of wall-clock time, and
+   dropping the additive floor entirely: allocation is deterministic for a
+   pure, single-threaded allocation workload like this one (no
+   timer-resolution noise to compensate for), so a bare ratio bound
+   discriminates cleanly even at these smaller depths, with no floor needed.
+   Depths raised back to 250/1000 (1000 being the maximum this cap allows,
+   for real margin) - still a 4x span, but now on a noise-free metric.
+
+   Verified directly against the same reconstructed pre-Task-5 quadratic
+   decoder/encoder as the original finding above (git commit 9cefe0b^'s
+   lib/value.ml swapped in temporarily, benchmarked, then reverted - see
+   this task's fix-round report for the full reproduction): at this exact
+   d=250/4d=1000 span, the quadratic reconstruction's allocation ratio
+   measures ~17.8x (encode) / ~19.0x (decode) and FAILS an 8x bound; the
+   current linear implementation measures ~4.3x (encode) / ~4.0x (decode)
+   and PASSES with a wide margin - the same discriminating gap the old
+   wall-clock version relied on (linear ~4x nominal, quadratic ~16x
+   nominal), just measured on a noise-free axis instead of a noisy one. *)
+let allocated_bytes_during f =
+  let before = Gc.allocated_bytes () in
+  let r = f () in
+  ignore (Sys.opaque_identity r);
+  Gc.allocated_bytes () -. before
+
+let allocation_scaling_bound ~a_d ~factor = a_d *. factor
+
 let test_deeply_nested_map_keys_encode_in_linear_time () =
-  (* Correctness pin, independent of timing: cross-check against the
+  (* Correctness pin, independent of allocation: cross-check against the
      independently hand-built wire bytes for the exact same structure, byte
      for byte, at depth 1000 - the maximum nesting depth Task 8's cap now
-     allows (see the update note above). Timing alone can't catch an
-     off-by-one in the backpatched Map-key length prefix (see
-     [Wbuf.reserve]/[Wbuf.patch_u64_be] in [lib/value.ml]) - a mismatch
-     there would silently produce a corrupt frame with a wrong length
-     prefix, only surfacing as a decode failure elsewhere. *)
+     allows (see the update note above). Neither timing nor allocation
+     alone can catch an off-by-one in the backpatched Map-key length prefix
+     (see [Wbuf.reserve]/[Wbuf.patch_u64_be] in [lib/value.ml]) - a
+     mismatch there would silently produce a corrupt frame with a wrong
+     length prefix, only surfacing as a decode failure elsewhere. *)
   let v_at_cap = build_nested_map_key_value ~depth:1000 in
   Alcotest.(check string) "encodes to the same bytes as the hand-built wire format"
     (build_nested_map_key_wire_bytes ~depth:1000) (Value.canonical_encode v_at_cap);
-  let time_at depth =
+  let alloc_at depth =
     let v = build_nested_map_key_value ~depth in
-    let start = Unix.gettimeofday () in
-    ignore (Value.canonical_encode v);
-    Unix.gettimeofday () -. start
+    allocated_bytes_during (fun () -> Value.canonical_encode v)
   in
-  let d = 200 in
-  let t_d = time_at d in
-  let t_4d = time_at (4 * d) in
-  let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
+  let d = 250 in
+  let a_d = alloc_at d in
+  let a_4d = alloc_at (4 * d) in
+  let bound = allocation_scaling_bound ~a_d ~factor:8.0 in
   Alcotest.(check bool)
     (Printf.sprintf
-       "encode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
-       d t_d (4 * d) t_4d bound)
-    true (t_4d <= bound)
+       "encode allocation scales ~linearly with depth, not quadratically (alloc(%d)=%.0f bytes, \
+        alloc(%d)=%.0f bytes, bound=%.0f bytes)"
+       d a_d (4 * d) a_4d bound)
+    true (a_4d <= bound)
 
 let test_deeply_nested_map_keys_decode_in_linear_time () =
-  let time_at depth =
+  let alloc_at depth =
     let wire = build_nested_map_key_wire_bytes ~depth in
-    let start = Unix.gettimeofday () in
-    ignore (Value.canonical_decode wire);
-    Unix.gettimeofday () -. start
+    allocated_bytes_during (fun () -> Value.canonical_decode wire)
   in
-  let d = 200 in
-  let t_d = time_at d in
-  let t_4d = time_at (4 * d) in
-  let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
+  let d = 250 in
+  let a_d = alloc_at d in
+  let a_4d = alloc_at (4 * d) in
+  let bound = allocation_scaling_bound ~a_d ~factor:8.0 in
   Alcotest.(check bool)
     (Printf.sprintf
-       "decode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
-       d t_d (4 * d) t_4d bound)
-    true (t_4d <= bound)
+       "decode allocation scales ~linearly with depth, not quadratically (alloc(%d)=%.0f bytes, \
+        alloc(%d)=%.0f bytes, bound=%.0f bytes)"
+       d a_d (4 * d) a_4d bound)
+    true (a_4d <= bound)
 
 (* Finding C1/C2 (task-5 fix round): [encode_into]'s Map case is only
    copy-free for the single-entry ("nothing to sort") fast path - a Map
@@ -502,10 +529,12 @@ let build_two_entry_per_level_deep_map_value ~depth =
 
 (* Unlike the two scaling tests above, this one is deliberately NOT a
    scaling assertion: its whole point is that this specific shape is
-   *still* quadratic on purpose (deferred to Task 8), so there is no
-   "linear" hypothesis to discriminate against here - it's pinning "still
-   fast enough to be a viable Task-8 baseline" at one fixed, bounded depth,
-   which is exactly what an absolute wall-clock threshold is for. Widened
+   *still* quadratic in the abstract, with Task 8's depth cap as the accepted,
+   now-landed mitigation that keeps its concrete cost bounded (see the update
+   note above) rather than a Big-O fix - so there is no "linear" hypothesis to
+   discriminate against here. It's pinning "still fast enough to stay bounded
+   at Task 8's now-enforced depth cap" at one fixed, bounded depth, which is
+   exactly what an absolute wall-clock threshold is for. Widened
    from an earlier 0.5s bound (flagged as fragile: only ~26x headroom over
    the ~19ms locally-measured cost, not much margin on this box's
    CPU-quota-throttled environment - see /work/CLAUDE.md's "cpu.max" note)
@@ -526,10 +555,11 @@ let test_two_entries_per_level_deep_map_encode_hash_residual_bounded () =
 (* ---- Task 8: bounded decode depth and an output-node budget ----
 
    docs/superpowers/plans/2026-09-29-audit-remediation.md Task 8. Two independent bounds,
-   tested separately below: a nesting-depth cap (stack-exhaustion DoS) and a decoded-node
-   count budget scaled to the input's own byte length (memory-amplification DoS - see
-   lib/value.ml's own doc comment on [max_decoded_nodes] for the full reasoning and the
-   measurements behind the formula). *)
+   tested separately below: a nesting-depth cap (stack-exhaustion DoS) and a total-node-count
+   budget, a FIXED ABSOLUTE ceiling derived from lib/transport/tcp.ml's own [max_message_size]
+   rather than scaled to any particular input's own byte length (memory-amplification DoS -
+   see lib/value.ml's own doc comment on [max_node_count] for the full reasoning, the
+   Finding-1 correction from the original scaled formula, and the measurements behind it). *)
 
 (* Hand-constructs the wire bytes for a value nested [depth] levels deep via [Sum] - tag_sum
    ++ len_prefixed(tag) ++ inner value, bottoming out at a plain Scalar Int. A different
@@ -561,14 +591,40 @@ let test_decode_rejects_excessive_nesting_depth () =
     (Invalid_argument "canonical_decode: nesting depth exceeds the limit of 1000 levels")
     (fun () -> ignore (Value.canonical_decode wire))
 
-(* Mirrors [lib/value.ml]'s own [max_decoded_nodes] formula exactly (that function is
-   internal, not exposed via value.mli, so it can't be called directly from here) -
-   duplicated rather than re-derived so this test's expected-budget computation and the
-   implementation's real one can never silently drift apart without a comment update on
-   both sides. *)
+(* Finding 4 (audit-remediation review fix round on Task 8): the decode-side depth cap has
+   the test just above, but nothing separately pinned that [canonical_encode] itself raises
+   for an in-memory [value] nested past 1000 levels (as opposed to one built AT exactly the
+   boundary, which [test_deeply_nested_map_keys_encode_in_linear_time] already touches via
+   its depth-1000 correctness cross-check). Builds the in-memory equivalent of
+   [build_nested_sum_wire_bytes]'s shape - a chain of 2000 nested [Sum]s, bottoming out at a
+   plain [Scalar (Int 0L)] - via a cheap O(depth) tail-recursive loop (no deep
+   *construction*-time recursion, matching [build_nested_map_key_value]'s own approach
+   above), and asserts [canonical_encode] raises the identical error [canonical_decode]
+   already does for the equivalent wire bytes - pinning that the two are symmetric for this
+   shape, not just at the boundary. *)
+let build_nested_sum_value ~depth =
+  let rec loop i acc = if i = 0 then acc else loop (i - 1) (Value.Sum ("x", acc)) in
+  loop depth (Value.Scalar (Value.Int 0L))
+
+let test_encode_rejects_excessive_nesting_depth () =
+  let v = build_nested_sum_value ~depth:2000 in
+  Alcotest.check_raises
+    "encode-side depth cap is enforced independently of decode's: an in-memory value nested past \
+     1000 levels must be rejected by canonical_encode itself, not only by canonical_decode on the \
+     equivalent wire bytes"
+    (Invalid_argument "canonical_encode: nesting depth exceeds the limit of 1000 levels")
+    (fun () -> ignore (Value.canonical_encode v))
+
+(* Mirrors [lib/value.ml]'s own [max_node_count] formula exactly (that constant is internal,
+   not exposed via value.mli, so it can't be referenced directly from here) - duplicated
+   rather than re-derived so this test's expected-budget computation and the implementation's
+   real one can never silently drift apart without a comment update on both sides. Also
+   mirrors [lib/transport/tcp.ml]'s own [max_message_size] (64 MiB) for the same reason - see
+   [lib/value.ml]'s own doc comment on [max_node_count] for why [lib/value.ml] can't just
+   reference [Tcp.max_message_size] directly instead of duplicating it. *)
+let mirrored_transport_max_message_size = 64 * 1024 * 1024
 let bytes_per_node_budget = 64
-let min_decoded_nodes_floor = 10_000
-let expected_node_budget ~input_len = max min_decoded_nodes_floor (input_len / bytes_per_node_budget)
+let expected_max_node_count = mirrored_transport_max_message_size / bytes_per_node_budget
 
 (* Mirrors the audit's own worst-case reproduction directly, at full scale: a 64
    MiB frame (matching [lib/transport/tcp.ml]'s own [max_message_size], the largest frame
@@ -579,7 +635,13 @@ let expected_node_budget ~input_len = max min_decoded_nodes_floor (input_len / b
    full scale rather than scaled down like the depth tests above because, unlike those, this
    construction is genuinely cheap (a single [Bytes.make] linear fill, no quadratic anything)
    and [canonical_decode]'s own node-count budget check fires within the first ~2 MiB of
-   this ~64 MiB input, so the test stays fast despite the large buffer.
+   this ~64 MiB input, so the test stays fast despite the large buffer. This also directly
+   exercises Finding 1's fix: this exact input has a declared byte length (~64 MiB) far above
+   the old formula's would-be scaled budget, so under the OLD (buggy) per-input-scaled
+   formula this test's own assertion would already have needed a much larger expected budget
+   than the new fixed [expected_max_node_count] - the fixed ceiling here is what makes a
+   64 MiB frame's own budget independent of the frame's exact declared length, which is
+   exactly the property Finding 1 restores.
 
    [Bytes.make total_len '\x00'] does double duty: '\x00' is both a harmless zero-fill byte
    AND [tag_scalar_bool], and a second '\x00' after it is a valid Bool-false payload byte -
@@ -599,11 +661,85 @@ let test_decode_rejects_a_node_count_over_budget () =
     Bytes.set buf (1 + i) (Char.chr ((element_count lsr (8 * (7 - i))) land 0xff))
   done;
   let oversized_wire = Bytes.unsafe_to_string buf in
-  let node_budget = expected_node_budget ~input_len:total_len in
+  (* The check fires the instant [node_count] first exceeds the budget - i.e. on the node that
+     pushes the running count from [expected_max_node_count] to [expected_max_node_count + 1] -
+     so that is the exact count [decode_value] reports, deterministically, regardless of how
+     many total elements this wire buffer declares beyond that point. *)
+  let expected_node_count_at_failure = expected_max_node_count + 1 in
   Alcotest.check_raises "node budget is enforced before allocating all of a 64 MiB frame's declared elements"
     (Invalid_argument
-       (Printf.sprintf "canonical_decode: decoded node count exceeds budget of %d nodes for this input" node_budget))
+       (Printf.sprintf "canonical_decode: decoded node count %d exceeds budget of %d nodes for this %d-byte input"
+          expected_node_count_at_failure expected_max_node_count total_len))
     (fun () -> ignore (Value.canonical_decode oversized_wire))
+
+(* Finding 2 (audit-remediation review fix round on Task 8): the node-count budget above was
+   decode-only until this fix round - an in-memory [value] built directly (never round-tripped
+   through [canonical_decode]) could exceed the budget with [canonical_encode] happily
+   succeeding anyway, which both falsified the round-trip invariant [value.mli] documents (see
+   its own doc comment) and opened a silent data-loss path through
+   [Riptide_crypto.Redaction_store] (see [lib/value.ml]'s own doc comment on [max_node_count]
+   for the concrete mechanism). This pins that [canonical_encode] now enforces the identical
+   budget independently, the same way [test_encode_rejects_excessive_nesting_depth] above pins
+   the depth cap's own encode-side symmetry. A flat [Sequence] of cheap [Bool] elements, built
+   directly via [List.init] rather than [Bytes.make] (there is no equivalent raw-bytes trick
+   for constructing an in-memory OCaml list cheaply, but [List.init] on ~1M elements is itself
+   fast - well under a second - so no such trick is needed here). *)
+let test_encode_rejects_a_node_count_over_budget () =
+  let elements = List.init (expected_max_node_count + 1) (fun _ -> Value.Scalar (Value.Bool true)) in
+  let v = Value.Sequence elements in
+  (* Same reasoning as the decode-side test above: the check fires the instant [node_count]
+     first exceeds the budget, deterministically, regardless of how many elements beyond that
+     point [elements] actually has. *)
+  let expected_node_count_at_failure = expected_max_node_count + 1 in
+  Alcotest.check_raises
+    "encode-side node-count budget is enforced independently of decode's: an in-memory value \
+     exceeding the same budget must be rejected by canonical_encode itself, not only by \
+     canonical_decode on the equivalent wire bytes"
+    (Invalid_argument
+       (Printf.sprintf "canonical_encode: node count %d exceeds budget of %d nodes" expected_node_count_at_failure
+          expected_max_node_count))
+    (fun () -> ignore (Value.canonical_encode v))
+
+(* Finding 1 (audit-remediation review fix round on Task 8): the OLD per-input-scaled formula
+   ([max 10_000 (input_len / 64)]) collapsed to a flat 10,000-node ceiling for any legitimate,
+   byte-compact payload this codebase actually produces (see [lib/value.ml]'s own doc comment
+   on [max_node_count] for the full argument) - so it rejected exactly the kind of real traffic
+   Task 8 must never break: e.g. a [Start_view]-shaped [Sequence] of ordinary log-entry
+   [Record]s, once a replicated log grows past roughly 1,000 entries.
+
+   This pins the fix directly: builds a value shaped like a real VSR log-carrying message (a
+   [Sequence] of 2,000 [Record] "log entries", each with 5 ordinary scalar fields - comparable
+   node density to a genuine batch_commit write, deliberately NOT the pathological all-[Bool]
+   shape [test_decode_rejects_a_node_count_over_budget] above uses) whose total node count
+   (12,001 = 1 top-level [Sequence] + 2,000 x (1 [Record] + 5 field-value [Scalar]s)) is
+   comfortably past the OLD formula's 10,000-node floor, while its wire length stays well
+   under 1 MiB - so the OLD formula's scaled term never approached the floor either. This exact
+   value would have been wrongly REJECTED by decode under the pre-fix formula, and must decode
+   successfully under the fixed, absolute [max_node_count] ceiling (1,048,576). *)
+let build_log_entry ~i =
+  Value.Record
+    [ ("op_number", Value.Scalar (Value.Int (Int64.of_int i)));
+      ("client_id", Value.Scalar (Value.String (Printf.sprintf "client-%d" i)));
+      ("request_number", Value.Scalar (Value.Int (Int64.of_int (i * 7))));
+      ("commit_number", Value.Scalar (Value.Int (Int64.of_int (i - 1))));
+      ("payload", Value.Scalar (Value.Bytes (String.make 16 '\x00')))
+    ]
+
+let test_decode_accepts_a_realistic_node_dense_legitimate_frame () =
+  let entry_count = 2000 in
+  let v = Value.Sequence (List.init entry_count (fun i -> build_log_entry ~i)) in
+  let encoded = Value.canonical_encode v in
+  (* Sanity check on the claim above: comfortably node-dense (well past the old 10,000-node
+     floor - 12,001 nodes) but still a small, ordinary wire size, nowhere near the 64 MiB
+     transport limit. *)
+  Alcotest.(check bool) "wire size stays small despite a node count that used to be rejected"
+    true (String.length encoded < 1024 * 1024);
+  match Value.canonical_decode encoded with
+  | decoded ->
+    Alcotest.(check string) "a realistic, node-dense legitimate frame decodes and re-encodes to the same bytes"
+      encoded (Value.canonical_encode decoded)
+  | exception Invalid_argument msg ->
+    Alcotest.failf "a realistic, node-dense legitimate frame must decode successfully, but raised: %s" msg
 
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
@@ -796,7 +932,12 @@ let tests =
       `Quick,
       test_two_entries_per_level_deep_map_encode_hash_residual_bounded );
     ("decode rejects excessive nesting depth", `Quick, test_decode_rejects_excessive_nesting_depth);
+    ("encode rejects excessive nesting depth", `Quick, test_encode_rejects_excessive_nesting_depth);
     ("decode rejects a node count over budget", `Quick, test_decode_rejects_a_node_count_over_budget);
+    ("encode rejects a node count over budget", `Quick, test_encode_rejects_a_node_count_over_budget);
+    ( "decode accepts a realistic node-dense legitimate frame",
+      `Quick,
+      test_decode_accepts_a_realistic_node_dense_legitimate_frame );
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;
