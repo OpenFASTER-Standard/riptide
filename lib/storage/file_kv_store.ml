@@ -36,6 +36,34 @@
    data" two-region shape [File_storage] uses for its ring slots and superblock records,
    transcribed here for a single record per file instead of many records sharing one file.
 
+   {b Sharded by hash prefix (Task 18), not flat.} [path_for] no longer places every key's file
+   directly in [dir_path]: each lives at [dir_path/xx/yy/<hash>], where [xx]/[yy] are the first 4
+   hex characters of the key's own [hash_to_hex (content_hash key)] (2 characters each) -- the
+   same [<hash>] that used to be the flat filename, now also the two directory levels above it.
+   This matches the convention content-addressed stores commonly use for exactly this reason (e.g.
+   Git's own [.git/objects/xx/yyyy...]): audit finding Storage-Important-5 found that a single
+   flat directory's own lookup cost degrades once its entry count climbs past the tens of
+   thousands on some filesystems, even though POSIX directory semantics don't require that.
+   Splitting into up to 65536 (256 x 256) second-level shard directories bounds any ONE
+   directory's entry count to roughly 1/65536th of the total key count, independent of how large
+   this store ever grows. {b This does not fix the other two costs Storage-Important-5 also
+   found} -- the fixed [header_slot_size + data_slot_size] = 8192-byte file per key (a real ~123x
+   space amplification for a small value) and one filesystem inode consumed per key with no
+   reclamation short of [delete] -- both inherent to this module's fixed-size-slot-per-file
+   layout, not the flat-vs-sharded directory structure sharding changes; see [file_kv_store.mli]'s
+   own note for the disclosed cost this leaves on the table by design (a materially larger,
+   variable-size-value-format change, out of proportion to this task's scope).
+
+   {b Ruling B (audit-remediation controller, pre-flight, binding on Task 18):} a key's own
+   temporary file (staged by [durable_write] before its atomic [rename] -- see "[put]'s overwrite
+   is crash-atomic" below) must live in that SAME sharded subdirectory as the key's own final
+   path, not at a stale flat-directory location -- it always has, structurally, since the temp
+   path is built as [path_for t ~key ^ tmp_suffix_for_call ()], i.e. [path_for]'s own sharded
+   result plus a suffix, never a separately-computed flat path. The consequence Ruling B calls out
+   is [sweep_stale_temp_files] (Task 16): it used to scan only [dir_path]'s own top level for
+   crash-debris temp files, which would now silently stop finding any of them once every per-key
+   temp file moves two levels deeper -- see that function's own comment below for the fix.
+
    {b Read vs. write opens deliberately use different flags}, matching the brief's own
    [open_flags_write]/[open_flags_read] split: [put] opens with [O_DIRECT+O_DSYNC+O_CREAT]
    (falling back to [O_DSYNC+O_CREAT] alone on [EINVAL], exactly [file_storage.ml]'s dance) --
@@ -254,10 +282,34 @@ let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
       in
       go ())
 
+(* Task 18: [dir_path/xx/yy/<hash>] -- see this file's top comment ("Sharded by hash prefix") for
+   the full rationale. [xx] is [hash]'s first 2 hex characters, [yy] its next 2 (characters 2-3);
+   both are always present since [hash_to_hex] always produces a fixed-length (64-character)
+   lowercase hex string, never anything shorter. *)
 let path_for t ~key =
+  let hash =
+    Riptide.Value.hash_to_hex
+      (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key)))
+  in
   Filename.concat t.dir_path
-    (Riptide.Value.hash_to_hex
-       (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key))))
+    (Filename.concat (String.sub hash 0 2) (Filename.concat (String.sub hash 2 2) hash))
+
+(* [path_for]'s own two shard-directory levels for [path] (i.e. [dir_path/xx] and [dir_path/xx/yy])
+   may not exist yet the first time a key under that shard is ever [put] -- this must run before
+   [durable_write] below tries to create [path]'s own temp file inside them (Ruling B: the temp
+   file lives in the same sharded subdirectory as the final path, so both need these directories to
+   already exist). Same try-[mkdir]-then-ignore-[Eio.Io] pattern [create]'s own [mkdir] uses
+   (this file's top comment explains why: no [mkdir -p] primitive exists in the installed Eio
+   0.12), applied twice, once per level -- outermost first, since the inner [mkdir] would itself
+   fail with ENOENT if attempted before the directory it lives in exists.
+   [Eio.Path.mkdir]'s own idempotency (an already-existing directory is just another [Eio.Io] this
+   catches, same as any other) is what makes it cheap to call unconditionally on every [put],
+   rather than only the first one for a given shard. *)
+let ensure_shard_dirs_exist ~fs path =
+  let shard2_dir = Filename.dirname path in
+  let shard1_dir = Filename.dirname shard2_dir in
+  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard1_dir) with Eio.Io _ -> ());
+  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard2_dir) with Eio.Io _ -> ())
 
 (* Atomic counter to make each [durable_write] call's temp-file suffix unique. Closed audit
    finding (Task 16): concurrent fibers [put]ting the *same* key with a fixed temp-file suffix
@@ -369,6 +421,10 @@ let durable_write t path data =
     invalid_arg
       (Printf.sprintf "put: value of %d bytes exceeds this store's max value size of %d bytes"
          (String.length data) max_value_size);
+  (* Task 18: [path]'s own two shard-directory levels (see [path_for]) may not exist yet -- ensure
+     both before staging the temp file below, since (Ruling B) that temp file lives inside the
+     same sharded subdirectory as [path] itself, not at some separately-computed flat location. *)
+  ensure_shard_dirs_exist ~fs:t.fs path;
   let tmp_path = path ^ tmp_suffix_for_call () in
   let h = open_file_handle_write ~sw:t.sw tmp_path in
   Fun.protect
@@ -512,30 +568,73 @@ let check_or_write_owner_marker ~fs ~dir_path tag =
    introduced (Task 16 Important 2): before the fix, a crash left at most one [.put.tmp]
    file per key, self-bounded by reuse (same deterministic name on next put). After the
    fix, each crash leaves a file with a name that will never be generated again (pid+counter
-   pair is global), so nothing would ever clean it up without an explicit sweep. *)
+   pair is global), so nothing would ever clean it up without an explicit sweep.
+
+   {b Task 18 (Ruling B): walks two levels of shard subdirectories, not just the top level.}
+   [path_for]'s sharding moved every per-key file -- and therefore every per-key temp file too,
+   since the temp path is [path_for]'s own result plus a suffix (see this file's top comment) --
+   from [dir_path] itself into [dir_path/xx/yy]. A sweep that only scanned [dir_path]'s own top
+   level would silently stop finding any of them, quietly reopening the exact crash-debris
+   accumulation this task exists to prevent. The top level now holds only the owner marker, the
+   lock file, and the shard-1 directories themselves (never a per-key file or temp file directly),
+   so this still needs to descend two levels down to find real leaves.
+
+   {b Distinguishing a shard directory from a leaf file without [Eio.Path.kind]/[stat]:} the
+   installed Eio 0.12 has neither (this file's top comment already documents this gap and its
+   general fix, "try the operation, catch [Eio.Io]", for every other existence check in this
+   module) -- so here too, rather than trying to recognize shard-directory names as a special
+   case, every entry at every level is discriminated by attempting [Eio.Path.read_dir] on it:
+   success means it really is a directory (POSIX's own [opendir] on a non-directory reliably
+   raises ENOTDIR, so this is a sound discriminator, not a heuristic), in which case it is
+   recursed into one more level; [Eio.Io] means it is a leaf, to be checked against
+   [is_stale_temp_file] and unlinked if it matches, exactly as the flat top-level scan always did.
+   This also means a stray leaf-level temp file directly at the top level (impossible for
+   [durable_write] to produce under the current, always-sharded [path_for], but a cheap safety net
+   against exactly this file's own kind of change) is still found and swept, not silently
+   skipped because it happens to sit above where the walk expects a leaf. *)
 let sweep_stale_temp_files ~fs ~dir_path =
-  try
-    let entries = Eio.Path.read_dir Eio.Path.(fs / dir_path) in
-    List.iter (fun basename ->
-        (* Match stale temp files: the pattern used by [durable_write] is [key_path].put.[pid].[counter].tmp.
-           Distinguish from real key files (exactly 64 lowercase hex, no ".put."), the owner marker
-           (starts with ".riptide-kv-"), and the lock file (".riptide-lock"). *)
-        let contains_substring haystack needle =
-          let nl = String.length needle and hl = String.length haystack in
-          let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
-          nl = 0 || go 0
-        in
-        let is_stale_temp_file =
-          (* Must contain ".put." and end with ".tmp" -- these patterns uniquely identify temp files.
-             Owner marker and lock file start with "." but don't contain ".put.", so checking for
-             ".put." + ".tmp" suffix is sufficient to distinguish temp files from private files. *)
-          contains_substring basename ".put." &&
-          String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp"
-        in
-        if is_stale_temp_file then
-          try Eio.Path.unlink Eio.Path.(fs / dir_path / basename)
-          with Eio.Io _ -> ()) (* Ignore errors: file already gone, or already handled by concurrent create *)
-      entries
+  (* Match stale temp files: the pattern used by [durable_write] is [key_path].put.[pid].[counter].tmp.
+     Distinguish from real key files (exactly 64 lowercase hex, no ".put."), the owner marker
+     (starts with ".riptide-kv-"), the lock file (".riptide-lock"), and shard directories (exactly
+     2 lowercase hex characters, no ".put." either). *)
+  let contains_substring haystack needle =
+    let nl = String.length needle and hl = String.length haystack in
+    let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+    nl = 0 || go 0
+  in
+  let is_stale_temp_file basename =
+    (* Must contain ".put." and end with ".tmp" -- these patterns uniquely identify temp files. *)
+    contains_substring basename ".put." &&
+    String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp"
+  in
+  let unlink_leaf_if_stale path_str basename =
+    if is_stale_temp_file basename then
+      try Eio.Path.unlink Eio.Path.(fs / path_str)
+      with Eio.Io _ -> () (* Ignore errors: file already gone, or already handled by concurrent create *)
+  in
+  (* Applies [unlink_leaf_if_stale] to every entry of [dir_str], which the caller has already
+     confirmed (by successfully [read_dir]-ing it) really is a directory of leaf files -- used
+     both for the deepest (shard-2) level and, defensively, for anything found one level too
+     shallow (see the top comment above). *)
+  let sweep_leaf_dir dir_str entries =
+    List.iter (fun basename -> unlink_leaf_if_stale (Filename.concat dir_str basename) basename) entries
+  in
+  (* One entry at [dir_path]'s own top level: either a shard-1 directory (descend one more level)
+     or a leaf (top-level owner marker/lock file, or -- defensively -- a stray temp file). *)
+  let visit_top_level_entry top_basename =
+    let top_path_str = Filename.concat dir_path top_basename in
+    match Eio.Path.read_dir Eio.Path.(fs / top_path_str) with
+    | shard1_entries ->
+      List.iter
+        (fun shard1_basename ->
+          let shard1_path_str = Filename.concat top_path_str shard1_basename in
+          match Eio.Path.read_dir Eio.Path.(fs / shard1_path_str) with
+          | shard2_entries -> sweep_leaf_dir shard1_path_str shard2_entries
+          | exception Eio.Io _ -> unlink_leaf_if_stale shard1_path_str shard1_basename)
+        shard1_entries
+    | exception Eio.Io _ -> unlink_leaf_if_stale top_path_str top_basename
+  in
+  try List.iter visit_top_level_entry (Eio.Path.read_dir Eio.Path.(fs / dir_path))
   with Eio.Io _ -> () (* Directory doesn't exist yet or can't be read; that's fine *)
 
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's

@@ -1,13 +1,30 @@
-(** A [Kv_store_intf.S] backend: one file per key, in a flat directory, named by the
-    hex-encoded SHA-256 content-hash of the key. Reuses {!Riptide_storage.File_storage}'s own
-    already-proven [O_DIRECT]+[O_DSYNC] durable I/O technique (transcribed, not imported --
-    that module's own [.mli] exposes only [Storage_intf.S] plus its own [create], nothing of
-    its low-level helpers). See {!Riptide_storage.File_kv_store}'s [.ml] top comment for: the
-    per-key on-disk record layout (header: length + checksum, then data); why reads
-    deliberately use different, non-[O_DIRECT], non-creating open flags than writes; and why
-    [delete] is a real [Eio.Path.unlink] rather than a header zero-out (unlike
+(** A [Kv_store_intf.S] backend: one file per key, named by the hex-encoded SHA-256 content-hash
+    of the key, sharded two directory levels deep by that same hash's own first 4 hex characters
+    (Task 18 -- [dir_path/xx/yy/<hash>], not a flat [dir_path/<hash>]; see below for why). Reuses
+    {!Riptide_storage.File_storage}'s own already-proven [O_DIRECT]+[O_DSYNC] durable I/O
+    technique (transcribed, not imported -- that module's own [.mli] exposes only
+    [Storage_intf.S] plus its own [create], nothing of its low-level helpers). See
+    {!Riptide_storage.File_kv_store}'s [.ml] top comment for: the per-key on-disk record layout
+    (header: length + checksum, then data); the sharding scheme itself; why reads deliberately
+    use different, non-[O_DIRECT], non-creating open flags than writes; and why [delete] is a
+    real [Eio.Path.unlink] rather than a header zero-out (unlike
     {!Riptide_storage.File_storage.wal_truncate_after}, which cannot unlink because its ring
     file holds many other still-live entries).
+
+    {b Supported key-count range, disclosed rather than fixed} (audit finding Storage-Important-5,
+    the two-thirds Task 18's sharding does {b not} close -- sharding only bounds any one
+    directory's own entry count, not total cost): every value, regardless of its own real size,
+    still occupies one full [header_slot_size (4096B) + data_slot_size (4096B) = 8192]-byte file
+    plus exactly one filesystem inode, neither reclaimable short of a real {!Kv_store_intf.S.delete}
+    of that key. For a value near the small end of what a caller might store, that per-key floor is
+    a real {b ~123x space amplification} over the value's own bytes. Both costs scale linearly with
+    total key count, sharded or not: an operator provisioning this backend should budget against
+    the target filesystem's own inode limit ([df -i], not just [df]) and the 8192-byte-per-key
+    floor, not against the actual value sizes being stored. No specific maximum key count is
+    asserted here -- both costs were found during an audit, not designed in as an explicit limit --
+    this note exists so they are visible up front rather than surfacing later as an unexplained
+    "no space left on device" (or exhausted inode count) with plenty of apparent free space still
+    showing under [df] alone.
 
     {b Two properties of [delete] worth stating here, since {!Kv_store_intf.S}'s own contract
     cannot state them for every backend.} First, the removal is durable against a crash, not

@@ -136,7 +136,16 @@ let key_hash_hex key =
   Riptide.Value.hash_to_hex
     (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key)))
 
-let real_path_for dir key = Filename.concat dir (key_hash_hex key)
+(* Task 18: [path_for] shards every key's file two directory levels deep
+   ([dir/xx/yy/<hash>], [xx]/[yy] being [hash]'s first 4 hex characters) instead of placing it
+   flat in [dir]. [path_for] itself is private (not exposed by [file_kv_store.mli]), so this
+   recomputes the expected location from the same public [Riptide.Value.hash_to_hex
+   (Riptide.Value.content_hash ...)] primitive [path_for] itself uses, rather than reaching into
+   the module's internals. *)
+let real_path_for dir key =
+  let hash = key_hash_hex key in
+  Filename.concat dir
+    (Filename.concat (String.sub hash 0 2) (Filename.concat (String.sub hash 2 2) hash))
 
 let contains ~needle haystack =
   let nl = String.length needle and hl = String.length haystack in
@@ -150,12 +159,23 @@ let is_temp_file_for path =
   String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp" &&
   contains ~needle:".put." basename
 
-(* Find any temp files in [dir] that match the dynamic suffix pattern. *)
+(* Find any temp files anywhere under [dir], however deeply nested -- Task 18 moved per-key temp
+   files two shard levels down, so this walks real subdirectories recursively (using plain
+   [Sys.is_directory], not [file_kv_store.ml]'s own Eio-based, kind-less-Eio-0.12 discrimination
+   trick, since this is test code operating through the OS directly rather than through Eio) instead
+   of assuming a flat top level the way this helper used to. *)
 let find_temp_files_in_dir dir =
-  try
-    Array.to_list (Sys.readdir dir)
-    |> List.filter (fun basename -> is_temp_file_for (Filename.concat dir basename))
-  with Sys_error _ -> []
+  let rec walk dir =
+    try
+      Array.to_list (Sys.readdir dir)
+      |> List.concat_map (fun basename ->
+             let path = Filename.concat dir basename in
+             if Sys.is_directory path then walk path
+             else if is_temp_file_for path then [ path ]
+             else [])
+    with Sys_error _ -> []
+  in
+  walk dir
 
 let test_put_overwrite_leaves_no_leftover_tmp_file () =
   (* Review Focus: a successful overwrite's staged temp file must be gone (renamed away, not
@@ -764,6 +784,90 @@ let test_storage_operations_do_not_depend_on_tmpdir () =
              without a usable TMPDIR"
             (Some "v") (File_kv_store.get t ~key:"k")))
 
+(* -- Task 18: shard the flat one-file-per-key directory by hash prefix. [path_for] is private
+   (not exposed by [file_kv_store.mli]), so these tests -- like [real_path_for]/[key_hash_hex]
+   above, which already compute this same sharded location -- check real files on disk through
+   [put]/[get]/[delete], never a private hook into the module. *)
+let test_path_for_shards_across_subdirectories () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      File_kv_store.put t ~key:"a" "va";
+      File_kv_store.put t ~key:"totally-different-key" "vb";
+      let p1 = real_path_for dir "a" and p2 = real_path_for dir "totally-different-key" in
+      (* Sanity, not a coincidence of these two literal keys: confirm their hashes actually land
+         in different shard subdirectories before treating that as evidence of anything. *)
+      Alcotest.(check bool) "the two test keys' hash prefixes actually differ" true
+        (Filename.dirname p1 <> Filename.dirname p2);
+      Alcotest.(check bool)
+        "key \"a\"'s file lives inside its own two-level hash-prefix shard subdirectory, not \
+         flat in dir_path"
+        true (Sys.file_exists p1);
+      Alcotest.(check bool)
+        "key \"totally-different-key\"'s file lives inside its own (different) two-level shard \
+         subdirectory"
+        true (Sys.file_exists p2);
+      Alcotest.(check bool) "the old flat top-level path is NOT where the file lives anymore"
+        false (Sys.file_exists (Filename.concat dir (key_hash_hex "a"))))
+
+let test_put_get_delete_round_trip_through_sharded_path () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      let sharded_path = real_path_for dir "round-trip-key" in
+      File_kv_store.put t ~key:"round-trip-key" "round-trip-value";
+      Alcotest.(check bool)
+        "put actually wrote the key's file into its two-level shard subdirectory" true
+        (Sys.file_exists sharded_path);
+      Alcotest.(check (option string)) "get returns what was put, through the sharded path"
+        (Some "round-trip-value") (File_kv_store.get t ~key:"round-trip-key");
+      File_kv_store.delete t ~key:"round-trip-key";
+      Alcotest.(check (option string)) "get after delete is None, through the sharded path" None
+        (File_kv_store.get t ~key:"round-trip-key");
+      Alcotest.(check bool) "delete actually removed the sharded file from disk, not just a copy"
+        false (Sys.file_exists sharded_path))
+
+(* Ruling B (audit-remediation controller, pre-flight): sharding [path_for] must move the per-key
+   TEMP file into the same sharded subdirectory as the final key path, and [sweep_stale_temp_files]
+   (Task 16) must be fixed to still find stale [.put.<pid>.<counter>.tmp] debris once it can no
+   longer sit flat at the top level. This is the regression test for that consequence: it plants
+   stale debris directly inside a real two-level shard subdirectory (independent of [path_for]'s
+   own current behavior -- built by hand via plain [Unix], the same way
+   [test_interrupted_overwrite_leaves_old_value_intact] above plants its own flat stale temp file)
+   and confirms a fresh [create]'s sweep still finds and removes it, and that an unrelated real key
+   elsewhere in the store survives the sweep untouched. *)
+let test_sweep_still_finds_stale_temp_files_inside_shard_subdirectories () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      let hash = key_hash_hex "shard-swept-key" in
+      let shard1_dir = Filename.concat dir (String.sub hash 0 2) in
+      let shard2_dir = Filename.concat shard1_dir (String.sub hash 2 2) in
+      Unix.mkdir shard1_dir 0o700;
+      Unix.mkdir shard2_dir 0o700;
+      let stale_tmp_path = Filename.concat shard2_dir (hash ^ ".put.99999.99999.tmp") in
+      let oc = open_out_bin stale_tmp_path in
+      output_string oc "garbage-partial-write-left-by-a-simulated-crash-inside-a-shard-dir";
+      close_out oc;
+      Alcotest.(check bool) "stale temp file exists, inside its shard subdirectory, before create"
+        true (Sys.file_exists stale_tmp_path);
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      Alcotest.(check bool)
+        "the sweep still finds and removes stale temp files nested inside a shard subdirectory \
+         (Ruling B regression: sharding must not silently reopen the crash-debris-accumulation \
+         bug Task 16 closed)"
+        false (Sys.file_exists stale_tmp_path);
+      (* The shard directories themselves, and real data elsewhere in the store, must survive the
+         deeper walk untouched -- the walk must distinguish a stale-temp-file leaf from a shard
+         directory entry, not unlink everything it finds two levels down. *)
+      Alcotest.(check bool) "the shard subdirectories themselves are not deleted by the sweep" true
+        (Sys.file_exists shard2_dir);
+      File_kv_store.put t ~key:"unrelated-key" "still-here";
+      Alcotest.(check (option string)) "an unrelated real key put after the sweep still works"
+        (Some "still-here") (File_kv_store.get t ~key:"unrelated-key"))
+
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
@@ -818,4 +922,13 @@ let tests =
     ( "Task 17: File_kv_store.create/put/get do not depend on TMPDIR",
       `Quick,
       test_storage_operations_do_not_depend_on_tmpdir );
+    ( "Task 18: path_for shards keys across two-level hash-prefix subdirectories",
+      `Quick,
+      test_path_for_shards_across_subdirectories );
+    ( "Task 18: put/get/delete round-trip correctly through the sharded path",
+      `Quick,
+      test_put_get_delete_round_trip_through_sharded_path );
+    ( "Task 18 (Ruling B): sweep_stale_temp_files still finds debris inside shard subdirectories",
+      `Quick,
+      test_sweep_still_finds_stale_temp_files_inside_shard_subdirectories );
   ]
