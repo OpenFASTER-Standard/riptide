@@ -58,6 +58,17 @@ let test_float_zero_and_negative_zero_hash_differently () =
   Alcotest.(check bool) "0.0 and -0.0 have different content_hash" false
     (Value.content_hash zero = Value.content_hash negative_zero)
 
+(* Keeps only the first entry for each distinct key. Defined before
+   value_gen (Task 7) specifically so value_gen's own Record/Map cases can
+   use it to dedupe THEIR generated fields/entries at every level of
+   recursion - see the doc comment on value_gen's Record/Map cases below for
+   why this has to happen inside the recursive generator itself, not just at
+   whichever top-level call site remembers to apply it. Also reused, as
+   before, by record_permutation_gen/map_permutation_gen further down to
+   dedupe the outermost Record/Map fields/entries THEY build directly. *)
+let dedup_by_key key_of entries =
+  List.fold_left (fun acc x -> if List.exists (fun y -> key_of y = key_of x) acc then acc else acc @ [ x ]) [] entries
+
 let value_gen =
   let open QCheck2.Gen in
   let scalar_gen =
@@ -75,14 +86,50 @@ let value_gen =
          | n ->
            oneof_weighted
              [ (3, scalar_gen);
+               (* Task 6 made canonical_encode/canonical_decode reject any
+                  duplicate-keyed Record/Map outright, at every nesting
+                  depth - not just at the top of a value. Before Task 7,
+                  this generator only got deduped by a handful of top-level
+                  call sites (record_permutation_gen/map_permutation_gen
+                  below), so any Record/Map value_gen produced as a NESTED
+                  field/entry value (i.e. every one of its own recursive
+                  `self` calls) could still carry duplicate keys - a
+                  genuinely unconstructible state under the codebase's own
+                  canonical form, and the reason value_injective_prop,
+                  round_trip_prop, and the two permutation-invariance props
+                  all started raising Invalid_argument the moment Task 6
+                  landed (with real probability, since Map keys are drawn
+                  from `self`, which is frequently just Scalar (Bool _), a
+                  2-element domain). Deduping right here, inside the fix's
+                  own Record/Map cases, fixes it at the source for every
+                  consumer at once: by induction on `n`, any value `self`
+                  produces (at any depth) is already duplicate-key-free, so
+                  a value one level up can dedupe its own fresh
+                  fields/entries without ever needing to re-check something
+                  deeper. Note dedup can shrink a Record's/Map's element
+                  count below what `list_size (int_range 0 3) ...` drew -
+                  the properties here treat Record/Map size as incidental
+                  (never asserted on directly), so this is safe; if a future
+                  property ever needs "generates exactly N Record fields",
+                  it should generate N *pre-deduped* keys up front instead
+                  of relying on a raw list_size draw staying full-size after
+                  a dedup pass. *)
                ( 1,
                  map
-                   (fun l -> Value.Record l)
+                   (fun l -> Value.Record (dedup_by_key fst l))
                    (list_size (int_range 0 3) (pair (string_size (int_range 1 4)) (self (n / 2)))) );
                (1, map (fun l -> Value.Sequence l) (list_size (int_range 0 3) (self (n / 2))));
                (1, map (fun (tag, v) -> Value.Sum (tag, v))
                   (pair (string_size (int_range 1 4)) (self (n / 2))));
-               (1, map (fun l -> Value.Map l)
+               (* Map keys are deduped by their own canonical_encode, matching
+                  canonical_encode's/canonical_decode's own notion of "same
+                  key" (structural/byte-level, not OCaml `=`) - two distinct
+                  in-memory representations of what encodes to the same key
+                  bytes are the same key for this purpose. Safe to call
+                  canonical_encode on each key here without it ever raising:
+                  each key comes from `self (n / 2)`, which by the same
+                  induction above is already free of nested duplicate keys. *)
+               (1, map (fun l -> Value.Map (dedup_by_key (fun (k, _) -> Value.canonical_encode k) l))
                   (list_size (int_range 0 3) (pair (self (n / 2)) (self (n / 2)))))
              ]))
 
@@ -139,22 +186,28 @@ let value_injective_prop =
     (QCheck2.Gen.pair value_gen value_gen)
     (fun (v1, v2) -> if Value.canonical_encode v1 = Value.canonical_encode v2 then canonical_equal v1 v2 else true)
 
-(* Keeps only the first entry for each distinct key. Permutation invariance
-   below is only claimed for maps/records with distinct keys: a value with a
-   duplicate key is no longer just an "order is a stable-sort tie-break"
-   open question (M6, task-6 review, correcting this comment's own earlier
-   claim) - Task 6 closed that question outright, and canonical_encode now
-   raises Invalid_argument on any duplicate-keyed Record/Map outright,
-   before any ordering could even matter. This generator still dedups its
-   own top-level output so these two properties can keep testing genuine
-   permutation invariance rather than merely re-deriving "duplicate keys
-   raise" (already covered directly by
-   test_encode_rejects_an_in_memory_duplicate_key_record/_map below);
-   value_gen itself does not yet dedup at every nesting level, which
-   is what makes the four QCheck properties below it fail post-Task-6 - see
-   this task's report for why that's Task 7's scope, not this comment's. *)
-let dedup_by_key key_of entries =
-  List.fold_left (fun acc x -> if List.exists (fun y -> key_of y = key_of x) acc then acc else acc @ [ x ]) [] entries
+(* Permutation invariance below is only claimed for maps/records with
+   distinct keys: a value with a duplicate key is no longer just an "order
+   is a stable-sort tie-break" open question (M6, task-6 review, correcting
+   this comment's own earlier claim) - Task 6 closed that question outright,
+   and canonical_encode now raises Invalid_argument on any duplicate-keyed
+   Record/Map outright, before any ordering could even matter.
+
+   Task 7: value_gen itself now dedupes its own Record fields / Map entries
+   at every nesting level it generates (see value_gen's own doc comments
+   above) - that's what makes this property, its Map sibling below,
+   value_injective_prop, and round_trip_prop all pass post-Task-6 again.
+   These two generators still need their OWN dedup pass (dedup_by_key,
+   defined above, right before value_gen) on top of that: the *outermost*
+   Record fields / Map entries built right here come from a directly-written
+   `list_size (int_range 0 5) (pair ... value_gen)`, not from value_gen's own
+   Record/Map case, so value_gen's internal fix has no opportunity to dedupe
+   them - only the fields/entries value_gen generates as part of some nested
+   value it builds go through that path. Kept deliberately separate from
+   "duplicate keys raise" coverage (already exercised directly by
+   test_encode_rejects_an_in_memory_duplicate_key_record/_map above) so
+   these two keep testing genuine permutation invariance instead of
+   re-deriving that same rejection. *)
 
 (* Separately: the canonicality guarantee itself, generated rather than the
    single hand-written example in test_record_field_order_independent
