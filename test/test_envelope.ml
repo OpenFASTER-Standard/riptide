@@ -69,14 +69,17 @@ let test_content_hash_changes_with_sequence () =
     (Envelope.content_hash e1 = Envelope.content_hash e2)
 
 (* Task 3 domain separation (Decision 5): Envelope.content_hash now hashes
-   Value.Sum (Envelope.domain_tag, to_value e) rather than a bare Record, so
-   an envelope's hash space can never collide with a plain payload
-   Value.value's hash space, even under adversarial construction. The two
+   Value.Sum (Envelope.domain_tag, to_value e) rather than a bare Record.
+   Collision with a plain payload Value.value is possible only for a
+   payload of the exact literal shape Sum ("Envelope", to_value e) —
+   an intentional, deliberately-tested equivalence, not a defect. The two
    tests below prove this by construction rather than merely asserting it:
-   the positive equivalence documents the exact mechanism, and the negative
-   case is the actual regression test for the vulnerability this closes
-   (task_003.md's carried-forward note / docs/superpowers/plans/
-   2026-09-18-event-id-domain-separation.md). *)
+   the positive equivalence documents the exact collision mechanism and is
+   intentional, while the negative case is the actual regression test for
+   the vulnerability this closes (the old bare Record collision was real and
+   unintended; that's what the negation now prevents - see task_003.md's
+   carried-forward note / docs/superpowers/plans/2026-09-18-event-id-
+   domain-separation.md). *)
 
 (* Positive: a plain payload Value.value that deliberately mimics the exact
    wire shape content_hash now produces internally (Sum ("Envelope",

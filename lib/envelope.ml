@@ -24,12 +24,15 @@ let to_value (e : envelope) : Value.value =
     ]
 
 (* Domain separation: an envelope is hashed as a Value.Sum wrapping its
-   Record shape, not as a bare Record, so a crafted payload Value.value
-   shaped like a Record with the envelope's exact field set can never
-   collide with a real event_id. Sum and Record have distinct leading
-   tag bytes in Value.canonical_encode (tag_sum vs tag_record), so this
-   holds by construction, not by convention - see
-   docs/superpowers/plans/2026-09-18-event-id-domain-separation.md. *)
+   Record shape, not as a bare Record. Collision between this hash space
+   and a plain payload Value.value's hash space is possible only for a
+   payload of the exact literal shape Sum ("Envelope", to_value e) - an
+   intentional, deliberately-tested equivalence, not a defect. A crafted
+   bare Record with the envelope's field set cannot collide. Sum and Record
+   have distinct leading tag bytes in Value.canonical_encode (tag_sum vs
+   tag_record), so this domain separation holds by construction, not by
+   convention - see docs/superpowers/plans/2026-09-18-event-id-domain-
+   separation.md. *)
 let domain_tag = "Envelope"
 
 let content_hash e = Value.content_hash (Value.Sum (domain_tag, to_value e))

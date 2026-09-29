@@ -31,12 +31,15 @@ val genesis_marker : Value.hash
 val to_value : envelope -> Value.value
 
 (** The domain tag {!content_hash} wraps {!to_value}'s output in (via
-    [Value.Sum (domain_tag, to_value e)]) before hashing, so an envelope's
-    hash space can never collide with a plain payload [Value.value]'s hash
-    space: [Sum] and [Record] have distinct leading tag bytes in
-    {!Value.canonical_encode}, so this holds by construction. Exposed so
-    tests can construct the exact preimage {!content_hash} uses internally
-    without duplicating the tag string. *)
+    [Value.Sum (domain_tag, to_value e)]) before hashing. Collision
+    between this hash space and a plain payload [Value.value]'s hash
+    space is possible only for a payload of the exact literal shape
+    [Sum (domain_tag, to_value e)] — an intentional, deliberately-tested
+    equivalence, not a defect. [Sum] and [Record] have distinct leading
+    tag bytes in {!Value.canonical_encode}, so a bare Record with the
+    envelope's field set cannot collide; this domain separation holds by
+    construction. Exposed so tests can construct the exact preimage
+    {!content_hash} uses internally without duplicating the tag string. *)
 val domain_tag : string
 
 val content_hash : envelope -> event_id
