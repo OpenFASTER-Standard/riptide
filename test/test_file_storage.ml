@@ -1042,6 +1042,46 @@ let test_create_rejects_a_negative_ring_capacity () =
         (fun () ->
           ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:(-1) dir)))
 
+(* Task 17: closes the audit finding that durable on-disk storage should never depend on
+   [TMPDIR] pointing anywhere usable -- a live reproduction showed [File_storage.create]/
+   [wal_append] raising [Sys_error] when it did not. By the time this test was written,
+   [File_storage.create]'s own code no longer calls [Filename.temp_file] directly (it never
+   did -- this module's WAL/superblock writes are in-place, guarded by a redundant-copy
+   quorum, not a temp-file/rename dance); the one remaining [TMPDIR] dependency reachable from
+   here is {!Riptide_storage.Aligned_buffer_pool.alloc_one_aligned_buffer}'s throwaway
+   [mmap]-backing file, called once per pool buffer from [File_storage.create] itself (see
+   that function's own [Aligned_buffer_pool.create] call site).
+
+   {b Why [Filename.set_temp_dir_name], not [Unix.putenv "TMPDIR"]} despite the plan's own
+   sketch naming the latter: confirmed live against this exact installed OCaml 5.0.0 stdlib
+   that [Filename.temp_file] does NOT re-read the [TMPDIR] environment variable on every call.
+   [Filename]'s own [current_temp_dir_name] is a [Domain.DLS] key, initialized once (lazily, on
+   first per-domain access) from a value computed at this process's own start time -- so a
+   later [Unix.putenv "TMPDIR" ...] mid-process has no observable effect on it at all (checked
+   empirically: [Unix.putenv] followed by [Filename.get_temp_dir_name ()] shows the pre-putenv
+   value, unchanged). [Filename.set_temp_dir_name] is the actual, public, live override -- the
+   exact primitive [Filename.temp_file] itself reads on every call -- so it reproduces the real
+   failure precisely rather than a lookalike that would pass today for the wrong reason.
+   Restored via [Fun.protect] so a poisoned value never leaks into a sibling test in this
+   same-process suite; the poisoning itself only wraps the [File_storage] exercise, not
+   [with_tmp_dir]'s own setup/teardown (which legitimately needs a real, working temp
+   directory of its own, unrelated to the audit finding this test is about). *)
+let test_storage_operations_do_not_depend_on_tmpdir () =
+  with_tmp_dir (fun dir ->
+      let original_temp_dir = Filename.get_temp_dir_name () in
+      Fun.protect
+        ~finally:(fun () -> Filename.set_temp_dir_name original_temp_dir)
+        (fun () ->
+          Filename.set_temp_dir_name "/nonexistent-audit-check-dir";
+          Eio_main.run @@ fun env ->
+          Eio.Switch.run @@ fun sw ->
+          let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+          File_storage.wal_append t ~op_number:1 "x";
+          Alcotest.(check (option string))
+            "append (and the pool allocation create performs to make it possible) succeeded \
+             without a usable TMPDIR"
+            (Some "x") (File_storage.wal_read t ~op_number:1)))
+
 let tests =
   [
     ( "Task 14: create rejects ring_capacity <= 0",
@@ -1140,4 +1180,7 @@ let tests =
     ( "Task 11 review (I1): a failed create releases its lock before re-raising",
       `Quick,
       test_a_failed_create_releases_its_lock_before_reraising );
+    ( "Task 17: File_storage.create/wal_append do not depend on TMPDIR",
+      `Quick,
+      test_storage_operations_do_not_depend_on_tmpdir );
   ]

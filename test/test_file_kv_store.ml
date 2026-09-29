@@ -737,6 +737,33 @@ let test_concurrent_same_key_puts_never_produce_a_torn_unreadable_record () =
         "the surviving value is one writer's complete value, never a torn mix or None"
         true (is_one_of_the_written_values ~candidates:written_values result))
 
+(* Task 17: the [File_kv_store] half of the same closed audit finding -- see
+   [test_file_storage.ml]'s own [test_storage_operations_do_not_depend_on_tmpdir] for the full
+   rationale, including why [Filename.set_temp_dir_name] (not [Unix.putenv "TMPDIR"], as the
+   plan's own sketch suggested) is the mechanism that actually reproduces this against this
+   installed OCaml 5.0.0 stdlib's [Filename.temp_file]. This module's own [durable_write]/
+   [check_or_write_owner_marker] temp files are already built via [path ^ tmp_suffix_for_call ()]/
+   [Filename.concat dir_path ...] (Task 16/Task 15, both already landed -- confirmed by reading
+   both functions directly), so the only [TMPDIR] dependency reachable from [File_kv_store.create]
+   is the same {!Riptide_storage.Aligned_buffer_pool.alloc_one_aligned_buffer} this test's
+   [File_storage] counterpart exercises, called from [File_kv_store.create]'s own
+   [Aligned_buffer_pool.create] call site. *)
+let test_storage_operations_do_not_depend_on_tmpdir () =
+  with_tmp_dir (fun dir ->
+      let original_temp_dir = Filename.get_temp_dir_name () in
+      Fun.protect
+        ~finally:(fun () -> Filename.set_temp_dir_name original_temp_dir)
+        (fun () ->
+          Filename.set_temp_dir_name "/nonexistent-audit-check-dir";
+          Eio_main.run @@ fun env ->
+          Eio.Switch.run @@ fun sw ->
+          let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+          File_kv_store.put t ~key:"k" "v";
+          Alcotest.(check (option string))
+            "put/get (and the pool allocation create performs to make it possible) succeeded \
+             without a usable TMPDIR"
+            (Some "v") (File_kv_store.get t ~key:"k")))
+
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
@@ -788,4 +815,7 @@ let tests =
     ( "Task 16: concurrent same-key puts never produce torn/phantom values",
       `Quick,
       test_concurrent_same_key_puts_never_produce_a_torn_unreadable_record );
+    ( "Task 17: File_kv_store.create/put/get do not depend on TMPDIR",
+      `Quick,
+      test_storage_operations_do_not_depend_on_tmpdir );
   ]

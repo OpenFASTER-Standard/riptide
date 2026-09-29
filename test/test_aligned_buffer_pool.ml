@@ -24,42 +24,69 @@
 
 open Riptide_storage
 
+(* [~dir_path] is exercised only by [test_valid_arguments_still_build_a_working_pool] below: every
+   other test here raises out of [create]'s own [~buffer_count]/[~slot_size] validation before
+   [~dir_path] is ever touched (see [create]'s own body -- both checks run before the allocation
+   loop), so an intentionally nonexistent path both keeps those tests' intent narrow (only the
+   argument named in each test is what's actually being exercised) and would loudly fail (a real
+   [Sys_error], not a silently-wrong pass) if a future change ever made [create] read [~dir_path]
+   before validating the other two arguments. *)
+let unused_dir_path = "/nonexistent-argument-validation-only-dir"
+
 let test_zero_buffer_count_is_rejected_immediately () =
   Alcotest.check_raises "buffer_count = 0 raises immediately instead of building a pool that
                           deadlocks on the first with_buffer call"
     (Invalid_argument "Aligned_buffer_pool.create: ~buffer_count must be positive, got 0")
-    (fun () -> ignore (Aligned_buffer_pool.create ~buffer_count:0 ~slot_size:4096 ()))
+    (fun () ->
+      ignore
+        (Aligned_buffer_pool.create ~dir_path:unused_dir_path ~buffer_count:0 ~slot_size:4096 ()))
 
 let test_negative_buffer_count_is_rejected_immediately () =
   Alcotest.check_raises "a negative buffer_count raises a clear, immediate error instead of a deep,
                           unhelpful one from Eio.Stream.create"
     (Invalid_argument "Aligned_buffer_pool.create: ~buffer_count must be positive, got -1")
-    (fun () -> ignore (Aligned_buffer_pool.create ~buffer_count:(-1) ~slot_size:4096 ()))
+    (fun () ->
+      ignore
+        (Aligned_buffer_pool.create ~dir_path:unused_dir_path ~buffer_count:(-1)
+           ~slot_size:4096 ()))
 
 let test_zero_slot_size_is_rejected_immediately () =
   Alcotest.check_raises "slot_size = 0 raises a clear, immediate error instead of a deep,
                           unhelpful one from Unix.map_file"
     (Invalid_argument "Aligned_buffer_pool.create: ~slot_size must be positive, got 0")
-    (fun () -> ignore (Aligned_buffer_pool.create ~buffer_count:4 ~slot_size:0 ()))
+    (fun () ->
+      ignore (Aligned_buffer_pool.create ~dir_path:unused_dir_path ~buffer_count:4 ~slot_size:0 ()))
 
 let test_negative_slot_size_is_rejected_immediately () =
   Alcotest.check_raises "a negative slot_size raises a clear, immediate error instead of a deep,
                           unhelpful one from Unix.map_file"
     (Invalid_argument "Aligned_buffer_pool.create: ~slot_size must be positive, got -4096")
-    (fun () -> ignore (Aligned_buffer_pool.create ~buffer_count:4 ~slot_size:(-4096) ()))
+    (fun () ->
+      ignore
+        (Aligned_buffer_pool.create ~dir_path:unused_dir_path ~buffer_count:4
+           ~slot_size:(-4096) ()))
 
 (* Non-vacuity: valid arguments still build a working pool, and a full acquire/use/release cycle
    through it round-trips real data -- proves the validation above rejects only genuinely bad
-   values, not a broken [create] that now rejects everything. *)
+   values, not a broken [create] that now rejects everything. Needs a REAL directory (unlike the
+   validation-only tests above): with valid arguments, [create] actually reaches
+   [alloc_one_aligned_buffer], which creates a real throwaway backing file inside [~dir_path]
+   (Task 17). *)
 let test_valid_arguments_still_build_a_working_pool () =
-  let pool = Aligned_buffer_pool.create ~buffer_count:2 ~slot_size:4096 () in
-  let result =
-    Aligned_buffer_pool.with_buffer pool 5 (fun buf ->
-        Cstruct.blit_from_string "hello" 0 buf 0 5;
-        Cstruct.to_string ~len:5 buf)
-  in
-  Alcotest.(check string) "a buffer acquired from a validly-sized pool round-trips real data"
-    "hello" result
+  let dir = Filename.temp_file "riptide_aligned_buffer_pool_test" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () ->
+      let pool = Aligned_buffer_pool.create ~dir_path:dir ~buffer_count:2 ~slot_size:4096 () in
+      let result =
+        Aligned_buffer_pool.with_buffer pool 5 (fun buf ->
+            Cstruct.blit_from_string "hello" 0 buf 0 5;
+            Cstruct.to_string ~len:5 buf)
+      in
+      Alcotest.(check string) "a buffer acquired from a validly-sized pool round-trips real data"
+        "hello" result)
 
 let tests =
   [

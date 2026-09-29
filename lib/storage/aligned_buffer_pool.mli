@@ -17,11 +17,23 @@
 
 type t
 
-val create : buffer_count:int -> slot_size:int -> unit -> t
-(** [create ~buffer_count ~slot_size ()] allocates [buffer_count] real, page-aligned,
+val create : dir_path:string -> buffer_count:int -> slot_size:int -> unit -> t
+(** [create ~dir_path ~buffer_count ~slot_size ()] allocates [buffer_count] real, page-aligned,
     [mmap]-backed buffers of exactly [slot_size] bytes each, up front, and returns a pool holding
     them. Never allocates again for the rest of [t]'s lifetime -- see {!with_buffer}, the only way
     to get at a buffer afterwards.
+
+    {b [~dir_path] (Task 17)}: each buffer needs a real, throwaway backing file purely to get a
+    page-aligned [mmap(2)] address (see the [.ml]'s own [alloc_one_aligned_buffer] comment for why
+    a file, not [Bigarray.Array1.create], is the allocation primitive) -- created, sized, mapped,
+    and then closed + unlinked immediately, all before this call returns. That backing file is
+    created inside [~dir_path] (the caller's own storage directory) rather than via
+    [Filename.temp_file]'s [TMPDIR]-rooted scratch directory, closing the audit finding that
+    durable on-disk storage must never depend on an environment variable pointing anywhere usable
+    at all -- a live reproduction showed [File_storage.create]/[wal_append] raising [Sys_error]
+    when [TMPDIR] pointed at a nonexistent directory, entirely through this call. Both real callers
+    ([File_storage.create], [File_kv_store.create]) already have their own [dir_path] in scope at
+    the point they call this, so this costs each call site nothing beyond passing it through.
 
     Raises [Invalid_argument] if [buffer_count <= 0] or [slot_size <= 0] (Task 10 review round 2,
     Finding 5) -- both fail fast and clearly here rather than surfacing as either a silent,

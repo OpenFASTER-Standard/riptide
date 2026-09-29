@@ -614,7 +614,9 @@ let create ~sw ~fs ~owner dir_path =
        the [exception exn -> ...] handler below and the lock is properly closed. *)
     sweep_stale_temp_files ~fs ~dir_path;
     check_or_write_owner_marker ~fs ~dir_path owner;
-    let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
+    let pool =
+      Aligned_buffer_pool.create ~dir_path ~buffer_count:pool_size ~slot_size:slot_alignment ()
+    in
     { sw; lock; fs; dir_path; owner; pool }
   with
   | t -> t

@@ -450,7 +450,9 @@ let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
       Array.init superblock_copies (fun i ->
           open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
     in
-    let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
+    let pool =
+      Aligned_buffer_pool.create ~dir_path ~buffer_count:pool_size ~slot_size:slot_alignment ()
+    in
     let t = { sw; lock; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
     t.highest_op_number <- recover_highest_op_number t;
     t
