@@ -1081,11 +1081,19 @@
             "id": 14,
             "title": "[3.6] Atomic owner-marker writes; a 0-byte marker is treated as unclaimed",
             "description": "Atomic owner-marker writes; a 0-byte marker is treated as unclaimed",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "check_or_write_owner_marker moves from create-then-write to write-temp-then-rename. A marker read as exactly 0 bytes is treated as absent rather than a claimed empty-string owner.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "319628dc92349f4bd5b39f5b5ed56509e6885db6",
+                "11c1ffbe1017a4d1eb42bf35b16885d1be078de9",
+                "e3885c857e0ce70fa05dff8ed41f93ad2fe1ac96"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 15,
