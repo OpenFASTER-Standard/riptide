@@ -551,14 +551,22 @@ let restart_refusal_message =
    wholesale, neither of which restart can decide on its own. TO REBUILD (Task 13): call this \
    backend's own Storage_intf.S.superblock_rebuild_from_wal ~view_number ~last_normal_view \
    ~commit_number (e.g. Riptide_storage.File_storage.superblock_rebuild_from_wal), then retry \
-   Replica.restart. THOSE THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED: none of them is \
-   derivable from this replica's own WAL, and supplying a last_normal_view or commit_number LOWER \
-   than the cluster's real state makes this replica lose view-change log selection to a peer \
-   holding a SHORTER log, which silently destroys a committed op cluster-wide -- the exact loss \
-   this refusal exists to prevent, reintroduced by the repair. Obtain them out of band from a \
-   live, trusted, surviving peer of this cluster (its view_number and last_normal_view, and this \
-   replica's own commit_number as that peer understands it); see that function's own doc comment \
-   for the full trace and for the limitations it discloses."
+   Replica.restart. THOSE THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED, AND THE ONLY SAFE \
+   VALUES ARE THIS REPLICA'S OWN TRUE PRIOR DURABLE STATE -- the exact triple its own superblock \
+   held before the write that tore it. DO NOT COPY THEM OFF A LIVE PEER'S CURRENT STATE: an earlier \
+   version of this message told you to do exactly that, and that advice is WITHDRAWN as actively \
+   wrong. A value too LOW makes this replica lose view-change log selection to a peer holding a \
+   SHORTER log, silently destroying a committed op cluster-wide -- the exact loss this refusal \
+   exists to prevent, reintroduced by the repair. A value too HIGH -- which is what a surviving \
+   peer's CURRENT last_normal_view gives you whenever this replica had fallen behind that peer on \
+   view transitions, something nobody can rule out once THIS replica's own superblock is gone -- \
+   makes this replica WIN that selection with a stale log and silently REPLACE the cluster's real, \
+   already-acknowledged committed values with its own. Supply the triple only from an independent, \
+   out-of-band record of THIS replica's own view/commit history, captured while it was still \
+   running (e.g. external monitoring); if no such record exists, this repair CANNOT be used safely \
+   and the backend must be discarded wholesale instead. See \
+   Storage_intf.S.superblock_rebuild_from_wal's own doc comment for both traces and for the full \
+   disclosed limitation."
 
 (* A replica with two durable entries, one of them committed, whose superblock then goes missing
    entirely -- [superblock_read] returning [None], the exact shape [File_storage] produces when
@@ -635,6 +643,130 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
     "and superblock_rebuild_from_wal cannot repair it either -- the disclosed residual gap" true
     refused
 
+(* ============================================================================================
+   TASK 13 RE-REVIEW, FINDING 2: THE GUARD'S OWN BLIND SPOT, NOW CLOSED.
+
+   The fix round that added [Storage_intf.S]'s header-only op-number derivation also added a comment
+   to [file_storage.ml] asserting that the STRICT derivation was still fine for
+   [wal_highest_op_number] because "[Replica.restart] takes its [op_number] from the SUPERBLOCK,
+   never from [wal_highest_op_number] ... so the dangerous direction genuinely does not exist on that
+   path". That was FALSE. [restart]'s own fail-stop guard reads [wal_highest_op_number] as half of its
+   condition ([superblock unusable && wal_highest_op_number () > 0]), and so does [create]'s
+   backend-is-not-virgin guard.
+
+   The state that reaches it needs TWO faults on one replica, not one, but both are ordinary crash
+   outcomes and neither is injected by anything exotic here:
+     1. the superblock write tore (3 sequential non-atomic copy writes -- [superblock_read] is
+        [None]), and
+     2. every slot whose HEADER verifies has DATA that no longer checksums (one torn data write is
+        enough when the WAL is short, which is exactly the case below: a single-entry WAL).
+
+   Under the strict reading, [wal_highest_op_number] is then 0, the guard does NOT fire, and the
+   replica comes back as a FRESH, EMPTY one over a WAL that still holds durable evidence of op 1 --
+   [op_number = 0], so it proves op 1 ABSENT via [sender_proves_absent]'s [o > n] disjunct, and one
+   honest nack from a replica that genuinely never saw it completes a nack quorum. That is Critical 2's
+   own hazard (under-reporting durable state) reached through [restart]'s guard instead of through the
+   rebuild tool, and the same "corrupt -> absent" mutation spec/tla/VSR.tla:111-150 records TLC
+   refuting against [NoCommittedOpProvablyAbsent].
+
+   THE FIX both guards now carry: they read [wal_highest_durable_op_number] -- the header-only
+   reading -- so "is this backend empty?" is answered by what it might still be HOLDING, not by what
+   it can still READ. This test pins the difference between the two readings AND the resulting refusal,
+   so neither half can silently regress.
+
+   Has to be a real {!Riptide_storage.File_storage} over a real directory: [Memory_storage]'s two
+   readings coincide by construction (no header/data split exists down there), so it structurally
+   cannot exhibit this state at all. ============================================================ *)
+let test_restart_refuses_when_only_the_header_only_scan_sees_the_wal () =
+  Eio_main.run @@ fun env ->
+  let ring_capacity = 8 in
+  let dir = Filename.temp_file "riptide_task13_header_only" "" in
+  Unix.unlink dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
+    (fun () ->
+      (* PHASE 1: a real replica durably takes on exactly one op, the ordinary way. *)
+      (Eio.Switch.run @@ fun sw ->
+       let backend =
+         Riptide_storage.File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir
+       in
+       let send, _sent = capturing_send () in
+       let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
+       let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+       Replica.handle_message t ~sender:3
+         (Message.encode (Message.Prepare { view = 0; n = 1; v = v "the only op this replica ever held"; k = 0; source = 3 }));
+       Alcotest.(check int) "precondition: op 1 is durable" 1 (Replica.op_number t));
+      (* PHASE 2: the two faults. Op 1 lives in slot 0, so its DATA slot starts at
+         [ring_capacity * 4096] (see file_storage.ml's own layout comment); zeroing it leaves the
+         HEADER -- which carries op_number/length/checksum -- completely untouched, which is exactly
+         what a crash between [wal_append]'s two non-atomic writes leaves behind. Then all three
+         superblock copies go, the same way [test_file_storage.ml]'s own tests tear them. *)
+      let fd = Unix.openfile (Filename.concat dir "ring") [ Unix.O_RDWR ] 0o600 in
+      ignore (Unix.lseek fd (ring_capacity * 4096) Unix.SEEK_SET);
+      ignore (Unix.write fd (Bytes.make 4096 '\000') 0 4096);
+      Unix.close fd;
+      List.iter
+        (fun i ->
+          let oc = open_out_bin (Filename.concat dir (Printf.sprintf "superblock-%d" i)) in
+          output_string oc "garbage, wrong length and checksum";
+          close_out oc)
+        [ 0; 1; 2 ];
+      (* PHASE 3: reopen, and pin the two readings apart before asserting anything about the guard --
+         otherwise a future change that made them coincide again would leave this test passing while
+         proving nothing. *)
+      Eio.Switch.run @@ fun sw ->
+      let backend =
+        Riptide_storage.File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir
+      in
+      Alcotest.(check (option string)) "precondition: the superblock is unusable" None
+        (Riptide_storage.File_storage.superblock_read backend);
+      Alcotest.(check int)
+        "precondition: the STRICT reading says 0 -- nothing in this WAL can be read back in full" 0
+        (Riptide_storage.File_storage.wal_highest_op_number backend);
+      Alcotest.(check int)
+        "precondition: the DURABLE reading says 1 -- op 1's header survived, so this backend may \
+         still be holding it"
+        1 (Riptide_storage.File_storage.wal_highest_durable_op_number backend);
+      Alcotest.(check (option string)) "and op 1 genuinely cannot be read back" None
+        (Riptide_storage.File_storage.wal_read backend ~op_number:1);
+      let send, _sent = capturing_send () in
+      let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
+      (* THE POINT. Before this fix, [restart] returned a perfectly usable replica here, with
+         [op_number = 0] -- i.e. one that proves op 1 absent. Now it fail-stops, exactly as it does
+         for the one-fault lost-superblock case above, and for exactly the same reason. *)
+      Alcotest.check_raises
+        "restart fail-stops instead of booting as a fresh replica over a WAL it may still be holding"
+        (Invalid_argument restart_refusal_message) (fun () ->
+          ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage ()));
+      (* THE OTHER GUARD, which had the identical blind spot: an operator (or a harness) reaching for
+         [create] instead must not be told this backend is virgin either. *)
+      let refused_create =
+        try
+          ignore (Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage ());
+          false
+        with Invalid_argument msg ->
+          String.starts_with ~prefix:"Replica.create: this storage backend already holds durable state"
+            msg
+      in
+      Alcotest.(check bool) "and create refuses it as non-virgin rather than initializing over it"
+        true refused_create;
+      (* Both refusals are total no-ops on durable state, which is what keeps this recoverable: the
+         header is still there for [superblock_rebuild_from_wal] to derive op 1 from. *)
+      Alcotest.(check int) "the refusals truncated nothing" 1
+        (Riptide_storage.File_storage.wal_highest_durable_op_number backend);
+      (* ...and the repair tool agrees with the guard about what is durable here: it derives
+         [op_number = 1] from the same header-only scan, so the recovered replica knows it owes op 1
+         (as CORRUPT, never ABSENT) rather than silently forgetting it. *)
+      Riptide_storage.File_storage.superblock_rebuild_from_wal backend ~view_number:0
+        ~last_normal_view:0 ~commit_number:0;
+      let send2, _sent2 = capturing_send () in
+      let t = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage () in
+      Alcotest.(check int) "the recovered replica claims op 1 -- corrupt, not absent" 1
+        (Replica.op_number t);
+      Alcotest.(check int) "and its in-memory log stops at the unreadable slot" 0
+        (List.length (Replica.entries t)))
+
 (* TASK 13 (audit-remediation): the actual repair action the message above now names by name,
    proven end-to-end -- not merely that [superblock_read] flips from [None] to [Some] (that is
    [test_file_storage.ml]'s own, storage-layer-only test), but that the REBUILT superblock is one
@@ -646,10 +778,12 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
    must now succeed.
 
    TASK 13 FIX ROUND (review finding 1): the three non-WAL-derivable values are now SUPPLIED, and
-   this test supplies the replica's REAL pre-crash state ([view_number = last_normal_view = 0],
-   [commit_number = 1] -- read straight off [t] before the crash, standing in for what an operator
-   would read off a surviving peer) rather than accepting the zeros the first cut invented. The
-   difference matters here concretely: [commit_number] really was 1, and the first cut wrote 0.
+   this test supplies the replica's OWN REAL pre-crash state ([view_number = last_normal_view = 0],
+   [commit_number = 1] -- read straight off [t] before the crash, standing in for the independent
+   out-of-band record of THIS replica's own history that a real operator would need to have; NOT off a
+   peer, see the retraction in [storage_intf.ml]) rather than accepting the zeros the first cut
+   invented. The difference matters here concretely: [commit_number] really was 1, and the first cut
+   wrote 0.
 
    WHAT THIS TEST DOES AND DOES NOT COVER FOR OTHER BACKENDS (review finding 5). It drives
    [Memory_storage]'s rebuild, not [File_storage]'s, and the old comment in [file_storage.ml] that
@@ -672,8 +806,10 @@ let test_superblock_rebuild_from_wal_lets_restart_recover_after_the_fail_stop_re
     (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Alcotest.(check int) "precondition: op 1 is committed and durable" 1 (Replica.commit_number t);
   Alcotest.(check int) "precondition: two durable entries" 2 (Replica.op_number t);
-  (* What an operator would obtain out of band from a surviving peer, captured here from the live
-     replica itself before the crash destroys its volatile copy. *)
+  (* THIS replica's own true durable triple, captured from the live replica itself before the crash
+     destroys its volatile copy -- standing in for the independent out-of-band record a real operator
+     would need. Deliberately not described as "what a peer would report": that procedure is
+     retracted (Task 13 re-review finding 1). *)
   let real_view_number = Replica.view_number t
   and real_last_normal_view = Replica.last_normal_view t
   and real_commit_number = Replica.commit_number t in
@@ -941,6 +1077,12 @@ module Raising_backend : Riptide_storage.Storage_intf.S with type t = unit -> un
   let wal_read _ ~op_number:_ = None
   let wal_truncate_after _ ~op_number:_ = ()
   let wal_highest_op_number _ = 0
+
+  (* Task 13 re-review (finding 2): equal to the strict reading, which is what a stub with no
+     durable state at all must report -- [Replica.create]'s own virgin-backend guard now reads THIS
+     one, so returning anything above 0 here would make every test below fail to construct. *)
+  let wal_highest_durable_op_number _ = 0
+
   let superblock_write _ _ = ()
   let superblock_read _ = None
 
@@ -1073,6 +1215,10 @@ module Flaky_then_memory_backend = struct
   let wal_read t ~op_number = Riptide_storage.Memory_storage.wal_read t.underlying ~op_number
   let wal_truncate_after t ~op_number = Riptide_storage.Memory_storage.wal_truncate_after t.underlying ~op_number
   let wal_highest_op_number t = Riptide_storage.Memory_storage.wal_highest_op_number t.underlying
+
+  let wal_highest_durable_op_number t =
+    Riptide_storage.Memory_storage.wal_highest_durable_op_number t.underlying
+
   let superblock_write t s = Riptide_storage.Memory_storage.superblock_write t.underlying s
   let superblock_read t = Riptide_storage.Memory_storage.superblock_read t.underlying
 
@@ -1123,6 +1269,7 @@ module Unhelpful_backend : Riptide_storage.Storage_intf.S with type t = unit = s
   let wal_read () ~op_number:_ = None
   let wal_truncate_after () ~op_number:_ = ()
   let wal_highest_op_number () = 0
+  let wal_highest_durable_op_number () = 0
   let superblock_write () _ = ()
   let superblock_read () = None
   let superblock_rebuild_from_wal () ~view_number:_ ~last_normal_view:_ ~commit_number:_ = ()
@@ -1516,8 +1663,13 @@ let test_an_op_the_primary_cannot_read_commits_nowhere_in_the_cluster () =
    This is the running-code evidence the fix round exists to produce, and the pair below is the
    whole point: ONE scenario function, run TWICE, differing in nothing but the three values handed
    to [superblock_rebuild_from_wal]. With the zeros the repair's first cut invented for itself, a
-   committed, client-acknowledged operation is destroyed on every live replica. With the real values
-   an operator would read off a surviving peer, it survives and the cluster keeps going.
+   committed, client-acknowledged operation is destroyed on every live replica. With the repaired
+   replica's OWN real prior values, it survives and the cluster keeps going.
+
+   READ THE OVER-CLAIM TRACE FURTHER DOWN TOO, not just this one: this section proves that supplying
+   values too LOW destroys data, and the fix round's answer was "get them from a live surviving peer".
+   That PROCEDURE is itself unsafe, in the opposite direction, and is retracted -- see
+   [run_superblock_rebuild_over_claim_trace] below. Neither trace is the whole picture on its own.
 
    Neither direction is asserted from a comment: the scenario drives real [Replica]s over real
    [Fault_injecting_storage] backends through a real view change, and the "destroyed" arm is a
@@ -1721,14 +1873,279 @@ let test_a_rebuild_with_zeroed_values_destroys_a_committed_op_through_a_view_cha
 let test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it () =
   run_superblock_rebuild_safety_trace ~rebuild_with:(1, 0, 0) ~expect_survival:false
 
-(* THE FIXED ARM: the replica's REAL durable view/commit state, which an operator obtains out of band
-   from a live surviving peer. [commit_number = 0] is the truth here and is deliberately left at 0 --
-   replica 2 never learned the commit (no second Prepare carried [k = 1] to it before the crash), so
-   supplying anything else would be inventing state, which is the very thing this fix forbids. The
-   ONLY difference from the arm above is [last_normal_view]/[view_number], and that difference alone
-   is what saves the committed op. *)
+(* THE FIXED ARM: the replica's OWN REAL prior durable view/commit state. [commit_number = 0] is the
+   truth here and is deliberately left at 0 -- replica 2 never learned the commit (no second Prepare
+   carried [k = 1] to it before the crash), so supplying anything else would be inventing state, which
+   is the very thing this fix forbids. The ONLY difference from the arm above is
+   [last_normal_view]/[view_number], and that difference alone is what saves the committed op.
+
+   NOTE, since these three numbers used to be described as "what an operator reads off a live
+   surviving peer": in THIS trace they happen to coincide with replica 3's current values, because
+   replica 2 had not fallen behind it. That coincidence is what made the retracted advice look sound,
+   and the over-claim trace immediately below is the case where it does not hold. *)
 let test_a_rebuild_with_correct_values_preserves_that_same_committed_op () =
   run_superblock_rebuild_safety_trace ~rebuild_with:(1, 1, 0) ~expect_survival:true
+
+(* ============================================================================================
+   TASK 13 RE-REVIEW, FINDING 1: THE OTHER DIRECTION, AND WHY "READ THE VALUES OFF A LIVE PEER" IS
+   RETRACTED RATHER THAN SOFTENED.
+
+   The three arms above prove that UNDER-claiming [last_normal_view] destroys committed data, and the
+   fix round's answer was: require the operator to supply the real values, obtained "from a live,
+   trusted, surviving peer of the same cluster -- ITS view_number, ITS last_normal_view". That
+   PROCEDURE is itself unsafe, and this scenario is why.
+
+   A peer's CURRENT [last_normal_view] equals the crashed replica's TRUE [last_normal_view] only if the
+   crashed replica never fell behind that peer on view transitions -- which is exactly the thing that
+   cannot be established from outside once the crashed replica's own superblock, the only record of it,
+   is gone. Copy the peer's value when the crashed replica HAD fallen behind, and the rebuilt replica
+   OVER-claims: it wins [WinningDVC]'s selection (tie on [last_normal_view], tie-broken by LONGEST
+   log -- replica.ml's [winning_dvc], VSR.tla:248-255) with a log from an ABANDONED view, [FillValue]
+   prefers the winner's own entries for every op-number both hold (replica.ml's [fill_value],
+   VSR.tla:440-444), and [HighestCommitNumber] -- a deliberately SEPARATE maximum (VSR.tla:257-260) --
+   carries the real commit-number forward over that stale log. The cluster does not lose an
+   acknowledged operation; it adopts a DIFFERENT value in its place and reports it committed. That is
+   strictly worse than the truncation the arms above demonstrate.
+
+   THE TRACE, which is the re-review's own, run for real here (no message anywhere is hand-forged):
+
+     1. View 1, Primary(1) = replica 1. It durably appends ops 1..5. Op 1 is committed cluster-wide
+        (replicas 2 and 3 hold it and acknowledge it); ops 2..5 are held by replica 1 ALONE, because
+        their Prepares are dropped. Replica 1 is then partitioned off.
+     2. Replicas 2 and 3 carry on without it: a view change to view 2 (Primary(2) = 2), which selects
+        a log of length 1 since neither of them ever had ops 2..5; then two NEW proposals, committed
+        as ops 2 and 3 with genuinely different values; then a second view change to view 3
+        (Primary(3) = 3). Their true state is now last_normal_view = 3, op_number = 3,
+        commit_number = 3. Replica 1's true state is last_normal_view = 1, op_number = 5.
+     3. Replica 1 crashes with a torn superblock. The operator supplies either replica 2's CURRENT
+        values (the retracted procedure -- (3, 3, 3)) or replica 1's OWN prior state ((1, 1, 1)).
+        BOTH pass every face-validity check: non-negative, commit <= op_number (5),
+        last_normal_view <= view_number.
+     4. Replica 3's last act is to start a view change to view 4 -- Primary(4) = 1, the repaired
+        replica -- and it is then lost for good. Its in-flight StartViewChange(4) is what brings BOTH
+        survivors into view 4 from whatever view the repair left them in, which is what makes the two
+        arms the IDENTICAL execution up to those three integers. (Same device, and same reason, as the
+        under-claim trace above: this subset's ReceiveHigherSVC does not rebroadcast, so a
+        timer-driven view change would require both survivors to fire from the same view -- which
+        cannot hold when the repaired view_number is itself one of the values under test.) Making the
+        REPAIRED replica the coordinator is also what makes the DVC quorum deterministic: its own DVC
+        is necessarily in every quorum it counts, so the outcome cannot hinge on message ordering.
+
+   WHY THE FIX IS A RETRACTION AND A DISCLOSED LIMITATION RATHER THAN A BETTER PROCEDURE: the two
+   directions are catastrophic by DIFFERENT mechanisms, and no external source splits the difference.
+   A peer's present state describes that peer's progress, not this replica's. The only safe triple is
+   an independent, out-of-band record of THIS replica's own history -- and when there is none, the
+   honest answer is that this tool cannot be used, which is what
+   [Storage_intf.S.superblock_rebuild_from_wal]'s doc comment now says in those words.
+   ============================================================================================ *)
+
+type rebuild_value_source =
+  | Copied_from_a_live_peers_current_state
+      (** The RETRACTED procedure, applied literally: read [view_number]/[last_normal_view]/
+          [commit_number] off a live, never-crashed peer at repair time. *)
+  | This_replicas_own_true_prior_state
+      (** The only safe source: the crashed replica's OWN durable triple, captured here off the live
+          replica before the crash -- standing in for the independent out-of-band record a real
+          operator would need to have. *)
+
+(* ONE scenario function for both arms, deliberately, exactly as the under-claim trace above is one
+   function: the whole evidential value is that the two runs are the SAME execution up to the three
+   integers handed to the repair. [~expect_replacement] is what must then happen to the cluster's real
+   committed ops 2 and 3. *)
+let run_superblock_rebuild_over_claim_trace ~value_source ~expect_replacement =
+  with_cluster_and_storage ~replica_count:3 ~svc_limit:3
+    (fun ~replicas ~storages ~stop ~restart ~settle ~isolate ~reconnect ->
+      let acked = v "op 1: committed and acknowledged cluster-wide in view 1" in
+      let stale = Array.init 4 (fun i -> v (Printf.sprintf "op %d: view-1 value held ONLY by replica 1" (i + 2))) in
+      let real2 = v "op 2: a DIFFERENT value, committed by the survivors in view 2" in
+      let real3 = v "op 3: another one, also committed by the survivors in view 2" in
+      let encoded x = Value.canonical_encode x in
+      (* STEP 1: op 1 is genuinely committed and acknowledged, with all three replicas reachable. *)
+      Replica.propose replicas.(0) acked;
+      settle ();
+      Alcotest.(check int) "precondition: op 1 is COMMITTED at the primary" 1
+        (Replica.commit_number replicas.(0));
+      Alcotest.(check bool) "precondition: and durable on replica 2" true
+        (Replica.for_test_wal_read replicas.(1) ~op_number:1 = Some acked);
+      Alcotest.(check bool) "precondition: and on replica 3" true
+        (Replica.for_test_wal_read replicas.(2) ~op_number:1 = Some acked);
+      (* STEP 2: replica 1 is cut off from BOTH peers (this harness's [isolate] drops by DESTINATION,
+         so isolating 2 and 3 is what silences replica 1's own outbound Prepares), and durably takes
+         on ops 2..5 that no peer will ever see. *)
+      isolate 2;
+      isolate 3;
+      Array.iter (fun x -> Replica.propose replicas.(0) x) stale;
+      settle ();
+      Alcotest.(check int) "replica 1 durably holds ops 1..5" 5 (Replica.op_number replicas.(0));
+      Alcotest.(check int) "but only op 1 is committed on it" 1 (Replica.commit_number replicas.(0));
+      Alcotest.(check int) "replica 2 never saw ops 2..5" 1 (Replica.op_number replicas.(1));
+      Alcotest.(check int) "nor did replica 3" 1 (Replica.op_number replicas.(2));
+      (* REPLICA 1'S OWN TRUE DURABLE TRIPLE, captured while it is still live. This is the ONLY safe
+         source for the repair, and it is what the fixed arm supplies. *)
+      let own_view = Replica.view_number replicas.(0)
+      and own_lnv = Replica.last_normal_view replicas.(0)
+      and own_commit = Replica.commit_number replicas.(0) in
+      Alcotest.(check (list int)) "replica 1's own true prior state is (view 1, lnv 1, commit 1)"
+        [ 1; 1; 1 ] [ own_view; own_lnv; own_commit ];
+      (* STEP 3: the survivors complete a view change to view 2 WITHOUT replica 1, selecting a log of
+         length 1 -- neither of them has anything above op 1 to contribute. *)
+      reconnect 2;
+      reconnect 3;
+      isolate 1;
+      Replica.check_timeout replicas.(1);
+      Replica.check_timeout replicas.(2);
+      settle ();
+      Alcotest.(check int) "the survivors reached view 2" 2 (Replica.view_number replicas.(1));
+      Alcotest.(check bool) "Primary(2) = 2 completed it" true
+        (Replica.is_primary replicas.(1) && Replica.status replicas.(1) = Replica.Normal);
+      Alcotest.(check bool) "and so is replica 3" true (Replica.status replicas.(2) = Replica.Normal);
+      Alcotest.(check int) "the new view's log really is just op 1" 1 (Replica.op_number replicas.(1));
+      (* STEP 4: the survivors commit two genuinely DIFFERENT values at ops 2 and 3. *)
+      Replica.propose replicas.(1) real2;
+      settle ();
+      Replica.propose replicas.(1) real3;
+      settle ();
+      Alcotest.(check int) "the survivors committed through op 3" 3 (Replica.commit_number replicas.(1));
+      Alcotest.(check bool) "op 2's real value is committed and acknowledged" true
+        (Replica.is_committed replicas.(1) real2);
+      Alcotest.(check bool) "so is op 3's" true (Replica.is_committed replicas.(1) real3);
+      Alcotest.(check bool) "and both are durable on replica 3 too -- f+1 copies" true
+        (Riptide_storage.Fault_injecting_storage.wal_read storages.(2) ~op_number:2 = Some (encoded real2)
+        && Riptide_storage.Fault_injecting_storage.wal_read storages.(2) ~op_number:3 = Some (encoded real3));
+      (* STEP 5: one more view change among the survivors, to view 3. This is what puts their
+         [last_normal_view] (3) genuinely AHEAD of replica 1's (still 1) -- the divergence the
+         retracted procedure cannot see. *)
+      Replica.check_timeout replicas.(1);
+      Replica.check_timeout replicas.(2);
+      settle ();
+      Alcotest.(check int) "the survivors reached view 3" 3 (Replica.view_number replicas.(1));
+      Alcotest.(check int) "and their last_normal_view is 3 -- AHEAD of replica 1's 1" 3
+        (Replica.last_normal_view replicas.(1));
+      Alcotest.(check bool) "with the committed ops 2 and 3 intact" true
+        (Replica.is_committed replicas.(1) real2 && Replica.is_committed replicas.(1) real3);
+      (* STEP 6: the repair. The two arms differ HERE and nowhere else. *)
+      let rb_view, rb_lnv, rb_commit =
+        match value_source with
+        | Copied_from_a_live_peers_current_state ->
+          (* Replica 2 never crashed, so this is exactly what the retracted advice told an operator to
+             read: a live, trusted, surviving peer's OWN current view_number/last_normal_view, plus
+             this replica's commit_number "as that peer understands it". *)
+          ( Replica.view_number replicas.(1),
+            Replica.last_normal_view replicas.(1),
+            Replica.commit_number replicas.(1) )
+        | This_replicas_own_true_prior_state -> (own_view, own_lnv, own_commit)
+      in
+      (match value_source with
+      | Copied_from_a_live_peers_current_state ->
+        Alcotest.(check (list int)) "the retracted procedure yields the PEER's (3, 3, 3)" [ 3; 3; 3 ]
+          [ rb_view; rb_lnv; rb_commit ]
+      | This_replicas_own_true_prior_state ->
+        Alcotest.(check (list int)) "the safe procedure yields replica 1's OWN (1, 1, 1)" [ 1; 1; 1 ]
+          [ rb_view; rb_lnv; rb_commit ]);
+      Riptide_storage.Fault_injecting_storage.for_test_lose_superblock storages.(0);
+      Alcotest.(check bool) "replica 1's superblock really is gone" true
+        (Riptide_storage.Fault_injecting_storage.superblock_read storages.(0) = None);
+      (* BOTH triples pass every check this layer can make -- which is the finding: face validity says
+         nothing about truth. *)
+      Riptide_storage.Fault_injecting_storage.superblock_rebuild_from_wal storages.(0)
+        ~view_number:rb_view ~last_normal_view:rb_lnv ~commit_number:rb_commit;
+      (* STEP 7: replica 3's last act starts the view change to view 4 (Primary(4) = 1, the repaired
+         replica), reaching both survivors from whatever view the repair left them in; then it is lost
+         for good. Replica 1 must be reconnected FIRST -- [isolate] drops at send time. *)
+      reconnect 1;
+      Replica.check_timeout replicas.(2);
+      Alcotest.(check int) "replica 3 started the view change to 4 before dying" 4
+        (Replica.view_number replicas.(2));
+      stop 3;
+      restart 1;
+      Alcotest.(check int) "the repaired replica recovered op_number 5 from its own WAL" 5
+        (Replica.op_number replicas.(0));
+      Alcotest.(check int) "its last_normal_view is exactly what the operator supplied" rb_lnv
+        (Replica.last_normal_view replicas.(0));
+      settle ();
+      Alcotest.(check int) "both survivors reached view 4" 4 (Replica.view_number replicas.(0));
+      Alcotest.(check int) "including the one that never crashed" 4 (Replica.view_number replicas.(1));
+      Alcotest.(check bool) "Primary(4) = 1: the REPAIRED replica coordinated the new view" true
+        (Replica.is_primary replicas.(0));
+      Alcotest.(check bool) "the view change completed on it" true
+        (Replica.status replicas.(0) = Replica.Normal);
+      Alcotest.(check bool) "and on the other survivor" true
+        (Replica.status replicas.(1) = Replica.Normal);
+      let live = [ replicas.(0); replicas.(1) ] in
+      let holds x r = List.exists (fun y -> encoded y = encoded x) (Replica.entries r) in
+      let durably_holds ~op_number x i =
+        Riptide_storage.Fault_injecting_storage.wal_read storages.(i) ~op_number = Some (encoded x)
+      in
+      if expect_replacement then begin
+        (* THE NEGATIVE CONTROL. It ASSERTS the replacement, so it stops proving anything the moment
+           the hazard stops being real. *)
+        Alcotest.(check int)
+          "THE POINT: replica 1's DVC WON selection with its 5-entry abandoned-view log" 5
+          (Replica.op_number replicas.(0));
+        Alcotest.(check int) "so did the other survivor adopt it" 5 (Replica.op_number replicas.(1));
+        Alcotest.(check int)
+          "the cluster's REAL committed op 2 is in NEITHER live replica's log any more" 0
+          (List.length (List.filter (holds real2) live));
+        Alcotest.(check int) "nor its real committed op 3" 0
+          (List.length (List.filter (holds real3) live));
+        (* Not merely lost -- REPLACED, at the same op-numbers, by values from an abandoned view. *)
+        Alcotest.(check bool) "op 2 now holds replica 1's stale view-1 value on BOTH live replicas" true
+          (durably_holds ~op_number:2 stale.(0) 0 && durably_holds ~op_number:2 stale.(0) 1);
+        Alcotest.(check bool) "and op 3 likewise" true
+          (durably_holds ~op_number:3 stale.(1) 0 && durably_holds ~op_number:3 stale.(1) 1);
+        (* The sharpest form of it: the replacements are not merely present, they are reported
+           COMMITTED -- so a client that was told ops 2 and 3 succeeded would now read back different
+           values at those op-numbers, with the cluster asserting they are committed. *)
+        Alcotest.(check int) "and the commit_number still covers them" 3
+          (Replica.commit_number replicas.(0));
+        Alcotest.(check bool) "so the STALE values are the ones reported committed, on both" true
+          (List.for_all (fun r -> Replica.is_committed r stale.(0) && Replica.is_committed r stale.(1)) live);
+        Alcotest.(check bool) "while the real committed values are reported committed nowhere" true
+          (List.for_all (fun r -> (not (Replica.is_committed r real2)) && not (Replica.is_committed r real3)) live)
+      end
+      else begin
+        (* THE FIXED ARM. The honest, LOWER [last_normal_view] loses selection to the survivors'
+           genuinely higher one -- which is exactly what it should do -- so the cluster keeps its real
+           committed data, and replica 1's never-committed ops 4..5 are correctly truncated. *)
+        Alcotest.(check int)
+          "THE POINT: the survivors' 3-entry log won, not replica 1's 5-entry abandoned-view one" 3
+          (Replica.op_number replicas.(0));
+        Alcotest.(check int) "and on the other survivor too" 3 (Replica.op_number replicas.(1));
+        Alcotest.(check int) "the cluster's real committed op 2 is in BOTH live replicas' logs" 2
+          (List.length (List.filter (holds real2) live));
+        Alcotest.(check int) "and its real committed op 3" 2
+          (List.length (List.filter (holds real3) live));
+        Alcotest.(check bool) "durably, on both disks" true
+          (durably_holds ~op_number:2 real2 0 && durably_holds ~op_number:2 real2 1
+          && durably_holds ~op_number:3 real3 0 && durably_holds ~op_number:3 real3 1);
+        Alcotest.(check bool) "and still reported committed on both" true
+          (List.for_all (fun r -> Replica.is_committed r real2 && Replica.is_committed r real3) live);
+        (* Replica 1's own uncommitted ops 4..5 are gone, and that is CORRECT, not a second loss:
+           they were acknowledged to nobody. Op 1, which WAS acknowledged, survives. *)
+        Alcotest.(check bool) "replica 1's never-acknowledged ops 4..5 are correctly truncated" true
+          (List.for_all (fun r -> (not (holds stale.(2) r)) && not (holds stale.(3) r)) live);
+        Alcotest.(check bool) "and the originally-acknowledged op 1 survived everything" true
+          (List.for_all (holds acked) live);
+        (* ...and the cluster genuinely carries on. Two follow-up proposals, for the reason this file's
+           own cluster tests already document: a backup's commit_number only advances when a LATER
+           Prepare carries the raised k. *)
+        Replica.propose replicas.(0) (v "a follow-up in view 4");
+        settle ();
+        Replica.propose replicas.(0) (v "a second follow-up, whose Prepare carries the raised k");
+        settle ();
+        Alcotest.(check bool) "the real committed ops are still committed after further progress" true
+          (Replica.is_committed replicas.(1) real2 && Replica.is_committed replicas.(1) real3)
+      end)
+
+(* THE NEGATIVE CONTROL: the retracted procedure, applied exactly as it was written. *)
+let test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data () =
+  run_superblock_rebuild_over_claim_trace ~value_source:Copied_from_a_live_peers_current_state
+    ~expect_replacement:true
+
+(* THE FIXED ARM: the same execution, with the crashed replica's OWN true prior triple instead. *)
+let test_a_rebuild_with_this_replicas_own_true_prior_state_preserves_committed_data () =
+  run_superblock_rebuild_over_claim_trace ~value_source:This_replicas_own_true_prior_state
+    ~expect_replacement:false
 
 let tests =
   [
@@ -1783,6 +2200,10 @@ let tests =
     ( "C1: a genuinely empty backend still restarts cleanly as Init (first boot keeps working)",
       `Quick,
       test_restart_still_accepts_a_genuinely_empty_backend );
+    ( "Task 13 re-review (finding 2): restart/create fail-stop when only the HEADER-ONLY scan sees \
+       the WAL -- the guards' own under-reporting blind spot",
+      `Quick,
+      test_restart_refuses_when_only_the_header_only_scan_sees_the_wal );
     ( "Task 13 fix (finding 1, NEGATIVE CONTROL): a rebuild with ZEROED values destroys a \
        committed, acknowledged op through a view change",
       `Quick,
@@ -1795,6 +2216,14 @@ let tests =
        committed op",
       `Quick,
       test_a_rebuild_with_correct_values_preserves_that_same_committed_op );
+    ( "Task 13 re-review (finding 1, NEGATIVE CONTROL, the OTHER direction): copying a live peer's \
+       CURRENT values into the rebuild silently REPLACES the cluster's committed data",
+      `Quick,
+      test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data );
+    ( "Task 13 re-review (finding 1): the SAME trace with the crashed replica's OWN true prior state \
+       preserves that committed data",
+      `Quick,
+      test_a_rebuild_with_this_replicas_own_true_prior_state_preserves_committed_data );
     ( "Task 13: superblock_rebuild_from_wal lets restart recover after the fail-stop refusal",
       `Quick,
       test_superblock_rebuild_from_wal_lets_restart_recover_after_the_fail_stop_refusal );

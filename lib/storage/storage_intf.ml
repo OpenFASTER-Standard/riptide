@@ -62,8 +62,40 @@ module type S = sig
       leave callers to discover it after a crash. *)
   val wal_truncate_after : t -> op_number:int -> unit
 
-  (** 0 if the WAL is empty. *)
+  (** 0 if the WAL is empty. {b The STRICT reading}: the highest op-number this backend can
+      currently hand back through {!wal_read} in full (header and data both verifying, where a
+      backend has such a distinction). See {!wal_highest_durable_op_number} for the other,
+      deliberately different reading, and why both exist. *)
   val wal_highest_op_number : t -> int
+
+  (** [wal_highest_durable_op_number t] is the highest op-number this backend has any durable
+      evidence it ever accepted an entry for -- {b whether or not that entry can still be read
+      back}. Always [>= wal_highest_op_number t]; equal for a backend with no partial-write failure
+      mode of its own (e.g. {!Riptide_storage.Memory_storage}, whose two readings coincide by
+      construction), and strictly greater for {!Riptide_storage.File_storage} exactly when a slot's
+      HEADER survived a crash but its DATA did not.
+
+      {b Why this is a second accessor rather than a stricter/looser reading of the one above}
+      (Task 13 re-review finding 2). The two readings are not interchangeable, and each caller needs
+      a specific one:
+      - A caller asking "can I READ op [o]?" -- {!Riptide_vsr.Replica}'s own [slot_state], and
+        {!wal_append}'s own [op_number = wal_highest_op_number t + 1] sequencing guard -- needs the
+        STRICT one.
+      - A caller asking "might this backend still be HOLDING something at op [o]?" needs this one,
+        and getting it wrong is a safety bug rather than an inefficiency. VSR's nack rule
+        ([CanNack], VSR.tla:157) lets a replica prove an op ABSENT purely from its own op-number
+        being lower, and [StorageWellFormed] (VSR.tla:742-745) is what makes that sound: a durably
+        written slot must never read back absent. A backend that under-reports here therefore makes
+        its replica prove absent ops it really did durably hold, which is precisely the
+        "corrupt -> absent" one-word mutation spec/tla/VSR.tla:111-150 records TLC refuting against
+        [NoCommittedOpProvablyAbsent].
+
+      The three callers that must use THIS one, all for that reason: {!Riptide_vsr.Replica.restart}'s
+      fail-stop guard and {!Riptide_vsr.Replica.create}'s
+      backend-is-not-virgin guard (both of which decide whether a backend is EMPTY -- and a backend
+      holding one header-only slot is not), and {!superblock_rebuild_from_wal}'s own [op_number]
+      derivation. *)
+  val wal_highest_durable_op_number : t -> int
 
   (** Durably overwrites the single superblock record. *)
   val superblock_write : t -> string -> unit
@@ -84,20 +116,32 @@ module type S = sig
 
       {b READ THIS BEFORE CALLING IT. This is a tool of last resort operated by a human with
       out-of-band knowledge, NOT a safe automatic self-heal, and it cannot be made into one.} The
-      three supplied values must be the replica's REAL durable view/commit state, obtained from a
-      live, trusted, surviving peer of the same cluster (its [view_number], its
-      [last_normal_view], and this replica's own commit-number as that peer understands it).
-      Supplying values this storage layer could have invented on its own -- in particular ZEROS,
-      which is what the first cut of this function silently wrote -- converts VSR's own safe
-      permanent-stall failure mode into SILENT, CLUSTER-WIDE LOSS of a committed,
-      client-acknowledged operation. That is not a theoretical concern; it is a concrete
-      three-replica trace, and it is pinned by a real running test
-      ([test/test_vsr_replica_recovery.ml]'s
-      [test_a_rebuild_with_zeroed_values_destroys_a_committed_op_through_a_view_change],
-      [test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it] and
-      [test_a_rebuild_with_correct_values_preserves_that_same_committed_op] -- three runs of the SAME
-      scenario function, differing in nothing but these three arguments):
+      three supplied values must be THIS REPLICA'S OWN real prior durable view/commit state -- the
+      exact triple its own superblock held immediately before the write that tore it. Supplying
+      values this storage layer could have invented on its own -- in particular ZEROS, which is what
+      the first cut of this function silently wrote -- converts VSR's own safe permanent-stall
+      failure mode into SILENT, CLUSTER-WIDE LOSS of a committed, client-acknowledged operation.
 
+      {b RETRACTION: DO NOT READ THESE VALUES OFF A LIVE PEER'S CURRENT STATE.} An earlier version
+      of this comment (and of {!Riptide_vsr.Replica.restart}'s own message, and of
+      {!Riptide_dst.Cluster}'s [superblock_repair]) instructed an operator to obtain them "from a
+      live, trusted, surviving peer of the same cluster -- ITS [view_number], ITS
+      [last_normal_view]". {b That instruction is withdrawn: it was actively wrong, not merely
+      risky-if-misapplied}, and following it destroys committed data in its own right by a mechanism
+      that is the exact OPPOSITE of the one the zeros trace below describes. A peer's CURRENT
+      [last_normal_view] equals this replica's true [last_normal_view] only if this replica never
+      fell behind that peer on view transitions -- which is precisely what cannot be established
+      from outside once this replica's own superblock, the only record of it, is gone.
+
+      {b THE TWO DIRECTIONS, both catastrophic, by different mechanisms.} Each is a concrete trace
+      pinned by a running test in [test/test_vsr_replica_recovery.ml]; neither is an argued
+      possibility.
+
+      TOO LOW (under-claiming) -- {b this replica's own uniquely-held committed data is truncated}
+      ([test_a_rebuild_with_zeroed_values_destroys_a_committed_op_through_a_view_change],
+      [test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it], and the fixed arm
+      [test_a_rebuild_with_correct_values_preserves_that_same_committed_op] -- three runs of ONE
+      scenario function, differing in nothing but these three arguments):
       - A 3-replica cluster commits and acknowledges op 1 in view 1. Replicas 1 and 2 hold it
         durably; replica 3 never saw it. Replica 1 is then lost for good, and replica 2 comes back
         from a crash with a torn superblock -- so the ONLY surviving durable copy of the
@@ -111,18 +155,64 @@ module type S = sig
         selection falls to the longer log -- replica 2's -- so the committed op survives, is
         re-replicated, and the cluster continues correctly.
 
-      The same reasoning applies to each field separately, so none of the three is optional or
-      "probably fine at 0":
+      TOO HIGH (over-claiming) -- {b the CLUSTER's already-committed data is silently REPLACED by
+      this replica's stale values}, which is strictly worse than the truncation above: the cluster
+      does not lose an acknowledged operation, it adopts a DIFFERENT one in its place and reports it
+      committed. This is exactly what copying a live peer's current values produces
+      ([test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data] and its fixed
+      counterpart [test_a_rebuild_with_this_replicas_own_true_prior_state_preserves_committed_data]
+      -- again one scenario function, two integer triples):
+      - Replica 1, primary of view 1, durably appends ops 1..5. Op 1 is committed cluster-wide; ops
+        2..5 are held by replica 1 ALONE (their Prepares never reached anyone). Replica 1 is then
+        partitioned off.
+      - Replicas 2 and 3 carry on without it: they complete view changes to view 2 and then view 3,
+        selecting a log of length 1 (neither of them ever had ops 2..5), and commit two genuinely
+        DIFFERENT values at ops 2 and 3 along the way. Their true state is now
+        [last_normal_view = 3], [op_number = 3], [commit_number = 3]. Replica 1's true (and now
+        lost) state is [last_normal_view = 1], [op_number = 5].
+      - Replica 1 crashes with a torn superblock. Following the retracted advice, the operator reads
+        replica 2's CURRENT values -- [view_number = 3], [last_normal_view = 3], [commit_number = 3]
+        -- and supplies them. Every face-validity check below passes: they are non-negative,
+        [3 <= 5], [3 <= 3].
+      - In the next view change, replica 1 is [Primary(4)] and collects the DVC quorum. Every DVC
+        now claims [last_normal_view = 3], so [WinningDVC] falls through to its tie-break on
+        [n] -- and replica 1 WINS with [n = 5] against the survivors' [n = 3]. [FillValue] prefers
+        the winner's own entries, so ops 2 and 3 are rebuilt from replica 1's STALE view-1 values,
+        while [HighestCommitNumber] (a separate maximum, VSR.tla:257-260) independently carries
+        [k = 3] forward. The [StartView] then installs that log on every LIVE replica (replica 3,
+        whose own last act started this view change, is permanently gone by then -- tolerating the
+        loss of one replica out of 2f+1 is exactly what VSR is for, so an unreachable machine's disk
+        is not a copy the protocol can ever use). Two committed, client-acknowledged operations have
+        been replaced by different values at the same op-numbers, and are reported committed.
+      - Rebuilt instead with replica 1's OWN true prior state ([view_number = 1],
+        [last_normal_view = 1], [commit_number = 1]), its DVC honestly reports the LOWER
+        [last_normal_view], loses selection to the survivors' [last_normal_view = 3], and the
+        cluster keeps its real committed ops 2 and 3 -- while replica 1's uncommitted ops 4..5 are
+        correctly truncated.
+
+      Nothing in this function's checks, or in {!Riptide_vsr.Replica}'s own
+      [handle_do_view_change] validation, can catch the over-claiming case:
+      [handle_do_view_change] validates a DVC's [entries]/[nacks]/[n]/[k]/[i]/[v] and bounds
+      [last_normal_view] below the view it announces, but it cannot verify that
+      [last_normal_view] is TRUE -- no receiver has any independent evidence of another replica's
+      own view history. That is the whole problem, not an unimplemented check.
+
+      Per-field, in both directions, so none of the three is optional or "probably fine at 0":
       - [last_normal_view] too LOW loses view-change log selection to a replica holding a shorter
-        log, as traced above.
+        log (first trace). Too HIGH wins selection it has no right to and overwrites the winner's
+        committed entries with its own stale ones (second trace). It is the primary sort key other
+        replicas rank this one by, so it is wrong in BOTH directions, never "conservative".
       - [commit_number] too LOW removes this replica's own protection against truncating a prefix it
         knows to be committed ([truncate_wal]'s [~committed] guard), so a later view change can
-        discard it locally.
+        discard it locally. Too HIGH makes this replica assert, through its own DVC's [k] and into
+        [HighestCommitNumber], that ops it merely holds are COMMITTED -- which is how the second
+        trace's stale ops 2 and 3 end up marked committed cluster-wide.
       - [view_number] too LOW makes the replica accept as current a view the cluster has already
-        abandoned. Note also (review finding M9) that [view_number] must be ACCURATE, not merely
-        non-zero: if the supplied view is one this replica is itself the primary of, the rebuilt
-        replica comes back as a [Normal] PRIMARY and will accept [propose] calls, durably appending
-        entries no peer may ever accept.
+        abandoned. Too HIGH makes it reject the real current primary's traffic and refuse every
+        [StartView] from the view actually in progress. Note also (review finding M9) that
+        [view_number] must be ACCURATE, not merely non-zero: if the supplied view is one this
+        replica is itself the primary of, the rebuilt replica comes back as a [Normal] PRIMARY and
+        will accept [propose] calls, durably appending entries no peer may ever accept.
 
       {b Why the caller has to supply them at all -- this is inherent, not an unfinished
       implementation.} The WAL is the only durable state this layer has left, and it records op
@@ -132,16 +222,34 @@ module type S = sig
       Recovering it from CROSS-REPLICA evidence is VSR's classical Recovery sub-protocol, which is
       real Layer-0 consensus-protocol scope (its own messages, its own quorum argument, its own
       TLA+ verification under this repo's own governance rules) and deliberately out of this
-      function's scope. What this function is, precisely, is the mechanical last step of that
-      recovery once a human has obtained the values some other way -- which is strictly better than
-      the alternative it replaced (a replica permanently down with a fully intact log and no
-      supported way to bring it back), and strictly worse than a real Recovery protocol.
+      function's scope.
+
+      {b WHEN THIS TOOL IS HONESTLY SAFE TO USE -- and the disclosed limitation when it is not.}
+      There is no known safe GENERAL procedure for externally sourcing these three values, and in
+      particular no procedure that queries other replicas: any peer's present state describes a
+      DIFFERENT replica's progress, not this one's. This function is therefore safe to call in
+      exactly one situation: {b the operator has independent, out-of-band certainty of THIS
+      replica's own prior durable state} -- for example an external monitoring/audit trail that
+      recorded this replica's own view transitions and commit progress in real time, BEFORE it
+      crashed, so the triple is read back from a record of this replica's own history rather than
+      inferred from anything currently live. If no such independent record exists, {b this tool
+      cannot be used safely, and there is no substitute for it in this codebase.} That is a real,
+      disclosed limitation of the feature, stated here rather than papered over with a procedure
+      that looks actionable and is not: a replica in this state with no trustworthy record of its
+      own prior view/commit state must be discarded wholesale and rejoin as an empty replica (which
+      costs its uniquely-held data, but cannot corrupt anyone else's), or wait for a real Recovery
+      sub-protocol. What this function is, precisely, is the mechanical last step of a recovery
+      whose EVIDENCE came from somewhere this layer cannot see -- strictly better than the
+      alternative it replaced (a replica permanently down with a fully intact log and no supported
+      way to bring it back) for an operator who has that evidence, and strictly worse than a real
+      Recovery protocol for one who does not.
 
       {b Preconditions}, both of them exactly {!Riptide_vsr.Replica.restart}'s own fail-stop
       condition, so this function is callable precisely in the state that guard refuses in:
       @raise Invalid_argument if [superblock_read t <> None] -- this function REPAIRS a lost
         superblock, it never overwrites one that is still perfectly good.
-      @raise Invalid_argument if [wal_highest_op_number t = 0] (review finding M8) -- an empty
+      @raise Invalid_argument if [wal_highest_durable_op_number t = 0] (review finding M8; the
+        DURABLE reading, matching {!Riptide_vsr.Replica.restart}'s own guard exactly) -- an empty
         backend is FIRST BOOT, not a lost superblock, and writing a degenerate superblock there
         repairs nothing while permanently foreclosing {!Riptide_vsr.Replica.create} (which refuses
         if any superblock already exists).
@@ -156,7 +264,8 @@ module type S = sig
       schema is {!Riptide_storage.Superblock_record}'s, the same single definition
       {!Riptide_vsr.Replica}'s own durable writes go through, so the two cannot drift.
 
-      {b [op_number] is derived in the OVER-reporting direction, deliberately} (review finding 2). A
+      {b [op_number] is derived in the OVER-reporting direction, deliberately} (review finding 2) --
+      it is exactly {!wal_highest_durable_op_number}, never {!wal_highest_op_number}. A
       backend derives it as the highest op-number whose slot HEADER still verifies and sits at the
       ring position that op-number belongs to -- {b regardless of whether that slot's DATA also
       verifies}. Requiring the data to verify too would UNDER-report, which is the one direction

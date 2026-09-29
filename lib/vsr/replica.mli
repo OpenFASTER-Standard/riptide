@@ -167,6 +167,12 @@ val create :
     non-empty backend means a previous life whose durable [view_number]/[last_normal_view] this
     constructor would silently discard — and those two surviving a crash is the whole basis of
     the recovery mechanism (VSR.tla's Decision 4). {!restart} is the constructor for that case.
+    {b "Already holds a WAL entry" means
+    {!Riptide_storage.Storage_intf.S.wal_highest_durable_op_number}[ > 0], not the strict
+    {!Riptide_storage.Storage_intf.S.wal_highest_op_number}} (Task 13 re-review finding 2): a backend
+    holding a slot whose header survived a crash while its data did not is NOT virgin, even though
+    nothing in it can be read back, and initializing over it would produce a replica claiming
+    [op_number = 0] over durable evidence of ops it really did accept — i.e. proving them absent.
 
     [?on_commit_advanced], if supplied, is a progress hook invoked {b synchronously and inline}
     (from within whichever {!propose} or {!handle_message} call caused the advance, on that
@@ -272,7 +278,11 @@ val restart :
     {b Raises [Invalid_argument] — fail-stop — if the superblock is unusable while the WAL is NOT
     empty}, i.e. if [superblock_read] returns [None] (fewer than a majority of copies verify and
     agree) OR returns bytes that do not decode as this module's own superblock record, while
-    [wal_highest_op_number > 0]. {b This is an ordinary crash state, not an exotic one}:
+    [wal_highest_durable_op_number > 0] — the DURABLE reading, not the strict
+    [wal_highest_op_number] this condition used to read (Task 13 re-review finding 2): a backend
+    whose every header-verifying slot has unreadable DATA reports 0 strictly, which would let this
+    guard stay silent and the replica boot as a fresh, empty one over durable evidence of ops it
+    really did accept. {b This is an ordinary crash state, not an exotic one}:
     {!Riptide_storage.Storage_intf.S.superblock_write} is implemented by
     {!Riptide_storage.File_storage} as 3 sequential, non-atomic copy writes, so a crash partway
     through leaves fewer than 2 copies agreeing while the WAL is fully intact.
@@ -301,16 +311,28 @@ val restart :
 
     {b That repair is a tool of last resort run by a human, not an automatic self-heal, and it takes
     three REQUIRED arguments it cannot derive} (Task 13 fix round): [~view_number],
-    [~last_normal_view] and [~commit_number] must be this replica's real durable view/commit state,
-    obtained out of band from a live, trusted, surviving peer of the same cluster. Only [op_number]
-    comes from the WAL. Supplying zeros — which the repair's first cut silently did on its own —
-    reintroduces exactly the cluster-wide committed-data loss this guard exists to prevent, by a
-    different route than the [n = 0] one above: a replica rebuilt with [last_normal_view] lower than
-    the truth loses view-change log selection (highest [last_normal_view] wins) to a peer that
+    [~last_normal_view] and [~commit_number] must be THIS REPLICA'S OWN real prior durable
+    view/commit state — the exact triple its own superblock held before the write that tore it. Only
+    [op_number] comes from the WAL. Supplying zeros — which the repair's first cut silently did on
+    its own — reintroduces exactly the cluster-wide committed-data loss this guard exists to prevent,
+    by a different route than the [n = 0] one above: a replica rebuilt with [last_normal_view] lower
+    than the truth loses view-change log selection (highest [last_normal_view] wins) to a peer that
     honestly reports a higher one over a SHORTER log, so the new view's log is reconstructed without
-    the committed op. Pinned by a running three-replica trace test, both directions — see that
-    function's own doc comment for the trace, the per-field reasoning, and the limitations it
-    discloses (including which shape of unusable superblock it cannot repair at all).
+    the committed op.
+
+    {b RETRACTED (Task 13 re-review finding 1): this doc used to say those values could be "obtained
+    out of band from a live, trusted, surviving peer of the same cluster". Do not do that.} A peer's
+    CURRENT [last_normal_view] is higher than this replica's true one whenever this replica had
+    fallen behind it on view transitions — which is exactly what cannot be established from outside
+    once this replica's own superblock is gone — and an OVER-claimed [last_normal_view] makes this
+    replica win log selection with a STALE log, silently replacing the cluster's real,
+    already-acknowledged committed values with its own. Both directions are catastrophic, by
+    different mechanisms, and both are pinned by running multi-replica trace tests. The only safe
+    triple is an independent, out-of-band record of THIS replica's own view/commit history captured
+    while it was still running; absent one, this repair cannot be used safely and the backend must be
+    discarded wholesale instead. See that function's own doc comment for both traces, the per-field
+    reasoning in both directions, and the limitations it discloses (including which shape of unusable
+    superblock it cannot repair at all).
 
     {b DURABLE, recovered here} (VSR.tla:592-596): the log (from the WAL), [op_number],
     [commit_number], [view_number], [last_normal_view]. The last two are Decision 4's whole point

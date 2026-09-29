@@ -21,11 +21,24 @@ type superblock_repair = {
 
     {b These are an OPERATOR's out-of-band knowledge, and a scenario using them must model that
     honestly.} Read that function's own doc comment before using this: the values must be the
-    repaired replica's REAL durable view/commit state, and supplying ones that are merely
+    repaired replica's OWN REAL prior durable view/commit state, and supplying ones that are merely
     well-formed — zeros, in particular — silently destroys committed, acknowledged operations
-    cluster-wide. In a DST scenario the faithful way to obtain them is from a LIVE, still-running
-    peer of the same cluster ([Riptide_vsr.Replica.view_number]/[last_normal_view]/[commit_number] of
-    a replica that never crashed), which is exactly what a real operator would query. *)
+    cluster-wide.
+
+    {b RETRACTED (Task 13 re-review finding 1): this comment used to say "in a DST scenario the
+    faithful way to obtain them is from a LIVE, still-running peer of the same cluster". That is
+    NOT faithful and must not be copied into new scenarios.} A live peer's CURRENT
+    [view_number]/[last_normal_view] describe THAT replica's progress, which may be strictly ahead
+    of the crashed one's; supplying the peer's higher [last_normal_view] makes the repaired replica
+    WIN view-change log selection with a STALE log and silently replace the cluster's real committed
+    values with its own (traced and pinned in [test/test_vsr_replica_recovery.ml]'s
+    [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data]). A scenario models
+    the operator honestly only by supplying the crashed replica's OWN prior state — which a scenario,
+    unlike a real operator, can simply read off that replica before crashing it, standing in for the
+    independent out-of-band record a real operator would need to have. Reading it off a peer is
+    acceptable ONLY where the scenario itself establishes that the two replicas' durable
+    view/commit state genuinely coincided at the moment of the crash, and such a scenario should say
+    so where it does it. *)
 
 exception Did_not_settle
 (** Raised by the [settle] function passed to a [run]/{!run_on_file_storage} body if the cluster

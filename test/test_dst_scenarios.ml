@@ -1024,10 +1024,18 @@ let test_the_superblock_repair_brings_a_refusing_replica_back () =
       Alcotest.(check int) "precondition: the value really is committed at the primary" 1
         (Replica.commit_number replicas.(0));
       check c ~phase:"before-the-crash" replicas;
-      (* THE OPERATOR'S OUT-OF-BAND KNOWLEDGE, read off the replica that is about to survive -- this
-         is the step that has no analogue inside the storage layer, and the reason the repair cannot
-         be an automatic self-heal: replica 1 (index 0) never crashes here, so its live view/commit
-         state IS the cluster's, exactly as a real operator would query a surviving peer for it. *)
+      (* THE OPERATOR'S OUT-OF-BAND KNOWLEDGE of the CRASHING replicas' OWN prior durable state --
+         the step that has no analogue inside the storage layer, and the reason the repair cannot be
+         an automatic self-heal.
+
+         WHY READING IT OFF replicas.(0) IS LEGITIMATE *HERE* SPECIFICALLY, now that "read a live
+         peer's current values" has been retracted as a general procedure (Task 13 re-review finding
+         1 -- see [Riptide_dst.Cluster.superblock_repair]'s own doc comment): this scenario never
+         performs a view change at all. Every replica is still in view 0 with
+         [last_normal_view = 0], so the surviving replica's view pair DEMONSTRABLY coincides with the
+         crashing replicas' own -- asserted below rather than assumed, precisely because the general
+         procedure is unsafe and this exception has to carry its own proof. The commit-number is NOT
+         taken from the peer for exactly that reason (see the next comment). *)
       let truth =
         { Riptide_dst.Cluster.view_number = Replica.view_number replicas.(0);
           last_normal_view = Replica.last_normal_view replicas.(0);
@@ -1041,6 +1049,16 @@ let test_the_superblock_repair_brings_a_refusing_replica_back () =
       in
       Alcotest.(check int) "the backups' own commit_number really is 0, not the primary's 1" 0
         (Replica.commit_number replicas.(1));
+      (* The proof the view pair really may be read off replicas.(0) here: no view change has
+         happened, so the crashing replicas' OWN view/last_normal_view are identical to it. If a
+         future edit to this scenario introduces a view change, these assertions fail and the
+         value-sourcing above has to change with it -- which is the point of asserting them. *)
+      Alcotest.(check (pair int int)) "crashing replica 2's own view pair matches the survivor's"
+        (Replica.view_number replicas.(0), Replica.last_normal_view replicas.(0))
+        (Replica.view_number replicas.(1), Replica.last_normal_view replicas.(1));
+      Alcotest.(check (pair int int)) "and crashing replica 3's does too"
+        (Replica.view_number replicas.(0), Replica.last_normal_view replicas.(0))
+        (Replica.view_number replicas.(2), Replica.last_normal_view replicas.(2));
       (* THE CRASH, exactly test 8's: two replicas go down with torn superblocks. Both must refuse. *)
       List.iter
         (fun i ->
@@ -1795,7 +1813,7 @@ let tests =
     ( "subtask 3.7, fix round 1 (finding C1): once the ring has WRAPPED, restart recovery cannot \
        recover a still-unmaterialized entry -- the real, narrower boundary of that claim", `Slow,
       test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry );
-    ( "Task 13 fix round: the superblock repair brings a refusing replica back, with real \
-       operator-supplied values read off a surviving peer", `Quick,
+    ( "Task 13 fix round: the superblock repair brings a refusing replica back, with the crashed \
+       replicas' own real prior view/commit values", `Quick,
       test_the_superblock_repair_brings_a_refusing_replica_back );
   ]

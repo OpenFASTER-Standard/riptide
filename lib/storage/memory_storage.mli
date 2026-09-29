@@ -36,7 +36,8 @@ val create : unit -> t
 
 val for_test_corrupt : t -> op_number:int -> unit
 (** [for_test_corrupt t ~op_number] makes that WAL entry unreadable ([wal_read] returns [None])
-    while leaving {!wal_highest_op_number} untouched — i.e. it moves exactly one slot from
+    while leaving {!wal_highest_op_number} (and {!wal_highest_durable_op_number}, which coincides
+    with it on this backend) untouched — i.e. it moves exactly one slot from
     VSR.tla's ["present"] to its ["corrupt"] state (VSR.tla:100-150), never to ["absent"].
 
     That distinction is the whole reason this function exists rather than tests simply truncating

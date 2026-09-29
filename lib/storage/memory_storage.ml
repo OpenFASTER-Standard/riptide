@@ -43,6 +43,13 @@ let wal_truncate_after t ~op_number =
   end
 
 let wal_highest_op_number t = t.highest
+
+(* {!Storage_intf.S.wal_highest_durable_op_number}: identical to the strict reading here, and that is
+   a property of this backend rather than a shortcut. There is no header/data split and no partial
+   write to survive -- [for_test_corrupt] marks a slot unreadable WITHOUT lowering [t.highest]
+   (deliberately -- see the [corrupt] field's own comment), which is exactly the durable reading. *)
+let wal_highest_durable_op_number t = t.highest
+
 let superblock_write t data = t.superblock <- Some data
 let superblock_read t = t.superblock
 

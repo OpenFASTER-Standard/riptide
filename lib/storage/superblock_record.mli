@@ -71,8 +71,9 @@ val check_rebuild_precondition : superblock_read:string option -> durable_op_num
     message (Task 13 fix round, review finding M10).
 
     [~durable_op_number] is the op-number the caller is about to write into the rebuilt record, i.e.
-    the backend's own answer to "what does my WAL still attest to" — not necessarily
-    [wal_highest_op_number], which for {!File_storage} carries the stricter
+    the backend's own answer to "what does my WAL still attest to" — i.e.
+    {!Storage_intf.S.wal_highest_durable_op_number}, NOT
+    {!Storage_intf.S.wal_highest_op_number}, which for {!File_storage} carries the stricter
     "this entry is fully readable" meaning. See
     {!Storage_intf.S.superblock_rebuild_from_wal} on why the rebuild deliberately uses the
     over-reporting derivation.

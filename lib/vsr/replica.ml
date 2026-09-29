@@ -46,6 +46,7 @@ type storage = {
   wal_read : op_number:int -> string option;
   wal_truncate_after : op_number:int -> unit;
   wal_highest_op_number : unit -> int;
+  wal_highest_durable_op_number : unit -> int;
   superblock_write : string -> unit;
   superblock_read : unit -> string option;
 }
@@ -57,6 +58,7 @@ let storage_of_module (type a) (module S : Riptide_storage.Storage_intf.S with t
     wal_read = (fun ~op_number -> S.wal_read backend ~op_number);
     wal_truncate_after = (fun ~op_number -> S.wal_truncate_after backend ~op_number);
     wal_highest_op_number = (fun () -> S.wal_highest_op_number backend);
+    wal_highest_durable_op_number = (fun () -> S.wal_highest_durable_op_number backend);
     superblock_write = (fun bytes -> S.superblock_write backend bytes);
     superblock_read = (fun () -> S.superblock_read backend);
   }
@@ -86,7 +88,21 @@ let volatile_storage () = storage_of_module (module Riptide_storage.Memory_stora
    disk but not yet covered by the superblock (a crash between the two writes) is treated as
    CORRUPT rather than ABSENT, i.e. it is never nacked. Erring this way costs liveness only;
    erring the other way is precisely the mutation VSR.tla:118-147 records TLC breaking
-   [NoCommittedOpProvablyAbsent] on at depth 6. *)
+   [NoCommittedOpProvablyAbsent] on at depth 6.
+
+   WHY THIS ONE STAYS ON THE STRICT [wal_highest_op_number] while [create]'s and [restart]'s guards
+   moved to [wal_highest_durable_op_number] (Task 13 re-review finding 2). Those two guards ask "is
+   this backend virgin / did it hold anything at all?", and there the strict reading is UNSOUND: it
+   answers "no" for a backend holding a slot whose header survived but whose data did not. This
+   function asks a different question, and the strict reading is SOUND for it -- because of the [max
+   t.op_number]. [CanNack] (VSR.tla:157) is exactly [o > rep_op_number[r]], so nacking an op above
+   this replica's own durable [op_number] is precisely what the spec licenses: such an op was never
+   acknowledged (the PREPAREOK is sent only after both the WAL and the superblock write), and
+   [restart] now physically discards those slots anyway. Using the durable reading here would be
+   strictly MORE conservative (a header-only slot above [op_number] would read [Corrupt] and never be
+   nacked) but it is not needed for soundness, and it would change the DVC nack set -- a protocol
+   observable -- for no safety gain, which is why it was deliberately left alone rather than swept
+   along with the guards. *)
 type slot_state = Present of Value.value | Corrupt | Absent
 
 (* ---- I2: the genuinely different reasons a durable append can be refused ----
@@ -522,7 +538,14 @@ let advance_commit_number t new_commit =
 
 let create ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.create" ~my_id ~replica_count ~svc_limit;
-  if storage.wal_highest_op_number () > 0 || storage.superblock_read () <> None then
+  (* [wal_highest_durable_op_number], not [wal_highest_op_number] (Task 13 re-review finding 2).
+     The question this guard asks is "is this backend VIRGIN?", and a backend holding one slot whose
+     header survived a crash while its data did not is not virgin, even though nothing in it can be
+     read back. Under the strict reading such a backend passes this guard, [create] writes a fresh
+     [Init] superblock over it, and the replica comes up claiming [op_number = 0] over durable
+     evidence of ops it really did accept -- proving them absent, the exact hazard
+     [restart]'s own fail-stop guard below exists to stop, reached through [create] instead. *)
+  if storage.wal_highest_durable_op_number () > 0 || storage.superblock_read () <> None then
     invalid_arg
       "Replica.create: this storage backend already holds durable state -- use Replica.restart to \
        recover it (VSR.tla's CrashRestart, :671-690), never Replica.create, which would silently \
@@ -933,11 +956,32 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    committed op -- cluster-wide, silently. Under-claiming is not automatically the conservative
    direction; it is only conservative for a value NOBODY ELSE compares against, and
    [last_normal_view] is precisely a value other replicas rank this one by. So the three
-   non-WAL-derivable fields are the caller's to supply, from a live surviving peer, and this guard's
-   message says exactly that. See
-   {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s own doc comment for the full trace
-   and for why a real VSR Recovery sub-protocol -- the classical mechanism for this situation -- is
-   deliberately out of scope here.
+   non-WAL-derivable fields are the caller's to supply, and this guard's message says exactly that.
+
+   TASK 13 RE-REVIEW (finding 1): that fix round's OWN advice about WHERE the caller gets them --
+   "from a live surviving peer", which both this comment and the message below used to say in those
+   words -- is RETRACTED, because it is catastrophic in the opposite direction. A peer's CURRENT
+   [last_normal_view] exceeds this replica's true one whenever this replica had fallen behind it on
+   view transitions, and an OVER-claimed [last_normal_view] makes this replica WIN [WinningDVC]'s
+   selection (tie on [last_normal_view], then longest log) with a STALE log, so [FillValue] rebuilds
+   already-committed op-numbers from this replica's superseded values while [HighestCommitNumber]
+   independently carries the real commit-number forward -- the cluster silently adopts DIFFERENT
+   values for operations clients were already told had succeeded. Pinned by
+   [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data] and its fixed
+   counterpart. There is no known safe GENERAL procedure for sourcing these values externally; the
+   only safe triple is this replica's OWN true prior state, and if no independent out-of-band record
+   of it exists, the repair cannot be used safely at all. See
+   {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s own doc comment for both traces,
+   for that disclosed limitation, and for why a real VSR Recovery sub-protocol -- the classical
+   mechanism for this situation -- is deliberately out of scope here.
+
+   THE GUARD'S OWN CONDITION reads [wal_highest_durable_op_number], not [wal_highest_op_number]
+   (Task 13 re-review finding 2, which found a previous comment in [file_storage.ml] falsely
+   claiming this path could not under-report). The strict reading returns 0 for a backend whose every
+   header-verifying slot has unreadable DATA, so this guard would stay silent and the replica would
+   come up as a fresh, empty one over durable evidence of ops it really did accept -- the same
+   prove-absent hazard, reached through this guard's own blind spot rather than through the
+   zero-fallback it replaced.
 
    The guard is conditioned on the WAL, not on the superblock alone, and that is load-bearing:
    an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
@@ -946,7 +990,7 @@ let adopt_durable_log t (values : Value.value list) ~committed =
 let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.restart" ~my_id ~replica_count ~svc_limit;
   let durable = Option.bind (storage.superblock_read ()) superblock_decode in
-  if durable = None && storage.wal_highest_op_number () > 0 then
+  if durable = None && storage.wal_highest_durable_op_number () > 0 then
     invalid_arg
       "Replica.restart: this backend's superblock is unreadable while its WAL is NOT empty -- \
        refusing to start. Coming up with op_number = 0 over a WAL that still holds entries would \
@@ -957,14 +1001,22 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
        (Task 13): call this backend's own Storage_intf.S.superblock_rebuild_from_wal ~view_number \
        ~last_normal_view ~commit_number (e.g. \
        Riptide_storage.File_storage.superblock_rebuild_from_wal), then retry Replica.restart. THOSE \
-       THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED: none of them is derivable from this \
-       replica's own WAL, and supplying a last_normal_view or commit_number LOWER than the cluster's \
-       real state makes this replica lose view-change log selection to a peer holding a SHORTER log, \
-       which silently destroys a committed op cluster-wide -- the exact loss this refusal exists to \
-       prevent, reintroduced by the repair. Obtain them out of band from a live, trusted, surviving \
-       peer of this cluster (its view_number and last_normal_view, and this replica's own \
-       commit_number as that peer understands it); see that function's own doc comment for the full \
-       trace and for the limitations it discloses.";
+       THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED, AND THE ONLY SAFE VALUES ARE THIS \
+       REPLICA'S OWN TRUE PRIOR DURABLE STATE -- the exact triple its own superblock held before \
+       the write that tore it. DO NOT COPY THEM OFF A LIVE PEER'S CURRENT STATE: an earlier version \
+       of this message told you to do exactly that, and that advice is WITHDRAWN as actively wrong. \
+       A value too LOW makes this replica lose view-change log selection to a peer holding a SHORTER \
+       log, silently destroying a committed op cluster-wide -- the exact loss this refusal exists to \
+       prevent, reintroduced by the repair. A value too HIGH -- which is what a surviving peer's \
+       CURRENT last_normal_view gives you whenever this replica had fallen behind that peer on view \
+       transitions, something nobody can rule out once THIS replica's own superblock is gone -- \
+       makes this replica WIN that selection with a stale log and silently REPLACE the cluster's \
+       real, already-acknowledged committed values with its own. Supply the triple only from an \
+       independent, out-of-band record of THIS replica's own view/commit history, captured while it \
+       was still running (e.g. external monitoring); if no such record exists, this repair CANNOT be \
+       used safely and the backend must be discarded wholesale instead. See \
+       Storage_intf.S.superblock_rebuild_from_wal's own doc comment for both traces and for the full \
+       disclosed limitation.";
   let view_number, last_normal_view, op_number, commit_number =
     match durable with
     | Some (v, lnv, n, k) -> (v, lnv, n, k)
@@ -978,7 +1030,13 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
       ~status:(if view_number > last_normal_view then View_change else Normal)
       ~on_commit_advanced
   in
-  if storage.wal_highest_op_number () > op_number then
+  (* Also the DURABLE reading (Task 13 re-review finding 2), so a slot whose header survived the
+     crash above the superblock's own [op_number] is physically discarded here rather than left
+     behind to read back [Absent] later. Sound for the same reason the strict version was: every
+     entry above the superblock's [op_number] was never acknowledged (the PREPAREOK that would have
+     exposed it is sent only after BOTH writes), and [truncate_wal]'s own [~committed] guard is what
+     checks that rather than this comment. *)
+  if storage.wal_highest_durable_op_number () > op_number then
     truncate_wal t ~op_number ~committed:commit_number ~resulting_length:op_number;
   let rec readable_prefix o acc =
     if o > op_number then List.rev acc

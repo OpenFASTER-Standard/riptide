@@ -460,8 +460,9 @@ let test_superblock_none_without_majority () =
 
    TASK 13 FIX ROUND. Two changes here, both real:
    - The three non-WAL-derivable fields are now SUPPLIED (review finding 1), and this test supplies
-     plausible real ones -- what an operator would have read off a surviving peer of a cluster that
-     had committed 4 of its 5 durable ops in view 3 -- not the zeros the first cut invented.
+     plausible real ones -- the replica's OWN prior state, as of having committed 4 of its 5 durable
+     ops in view 3 -- not the zeros the first cut invented. (Deliberately not "what an operator would
+     read off a surviving peer": that procedure is retracted, Task 13 re-review finding 1.)
    - The assertion DECODES the rebuilt record and checks every field (review finding M11). Asserting
      only [Option.is_some] would pass for any bytes at all, including bytes no
      [Riptide_vsr.Replica.restart] could ever use, which is precisely what this repair has to
@@ -552,6 +553,15 @@ let test_superblock_rebuild_over_reports_an_op_whose_data_no_longer_verifies () 
          the value whose meaning is "fully readable", and it is unchanged by this fix. *)
       Alcotest.(check int) "precondition: op 3's data no longer verifies, so wal_read cannot see it"
         2 (File_storage.wal_highest_op_number t2);
+      (* Task 13 re-review (finding 2): the same over-reporting scan is now a NAMED accessor on
+         [Storage_intf.S], because [Replica.restart]'s and [Replica.create]'s own guards need it too --
+         not just this rebuild. This is the storage-layer assertion that the two readings really do
+         diverge here; [test_vsr_replica_recovery.ml]'s
+         [test_restart_refuses_when_only_the_header_only_scan_sees_the_wal] asserts the protocol-level
+         consequence over the same fault. *)
+      Alcotest.(check int)
+        "and the DURABLE reading says 3 -- op 3's header survived, so this backend may still hold it"
+        3 (File_storage.wal_highest_durable_op_number t2);
       Alcotest.(check (option string)) "precondition: and op 3 really is unreadable" None
         (File_storage.wal_read t2 ~op_number:3);
       Alcotest.(check bool) "precondition: op 2 next to it is fine" true

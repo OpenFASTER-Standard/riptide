@@ -136,6 +136,16 @@ let wal_highest_op_number (T r) =
   let module U = (val r.module_) in
   U.wal_highest_op_number r.value
 
+(* {!Storage_intf.S.wal_highest_durable_op_number}: a passthrough for the same reason as the strict
+   reading above, and deliberately NOT masked by [corrupted_slots]/[dropped_slots]. A slot this
+   wrapper has faulted must keep counting toward the DURABLE op-number -- lowering it is precisely
+   the "corrupt -> absent" mutation spec/tla/VSR.tla:111-150 records TLC refuting against
+   [NoCommittedOpProvablyAbsent], i.e. this wrapper would be injecting an unsoundness rather than a
+   fault the protocol is supposed to survive. *)
+let wal_highest_durable_op_number (T r) =
+  let module U = (val r.module_) in
+  U.wal_highest_durable_op_number r.value
+
 (* The DETERMINISTIC counterpart of the [corrupt_probability] path above -- see the .mli for the
    full rationale. Two implementation points worth stating next to the code:
 
@@ -288,24 +298,22 @@ let for_test_lose_superblock (T r) =
    bookkeeping ([superblock_lost <- false]) itself, in the one place it changes -- the same "an untorn
    write repairs a previously torn one" property [superblock_write] above already documents.
 
-   THE OP-NUMBER DERIVATION is [U.wal_highest_op_number], and the choice is worth stating because the
-   masking asymmetry above also blocks the obvious alternative (asking the wrapped backend for its own
-   rebuild derivation -- there is no entry point for that short of the guarded rebuild itself). This is
-   the right value here rather than merely an available one: for {!Memory_storage} it IS that backend's
-   own rebuild derivation exactly (see its own comment), and for {!File_storage} it is that backend's
-   live append counter, which differs from its header-only rebuild scan only for a [t] produced by a
-   FRESH [create] over a crashed ring -- a thing this wrapper explicitly does not model (its own [.mli]
-   states that its fault state does not survive re-wrapping, i.e. a re-opened backend is outside its
-   model, and no harness in this repo re-[create]s a wrapped backend across a simulated restart; they
-   reuse the same live [t], which is what makes the crash a loss of VOLATILE state only). Deliberately
-   NOT masked by [corrupted_slots]/[dropped_slots]: a slot this wrapper has faulted must keep counting
-   toward the durable op-number, since lowering it is precisely the "corrupt -> absent" mutation the
-   whole nack-soundness argument forbids. *)
+   THE OP-NUMBER DERIVATION is [U.wal_highest_durable_op_number] -- the wrapped backend's OWN
+   header-only, over-reporting scan, which is the same value that backend's own
+   [superblock_rebuild_from_wal] would have derived. This was [U.wal_highest_op_number] (the strict
+   reading) in the fix round that rewrote this function, disclosed there as a residual on the
+   reasoning that "the masking asymmetry leaves no entry point for the latter" and that closing it
+   would mean widening [Storage_intf.S]. Task 13's re-review found that same under-reporting gap
+   reaching [Replica.restart]'s and [Replica.create]'s own guards, so the accessor exists now and
+   there is no reason left not to use it here. Deliberately NOT masked by
+   [corrupted_slots]/[dropped_slots]: a slot this wrapper has faulted must keep counting toward the
+   durable op-number, since lowering it is precisely the "corrupt -> absent" mutation the whole
+   nack-soundness argument forbids. *)
 let superblock_rebuild_from_wal t ~view_number ~last_normal_view ~commit_number =
   match t with
   | T r ->
     let module U = (val r.module_) in
-    let op_number = U.wal_highest_op_number r.value in
+    let op_number = U.wal_highest_durable_op_number r.value in
     Superblock_record.check_rebuild_precondition ~superblock_read:(superblock_read t)
       ~durable_op_number:op_number;
     Superblock_record.check_rebuild_values ~view_number ~last_normal_view ~op_number ~commit_number;

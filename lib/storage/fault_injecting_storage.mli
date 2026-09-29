@@ -178,7 +178,9 @@ val for_test_corrupt_entry : t -> op_number:int -> unit
     premise is that the fault landed; a silent no-op there does not fail, it produces a
     fault-free run wearing a corruption test's name.
 
-    {b [wal_highest_op_number] is deliberately UNCHANGED}: this moves exactly one slot from
+    {b [wal_highest_op_number] is deliberately UNCHANGED} (and {!wal_highest_durable_op_number}
+    with it -- the corruption is applied by rewriting the slot through the wrapped backend, so its
+    header stays valid down there): this moves exactly one slot from
     VSR.tla's ["present"] to its ["corrupt"] state, never to ["absent"] -- a slot the replica
     durably wrote must never read back as provably-empty, or two replicas could jointly "prove" a
     committed op was never held. A caller that wants ["absent"] wants {!wal_truncate_after}. Entries

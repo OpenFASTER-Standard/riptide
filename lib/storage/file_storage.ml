@@ -377,16 +377,30 @@ let recover_highest_op_number t =
    [None], i.e. VSR.tla's "corrupt", so the replica declines new Prepares until a StartView repairs
    it, which is precisely the behaviour [Replica.restart] is already written to handle.
 
-   WHY [create]'s OWN [highest_op_number] KEEPS THE STRICTER RULE. [create] is not making a durable
-   claim about anything: [Replica.restart] takes its [op_number] from the SUPERBLOCK, never from
-   [wal_highest_op_number], and uses the latter only to decide whether a crash left unacknowledged
-   entries ABOVE the superblock's op-number to discard. Under-reporting there can only cause that
-   truncate to be skipped, never to discard something the superblock still accounts for -- so the
-   dangerous direction genuinely does not exist on that path, and [recover_highest_op_number]'s
-   tighter "this entry is fully readable" meaning is the right one for the field {!wal_read} is
-   checked against. The two scans are kept as two functions, each used at exactly one place, rather
-   than one parameterized scan: the choice between them IS the safety argument above, and a boolean
-   flag at a call site is a poor place to keep an argument. *)
+   WHY [create]'s OWN CACHED [highest_op_number] KEEPS THE STRICTER RULE, and the CORRECTION that
+   goes with it (Task 13 re-review finding 2). [highest_op_number] is the field {!wal_read} is
+   checked against and the field {!wal_append}'s [op_number = highest + 1] sequencing guard is stated
+   against, so for THAT field "this entry is fully readable" is the right meaning and
+   [recover_highest_op_number] stays as it is.
+
+   What this comment previously claimed to follow from that, and which was FALSE: that
+   "[Replica.restart] takes its [op_number] from the SUPERBLOCK, never from [wal_highest_op_number]
+   ... so the dangerous direction genuinely does not exist on that path". [Replica.restart]'s
+   fail-stop guard reads [wal_highest_op_number] too -- its condition is
+   [superblock unusable && wal_highest_op_number () > 0] -- and so does [Replica.create]'s
+   backend-is-not-virgin guard. Under the strict scan, a backend whose every header-verifying slot
+   has unverifiable DATA reports 0, both guards stay silent, and the replica comes back as a FRESH,
+   EMPTY one over a WAL that still holds durable evidence of those ops -- proving them absent, which
+   is the exact hazard this task's own [recover_highest_durable_op_number] exists to prevent one
+   level up. Two faults on one replica reach it (a torn superblock plus one corrupt data slot over a
+   short WAL), not one, but it is real.
+
+   So the gap is CLOSED rather than disclosed: this scan is exported as
+   {!Storage_intf.S.wal_highest_durable_op_number}, and both of those guards now read THAT instead.
+   The two scans remain two functions rather than one parameterized scan -- the choice between them
+   IS the safety argument above, and a boolean flag at a call site is a poor place to keep an
+   argument -- but each now has a named accessor rather than one of them being reachable only from
+   inside [superblock_rebuild_from_wal]. *)
 let recover_highest_durable_op_number t =
   let best = ref 0 in
   for slot = 0 to t.ring_capacity - 1 do
@@ -518,6 +532,14 @@ let wal_read t ~op_number =
       end
 
 let wal_highest_op_number t = t.highest_op_number
+
+(* {!Storage_intf.S.wal_highest_durable_op_number} (Task 13 re-review finding 2): the header-only
+   scan, exported. A fresh scan rather than a cached field on purpose -- [t.highest_op_number] is the
+   STRICT value maintained across appends/truncates, and the whole point here is the case where the
+   two disagree. It is called at most once per restart, so the cost of re-walking the ring is
+   irrelevant next to the property it buys. See [recover_highest_durable_op_number]'s own comment for
+   the full safety argument and for what the previous, false version of that comment claimed. *)
+let wal_highest_durable_op_number t = recover_highest_durable_op_number t
 
 (* DURABLE, not merely a counter decrement (final-review finding I3).
 

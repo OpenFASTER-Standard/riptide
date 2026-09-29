@@ -138,6 +138,40 @@ module Make_storage_tests (S : Storage_intf.S) = struct
           (refused (fun () ->
                S.superblock_rebuild_from_wal t ~view_number:4 ~last_normal_view:3 ~commit_number:1)))
 
+  (* TASK 13 RE-REVIEW (finding 2): the cross-backend contract of the SECOND op-number accessor,
+     [Storage_intf.S.wal_highest_durable_op_number], added because [Replica.restart]'s and
+     [Replica.create]'s own guards must ask "might this backend still be HOLDING something?" rather
+     than "can it still READ something?".
+
+     Only the implementation-INDEPENDENT half of that contract belongs here, and it is exactly two
+     clauses: the two readings agree on a virgin backend and across ordinary appends and truncates
+     (nothing in this suite can produce a torn write, since [Memory_storage] has no header/data split
+     to tear), and the durable reading is never BELOW the strict one. The interesting half -- the two
+     genuinely diverging, which is the whole reason the accessor exists -- is necessarily
+     backend-specific and lives in [test_file_storage.ml] (the storage-layer assertion) and
+     [test_vsr_replica_recovery.ml]'s
+     [test_restart_refuses_when_only_the_header_only_scan_sees_the_wal] (the protocol-level
+     consequence). Stated explicitly so a reader does not mistake this clause for full coverage of
+     the accessor. *)
+  let test_durable_op_number_never_below_the_strict_one (with_storage : (S.t -> unit) -> unit) () =
+    with_storage (fun t ->
+        let both label ~expected =
+          Alcotest.(check int) (label ^ ": strict") expected (S.wal_highest_op_number t);
+          Alcotest.(check int) (label ^ ": durable") expected (S.wal_highest_durable_op_number t)
+        in
+        both "a virgin backend" ~expected:0;
+        S.wal_append t ~op_number:1 "one";
+        S.wal_append t ~op_number:2 "two";
+        both "after two appends" ~expected:2;
+        S.wal_truncate_after t ~op_number:1;
+        (* Load-bearing rather than incidental: a DURABLE truncate must lower BOTH readings. A backend
+           that only lowered the strict one would make [Replica.create] refuse a backend it had just
+           been told was emptied, and one that only lowered the durable one would resurrect discarded
+           entries into the very guard that decides whether a replica may boot. *)
+        both "after a durable truncate" ~expected:1;
+        Alcotest.(check bool) "the durable reading is never below the strict one" true
+          (S.wal_highest_durable_op_number t >= S.wal_highest_op_number t))
+
   let shared_tests (with_storage : (S.t -> unit) -> unit) =
     [ ("append and read", `Quick, test_append_and_read with_storage);
       ("read of never-written op_number is None", `Quick, test_read_never_written_is_none with_storage);
@@ -148,7 +182,9 @@ module Make_storage_tests (S : Storage_intf.S) = struct
         test_truncate_after with_storage );
       ("superblock write then read (round trip)", `Quick, test_superblock_round_trip with_storage);
       ( "Task 13 fix (finding 6): superblock_rebuild_from_wal's contract", `Quick,
-        test_superblock_rebuild_from_wal_contract with_storage )
+        test_superblock_rebuild_from_wal_contract with_storage );
+      ( "Task 13 re-review (finding 2): wal_highest_durable_op_number's shared contract", `Quick,
+        test_durable_op_number_never_below_the_strict_one with_storage )
     ]
 end
 
