@@ -48,12 +48,19 @@ let tag_map = '\x08'
    held an entire second copy of the value's shape (one [sized_value]
    record + one [sized_shape] block per input node) live in memory
    *simultaneously* with both the input [value] and the output buffer, for
-   every value encoded, not just ones with deep Map-key chains. Measured
-   live on an ordinary 2-million-element [Sequence] of [Bool] (3.8MB
-   encoded, no [Map] anywhere in it): live heap for the value tree alone
-   was 107.5 MiB, but peak heap during [canonical_encode] reached 237.2
-   MiB - a +117% regression on the exact memory axis this task exists to
-   improve, paid by every caller, unconditionally (audit finding I1).
+   every value encoded, not just ones with deep Map-key chains. Measured on
+   the original reviewer's own reproduction input (a 2-million-element
+   [Sequence] of [Bool] with distinct blocks, no [Map] anywhere in it):
+   peak heap during [canonical_encode] with this [sized_value] shadow tree
+   reached 241.2 MiB - a regression on the exact memory axis this task
+   exists to improve, paid by every caller, unconditionally (audit finding
+   I1). [Wbuf] below removes the shadow tree and brings that same
+   reproduction's peak down to 152.8 MiB (a ~37% reduction). These are the
+   reconciled, authoritative figures - see task-5-report.md's Finding I1
+   section for the full reproduction; two earlier, differently-scoped
+   measurements (taken with different repro inputs and never reconciled
+   against each other) previously disagreed with these and with each
+   other, and are superseded by these numbers.
 
    [Wbuf] removes the shadow tree entirely: [encode_into] walks the real
    [value] tree once, writing directly into the growable output buffer,

@@ -303,13 +303,31 @@ let build_nested_map_key_value ~depth =
    core count - see /work/CLAUDE.md's "cpu.max" note), which can make an
    absolute-time assertion fail for reasons unrelated to the code under
    test. Fixed by asserting on how time SCALES with depth instead of an
-   absolute bound: doubling the depth should roughly double a linear
-   algorithm's time (up to noise) but roughly quadruple a quadratic one -
-   asserting the doubled-depth time stays within ~4x (plus a small additive
-   floor to stay non-flaky when both measurements are too fast for the
-   ratio itself to be meaningful) catches a real regression back to
-   quadratic behavior while staying insensitive to the machine's absolute
-   speed. *)
+   absolute bound.
+
+   Round-2 correction (Finding 1, task-5 fix loop): the first version of
+   this fix compared t(2D) against t(D) with a 4.0x factor - independently
+   re-derived by reconstructing the pre-Task-5 quadratic decoder and
+   measuring it at these exact depths, that gave a *measured* ratio of
+   3.81x, which PASSES a 4.0x bound. At only a 2x depth span, a genuinely
+   quadratic algorithm's ratio (nominally 4x) sits close enough to a
+   linear algorithm's ratio (nominally 2x, but with real lower-order-term
+   noise pushing it up) that a single factor can't cleanly separate them -
+   the test would not have caught a reintroduction of the exact bug it
+   exists to prevent.
+
+   Fix: widen the span to 4x (compare t(4D) against t(D) instead of t(2D)
+   against t(D)). At a 4x span the two hypotheses separate widely: linear
+   cost gives a ~4x ratio (with noise), quadratic gives a ~16x ratio - a
+   16x/4x = 4x gap between the two nominal ratios, vs. only a 4x/2x = 2x
+   gap at the old 2x span. asserting the 4x-depth time stays within an 8x
+   bound (plus a small additive floor to stay non-flaky when both
+   measurements are too fast for the ratio itself to be meaningful) gives
+   real margin on both sides: comfortably above a linear algorithm's noisy
+   ~4x, comfortably below a quadratic algorithm's ~16x. Verified directly
+   (see the fix-round report): the reconstructed quadratic decoder measures
+   ~15-16x at this span and FAILS an 8x bound; the current linear
+   implementation measures ~2.3-2.6x and passes with a wide margin. *)
 let scaling_bound ~t_d ~factor ~floor = (t_d *. factor) +. floor
 
 let test_deeply_nested_map_keys_encode_in_linear_time () =
@@ -331,13 +349,13 @@ let test_deeply_nested_map_keys_encode_in_linear_time () =
   in
   let d = 20_000 in
   let t_d = time_at d in
-  let t_2d = time_at (2 * d) in
-  let bound = scaling_bound ~t_d ~factor:4.0 ~floor:0.05 in
+  let t_4d = time_at (4 * d) in
+  let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
   Alcotest.(check bool)
     (Printf.sprintf
        "encode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
-       d t_d (2 * d) t_2d bound)
-    true (t_2d <= bound)
+       d t_d (4 * d) t_4d bound)
+    true (t_4d <= bound)
 
 let test_deeply_nested_map_keys_decode_in_linear_time () =
   let time_at depth =
@@ -348,13 +366,13 @@ let test_deeply_nested_map_keys_decode_in_linear_time () =
   in
   let d = 20_000 in
   let t_d = time_at d in
-  let t_2d = time_at (2 * d) in
-  let bound = scaling_bound ~t_d ~factor:4.0 ~floor:0.05 in
+  let t_4d = time_at (4 * d) in
+  let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
   Alcotest.(check bool)
     (Printf.sprintf
        "decode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
-       d t_d (2 * d) t_2d bound)
-    true (t_2d <= bound)
+       d t_d (4 * d) t_4d bound)
+    true (t_4d <= bound)
 
 (* Finding C1/C2 (task-5 fix round): [encode_into]'s Map case is only
    copy-free for the single-entry ("nothing to sort") fast path - a Map
@@ -404,6 +422,17 @@ let build_two_entry_per_level_deep_map_value ~depth =
   in
   loop depth (Value.Scalar (Value.Int 0L))
 
+(* Unlike the two scaling tests above, this one is deliberately NOT a
+   scaling assertion: its whole point is that this specific shape is
+   *still* quadratic on purpose (deferred to Task 8), so there is no
+   "linear" hypothesis to discriminate against here - it's pinning "still
+   fast enough to be a viable Task-8 baseline" at one fixed, bounded depth,
+   which is exactly what an absolute wall-clock threshold is for. Widened
+   from an earlier 0.5s bound (flagged as fragile: only ~26x headroom over
+   the ~19ms locally-measured cost, not much margin on this box's
+   CPU-quota-throttled environment - see /work/CLAUDE.md's "cpu.max" note)
+   to 2.0s (~100x headroom) for real safety margin on a slow/loaded
+   machine, while staying far under the suite's 15s per-test watchdog. *)
 let test_two_entries_per_level_deep_map_encode_hash_residual_bounded () =
   let v = build_two_entry_per_level_deep_map_value ~depth:1000 in
   let start = Unix.gettimeofday () in
@@ -412,9 +441,9 @@ let test_two_entries_per_level_deep_map_encode_hash_residual_bounded () =
   Alcotest.(check bool)
     (Printf.sprintf
        "2-entries-per-level Map with a 1000-deep chain (Task 8's future depth cap) content_hashes \
-        in well under 500ms (residual pinning baseline for Task 8 not to regress past; took %.4fs)"
+        in well under 2.0s (residual pinning baseline for Task 8 not to regress past; took %.4fs)"
        elapsed)
-    true (elapsed < 0.5)
+    true (elapsed < 2.0)
 
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
