@@ -129,53 +129,75 @@ let test_put_overwrites () =
 
 (* -- Finding 1: [put]'s overwrite must be crash-atomic (write-temp-then-rename), not an
    in-place header-then-data overwrite. [File_kv_store.mli] exposes no way to see the on-disk
-   temp-file layout, so it's mirrored here deliberately, purely for these two tests -- if
-   [file_kv_store.ml]'s own [path_for]/[tmp_suffix] ever changes, these two tests fail loudly
-   (the leftover-tmp / manufactured-crash-debris assertions below) rather than silently. *)
+   temp-file layout. Task 16 changed [tmp_suffix] from a fixed constant to a per-call dynamic
+   value ([pid + atomic counter]), so the temp-file test helpers below are updated to work with
+   that pattern: any file matching the pattern [*\.put\.\d+\.\d+\.tmp$] is a temp file. *)
 let key_hash_hex key =
   Riptide.Value.hash_to_hex
     (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key)))
 
-let tmp_suffix = ".put.tmp"
 let real_path_for dir key = Filename.concat dir (key_hash_hex key)
-let tmp_path_for dir key = real_path_for dir key ^ tmp_suffix
+
+let contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+(* Match any temp file for a key: the pattern is [keypath].put.[pid].[counter].tmp *)
+let is_temp_file_for path =
+  let basename = Filename.basename path in
+  (* Check if the filename ends with .tmp and contains .put. *)
+  String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp" &&
+  contains ~needle:".put." basename
+
+(* Find any temp files in [dir] that match the dynamic suffix pattern. *)
+let find_temp_files_in_dir dir =
+  try
+    Array.to_list (Sys.readdir dir)
+    |> List.filter (fun basename -> is_temp_file_for (Filename.concat dir basename))
+  with Sys_error _ -> []
 
 let test_put_overwrite_leaves_no_leftover_tmp_file () =
   (* Review Focus: a successful overwrite's staged temp file must be gone (renamed away, not
      merely written and left behind) once [put] returns, and the real path must hold exactly
-     the new value -- the normal-path half of the atomic-overwrite fix. *)
+     the new value -- the normal-path half of the atomic-overwrite fix. Task 16: with dynamic
+     per-call suffixes, we verify no .put.*.*.tmp files are left behind, rather than checking
+     for a specific fixed filename. *)
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"k" "v1";
       File_kv_store.put t ~key:"k" "v2";
-      Alcotest.(check bool) "no leftover temp file after rename" false
-        (Sys.file_exists (tmp_path_for dir "k"));
+      let temp_files = find_temp_files_in_dir dir in
+      Alcotest.(check bool) "no leftover temp files after rename" false
+        (List.length temp_files > 0);
       Alcotest.(check bool) "real file exists" true (Sys.file_exists (real_path_for dir "k"));
       Alcotest.(check (option string)) "real file holds exactly the new value" (Some "v2")
         (File_kv_store.get t ~key:"k"))
 
 let test_interrupted_overwrite_leaves_old_value_intact () =
   (* Review Focus: this is exactly the crash scenario the reviewer described -- a failure
-     partway through a second [put]'s write-to-temp phase must leave the key's already-durable
-     value fully intact and readable, never a torn header/data mix. A real [put] always writes
-     its full header+data record into [tmp_path_for dir "k"] *before* ever calling [rename]; we
-     stand in for "the process died at some point during that write" by dropping clearly-invalid
-     bytes at that same temp path directly and never renaming it -- precisely what an
-     interrupted writer could never do either, since only [put] itself ever calls [rename]. *)
+     partway through a [put]'s write-to-temp phase must leave the key's already-durable
+     value fully intact and readable, never a torn header/data mix. We simulate this by
+     creating a stale temp file (matching the dynamic [.put.[pid].[counter].tmp] pattern)
+     before calling a real [put], then verify the real [put] correctly writes its own distinct
+     temp file and the old value remains readable. *)
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
       File_kv_store.put t ~key:"k" "original";
-      let oc = open_out_bin (tmp_path_for dir "k") in
+      (* Create a stale temp file with a dynamic-style name to simulate crash debris. *)
+      let stale_tmp_path = Filename.concat dir (key_hash_hex "k" ^ ".put.99999.99999.tmp") in
+      let oc = open_out_bin stale_tmp_path in
       output_string oc "garbage-partial-write-left-by-a-simulated-crash";
       close_out oc;
       Alcotest.(check (option string)) "old value still fully intact and readable" (Some "original")
         (File_kv_store.get t ~key:"k");
       (* A later, successful put must still work correctly despite the stale temp-file debris
-         a real crash would also have left behind. *)
+         a real crash would also have left behind. Task 16: the new [put] uses its own dynamic
+         suffix and won't collide with the stale temp file. *)
       File_kv_store.put t ~key:"k" "new";
       Alcotest.(check (option string)) "subsequent put still succeeds" (Some "new")
         (File_kv_store.get t ~key:"k"))
@@ -252,11 +274,6 @@ let top_level_binding_body source name =
       else find rest
   in
   find lines
-
-let contains ~needle haystack =
-  let nl = String.length needle and hl = String.length haystack in
-  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
-  nl = 0 || go 0
 
 let index_of ~needle haystack =
   let nl = String.length needle and hl = String.length haystack in
@@ -670,6 +687,57 @@ let test_a_real_second_os_process_holding_the_lock_is_refused () =
                       (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore"
                          dir)))))
 
+(* Task 16: concurrent same-key writes must not produce torn/phantom values.
+   Two concurrent fibers writing different-length values to the same key can race to use the
+   same temp-file path (with the fixed [".put.tmp"] suffix), resulting in one writer's partial
+   write landing in the file the other writer then renames into place -- a mix of both writers'
+   bytes, neither readable, or neither recoverable. This test reproduces that bug by spawning
+   [n] concurrent fibers, each writing a distinct, identifiable value to the same key, and
+   verifies the result is exactly one complete, unscrambled value. *)
+
+let is_one_of_the_written_values ~candidates result =
+  match result with
+  | None -> false
+  | Some v -> Array.exists (String.equal v) candidates
+
+let test_concurrent_same_key_puts_never_produce_a_torn_unreadable_record () =
+  (* Real concurrent Eio fibers, same key, distinguishable different-length values,
+     driven the same way the audit's own reproduction did. *)
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      (* Spawn n concurrent fibers, each writing a distinct value to the same key.
+         Values differ in length (value_i is repeated i+1 times) so a torn write is easily
+         distinguishable from a complete one -- "ab" can never be produced by writing any
+         individual value (each is one of ["a", "aa", "aaa", ... "aaa...a"]).
+
+         Use a counter to track completion: each fiber increments it when done, and we
+         wait until all fibers have signaled completion before proceeding to [get]. *)
+      let n = 16 in
+      let written_values = Array.init n (fun i -> String.make (i + 1) 'a') in
+      let completed = Atomic.make 0 in
+      for i = 0 to n - 1 do
+        Eio.Fiber.fork ~sw (fun () ->
+            File_kv_store.put t ~key:"shared" written_values.(i);
+            ignore (Atomic.fetch_and_add completed 1))
+      done;
+      (* Wait for all fibers to complete. Spin-yield until all n fibers have incremented
+         the counter. This is a simple polling loop; a production system might use Eio's
+         condition variables or channels, but this is sufficient for a test. *)
+      let rec wait_for_completion () =
+        if Atomic.get completed < n then begin
+          Eio.Fiber.yield ();
+          wait_for_completion ()
+        end
+      in
+      wait_for_completion ();
+      (* Now all puts have completed. Verify the result is one of the complete values. *)
+      let result = File_kv_store.get t ~key:"shared" in
+      Alcotest.(check bool)
+        "the surviving value is one writer's complete value, never a torn mix or None"
+        true (is_one_of_the_written_values ~candidates:written_values result))
+
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
@@ -718,4 +786,7 @@ let tests =
     ( "Task 11 review (I1): a failed create releases its lock before re-raising",
       `Quick,
       test_a_failed_create_releases_its_lock_before_reraising );
+    ( "Task 16: concurrent same-key puts never produce torn/phantom values",
+      `Quick,
+      test_concurrent_same_key_puts_never_produce_a_torn_unreadable_record );
   ]

@@ -259,13 +259,29 @@ let path_for t ~key =
     (Riptide.Value.hash_to_hex
        (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key))))
 
+(* Atomic counter to make each [durable_write] call's temp-file suffix unique. Closed audit
+   finding (Task 16): concurrent fibers [put]ting the *same* key with a fixed temp-file suffix
+   (the old [".put.tmp"] constant) can race to write the same temp path, resulting in one
+   writer's partial write landing in the file the other writer then renames into place -- a
+   torn mix, never readable, or permanently lost. Making the suffix unique per call
+   (pid + atomic counter) ensures each concurrent writer uses its own temp file; POSIX
+   [rename]'s atomicity then guarantees a reader always sees one complete writer's record.
+
+   {b Why a module-level atomic counter, not a Thread-local or fiber-local counter:} Eio
+   fibers are lightweight OS-thread-less tasks that share one real OS process, so they all
+   share the same [Unix.getpid ()] value. Fiber-local storage alone (if Eio exposed it) would
+   be wrong: two fibers on the same OS thread would still generate colliding names. The atomic
+   counter makes collisions impossible across all fibers in one process. Cross-process
+   collisions are already ruled out by the [Unix.getpid ()] part: two separate processes get
+   different PIDs. *)
+let call_counter = Atomic.make 0
+
 (* Suffix for the per-key temporary file [durable_write] stages a new record into before
    atomically publishing it via [Eio.Path.rename] -- see this file's top comment ("[put]'s
-   overwrite is crash-atomic...") for the full rationale. Fixed, not randomized: two callers
-   concurrently [put]ting the *same* key is not a case [Kv_store_intf.S] promises to handle
-   (nothing in its contract mentions concurrent writers) -- this only needs to survive a crash
-   during a single writer's own interrupted write, not race a second writer for the name. *)
-let tmp_suffix = ".put.tmp"
+   overwrite is crash-atomic...") for the full rationale. Made unique per call to close the
+   audit finding above: concurrent writers to the same key no longer collide on the temp path. *)
+let tmp_suffix_for_call () =
+  Printf.sprintf ".put.%d.%d.tmp" (Unix.getpid ()) (Atomic.fetch_and_add call_counter 1)
 
 (* The durability step BOTH [durable_write] and [delete] need, and the reason neither is finished
    once its own file operation returns: POSIX leaves a directory's own metadata -- the list of
@@ -337,11 +353,13 @@ let fsync_file ~path =
   Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
 
 (* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
-   first, then data, into [path ^ tmp_suffix] -- the same "header always written first"
-   ordering [File_storage.wal_append] uses, so a crash between the two *temp*-file writes
-   leaves (at worst) a garbage temp file that the real [path] never points at -- then a single
-   [Eio.Path.rename] of the temp file onto [path] publishes the whole record atomically. Opens
-   the temp file with [creat] so a first [put] for a key with no file yet succeeds.
+   first, then data, into a per-call unique temp file (generated via [tmp_suffix_for_call])
+   -- the same "header always written first" ordering [File_storage.wal_append] uses, so a
+   crash between the two *temp*-file writes leaves (at worst) a garbage temp file that the
+   real [path] never points at -- then a single [Eio.Path.rename] of the temp file onto
+   [path] publishes the whole record atomically. Opens the temp file with [creat] so a first
+   [put] for a key with no file yet succeeds. Per-call uniqueness ensures concurrent writers
+   to the same key never share a temp path (closes audit finding, Task 16).
 
    The [fsync_dir] after the rename is not optional bookkeeping -- see [fsync_dir]'s own comment
    above for why a durable-content, atomically-renamed file is still not a durable KEY without it,
@@ -351,7 +369,7 @@ let durable_write t path data =
     invalid_arg
       (Printf.sprintf "put: value of %d bytes exceeds this store's max value size of %d bytes"
          (String.length data) max_value_size);
-  let tmp_path = path ^ tmp_suffix in
+  let tmp_path = path ^ tmp_suffix_for_call () in
   let h = open_file_handle_write ~sw:t.sw tmp_path in
   Fun.protect
     ~finally:(fun () -> ignore (Eio_unix.Fd.close h.fd))
