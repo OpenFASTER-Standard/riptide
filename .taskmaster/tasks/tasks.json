@@ -916,11 +916,18 @@
             "id": 5,
             "title": "[2.1] Decode a Map key in place; drop the String.sub copy",
             "description": "Decode a Map key in place; drop the String.sub copy",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Replace value.ml:238-240's quadratic copy-then-recurse with in-place decoding against the outer buffer, bounded by an expected-consumption offset. Mirror in encode_into's Map case.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "c2bc68e9bc33ff4e30a8c6f107f57bad03132332",
+                "8f17f647c05faf42a382c127f453e68663986031"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 6,
