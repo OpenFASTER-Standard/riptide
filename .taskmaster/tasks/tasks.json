@@ -1026,11 +1026,19 @@
             "id": 11,
             "title": "[3.3] Classify real I/O failures the same way guard-failures already are",
             "description": "Classify real I/O failures the same way guard-failures already are",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Extend append_refusals with a storage_fault bucket populated when wal_append raises Eio.Io/Sys_error/Out_of_memory. durable_append catches these, counts them, returns false -- no more unclassified escapes.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "911fcd42c80c8cdcddb098ced39664bdfd707f59",
+                "f7ba03dfe5544065ad79c8a56791444ab8783cf8",
+                "07542afea95d97aeb670946bfe20fad472b13622"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 12,
