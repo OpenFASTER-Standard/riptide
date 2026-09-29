@@ -243,7 +243,8 @@ let test_interrupted_overwrite_leaves_old_value_intact () =
    1. [test_put_is_durable_across_reopen] mirrors [test_delete_is_durable_across_reopen] above --
       which is, on inspection, exactly and only how [delete]'s own [fsync_dir] is covered today.
       It proves the value survives a real close-and-reopen; it does NOT prove the sync happened.
-   2. [test_put_and_delete_both_fsync_the_directory] is a source-level guard on the two call sites
+   2. [test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path] is a source-level
+      guard on the two call sites
       themselves, and is honest about being one. It fails loudly if the [fsync_dir] call after
       [durable_write]'s [Eio.Path.rename] (or [delete]'s, for symmetry) is ever removed or
       reordered -- which is the actual regression to prevent, since the bug being fixed was a
@@ -301,27 +302,90 @@ let index_of ~needle haystack =
   in
   go 0
 
-let test_put_and_delete_both_fsync_the_directory () =
+(* Task 18 post-review Critical fix: before sharding, a key's own [path] lived directly in
+   [t.dir_path], so fsyncing [t.dir_path] after [durable_write]'s [rename]/[delete]'s [unlink] WAS
+   fsyncing the directory whose entries actually changed -- they were the same directory. After
+   sharding, [path] is [t.dir_path/xx/yy/<hash>]; the [rename]/[unlink] only ever changes the
+   SHARD2 directory's entries ([Filename.dirname path]), two levels below [t.dir_path]. Fsyncing
+   [t.dir_path] itself therefore closes nothing real: [fsync(fd)] on a directory only durabilizes
+   THAT directory's own entry list, never a descendant's (the exact principle this file's own
+   [fsync_file] comment already invokes for a different call site). This is a real, live regression
+   this test file's own logical read-after-write/delete tests above cannot catch: a directory fsync
+   has no observable effect short of an actual crash/remount (see [test_put_is_durable_across_reopen]
+   and this suite's own top comment for why no such simulation is practical on this box), so this
+   is a source-level guard instead, matching this file's own established convention for exactly
+   this class of otherwise-unobservable durability property (see
+   [test_check_or_write_owner_marker_is_atomic_via_temp_then_rename_then_fsync] below for the
+   precedent). It fails loudly if either call site ever regresses back to fsyncing [t.dir_path]
+   directly. *)
+let test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path () =
   let source = read_file file_kv_store_source_path in
   let durable_write = top_level_binding_body source "durable_write" in
   Alcotest.(check bool)
     "durable_write still publishes via Eio.Path.rename" true
     (contains ~needle:"Eio.Path.rename" durable_write);
   Alcotest.(check bool)
-    "durable_write fsyncs the containing directory (Finding 1 regression guard)" true
+    "durable_write fsyncs the SHARD directory that actually changed (Filename.dirname path), not \
+     t.dir_path (Critical fix regression guard)"
+    true
+    (contains ~needle:"fsync_dir ~dir_path:(Filename.dirname path)" durable_write);
+  Alcotest.(check bool)
+    "durable_write does NOT fsync t.dir_path directly -- that would durabilize nothing the rename \
+     actually touched, post-sharding"
+    false
     (contains ~needle:"fsync_dir ~dir_path:t.dir_path" durable_write);
   (* Ordering matters, not just presence: syncing the directory before the rename would sync a
      state that does not yet contain the new entry, which is no guarantee at all. *)
   (match
-     (index_of ~needle:"Eio.Path.rename" durable_write, index_of ~needle:"fsync_dir ~dir_path:t.dir_path" durable_write)
+     (index_of ~needle:"Eio.Path.rename" durable_write,
+      index_of ~needle:"fsync_dir ~dir_path:(Filename.dirname path)" durable_write)
    with
   | Some rename_at, Some fsync_at ->
     Alcotest.(check bool) "the fsync_dir comes AFTER the rename, not before" true (fsync_at > rename_at)
-  | _ -> Alcotest.fail "expected both Eio.Path.rename and fsync_dir ~dir_path:t.dir_path in durable_write's body");
+  | _ ->
+    Alcotest.fail
+      "expected both Eio.Path.rename and fsync_dir ~dir_path:(Filename.dirname path) in \
+       durable_write's body");
   let delete_body = top_level_binding_body source "delete" in
   Alcotest.(check bool)
-    "delete still fsyncs the containing directory too" true
+    "delete fsyncs the SHARD directory that actually changed (Filename.dirname path), not \
+     t.dir_path (Critical fix regression guard)"
+    true
+    (contains ~needle:"fsync_dir ~dir_path:(Filename.dirname path)" delete_body);
+  Alcotest.(check bool)
+    "delete does NOT fsync t.dir_path directly -- same reasoning as durable_write above" false
     (contains ~needle:"fsync_dir ~dir_path:t.dir_path" delete_body)
+
+(* Task 18 post-review Critical fix, second layer: a freshly-created shard directory is itself a
+   directory-entry change in ITS OWN PARENT, which needs the same [fsync_dir] treatment as any
+   other entry change this module makes durable -- otherwise a crash right after the very first
+   [put] under a cold two-level prefix could leave that shard directory's own existence unpersisted,
+   even though the key file inside it (fsynced by [durable_write] itself) is fine. Equally, this
+   must NOT fsync unconditionally on every call once a shard is warm (real, avoidable I/O cost on
+   every single [put] for directories that already exist and did not change), so the guard here is
+   two-sided: presence of [fsync_dir] calls guarded by an actual mkdir-succeeded check, not just
+   presence of [Eio.Path.mkdir] on its own. Same source-level-guard technique and rationale as
+   [test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path] above. *)
+let test_ensure_shard_dirs_exist_fsyncs_only_newly_created_parent_levels () =
+  let source = read_file file_kv_store_source_path in
+  let body = top_level_binding_body source "ensure_shard_dirs_exist" in
+  Alcotest.(check bool) "still creates both shard levels via Eio.Path.mkdir" true
+    (let count =
+       let rec go i n = match index_of ~needle:"Eio.Path.mkdir" (String.sub body i (String.length body - i)) with
+         | None -> n
+         | Some rel -> go (i + rel + 1) (n + 1)
+       in
+       go 0 0
+     in
+     count >= 2);
+  Alcotest.(check bool)
+    "mkdir's own success/failure is captured (not swallowed by a bare try...with, which would lose \
+     the created-vs-already-there distinction this fix depends on)"
+    true
+    (contains ~needle:"exception Eio.Io _ -> false" body);
+  Alcotest.(check bool) "fsyncs a parent level when this call actually created it" true
+    (contains ~needle:"if shard1_created then fsync_dir" body
+    && contains ~needle:"if shard2_created then fsync_dir" body)
 
 (* -- Subtask 4.6: [create]'s [~owner] closes PART of a confirmed, real data-destruction bug --
    sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
@@ -473,13 +537,15 @@ let test_a_zero_byte_marker_is_treated_as_unclaimed_not_as_owner_empty_string ()
 
 (* Review finding 3 (Task 15 review): the atomic-write property itself
    (temp-then-rename-then-fsync) for the owner marker had zero test coverage -- unlike
-   [durable_write]'s equivalent, which [test_put_and_delete_both_fsync_the_directory] above already
-   guards at the source level. Right now, replacing the whole Task 15 fix with a single
-   non-atomic [Eio.Path.save ~create:(`Or_truncate 0o600) marker_path tag] (no temp file, no
-   rename, no fsync) would leave every other test in this file green -- silently reverting the fix.
-   Same source-level-guard technique as [test_put_and_delete_both_fsync_the_directory] (see that
-   test's own comment for why this is deliberately not trying to observe the fsync's effect, only
-   its presence and ordering in the source). *)
+   [durable_write]'s equivalent, which
+   [test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path] above already guards at
+   the source level. Right now, replacing the whole Task 15 fix with a single non-atomic
+   [Eio.Path.save ~create:(`Or_truncate 0o600) marker_path tag] (no temp file, no rename, no fsync)
+   would leave every other test in this file green -- silently reverting the fix. Same
+   source-level-guard technique as
+   [test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path] (see that test's own
+   comment for why this is deliberately not trying to observe the fsync's effect, only its
+   presence and ordering in the source). *)
 let owner_marker_tmp_suffix = ".tmp"
 let owner_tmp_path_for dir = Filename.concat dir (owner_marker_name ^ owner_marker_tmp_suffix)
 
@@ -884,8 +950,14 @@ let tests =
     ("interrupted overwrite leaves old value intact", `Quick,
       test_interrupted_overwrite_leaves_old_value_intact);
     ("put is durable across reopen", `Quick, test_put_is_durable_across_reopen);
-    ("put and delete both fsync the directory", `Quick,
-      test_put_and_delete_both_fsync_the_directory);
+    ( "Task 18 review (Critical fix): durable_write/delete fsync the shard directory, not \
+       t.dir_path",
+      `Quick,
+      test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path );
+    ( "Task 18 review (Critical fix): ensure_shard_dirs_exist fsyncs only newly-created parent \
+       levels",
+      `Quick,
+      test_ensure_shard_dirs_exist_fsyncs_only_newly_created_parent_levels );
     ("owner mismatch is rejected at construction", `Quick,
       test_owner_mismatch_is_rejected_at_construction);
     ("matching owner reopens cleanly", `Quick, test_matching_owner_reopens_cleanly);

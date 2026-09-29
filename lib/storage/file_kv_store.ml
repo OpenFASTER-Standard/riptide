@@ -294,23 +294,6 @@ let path_for t ~key =
   Filename.concat t.dir_path
     (Filename.concat (String.sub hash 0 2) (Filename.concat (String.sub hash 2 2) hash))
 
-(* [path_for]'s own two shard-directory levels for [path] (i.e. [dir_path/xx] and [dir_path/xx/yy])
-   may not exist yet the first time a key under that shard is ever [put] -- this must run before
-   [durable_write] below tries to create [path]'s own temp file inside them (Ruling B: the temp
-   file lives in the same sharded subdirectory as the final path, so both need these directories to
-   already exist). Same try-[mkdir]-then-ignore-[Eio.Io] pattern [create]'s own [mkdir] uses
-   (this file's top comment explains why: no [mkdir -p] primitive exists in the installed Eio
-   0.12), applied twice, once per level -- outermost first, since the inner [mkdir] would itself
-   fail with ENOENT if attempted before the directory it lives in exists.
-   [Eio.Path.mkdir]'s own idempotency (an already-existing directory is just another [Eio.Io] this
-   catches, same as any other) is what makes it cheap to call unconditionally on every [put],
-   rather than only the first one for a given shard. *)
-let ensure_shard_dirs_exist ~fs path =
-  let shard2_dir = Filename.dirname path in
-  let shard1_dir = Filename.dirname shard2_dir in
-  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard1_dir) with Eio.Io _ -> ());
-  (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard2_dir) with Eio.Io _ -> ())
-
 (* Atomic counter to make each [durable_write] call's temp-file suffix unique. Closed audit
    finding (Task 16): concurrent fibers [put]ting the *same* key with a fixed temp-file suffix
    (the old [".put.tmp"] constant) can race to write the same temp path, resulting in one
@@ -341,8 +324,22 @@ let tmp_suffix_for_call () =
    names point at is itself durable. The entry change can sit in the page cache, or in the
    filesystem's journal ahead of the commit that makes it visible again after a power loss, for an
    unbounded time. Making a change to a DIRECTORY durable requires fsyncing the directory (fsyncing
-   a file would say nothing about its name existing, or being gone), which is why this opens
-   [dir_path] rather than any key's own path.
+   a file would say nothing about its name existing, or being gone), which is why this opens a
+   directory path rather than any key's own file path.
+
+   {b Critical fix (review finding, post-Task-18): fsync the directory the [rename]/[unlink]
+   ACTUALLY changed, not [t.dir_path].} [fsync(fd)] on a directory only forces durability of THAT
+   directory's own entry list -- never anything below it -- exactly the same principle
+   [fsync_file]'s own comment below invokes to explain why [check_or_write_owner_marker] needs a
+   separate content fsync in addition to this directory one. Before Task 18's sharding, a key's
+   own [path] lived directly in [dir_path], so fsyncing [dir_path] WAS fsyncing the directory that
+   held the changed entry -- they were the same directory. After sharding, [path] is
+   [dir_path/xx/yy/<hash>]: the [rename]/[unlink] only ever mutates the SHARD2 directory's entries
+   ([Filename.dirname path]), two levels below [dir_path]. Fsyncing [dir_path] after that closes
+   nothing -- it durabilizes a directory whose entry list never changed, while the actual changed
+   entry (in the shard2 directory) stays exactly as unsynced as if this call were never made. Both
+   [durable_write] and [delete] below therefore fsync [Filename.dirname path] (the shard2
+   directory), not [t.dir_path] -- see each call site's own comment.
 
    For [delete] this closes the "deleted key must never be resurrected" bug
    [Kv_store_intf.S.delete]'s own contract forbids: a crash right after [delete] returned could
@@ -404,6 +401,48 @@ let fsync_file ~path =
   let fd = Unix.openfile path [ Unix.O_WRONLY ] 0 in
   Fun.protect ~finally:(fun () -> try Unix.close fd with Unix.Unix_error _ -> ()) (fun () -> Unix.fsync fd)
 
+(* [path_for]'s own two shard-directory levels for [path] (i.e. [dir_path/xx] and [dir_path/xx/yy])
+   may not exist yet the first time a key under that shard is ever [put] -- this must run before
+   [durable_write] below tries to create [path]'s own temp file inside them (Ruling B: the temp
+   file lives in the same sharded subdirectory as the final path, so both need these directories to
+   already exist). Same try-[mkdir]-then-catch-[Eio.Io] pattern [create]'s own [mkdir] uses (this
+   file's top comment explains why: no [mkdir -p] primitive exists in the installed Eio 0.12),
+   applied twice, once per level -- outermost first, since the inner [mkdir] would itself fail with
+   ENOENT if attempted before the directory it lives in exists.
+
+   {b Critical fix (review finding, post-Task-18): a freshly-created shard directory is itself a
+   directory-entry change in its OWN PARENT, and needs the exact same [fsync_dir] treatment
+   [durable_write]/[delete] already give their own entry changes -- a crash right after this
+   function creates, say, [dir_path/3f] for the very first time, before [dir_path] itself is
+   fsynced, can leave that shard directory's own existence unpersisted even though every [put]
+   into it afterwards individually fsyncs correctly one level further down.} [Eio.Path.mkdir]
+   returning normally (as opposed to raising [Eio.Io] because the directory was already there) is
+   exactly the signal that this call changed that parent's entries and therefore needs fsyncing;
+   an already-existing shard directory changed nothing, so no extra fsync is needed on the common
+   warm-shard path -- fsyncing [dir_path] (or [shard1_dir]) unconditionally on every single [put]
+   regardless of whether anything changed there would be real, avoidable I/O cost. This is why the
+   two [mkdir] attempts below capture a success/failure boolean via pattern-matching on the call
+   itself, rather than being swallowed by a bare [try ... with Eio.Io _ -> ()] the way [create]'s
+   own top-level [mkdir] can afford to (nothing downstream of THAT call needs to know whether it
+   created [dir_path] or found it already there, since [create] never fsyncs [dir_path]'s own
+   parent -- [dir_path]'s parent isn't this module's to manage). *)
+let ensure_shard_dirs_exist ~fs path =
+  let shard2_dir = Filename.dirname path in
+  let shard1_dir = Filename.dirname shard2_dir in
+  let dir_path = Filename.dirname shard1_dir in
+  let shard1_created =
+    match Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard1_dir) with
+    | () -> true
+    | exception Eio.Io _ -> false
+  in
+  if shard1_created then fsync_dir ~dir_path;
+  let shard2_created =
+    match Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / shard2_dir) with
+    | () -> true
+    | exception Eio.Io _ -> false
+  in
+  if shard2_created then fsync_dir ~dir_path:shard1_dir
+
 (* Durably writes [data] to [path] via write-temp-then-rename: header (length + checksum)
    first, then data, into a per-call unique temp file (generated via [tmp_suffix_for_call])
    -- the same "header always written first" ordering [File_storage.wal_append] uses, so a
@@ -415,7 +454,10 @@ let fsync_file ~path =
 
    The [fsync_dir] after the rename is not optional bookkeeping -- see [fsync_dir]'s own comment
    above for why a durable-content, atomically-renamed file is still not a durable KEY without it,
-   and what [Riptide_crypto.Redaction_store] loses if it is missing. *)
+   and what [Riptide_crypto.Redaction_store] loses if it is missing. {b Fsyncs [Filename.dirname
+   path] (the shard2 directory the [rename] actually changed), not [t.dir_path]} -- see
+   [fsync_dir]'s own comment for why fsyncing [t.dir_path] itself would durabilize nothing the
+   rename actually touched, post-Task-18 sharding. *)
 let durable_write t path data =
   if String.length data > max_value_size then
     invalid_arg
@@ -436,7 +478,7 @@ let durable_write t path data =
       perform_write_from_string ~pool:t.pool ~sw:t.sw h ~offset:header_slot_size
         ~n:data_slot_size data);
   Eio.Path.rename Eio.Path.(t.fs / tmp_path) Eio.Path.(t.fs / path);
-  fsync_dir ~dir_path:t.dir_path
+  fsync_dir ~dir_path:(Filename.dirname path)
 
 (* [None] for every way this can fail to verify: the file doesn't exist (never put, or
    deleted -- caught as [Eio.Io] from the open itself), a short/missing header or data read, a
@@ -735,7 +777,11 @@ let get t ~key = durable_read t (path_for t ~key)
 let put t ~key data = durable_write t (path_for t ~key) data
 
 let delete t ~key =
-  (try Eio.Path.unlink Eio.Path.(t.fs / path_for t ~key) with
+  let path = path_for t ~key in
+  (try Eio.Path.unlink Eio.Path.(t.fs / path) with
   | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
     () (* ENOENT: already absent, matching put's own idempotent-overwrite spirit *));
-  fsync_dir ~dir_path:t.dir_path
+  (* Fsyncs [Filename.dirname path] (the shard2 directory the [unlink] actually changed), not
+     [t.dir_path] -- see [fsync_dir]'s own comment (Critical fix, post-Task-18 review) for why
+     fsyncing [t.dir_path] itself would durabilize nothing this [unlink] actually touched. *)
+  fsync_dir ~dir_path:(Filename.dirname path)

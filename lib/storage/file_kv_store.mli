@@ -26,6 +26,16 @@
     "no space left on device" (or exhausted inode count) with plenty of apparent free space still
     showing under [df] alone.
 
+    {b Worked example, so this range note is literal, not just descriptive:} at [N = 10,000,000]
+    keys, this store consumes exactly [N] inodes (10 million) and at least [8192 * N] bytes on
+    disk -- 81,920,000,000 bytes, i.e. ~81.9 GB (~76.3 GiB) -- {e before counting a single byte of
+    real value data}, purely from the fixed per-key slot floor. Scale that arithmetic to whatever
+    [N] a real deployment expects, then check {b both} numbers against the target filesystem
+    ([df -i]'s available inode count, and [df]'s available space) before provisioning at that
+    scale -- inode exhaustion in particular produces the same "no space left on device" error as
+    running out of blocks, on a filesystem that can easily still show gigabytes of nominal free
+    space.
+
     {b Two properties of [delete] worth stating here, since {!Kv_store_intf.S}'s own contract
     cannot state them for every backend.} First, the removal is durable against a crash, not
     merely against a reopen: the [unlink] is followed by an fsync of the containing {e directory},
