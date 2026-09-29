@@ -127,18 +127,58 @@ type slot_state = Present of Value.value | Corrupt | Absent
        flattened into [Entry_rejected]'s "this entry can never be durable here".
 
    TASK 12 (audit-remediation Decision 3.3, closing Storage-Important-1) adds a fifth, and the
-   first that is not an [Invalid_argument] at all:
+   first that is not an [Invalid_argument] at all -- and, alongside [Eviction_blocked], the second
+   genuinely TRANSIENT one:
 
-     [Storage_fault] -- a REAL I/O failure out of the backend: [Eio.Io], [Sys_error] (the shape
-       OCaml's own channel-based I/O raises for a genuine ENOSPC), or [Out_of_memory]. Before this
-       task, none of these matched [classify_append_refusal] (which only ever looks at an
+     [Storage_fault] -- a REAL, genuinely transient resource condition out of the backend:
+       [Out_of_memory], or an [Eio.Io]/bare [Unix.Unix_error] wrapping one of exactly four errnos
+       -- [ENOSPC] (disk full), [EDQUOT] (quota exceeded; OCaml's [Unix.error] has no symbolic
+       constructor for this, so it is matched as [EUNKNOWNERR 122], its value on every Linux this
+       runs on -- see {!Riptide_storage.File_storage}'s own Linux-only, io_uring-only stance),
+       [EIO] (hardware I/O error), and [ENOMEM] (allocation failure at the syscall level). Before
+       this task, none of these matched [classify_append_refusal] (which only ever looks at an
        [Invalid_argument]'s message), so they propagated straight out of [durable_append] as an
        unhandled exception -- a disk filling up under a live [File_storage] could kill the whole
        replica process instead of being refused like every other kind of append failure. It is
        caught by its OWN arm in [durable_append], after (not instead of) the [Invalid_argument]
        classification below, precisely so it stays a distinct signal rather than being folded into
-       [Entry_rejected]'s "this entry can never be durable here" -- a transient ENOSPC, unlike a
-       too-large entry, may well succeed on retry once space frees up.
+       [Entry_rejected]'s "this entry can never be durable here" -- an ENOSPC, unlike a too-large
+       entry, may well succeed on retry once space frees up (see [durable_append]'s own comment
+       below for the test that actually exercises this, not just documents it).
+
+       {b Deliberately NARROW, matching this same block's discrimination discipline for
+       [Invalid_argument] above:} EVERY OTHER shape -- a bare [Sys_error] (OCaml's channel-based
+       I/O uses it for ENOSPC too, but this module's storage layer never goes through a channel, so
+       there is no real backend shape to classify here, and a bare [Sys_error] is far more often a
+       genuine bug, e.g. a format-string mismatch, than a storage refusal), any [Eio.Io] wrapping an
+       errno OTHER than the four above (a permission change mid-run, an already-closed file
+       descriptor, ...), or any [Eio.Io] wrapping a classified {!Eio.Fs.error} at all (e.g.
+       [Not_found]/[Permission_denied]) -- PROPAGATES, exactly like an unrecognized
+       [Invalid_argument] does below. An unrecognized exception out of a backend is a contract
+       violation, not a documented storage refusal, and laundering it into "safe to retry" would be
+       the same conflation this whole block exists to close, just moved one exception family over.
+       [Unix.Unix_error] (not wrapped in [Eio.Io]) is matched with the same four-errno narrowness
+       too, even though no backend in this repo raises it directly today ({!Riptide_storage.File_storage}'s
+       own errors are all wrapped into [Eio.Io] by eio_linux; {!Riptide_storage.Memory_storage} and
+       {!Riptide_storage.Fault_injecting_storage} raise [Invalid_argument]) -- it is the shape any
+       FUTURE backend built directly on OCaml's [Unix] module (the way
+       {!Riptide_storage.File_kv_store} already is, elsewhere in this codebase) would naturally
+       produce, and there is no reason to leave that predictable future case unclassified when the
+       classification is identical either way.
+
+   HONEST DISCLOSURE, because [Storage_fault] is NOT the same safe "total no-op" guarantee the
+   other four refusals get: {!Riptide_storage.File_storage.wal_append} writes a slot's header, then
+   its data, as two SEPARATE, non-atomic writes. A [Storage_fault] raised between them (order is a
+   real, load-bearing fact about the backend, not an implementation detail) leaves the slot's PRIOR
+   occupant's header already overwritten while its data (or, symmetrically, a NEW header already
+   written over an old one whose data write then fails) is not -- so that prior entry now reads back
+   [Corrupt] (a checksum mismatch, per [wal_read]/[slot_state] above), permanently, even if it was
+   below a [?may_evict] watermark that had refused to let it be evicted moments earlier. This is
+   categorically worse than the other four refusals' guarantee (nothing written, nothing else
+   disturbed) -- it is disclosed here, not hidden behind a claim of parity, matching
+   [adopt_durable_log]'s own disclosure of its partial-rewrite case below for the identical reason:
+   a real, narrower guarantee stated plainly is worth more than a broad one that is not actually
+   true for every case it is asserted to cover.
 
    All five still mean "not durable" to the protocol, and the protocol still behaves identically
    -- the replica declines to acknowledge. What changes is that they are told apart and COUNTED
@@ -707,13 +747,17 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
    is that coupling, made real. Returning [false] keeps [handle_message] total on adversarial
    input (an oversized value on the wire must drop the message, never escape as an exception).
 
-   I2: WHICH refusal is now classified and counted rather than flattened -- see [append_refusal]'s
-   own comment above for the four shapes (three from I2, [Eviction_blocked] added by subtask 3.7),
-   the measurement behind them, and why an Invalid_argument matching none of them PROPAGATES
-   instead. That propagation does not weaken the totality guarantee above: every refusal a real
-   backend in this repo raises for a real entry is one of the four classified shapes (pinned by a
-   test), so what escapes here is a backend contract violation, which is precisely the thing that
-   must not be laundered into "the protocol declined an op".
+   I2 / TASK 12: WHICH refusal is now classified and counted rather than flattened -- see
+   [append_refusal]'s own comment above for the five shapes (three from I2, [Eviction_blocked]
+   added by subtask 3.7, [Storage_fault] added by Task 12), the measurement behind the first three,
+   and why an [Invalid_argument] matching none of the first four, or a real I/O exception matching
+   neither [Storage_fault]'s four narrow errnos nor [Out_of_memory], PROPAGATES instead. That
+   propagation does not weaken the totality guarantee above: every refusal a real backend in this
+   repo raises for a real entry is one of the five classified shapes (each pinned by a test -- see
+   test_vsr_replica_recovery.ml's refusal-classification section, which covers all five, including
+   [Storage_fault]'s own narrow classification and its propagating counter-cases), so what escapes
+   here is a backend contract violation, which is precisely the thing that must not be laundered
+   into "the protocol declined an op".
 
    Subtask 3.7's [Eviction_blocked] is worth one extra note HERE, at the call site, because it is
    the first refusal a well-formed append can hit: returning [false] for it means this replica
@@ -739,14 +783,24 @@ let truncate_wal t ~op_number ~committed ~resulting_length =
    [Invalid_argument] failure modes, and catching those here would put an encoding bug in the
    value layer into a storage-refusal bucket -- the same conflation at one remove.
 
-   TASK 12 (Decision 3.3): the [Eio.Io _ | Sys_error _ | Out_of_memory] arm below sits AFTER the
-   [Invalid_argument] classification, deliberately -- it catches only what that classification
-   cannot: a REAL I/O failure out of the backend (a genuine ENOSPC, an [Eio.Io] from a failed
-   syscall, an allocation failure), never a guard the backend itself raises as [Invalid_argument]
-   to say "this call was malformed". Ordering the two this way keeps every existing
-   [Invalid_argument] shape -- including the propagating [None] case above, which must stay an
-   [Invalid_argument] escape, not get laundered into [Storage_fault] -- completely unaffected by
-   this addition. *)
+   TASK 12 (Decision 3.3): the [Storage_fault] arm below sits AFTER the [Invalid_argument]
+   classification, deliberately -- it catches only what that classification structurally cannot
+   (none of its patterns are [Invalid_argument]), and only a NARROW slice even of that: [Out_of_memory]
+   itself, and an [Eio.Io]/bare [Unix.Unix_error] wrapping exactly [ENOSPC], [EDQUOT]
+   ([EUNKNOWNERR 122] -- see [append_refusal]'s own comment above for why), [EIO], or [ENOMEM].
+   Everything else -- a bare [Sys_error], any other errno, any [Eio.Io] wrapping a classified
+   {!Eio.Fs.error} -- propagates, exactly like an unrecognized [Invalid_argument] does. Ordering the
+   two arms this way keeps every existing [Invalid_argument] shape -- including the propagating
+   [None] case above, which must stay an [Invalid_argument] escape, not get laundered into
+   [Storage_fault] -- completely unaffected by this addition.
+
+   WAL-LEVEL CAVEAT (Storage-Important-1 follow-up, not a new problem this task introduces): unlike
+   the four [Invalid_argument] refusals above, a [Storage_fault] raised mid-{!Riptide_storage.File_storage.wal_append}
+   is not always a clean no-op at the DURABLE-STORAGE level, even though it is always a clean no-op
+   at THIS replica's in-memory level (nothing above this line mutates before the call, and [false]
+   is returned without touching anything else). See [append_refusal]'s own comment above for the
+   full disclosure of what a failure between [wal_append]'s two non-atomic writes can leave behind
+   in the ring. *)
 let durable_append t ~op_number (v : Value.value) =
   let bytes = Value.canonical_encode v in
   match t.storage.wal_append ~op_number bytes with
@@ -758,7 +812,10 @@ let durable_append t ~op_number (v : Value.value) =
       t.append_refusals.(i) <- t.append_refusals.(i) + 1;
       false
     | None -> invalid_arg msg)
-  | exception (Eio.Io _ | Sys_error _ | Out_of_memory) ->
+  | exception
+      ( Out_of_memory
+      | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.(ENOSPC | EIO | ENOMEM | EUNKNOWNERR 122), _, _)), _)
+      | Unix.Unix_error (Unix.(ENOSPC | EIO | ENOMEM | EUNKNOWNERR 122), _, _) ) ->
     let i = append_refusal_index Storage_fault in
     t.append_refusals.(i) <- t.append_refusals.(i) + 1;
     false

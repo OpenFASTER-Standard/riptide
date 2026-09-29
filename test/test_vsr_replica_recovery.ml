@@ -796,6 +796,197 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
         true
         (Replica.for_test_wal_read t ~op_number:1 = None))
 
+(* [storage_fault] (TASK 12, audit-remediation Decision 3.3): a REAL, narrowly-classified resource
+   condition out of the backend -- [Out_of_memory], or an [Eio.Io]/bare [Unix.Unix_error] wrapping
+   exactly [ENOSPC]/[EDQUOT]/[EIO]/[ENOMEM] -- refused like every other classified shape instead of
+   propagating and killing the replica process, and the FIRST shape here that is not an
+   [Invalid_argument] at all. Lives here, alongside its four siblings, rather than in a separate
+   file (Task 12 re-review, Minor-8): a future refusal-bucket addition should only have to touch
+   one place, and these five tests share this file's [refusals]/[fresh_storage] helpers and
+   discipline of asserting the FULL vector, not just the bucket under test.
+
+   TASK 12 RE-REVIEW (Important-1): the first cut of this task classified EVERY [Eio.Io]/
+   [Sys_error]/[Out_of_memory] unconditionally, regardless of payload -- silently laundering
+   genuinely PERMANENT, contract-violation-shaped failures (a bad file descriptor, a permission
+   change, a missing file -- the exact shape the ORIGINAL version of the third test below
+   accidentally produced, per Minor-7) into "transient, safe to retry". The tests below now prove
+   BOTH directions: the four real transient shapes are still classified, AND the shapes that only
+   superficially resemble them (a bare [Sys_error]; an [Eio.Io] wrapping an unrelated errno)
+   correctly propagate instead -- getting either direction wrong defeats the whole point of this
+   task. *)
+
+(* One backend, parameterized by the exact exception its [wal_append] raises on every call --
+   replacing three near-identical modules from the first cut of this task that differed only in
+   which exception they raised (Task 12 re-review, Minor-8a). *)
+module Raising_backend : Riptide_storage.Storage_intf.S with type t = unit -> unit = struct
+  type t = unit -> unit
+
+  let wal_append raise_exn ~op_number:_ _ = raise_exn ()
+  let wal_read _ ~op_number:_ = None
+  let wal_truncate_after _ ~op_number:_ = ()
+  let wal_highest_op_number _ = 0
+  let superblock_write _ _ = ()
+  let superblock_read _ = None
+end
+
+let test_refusal_storage_fault_out_of_memory_is_counted_as_its_own_shape () =
+  let send, sent = capturing_send () in
+  let storage = Replica.storage_of_module (module Raising_backend) (fun () -> raise Out_of_memory) in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.for_test_set_view_number t 1;
+  (* [propose] must return cleanly -- no escaped exception -- exactly like every other classified
+     refusal already does. *)
+  Replica.propose t (v "a");
+  Alcotest.(check int) "the op was NOT taken on (refused, not durable)" 0 (Replica.op_number t);
+  Alcotest.(check bool) "nothing was sent -- refused before the Prepare broadcast" true (decoded_sent sent = []);
+  Alcotest.(check (list (pair string int)))
+    "counted as storage_fault, and as nothing else"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 1) ]
+    (refusals t)
+
+(* A REAL [Eio.Io] ENOSPC, from a REAL [write(2)] that cannot succeed: [/dev/full] is a standard
+   Linux character device that returns ENOSPC on every write, the standard technique for testing
+   ENOSPC handling without actually filling a disk -- confirmed live (a standalone probe outside
+   this suite) to raise exactly [Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.ENOSPC, "write", "")), _)],
+   the precise shape [durable_append]'s new arm matches. Driven through [handle_prepare] (not
+   [propose]) specifically to cover the OTHER caller the brief names -- [test_refusal_storage_fault_out_of_memory...]
+   above already covers [propose]. *)
+let test_refusal_storage_fault_real_enospc_eio_io_is_counted_as_its_own_shape () =
+  Eio_main.run @@ fun env ->
+  let send, sent = capturing_send () in
+  let storage =
+    Replica.storage_of_module (module Raising_backend) (fun () ->
+        Eio.Path.save ~create:`Never Eio.Path.(Eio.Stdenv.fs env / "/dev/full") "x")
+  in
+  (* Deliberately left at the default [view_number = 0]: [Primary(0) = 3] at [replica_count = 3],
+     matching this file's own refusal tests above, so [my_id = 1] is a BACKUP and a Prepare from
+     sender 3 reaches [handle_prepare] instead of being dropped by the "addressed to the primary
+     itself" guard. *)
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Alcotest.(check int) "the op was NOT taken on (refused, not durable)" 0 (Replica.op_number t);
+  Alcotest.(check bool) "nothing was sent (a backup never replies to a refused Prepare)" true (decoded_sent sent = []);
+  Alcotest.(check (list (pair string int)))
+    "counted as storage_fault, and as nothing else"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 1) ]
+    (refusals t)
+
+(* TASK 12 RE-REVIEW (Important-1), the propagating half: a bare [Sys_error] is NOT a shape this
+   module's own storage layer can ever produce (nothing in [Storage_intf.S]'s conforming
+   implementations goes through an OCaml channel), so it is far more likely a genuine bug than a
+   storage refusal -- the first cut's blanket catch laundered it into [storage_fault] anyway. It
+   must now propagate, exactly like an unrecognized [Invalid_argument] already does. *)
+let test_a_bare_sys_error_propagates_rather_than_being_classified_as_storage_fault () =
+  let send, _sent = capturing_send () in
+  let storage =
+    Replica.storage_of_module (module Raising_backend) (fun () ->
+        raise (Sys_error "wal_append: No space left on device"))
+  in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.for_test_set_view_number t 1;
+  Alcotest.check_raises
+    "a bare Sys_error is not laundered into storage_fault -- it is not a shape this module's \
+     storage layer can produce, and treating it as one would reopen Storage-Important-1 in a new \
+     form"
+    (Sys_error "wal_append: No space left on device") (fun () -> Replica.propose t (v "a"));
+  Alcotest.(check (list (pair string int)))
+    "and it is not counted as any known refusal shape either"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 0) ]
+    (refusals t)
+
+(* TASK 12 RE-REVIEW (Important-1 + Minor-7), the other half of the propagating proof: an [Eio.Io]
+   whose errno is NOT one of the four [storage_fault] recognizes must also propagate. This is
+   [Eio.Path.load] on a structurally-nonexistent path -- [Eio.Io (Fs (Not_found _))], an ENOENT
+   shape -- which is exactly the payload the FIRST cut of this task's own Eio.Io test accidentally
+   produced (Minor-7) while its surrounding docs claimed to cover an ENOSPC-shaped failure. Under
+   the narrowed classification this Important-1 fix introduces, that mismatch would have made the
+   original test wrong in a new way (asserting classification for a shape that should now
+   propagate) even if it had been left in place -- which is why it is rewritten here as a
+   propagation test instead of a classification one. *)
+let test_an_eio_io_with_an_unrecognized_errno_propagates_rather_than_being_classified () =
+  Eio_main.run @@ fun env ->
+  let send, _sent = capturing_send () in
+  let storage =
+    Replica.storage_of_module (module Raising_backend) (fun () ->
+        ignore (Eio.Path.load Eio.Path.(Eio.Stdenv.fs env / "riptide-task-12-definitely-nonexistent" / "path")))
+  in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  let raised_eio_io =
+    try
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+      false
+    with Eio.Io _ -> true
+  in
+  Alcotest.(check bool)
+    "an Eio.Io whose errno is not ENOSPC/EDQUOT/EIO/ENOMEM propagates rather than being classified"
+    true raised_eio_io;
+  Alcotest.(check (list (pair string int)))
+    "and it is not counted as any known refusal shape either"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 0) ]
+    (refusals t)
+
+(* TASK 12 RE-REVIEW (Important-3): [replica.mli] asserts a [storage_fault] "may clear and a later
+   retry of the same op_number may succeed" -- this repo's own CLAUDE.md ("No rule ... is ever
+   allowed to exist as prose or a formal spec alone") means that claim needs running code behind
+   it, not just documentation, exactly like [eviction_blocked]'s own retry test above already has.
+
+   A backend that fails its FIRST [wal_append] with the same real ENOSPC-shaped [Eio.Io] the test
+   above uses, then delegates to a real {!Riptide_storage.Memory_storage} for every call after --
+   simulating a transient condition that clears. *)
+module Flaky_then_memory_backend = struct
+  type t = { fs : Eio.Fs.dir_ty Eio.Path.t; mutable failed_once : bool; underlying : Riptide_storage.Memory_storage.t }
+
+  let create fs = { fs; failed_once = false; underlying = Riptide_storage.Memory_storage.create () }
+
+  let wal_append t ~op_number bytes =
+    if not t.failed_once then begin
+      t.failed_once <- true;
+      Eio.Path.save ~create:`Never Eio.Path.(t.fs / "/dev/full") "x"
+    end
+    else Riptide_storage.Memory_storage.wal_append t.underlying ~op_number bytes
+
+  let wal_read t ~op_number = Riptide_storage.Memory_storage.wal_read t.underlying ~op_number
+  let wal_truncate_after t ~op_number = Riptide_storage.Memory_storage.wal_truncate_after t.underlying ~op_number
+  let wal_highest_op_number t = Riptide_storage.Memory_storage.wal_highest_op_number t.underlying
+  let superblock_write t s = Riptide_storage.Memory_storage.superblock_write t.underlying s
+  let superblock_read t = Riptide_storage.Memory_storage.superblock_read t.underlying
+end
+
+let test_a_storage_fault_clears_and_the_same_op_number_succeeds_on_retry () =
+  Eio_main.run @@ fun env ->
+  let send, sent = capturing_send () in
+  let storage =
+    Replica.storage_of_module (module Flaky_then_memory_backend) (Flaky_then_memory_backend.create (Eio.Stdenv.fs env))
+  in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.for_test_set_view_number t 1;
+  Replica.propose t (v "a");
+  Alcotest.(check int) "the first attempt was refused, not taken on" 0 (Replica.op_number t);
+  Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = []);
+  Alcotest.(check (list (pair string int)))
+    "counted as storage_fault, and as nothing else"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 1) ]
+    (refusals t);
+  (* TRANSIENT: re-driving the SAME op (same replica, same backend, no restart or repair in
+     between -- matching [eviction_blocked]'s own retry test above) now succeeds, because the
+     underlying condition cleared. [propose]'s own duplicate-value guard does not interfere here:
+     the first attempt was REFUSED, so [v "a"] was never appended to [entries t], and this is a
+     genuinely fresh attempt at op_number 1, not a duplicate of an already-taken-on entry. *)
+  Replica.propose t (v "a");
+  Alcotest.(check int) "and it is taken on this time" 1 (Replica.op_number t);
+  Alcotest.(check (list (pair string int)))
+    "storage_fault stayed at exactly 1 -- not incremented again on the successful retry"
+    [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
+      ("eviction_blocked", 0); ("storage_fault", 1) ]
+    (refusals t);
+  Alcotest.(check bool) "and the entry is durably readable" true
+    (Replica.for_test_wal_read t ~op_number:1 = Some (v "a"))
+
 (* THE PROPAGATING ARM, which is the half of this fix that is not merely bookkeeping: an
    [Invalid_argument] matching NONE of the four known shapes is a backend contract violation, not
    a documented storage refusal, and swallowing it as "the protocol declined this op" is exactly
@@ -1225,6 +1416,21 @@ let tests =
     ( "3.7: File_storage's blocked-eviction refusal is counted as its own shape",
       `Quick,
       test_refusal_eviction_blocked_is_counted_as_its_own_shape );
+    ( "Task 12: an Out_of_memory refusal is counted as storage_fault",
+      `Quick,
+      test_refusal_storage_fault_out_of_memory_is_counted_as_its_own_shape );
+    ( "Task 12: a real ENOSPC-shaped Eio.Io refusal is counted as storage_fault",
+      `Quick,
+      test_refusal_storage_fault_real_enospc_eio_io_is_counted_as_its_own_shape );
+    ( "Task 12 re-review (Important-1): a bare Sys_error propagates, not classified as storage_fault",
+      `Quick,
+      test_a_bare_sys_error_propagates_rather_than_being_classified_as_storage_fault );
+    ( "Task 12 re-review (Important-1/Minor-7): an Eio.Io with an unrecognized errno propagates",
+      `Quick,
+      test_an_eio_io_with_an_unrecognized_errno_propagates_rather_than_being_classified );
+    ( "Task 12 re-review (Important-3): a storage_fault clears and the same op_number succeeds on retry",
+      `Quick,
+      test_a_storage_fault_clears_and_the_same_op_number_succeeds_on_retry );
     ( "I2: an unrecognized backend refusal propagates rather than being swallowed",
       `Quick,
       test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed );

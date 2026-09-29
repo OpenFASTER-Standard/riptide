@@ -90,6 +90,18 @@ val create :
       and the entry that would have been evicted stays readable. Retrying the {e same} [op_number]
       after the predicate relents is therefore sound and is the intended usage — the refusal is
       backpressure, not a permanent rejection of the entry.
+
+      {b This "clean no-op" guarantee is specific to the two [Invalid_argument] guard-failure
+      refusals ([?may_evict] declining, and an oversized entry) — it does NOT extend to a genuine
+      I/O failure (Task 12, audit-remediation Decision 3.3; the [Eio.Io]/[Unix.Unix_error] shape
+      {!Riptide_vsr.Replica.durable_append} classifies as [storage_fault]).} [wal_append] below
+      writes a slot's header, then its data, as two SEPARATE, non-atomic writes (see the [.ml]'s own
+      comment above [write_header]/[write_data]); an I/O failure raised between them can leave the
+      ring slot's PRIOR occupant permanently unreadable ([Corrupt], per [wal_read]) — even one a
+      [?may_evict] predicate had just refused to let be evicted — regardless of which of the two
+      writes the failure landed between. This is an inherent property of a two-write update to a
+      fixed slot, not a bug in either write's ordering: whichever write happens first, a fault
+      before the second one always risks losing whatever the first one just overwrote.
     - {b Precedence.} The two pre-existing [Invalid_argument] refusals both win over this one: an
       out-of-sequence [op_number], and an entry too large for one data slot, are each reported as
       themselves even when the same call would also have evicted a blocked op-number. They mean

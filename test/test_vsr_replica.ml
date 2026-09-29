@@ -1944,120 +1944,6 @@ let test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup () =
    [test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advance] in
    test_vsr_replica_recovery.ml, which shares that file's [fresh_storage] durable-state helper. *)
 
-(* ============================================================================================
-   TASK 12 (audit-remediation Decision 3.3, Storage-Important-1): a REAL I/O failure out of
-   [wal_append] -- [Eio.Io], [Sys_error], [Out_of_memory] -- used to match none of
-   [classify_append_refusal]'s [Invalid_argument] shapes and therefore propagate as an
-   unhandled exception straight out of [durable_append], through [propose]/[handle_prepare], to
-   whatever drives this replica (e.g. a real disk filling up under a live [File_storage], ENOSPC).
-   That is a process-killing escape, not a "declined, total no-op" the rest of this module already
-   guarantees for every OTHER kind of append refusal (see the "I2" comment block above
-   [classify_append_refusal] in replica.ml).
-
-   [durable_append] now adds a catch-all arm AFTER the existing [Invalid_argument] classification,
-   recognizing exactly [Eio.Io _ | Sys_error _ | Out_of_memory], counting it in a new
-   [storage_fault] bucket, and returning [false] -- the SAME "counted, total no-op" shape
-   [Fault_injection_cap]/[Entry_rejected]/[Out_of_sequence]/[Eviction_blocked] already get.
-
-   Three tests, one per recognized exception shape, following test_vsr_replica_recovery.ml's own
-   established discipline of driving each classified refusal through a REAL exception rather than
-   a hand-written message string, and asserting the FULL refusal vector (not just the
-   [storage_fault] bucket) so a classifier change that starts mis-bucketing shows up here too. *)
-
-(* A minimal [Storage_intf.S] backend whose [wal_append] fails with a real [Sys_error] -- the
-   shape OCaml's own channel-based I/O (e.g. [output_string]) raises for a genuine ENOSPC, matching
-   Storage-Important-1's live-reproduced disk-full condition. Modeled on
-   [test_vsr_replica_recovery.ml]'s own [Unhelpful_backend]. *)
-module Sys_error_backend : Riptide_storage.Storage_intf.S with type t = unit = struct
-  type t = unit
-
-  let wal_append () ~op_number:_ _ = raise (Sys_error "wal_append: No space left on device")
-  let wal_read () ~op_number:_ = None
-  let wal_truncate_after () ~op_number:_ = ()
-  let wal_highest_op_number () = 0
-  let superblock_write () _ = ()
-  let superblock_read () = None
-end
-
-(* Same shape, [wal_append] raising [Out_of_memory] directly -- the other non-[Invalid_argument]
-   exception Decision 3.3 names explicitly. *)
-module Out_of_memory_backend : Riptide_storage.Storage_intf.S with type t = unit = struct
-  type t = unit
-
-  let wal_append () ~op_number:_ _ = raise Out_of_memory
-  let wal_read () ~op_number:_ = None
-  let wal_truncate_after () ~op_number:_ = ()
-  let wal_highest_op_number () = 0
-  let superblock_write () _ = ()
-  let superblock_read () = None
-end
-
-(* Same shape again, but [wal_append] raises a REAL [Eio.Io] rather than a fabricated one --
-   attempting [Eio.Path.load] on a path that structurally cannot exist, exactly the technique
-   test_file_storage.ml's own [test_a_failed_create_releases_its_lock_before_reraising] uses to
-   pin a real [Eio.Io] shape rather than asserting against a hand-built exception. *)
-module Eio_io_backend : Riptide_storage.Storage_intf.S with type t = Eio.Fs.dir_ty Eio.Path.t = struct
-  type t = Eio.Fs.dir_ty Eio.Path.t
-
-  let wal_append fs ~op_number:_ _ =
-    ignore (Eio.Path.load Eio.Path.(fs / "riptide-task-12-definitely-nonexistent" / "path"))
-
-  let wal_read _ ~op_number:_ = None
-  let wal_truncate_after _ ~op_number:_ = ()
-  let wal_highest_op_number _ = 0
-  let superblock_write _ _ = ()
-  let superblock_read _ = None
-end
-
-(* Every bucket by name, in [append_refusal_kinds]'s own fixed order, with only [storage_fault]
-   nonzero -- pins that a real I/O failure is told apart from every other refusal shape, not just
-   that it is counted somewhere. *)
-let only_storage_fault_refused =
-  [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
-    ("eviction_blocked", 0); ("storage_fault", 1) ]
-
-let test_a_sys_error_io_failure_is_counted_as_storage_fault_not_left_unclassified () =
-  let send, sent = capturing_send () in
-  let storage = Replica.storage_of_module (module Sys_error_backend) () in
-  let t = Replica.create ~storage ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
-  Replica.for_test_set_view_number t 1;
-  (* [propose] must return cleanly -- no escaped exception -- exactly like every other classified
-     refusal already does. *)
-  Replica.propose t (v "a");
-  Alcotest.(check int) "the op was NOT taken on (refused, not durable)" 0 (Replica.op_number t);
-  Alcotest.(check bool) "nothing was sent -- refused before the Prepare broadcast" true (decoded_sent sent = []);
-  Alcotest.(check (list (pair string int)))
-    "counted as storage_fault, and as nothing else" only_storage_fault_refused (Replica.append_refusals t)
-
-let test_an_out_of_memory_failure_is_counted_as_storage_fault_not_left_unclassified () =
-  let send, sent = capturing_send () in
-  let storage = Replica.storage_of_module (module Out_of_memory_backend) () in
-  let t = Replica.create ~storage ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
-  Replica.for_test_set_view_number t 1;
-  Replica.propose t (v "a");
-  Alcotest.(check int) "the op was NOT taken on (refused, not durable)" 0 (Replica.op_number t);
-  Alcotest.(check bool) "nothing was sent -- refused before the Prepare broadcast" true (decoded_sent sent = []);
-  Alcotest.(check (list (pair string int)))
-    "counted as storage_fault, and as nothing else" only_storage_fault_refused (Replica.append_refusals t)
-
-let test_a_real_eio_io_failure_is_counted_as_storage_fault_not_left_unclassified () =
-  Eio_main.run @@ fun env ->
-  let send, sent = capturing_send () in
-  let storage = Replica.storage_of_module (module Eio_io_backend) (Eio.Stdenv.fs env) in
-  (* Deliberately left at the default [view_number = 0]: [Primary(0) = 3] at [replica_count = 3]
-     (this file's own top-of-file note, and matching test_vsr_replica_recovery.ml's own refusal
-     tests exactly), so [my_id = 1] is a BACKUP and a Prepare from sender 3 reaches [handle_prepare]
-     instead of being dropped by the "Prepare addressed to the primary itself" guard. *)
-  let t = Replica.create ~storage ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send () in
-  (* [handle_prepare], the backup-side caller of [durable_append], returns cleanly too -- driven
-     here instead of [propose] to cover BOTH callers the brief names, matching this replica's own
-     "guard failure => total no-op" discipline regardless of which path reaches [durable_append]. *)
-  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
-  Alcotest.(check int) "the op was NOT taken on (refused, not durable)" 0 (Replica.op_number t);
-  Alcotest.(check bool) "nothing was sent (a backup never replies to a refused Prepare)" true (decoded_sent sent = []);
-  Alcotest.(check (list (pair string int)))
-    "counted as storage_fault, and as nothing else" only_storage_fault_refused (Replica.append_refusals t)
-
 let tests =
   [
     (* Fix-round M2/M3 (task-1-review.md): Primary(v)/view_number/last_normal_view coverage *)
@@ -2273,18 +2159,10 @@ let tests =
        still-Normal backup receiving a higher-view StartView directly",
       `Quick,
       test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup );
-    (* Task 12 (audit-remediation Decision 3.3): real I/O failures classified like guard refusals *)
-    ( "Task 12: a Sys_error (e.g. ENOSPC) out of wal_append is counted as storage_fault, not left \
-       unclassified",
-      `Quick,
-      test_a_sys_error_io_failure_is_counted_as_storage_fault_not_left_unclassified );
-    ( "Task 12: an Out_of_memory out of wal_append is counted as storage_fault, not left \
-       unclassified",
-      `Quick,
-      test_an_out_of_memory_failure_is_counted_as_storage_fault_not_left_unclassified );
-    ( "Task 12: a real Eio.Io out of wal_append is counted as storage_fault, not left \
-       unclassified (via handle_prepare)",
-      `Quick,
-      test_a_real_eio_io_failure_is_counted_as_storage_fault_not_left_unclassified );
+    (* Task 12 (audit-remediation Decision 3.3): real I/O failures classified like guard refusals.
+       Re-review Minor-8 moved these tests (and their backend modules) into
+       test_vsr_replica_recovery.ml, alongside their four sibling refusal-classification tests,
+       and rewrote them for Important-1's narrowed classification -- see that file's own "storage_fault"
+       section. *)
   ]
   @ create_invalid_arg_tests

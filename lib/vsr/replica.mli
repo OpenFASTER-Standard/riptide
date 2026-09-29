@@ -935,25 +935,60 @@ val append_refusals : t -> (string * int) list
       the degradation is safe — which is exactly why it has to be visible rather than silently
       equated with the case above.
     - [eviction_blocked] — {!Riptide_storage.File_storage}'s [?may_evict] predicate declining to
-      let this append overwrite an older entry the ring's owner still needs (subtask 3.7). {b The
-      only transient shape of the four:} the call is well-formed, and the same [op_number] succeeds
-      once the predicate relents, so this is backpressure rather than a defect. Flattening it into
-      [entry_rejected] would say the exact opposite of what it means — that the entry can never be
-      durable here — and would make this counter useless for the lag signal described above.
-    - [storage_fault] (Task 12, audit-remediation Decision 3.3) — a REAL I/O failure out of the
-      backend: {!Eio.Io}, {!Sys_error} (the shape OCaml's own channel-based I/O raises for a
-      genuine ENOSPC), or {!Out_of_memory}. Before this bucket existed, none of these were
-      [Invalid_argument] at all, so they matched nothing below and propagated straight out of
-      {!durable_append} as an unhandled exception instead of being refused like every other kind
-      of append failure — closing Storage-Important-1 (a disk filling up under a live
-      {!Riptide_storage.File_storage} could kill the whole replica process). {b The only shape here
-      that is not an [Invalid_argument]}, and — like [eviction_blocked] — potentially transient: an
-      ENOSPC condition may clear and a later retry of the same op_number may succeed, unlike
-      [entry_rejected]'s permanent "too large for this backend".
+      let this append overwrite an older entry the ring's owner still needs (subtask 3.7). {b One of
+      two transient shapes} (the other is [storage_fault] below, added by Task 12): the call is
+      well-formed, and the same [op_number] succeeds once the predicate relents, so this is
+      backpressure rather than a defect. Flattening it into [entry_rejected] would say the exact
+      opposite of what it means — that the entry can never be durable here — and would make this
+      counter useless for the lag signal described above.
+    - [storage_fault] (Task 12, audit-remediation Decision 3.3) — a REAL, narrowly-classified
+      resource condition out of the backend: {!Out_of_memory} itself, or an
+      {!Eio.Io}/bare {!Unix.Unix_error} wrapping exactly one of four errnos — [ENOSPC] (disk full),
+      [EDQUOT] (quota exceeded — OCaml's [Unix.error] has no symbolic constructor for this, so it is
+      matched as [EUNKNOWNERR 122], its value on every Linux this runs on), [EIO] (hardware I/O
+      error), or [ENOMEM] (allocation failure at the syscall level). Before this bucket existed,
+      none of these were [Invalid_argument] at all, so they matched nothing below and propagated
+      straight out of {!durable_append} as an unhandled exception instead of being refused like
+      every other kind of append failure — closing Storage-Important-1 (a disk filling up under a
+      live {!Riptide_storage.File_storage} could kill the whole replica process).
+
+      {b Deliberately narrow, not a blanket catch of [Eio.Io]/[Sys_error]/[Out_of_memory]:} a bare
+      [Sys_error] (this module's storage layer never goes through an OCaml channel, so there is no
+      real backend shape behind one — it is far more likely a genuine bug), any [Eio.Io] wrapping an
+      errno other than the four above, or any [Eio.Io] wrapping a classified {!Eio.Fs.error} at all
+      (e.g. [Not_found] — a missing file — or [Permission_denied] — permissions changed
+      unexpectedly) all PROPAGATE instead, matching this same doc's own discrimination for
+      [Invalid_argument] just below: an exception whose specific shape is not a recognized,
+      documented refusal is a backend contract violation, not a storage refusal, and must crash
+      loudly rather than be laundered into "safe to retry".
+
+      {b One of two transient shapes} (see [eviction_blocked] above): an [ENOSPC]/[EDQUOT]/[EIO]/
+      [ENOMEM]/[Out_of_memory] condition may clear, and a later retry of the same op_number may
+      succeed — proven, not just asserted, by
+      [test_vsr_replica_recovery.ml]'s "a storage_fault clears and the same op_number succeeds on
+      retry" test (Task 12 re-review, Important-3), which drives a backend that fails the FIRST
+      [wal_append] with a real [ENOSPC]-shaped [Eio.Io] and then delegates to
+      {!Riptide_storage.Memory_storage} for every call after, and asserts the retried op is taken
+      on with [storage_fault] staying at exactly 1 (not incremented again on the successful retry)
+      — unlike [entry_rejected]'s permanent "too large for this backend".
+
+      {b Weaker guarantee than the other four refusals, disclosed rather than hidden:} the other
+      four are a clean no-op at the DURABLE-STORAGE level too (nothing written, nothing else
+      disturbed — see {!Riptide_storage.File_storage}'s own [wal_append] doc). [storage_fault] is
+      only guaranteed to be a clean no-op at THIS REPLICA's in-memory level.
+      {!Riptide_storage.File_storage.wal_append} writes a slot's header, then its data, as two
+      separate, non-atomic writes; a [storage_fault] raised between them can leave the ring slot's
+      PRIOR occupant permanently unreadable ([Corrupt], per [wal_read]) — including an entry a
+      [?may_evict] watermark had just refused to let be evicted — even though the append that
+      triggered it was correctly refused. This is a real, disclosed limitation of a two-write
+      update, not a bug: whichever write order a backend uses, a fault between the two writes
+      always risks losing the OTHER one.
 
     An [Invalid_argument] matching none of the first four is NOT counted and NOT swallowed: it
     propagates, because an unrecognized [Invalid_argument] out of a backend is a contract violation
-    rather than a documented storage refusal. *)
+    rather than a documented storage refusal. The same is true, by the identical reasoning, of any
+    [Eio.Io]/[Sys_error]/[Unix.Unix_error]/[Out_of_memory] that does not match [storage_fault]'s
+    narrow four-errno classification above. *)
 
 (** {2 Test-support surface}
 
