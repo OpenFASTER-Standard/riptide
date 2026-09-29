@@ -1678,10 +1678,16 @@ let test_no_plaintext_on_a_real_mtls_wire () =
          let t1 = Option.get !t1 and t2 = Option.get !t2 in
          let message = Printf.sprintf "{\"payload\":\"%s\"}" wire_marker in
          Riptide_transport.Tcp.send t1 ~to_:2 message;
-         let received = Riptide_transport.Tcp.receive t2 in
+         let received, sender = Riptide_transport.Tcp.receive t2 in
          (* Non-vacuity, in both directions: the marker really did cross this connection at the
             application layer, and the proxy really did see the bytes it crossed on. *)
          Alcotest.(check string) "the marker-bearing message arrived verbatim" message received;
+         (* The proxy relays raw TCP bytes only -- it never terminates or re-establishes TLS -- so
+            the mutual TLS handshake, and therefore the certificate [receive] authenticates the
+            sender from, is still directly between peer 1 and peer 2. This is incidental coverage
+            of subtask 1's fix (the proxy exists for the no-plaintext-on-the-wire property above),
+            worth asserting since it's free here: peer 1's identity survives being proxied. *)
+         Alcotest.(check int) "receive attributes the message to peer 1, even proxied" 1 sender;
          Alcotest.(check bool) "the application message really does contain the marker" true
            (contains ~needle:wire_marker message);
          Alcotest.(check bool) "the proxy captured real traffic" true (Buffer.length capture > 512);

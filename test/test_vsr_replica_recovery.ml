@@ -948,7 +948,9 @@ let with_cluster_and_storage ~replica_count ~svc_limit
                   Eio.Switch.run (fun replica_sw ->
                       stop_fns.(i) <- Some (fun () -> Eio.Switch.fail replica_sw Replica_stopped);
                       let rec dispatch_loop () =
-                        let msg = Riptide_sim.Sim_transport.receive handles.(i) in
+                        (* [_sender] (the authenticated sender [receive] now also reports) is not
+                           yet consumed here -- see [transport_intf.ml]. *)
+                        let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
                         Replica.handle_message replica msg;
                         dispatch_loop ()
                       in

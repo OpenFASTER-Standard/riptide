@@ -494,7 +494,12 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
           (fun i _replica ->
             Eio.Fiber.fork ~sw (fun () ->
                 let rec dispatch_loop () =
-                  let msg = Riptide_sim.Sim_transport.receive handles.(i) in
+                  (* [receive] now also reports the authenticated sender (subtask/Task 1 of the
+                     audit-remediation plan) -- not yet consumed here: [Replica.handle_message]
+                     still takes only the payload, and cross-checking the sender against the
+                     message's own claimed identity is a later task's job (see
+                     [docs/superpowers/plans/2026-09-29-audit-remediation.md], Task 3). *)
+                  let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
                   (* [replicas.(i)], read fresh on every message rather than captured once at fork
                      time: [restart] SWAPS the array element, and a fiber holding the pre-crash
                      value would keep feeding the dead replica forever -- the restart would appear

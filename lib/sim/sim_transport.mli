@@ -11,12 +11,18 @@
     that already knows its own identity ([int], matching this repo's VSR replica-id domain) and
     never has to say who a message is from, only where it's going.
 
-    This module bridges the two by (a) fixing [Network.t]'s message type to [string] -- a NEW
-    choice made only here, not a change to {!Network} itself, which stays fully polymorphic for
+    This module bridges the two by (a) fixing [Network.t]'s message type to [string * int] -- a
+    NEW choice made only here, not a change to {!Network} itself, which stays fully polymorphic for
     its other, pre-existing consumers ([workload.ml], [test/test_sim_network.ml],
-    [test/test_sim_faults.ml]) -- and (b) pairing a shared [string Network.t] with one fixed [int]
-    peer id per {!t}, so every {!Riptide_transport.Transport_intf.S} operation on a given {!t} implicitly supplies
-    that id as [Network]'s [~from_]/[peer_id] argument.
+    [test/test_sim_faults.ml]) -- and (b) pairing a shared [(string * int) Network.t] with one
+    fixed [int] peer id per {!t}, so every {!Riptide_transport.Transport_intf.S} operation on a
+    given {!t} implicitly supplies that id as [Network]'s [~from_]/[peer_id] argument. The [int]
+    half of the message type is {!send}'s own sending peer id, stamped on at [send] time and
+    carried, unmodified, all the way through to {!receive} -- this is what {!receive} returns as
+    its authenticated [sender] (see {!Riptide_transport.Transport_intf.S.receive}): "authenticated"
+    here means "written by the one call that could possibly know who is sending", which is exactly
+    what a same-process, non-adversarial simulated fabric can offer in place of {!Tcp}'s real
+    certificate-backed proof.
 
     Peer ids are encoded to {!Network}'s [string] peer ids via [string_of_int]/back via nothing
     (the translation is one-directional at this boundary: callers only ever supply an [int], and
@@ -64,7 +70,7 @@
 
 type t
 
-val create : ?corrupt:(string -> string) -> string Network.t -> int -> t
+val create : ?corrupt:(string -> string) -> (string * int) Network.t -> int -> t
 (** [create net me] is a handle onto [net], acting as peer [me]. [me] must already be registered
     on [net] (i.e. [Network.register net (string_of_int me)] must have already been called) --
     {!receive}/{!receive_nonblocking} below raise [Invalid_argument] (via {!Network}'s own check)
@@ -81,8 +87,8 @@ val create : ?corrupt:(string -> string) -> string Network.t -> int -> t
 
 val create_cluster : ?faults:Network.fault_config -> seed:int -> int -> t array
 (** [create_cluster ?faults ~seed peer_count] is a convenience wrapper around {!Network.create} +
-    {!Network.register} + {!create}: a fresh [string Network.t] (seeded from [seed], with fault
-    behavior [faults], defaulting to {!Network.default_fault_config} same as {!Network.create}
+    {!Network.register} + {!create}: a fresh [(string * int) Network.t] (seeded from [seed], with
+    fault behavior [faults], defaulting to {!Network.default_fault_config} same as {!Network.create}
     itself), with peer ids [0, 1, ..., peer_count - 1] registered on it, returning one {!t} per
     peer id, indexed so the array's [i]-th element is the handle for peer [i]. All returned
     handles share the one underlying [Network.t] -- {!pump_one}/{!pump_all} called on any one of

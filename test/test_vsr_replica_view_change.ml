@@ -224,7 +224,9 @@ let with_cluster ~replica_count ~svc_limit
                          (this one replica only, via Replica_stopped) or, for whichever replicas are
                          still running at test end, by the outer switch's own Cluster_test_done. *)
                       let rec dispatch_loop () =
-                        let msg = Sim_transport.receive handles.(i) in
+                        (* [_sender] (the authenticated sender [receive] now also reports) is not
+                           yet consumed here -- see [transport_intf.ml]. *)
+                        let msg, _sender = Sim_transport.receive handles.(i) in
                         Replica.handle_message replica msg;
                         dispatch_loop ()
                       in

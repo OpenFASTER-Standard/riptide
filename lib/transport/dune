@@ -1,3 +1,8 @@
 (library
  (name riptide_transport)
- (libraries eio eio.unix tls tls-eio x509 ptime ptime.clock.os mirage-crypto-rng.unix fmt))
+ ;; [domain-name] is for decoding the authenticated peer id out of a certificate's SAN (see
+ ;; [Tcp]'s [authenticated_peer_id]) -- [x509] exposes [Domain_name.t]-typed values but does not
+ ;; re-export the [Domain_name] module itself, so this needs the library directly, same as
+ ;; [lib/pki/dune] already does for the encode side.
+ (libraries eio eio.unix tls tls-eio x509 ptime ptime.clock.os domain-name mirage-crypto-rng.unix
+   fmt))

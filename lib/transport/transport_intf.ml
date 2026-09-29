@@ -61,9 +61,23 @@ module type S = sig
       never raising for a gone peer -- only on the fact that it never blocks waiting for
       delivery. *)
 
-  val receive : t -> string
+  val receive : t -> string * int
   (** [receive t] blocks (cooperatively) until the next message addressed to this handle's own
-      peer is available, then returns its raw bytes.
+      peer is available, then returns [(payload, sender)]: the raw bytes, paired with the peer id
+      of whoever actually sent them.
+
+      {b [sender] is authenticated, not merely claimed.} A conforming implementation must derive
+      [sender] from something it has actually verified belongs to the party it is talking to --
+      {!Tcp} decodes it from the SubjectAltName of the X.509 certificate presented on that
+      connection's mutually-authenticated TLS session (see [tcp.mli]'s "Authentication" section),
+      never from any in-band, unauthenticated claim a peer could simply lie about. {!Sim_transport}
+      satisfies this trivially: it returns the sending peer's id exactly as recorded when that
+      peer called {!send}, which cannot be spoofed inside a single simulated process. This is a
+      floor, not a promise about {e which} id space [sender] ranges over beyond "this
+      implementation's own notion of peer id" -- callers that need to cross-check [sender] against
+      an application-level claim embedded in the payload itself (e.g. a VSR message's own [i]
+      field) must still do that themselves; this signature only guarantees [sender] was not
+      forgeable by whoever sent the message.
 
       {b An implementation may require delivery to be driven externally, so a [receive] loop must
       not assume it is the only thing that needs to run.} This signature says when [receive]
@@ -72,18 +86,20 @@ module type S = sig
       only when some {e other} code explicitly advances it (as the simulated-network adapter does
       -- nothing is delivered there until a [pump_one]/[pump_all] call, which is deliberately not
       part of this signature because it is meaningless for a real socket). Against the latter, the
-      obvious single-fiber loop [let msg = receive t in handle msg] never returns: it blocks
-      forever without ever yielding to whatever would have pumped. Portable code must therefore
-      either run its receive loop in a fiber alongside whatever drives delivery, or take the
-      driving step as a parameter -- see [test/test_transport_shared.ml], whose shared body does
-      exactly the latter.
+      obvious single-fiber loop [let msg, _sender = receive t in handle msg] never returns: it
+      blocks forever without ever yielding to whatever would have pumped. Portable code must
+      therefore either run its receive loop in a fiber alongside whatever drives delivery, or take
+      the driving step as a parameter -- see [test/test_transport_shared.ml], whose shared body
+      does exactly the latter.
 
       Nor is there any guarantee [receive] ever returns even on an implementation that does
       deliver on its own: if every peer is gone, it simply blocks. This contract exposes no
       liveness or peer-state signal, and no timeout -- a caller that needs one must impose it
       itself (e.g. {!Eio.Time.with_timeout}). *)
 
-  val receive_nonblocking : t -> string option
+  val receive_nonblocking : t -> (string * int) option
   (** [receive_nonblocking t] is like {!receive}, but returns [None] immediately instead of
-      blocking if no message is currently available for this handle's own peer. *)
+      blocking if no message is currently available for this handle's own peer. Carries the same
+      authenticated-[sender] guarantee as {!receive} on [Some] -- it is the same underlying
+      delivery mechanism, only the blocking behavior differs. *)
 end

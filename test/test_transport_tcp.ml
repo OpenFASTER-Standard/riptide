@@ -143,10 +143,15 @@ let test_three_peer_mesh_bidirectional_delivery () =
           List.iter (fun m -> Tcp.send (get from_) ~to_ m) msgs;
           List.iter
             (fun expected ->
+              let payload, sender = Tcp.receive (get to_) in
               Alcotest.(check string)
                 (Printf.sprintf "peer %d receives peer %d's message, verbatim and in order" to_
                    from_)
-                expected (Tcp.receive (get to_)))
+                expected payload;
+              Alcotest.(check int)
+                (Printf.sprintf "peer %d's receive attributes it to the real sender, peer %d" to_
+                   from_)
+                from_ sender)
             msgs)
         pairs)
 
@@ -166,8 +171,8 @@ let test_framing_boundary_back_to_back_messages_stay_distinct () =
       let msg2 = "\x00\x00\x00\x00\x00\x00\x00\x04ABCD-and-this-is-all-of-msg2-too" in
       Tcp.send a ~to_:2 msg1;
       Tcp.send a ~to_:2 msg2;
-      let r1 = Tcp.receive b in
-      let r2 = Tcp.receive b in
+      let r1, sender1 = Tcp.receive b in
+      let r2, sender2 = Tcp.receive b in
       Alcotest.(check string)
         "first back-to-back send is received whole and unmodified, not merged with the second" msg1
         r1;
@@ -175,6 +180,8 @@ let test_framing_boundary_back_to_back_messages_stay_distinct () =
         "second back-to-back send is received whole and unmodified, not merged with or split off \
          the first"
         msg2 r2;
+      Alcotest.(check int) "first message is attributed to the real sender, peer 1" 1 sender1;
+      Alcotest.(check int) "second message is attributed to the real sender, peer 1" 1 sender2;
       Alcotest.(check bool) "no leftover/duplicated bytes beyond the two expected messages" true
         (Tcp.receive_nonblocking b = None))
 
@@ -191,12 +198,20 @@ let test_no_cross_peer_misattribution_under_concurrent_traffic () =
           (fun from_ -> List.filter_map (fun to_ -> if from_ = to_ then None else Some (from_, to_)) ids)
           ids
       in
-      (* [receive]'s own signature carries no sender identity (see transport_intf.ml) -- the only
-         way this layer can prove "peer A only ever sees messages actually sent [~to_:A]" is by
-         round-tripping identity through payload content itself, the same way a real caller's
-         envelope would. *)
+      (* Two independent proofs of attribution, checked together: the payload content itself
+         (round-tripping [from_] through the message the way a real caller's envelope would,
+         which is the only proof available before Task 1) AND, now, [receive]'s own [sender]
+         (transport_intf.ml) -- authenticated straight off the TLS certificate actually presented
+         on the connection each message arrived on, per peer's own certificate identity (see
+         [leaf_of]/[peer_identity] above), not derived from payload content at all. The two must
+         agree for every message: a bug that routed a send meant for peer 3 onto peer 2's
+         connection instead would now be caught either way -- by the payload landing in the wrong
+         receiver's expected set (as before), or by that receiver's reported [sender] disagreeing
+         with what the payload itself claims (new). *)
       let expected_for p =
-        List.concat_map (fun (from_, to_) -> if to_ = p then List.map (tag from_ to_) seqs else []) pairs
+        List.concat_map
+          (fun (from_, to_) -> if to_ = p then List.map (fun seq -> (tag from_ to_ seq, from_)) seqs else [])
+          pairs
         |> List.sort compare
       in
       let received = Hashtbl.create (List.length ids) in
@@ -218,10 +233,10 @@ let test_no_cross_peer_misattribution_under_concurrent_traffic () =
             ids);
       List.iter
         (fun p ->
-          Alcotest.(check (list string))
+          Alcotest.(check (list (pair string int)))
             (Printf.sprintf
-               "peer %d's receive() surfaces exactly the messages sent ~to_ it (and only those), \
-                even under concurrent multi-connection traffic"
+               "peer %d's receive() surfaces exactly the (payload, authenticated sender) pairs \
+                sent ~to_ it (and only those), even under concurrent multi-connection traffic"
                p)
             (expected_for p) (Hashtbl.find received p))
         ids)
@@ -301,11 +316,14 @@ let test_create_waits_for_the_specific_expected_peers () =
                peer_specs);
         List.iter
           (fun id ->
+            let payload, sender = Tcp.receive (Hashtbl.find handles id) in
             Alcotest.(check string)
               (Printf.sprintf
                  "peer %d receives what peer 3 sent the instant peer 3's own create returned" id)
-              msg
-              (Tcp.receive (Hashtbl.find handles id)))
+              msg payload;
+            Alcotest.(check int)
+              (Printf.sprintf "peer %d attributes it to the real sender, peer 3 (not a stray)" id)
+              3 sender)
           [ 1; 2 ];
         Eio.Switch.fail sw Stray_mesh_torn_down)
   with Stray_mesh_torn_down -> ()

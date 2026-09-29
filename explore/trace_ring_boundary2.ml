@@ -93,7 +93,7 @@ let () =
            (fun i _ ->
              Eio.Fiber.fork ~sw:sw2 (fun () ->
                  let rec loop () =
-                   let msg = Riptide_sim.Sim_transport.receive handles.(i) in
+                   let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
                    Riptide_vsr.Replica.handle_message replicas.(i) msg;
                    decr inflight;
                    loop ()

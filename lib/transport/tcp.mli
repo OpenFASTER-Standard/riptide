@@ -20,13 +20,26 @@
     {b What mTLS here does and does not establish.} It establishes that the party on the other end
     holds a certificate this cluster's CA issued, and that every byte exchanged afterwards is
     confidential, integrity-protected, and not replayable onto the connection by anyone else. It
-    does {e not} establish {e which} cluster member that party is: the peer id below is still the
-    one the preamble claims, and nothing binds it to the certificate presented. So one holder of a
-    cluster certificate can still claim another member's id. That is a real, remaining gap, and it
-    is stated rather than closed here because closing it means deciding a naming convention
-    between certificate subjects and peer ids -- policy this repo has no running code needing yet.
-    The gap it {e does} close is the one that mattered most: an arbitrary party on the network can
-    no longer inject, read, or tamper with cluster traffic at all.
+    also establishes {e which} cluster member that party is, for {!receive}'s purposes: {!receive}
+    reports a [sender] decoded from the SubjectAltName of the certificate {e actually presented and
+    verified} on the connection a message arrived on (see the module-level implementation, in
+    particular [authenticated_peer_id]), never from the handshake preamble below. So one holder of
+    a cluster certificate can no longer make a message it sends appear, to a {!receive} caller, to
+    come from another member -- the naming convention this used to need deciding (mapping
+    certificate SAN to peer id) is now decided: the peer's numeric id is the trailing run of
+    decimal digits in the SAN hostname's leftmost DNS label (e.g. ["peer-3.riptide.test"] and
+    bare ["3"] both decode to [3]).
+
+    {b What is still not bound to the certificate.} This module's own OUTBOUND routing table (keyed
+    by peer id, used by {!send} to find which live connection to write to) is still populated from
+    the handshake preamble's claim, unverified against the certificate on that same connection --
+    see the {!create} implementation's [writers] field for the precise, current boundary. So a
+    cluster member can still cause its {e own} outbound traffic to be routed onto a connection an
+    attacker holds (a routing-table poisoning, not a message-attribution forgery), and a second
+    connection claiming an id already routed silently replaces the first. The gap {!receive}'s
+    fix closes is the one that mattered most for message provenance: an arbitrary party on the
+    network can no longer inject, read, tamper with, or (as of this fix) falsely attribute cluster
+    traffic. What remains is narrower, and is a separate, later fix.
 
     {2 Wire format}
 
@@ -44,9 +57,13 @@
       direction needs it, since the connecting side already knows which peer it dialed.
 
       {b This preamble is authenticated as coming from some cluster member, but the id it claims
-      is not verified} -- see the Authentication section above. A second connection claiming an id
-      already present in this peer's connection table silently replaces the first one (an
-      implementation detail of [Hashtbl.replace], not a validated "reconnect" feature).
+      is not verified against the certificate on the same connection} -- see the Authentication
+      section above for the precise, now-narrower boundary: this preamble still decides this
+      connection's entry in the OUTBOUND routing table ({!send}'s target lookup), but no longer
+      decides what {!receive} reports a delivered message's sender as -- that is decoded
+      independently, straight from the certificate. A second connection claiming an id already
+      present in this peer's connection table silently replaces the first one (an implementation
+      detail of [Hashtbl.replace], not a validated "reconnect" feature).
 
       The accepting side's waits are bounded, at both layers and for the same reason: ~10s for the
       TLS handshake to complete, then ~10s for the preamble. A connection that is accepted but
@@ -161,8 +178,10 @@
 
     No reconnection/retry once a connection has been established (only the initial "wait for the
     rest of the cluster to come up" retry during {!create} exists, bounded -- see {!create}); no
-    binding of a peer's claimed id to the certificate it presented (see "Authentication" above);
-    no certificate revocation, rotation or expiry handling of any kind -- {!create} takes the
+    binding of a peer's PREAMBLE-claimed id (used for {!send}'s outbound routing table) to the
+    certificate it presented on that connection -- {!receive}'s reported sender {e is} now bound to
+    the certificate; the routing table is the narrower, still-open part (see "Authentication"
+    above); no certificate revocation, rotation or expiry handling of any kind -- {!create} takes the
     material it is given, and an expired certificate simply starts failing handshakes; no explicit
     shutdown/close (see the note at the end of this comment); no backpressure or flow control of
     any kind -- despite an earlier draft of this comment claiming {!Eio.Buf_write} provides some,

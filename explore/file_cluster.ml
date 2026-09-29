@@ -124,7 +124,7 @@ let run_scenario ~env ~seed ~replica_count ~ring_capacity ~rounds ~ops_per_round
        (fun i replica ->
          Eio.Fiber.fork ~sw (fun () ->
              let rec dispatch () =
-               let msg = Riptide_sim.Sim_transport.receive handles.(i) in
+               let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
                Replica.handle_message replica msg;
                decr inflight;
                dispatch ()

@@ -99,7 +99,8 @@ let record_value name =
    thing a later change could introduce -- but do not cite "2 yields" as a mutation-tested
    minimum, because it isn't one. *)
 let with_cluster ?(replica_count = default_replica_count)
-    (body : replicas:Replica.t array -> settle:(unit -> unit) -> net:string Network.t -> unit) =
+    (body :
+      replicas:Replica.t array -> settle:(unit -> unit) -> net:(string * int) Network.t -> unit) =
   Eio_mock.Backend.run @@ fun () ->
   let net = Network.create ~seed:1 () (* faults default to Network.default_fault_config *) in
   for id = 1 to replica_count do
@@ -141,7 +142,10 @@ let with_cluster ?(replica_count = default_replica_count)
                    message, dispatch it, repeat -- the exact shape replica.mli's own doc comment
                    sketches. Never returns on its own; torn down via Eio.Switch.fail below. *)
                 let rec dispatch_loop () =
-                  let msg = Sim_transport.receive handles.(i) in
+                  (* [_sender] (the authenticated sender [receive] now also reports) is not yet
+                     consumed here -- see [transport_intf.ml]; cross-checking it against the
+                     message's own claimed identity is a later task's job. *)
+                  let msg, _sender = Sim_transport.receive handles.(i) in
                   Replica.handle_message replica msg;
                   dispatch_loop ()
                 in

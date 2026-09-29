@@ -108,21 +108,31 @@ type t = {
      authenticator built from the same trust anchor, which is what makes every connection in the
      mesh mutually authenticated in both directions -- see tls_identity.mli. *)
   tls : Tls_identity.t;
-  inbox : string Eio.Stream.t;
+  (* Each element is [(payload, sender)], where [sender] is the id [authenticated_peer_id] (see
+     below) decoded from the certificate actually presented on the connection the message arrived
+     on -- never the handshake preamble's claim. [reader_body] is the only producer. *)
+  inbox : (string * int) Eio.Stream.t;
   (* One entry per live connection, keyed by the *remote* peer's id: the [Eio.Buf_write.t] to
      write framed messages to in order to reach that peer. Populated by both the dialing path
      (connect_to) and the accepting path (handle_accepted) as connections come up, via
      [register_writer]. Every connection that gets this far has completed mutual TLS, so an entry
-     here always belongs to a holder of a certificate this cluster's CA issued -- but the peer
-     *id* is still the one the handshake preamble claimed, and nothing binds that id to the
-     certificate that was actually presented. So a cluster member can still claim another member's
-     id, and a second connection claiming an id already present here silently replaces the first
-     via [Hashtbl.replace]. See tcp.mli's "Authentication" section for why that residual gap is
-     stated rather than closed here. An
-     entry is removed by [run_connection] once that connection's reader and writer fibers have
-     BOTH confirmed the connection is dead -- see [run_connection] for why cleanup only happens
-     there, coupled, rather than independently in whichever of the reader/writer notices death
-     first. *)
+     here always belongs to a holder of a certificate this cluster's CA issued -- but the *key*
+     under which it is stored is still the one the handshake preamble claimed, and nothing yet
+     binds that key to the certificate that was actually presented on the connection it names.
+
+     This is narrower than it used to be, not the same residual gap restated: {!receive} (via
+     [reader_body]/[authenticated_peer_id]) now reports a real, certificate-bound sender for every
+     delivered message, so a peer can no longer make itself appear, to the code actually consuming
+     messages, as a cluster member it is not. What remains open is [send]-side routing: this table
+     decides which live connection a given outbound peer id resolves to, and that decision is
+     still keyed by the preamble, so a cluster member can still cause a peer's OWN outbound
+     messages to route to a connection the attacker holds (rather than forging what the receiving
+     side believes about a message it receives), and a second connection claiming an id already
+     present here still silently replaces the first via [Hashtbl.replace]. See tcp.mli's
+     "Authentication" section for the precise boundary. An entry is removed by [run_connection]
+     once that connection's reader and writer fibers have BOTH confirmed the connection is dead --
+     see [run_connection] for why cleanup only happens there, coupled, rather than independently
+     in whichever of the reader/writer notices death first. *)
   writers : (int, Eio.Buf_write.t) Hashtbl.t;
   (* Broadcast every time an entry is added to [writers], so [create] can block until the whole
      mesh implied by [peers] is up without busy-polling [writers]'s length. *)
@@ -154,6 +164,78 @@ let read_frame r =
 
 let write_preamble w my_id = Eio.Buf_write.BE.uint64 w (Int64.of_int my_id)
 let read_preamble r = Eio.Buf_read.BE.uint64 r |> Int64.to_int
+
+(* -- Deriving the authenticated sender from the peer's actual TLS certificate -- *)
+
+(* Raised by [authenticated_peer_id] when the certificate [Tls_eio.epoch] reports as verified on a
+   connection does not encode a usable replica id -- no certificate at all (unreachable once a
+   mutual-TLS handshake has actually completed, since both [Tls_identity.client_config] and
+   [Tls_identity.server_config] set a required/optional [authenticator] that only ever accepts a
+   chain rooted at [trust_anchor], but checked here rather than assumed, since this function must
+   never crash the process over a peer whose certificate is merely unusual), no SubjectAltName DNS
+   entry, more than one, or a SAN whose leftmost DNS label carries no trailing decimal digits.
+   Caught by [reader_body] right next to where it matters, exactly like [Frame_too_large] above --
+   this exists as a named exception, rather than reusing [Failure]/[Invalid_argument], purely so a
+   [Tcp: connection error] log line can say *why* a connection was dropped. *)
+exception Unauthenticated_peer of string
+
+(* The authenticated sender id for [flow]: decoded from the SubjectAltName of the certificate
+   [Tls_eio.epoch] reports as the one actually verified on this connection during the mutual TLS
+   handshake -- NEVER from the handshake preamble above, which a hostile peer fully controls (see
+   the [writers] field's own doc comment on [t] above for why the preamble alone is not a binding
+   of claimed id to presented certificate).
+
+   [lib/pki/ca.ml]'s [sign_leaf] mints exactly one DNS SAN entry per leaf
+   ([X509.General_name.singleton DNS [ common_name ]]), so exactly one [X509.Host.Set.t] element is
+   expected here too -- zero or more than one is treated as a malformed/unusable certificate rather
+   than arbitrarily picking one.
+
+   {b The id-encoding convention.} The replica's numeric id is the trailing run of ASCII decimal
+   digits in that hostname's LEFTMOST label, e.g. ["peer-3.riptide.test"], ["replica-3.example"],
+   and bare ["3"] all decode to [3] -- deciding this is genuinely new policy this module did not
+   need before (see tcp.mli's "Authentication" section: closing this gap was explicitly deferred
+   pending exactly this decision), not a convention [ca.ml] already established, since [sign_leaf]
+   accepts an arbitrary caller-chosen hostname and enforces nothing about its shape beyond being a
+   valid DNS name. Anchoring on a trailing digit run in the first label, rather than requiring the
+   whole label (or the whole hostname) to be numeric, is what lets every existing test fixture's
+   ["<name>-<id>.<domain>"]-shaped common name keep working unchanged, while still letting a real
+   deployment use bare numeric hostnames or any domain suffix it likes. *)
+let authenticated_peer_id flow =
+  match Tls_eio.epoch flow with
+  | Error () -> raise (Unauthenticated_peer "no TLS epoch available (handshake not complete?)")
+  | Ok epoch -> (
+    match epoch.Tls.Core.peer_certificate with
+    | None ->
+      raise
+        (Unauthenticated_peer
+           "peer presented no certificate (unreachable under mutual TLS once the handshake has \
+            completed)")
+    | Some cert -> (
+      match X509.Host.Set.elements (X509.Certificate.hostnames cert) with
+      | [] -> raise (Unauthenticated_peer "certificate has no SubjectAltName DNS entry")
+      | _ :: _ :: _ ->
+        raise (Unauthenticated_peer "certificate has more than one SubjectAltName DNS entry")
+      | [ (_, host) ] -> (
+        let name = Domain_name.to_string host in
+        let label = match String.index_opt name '.' with Some i -> String.sub name 0 i | None -> name in
+        let len = String.length label in
+        let is_digit c = c >= '0' && c <= '9' in
+        let rec digits_start i =
+          if i <= 0 then 0 else if is_digit label.[i - 1] then digits_start (i - 1) else i
+        in
+        let start = digits_start len in
+        if start = len then
+          raise
+            (Unauthenticated_peer
+               (Printf.sprintf
+                  "certificate SAN %S has no trailing replica id in its leftmost label" name))
+        else
+          match int_of_string_opt (String.sub label start (len - start)) with
+          | Some id -> id
+          | None ->
+            raise
+              (Unauthenticated_peer
+                 (Printf.sprintf "certificate SAN %S: replica id does not fit an OCaml int" name)))))
 
 let register_writer t peer_id w =
   Hashtbl.replace t.writers peer_id w;
@@ -204,12 +286,21 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
   | Failure _ -> ()
   | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> ()
 
-(* The read side of one connection's lifetime: loops decoding length-prefixed frames and pushing
-   their payload bytes onto the shared inbox for this local peer. Like [writer_body], always
+(* The read side of one connection's lifetime: decodes the connection's own authenticated sender
+   id ONCE from [flow] (see [authenticated_peer_id] above), then loops decoding length-prefixed
+   frames and pushing [(payload, sender)] onto the shared inbox for this local peer. Decoding once
+   up front rather than per message is correct, not just an optimization: a single TLS connection
+   has exactly one peer certificate for its whole lifetime (renegotiation is never used here), so
+   the sender cannot change between messages on the same connection. Like [writer_body], always
    returns [unit] (never re-raises a fault it catches) so it composes with [Eio.Fiber.first] the
    same way; [Eio.Cancel.Cancelled] is likewise left uncaught, for the same reason.
 
    Ends on:
+   - [Unauthenticated_peer]: the certificate actually presented on this connection does not encode
+     a usable replica id -- see [authenticated_peer_id] for the exact cases. Checked before the
+     read loop even starts: a connection this module cannot attribute a sender to is as useless as
+     one that never completed its handshake, and must not deliver a single message while
+     unattributed.
    - [End_of_file]/[Eio.Io _]: the connection closed or reset;
    - [Tls_eio.Tls_alert]/[Tls_eio.Tls_failure]: the TLS session died -- see [writer_body] above
      for why these are treated as ordinary connection death rather than allowed to escape;
@@ -220,18 +311,28 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
 
    This same function is used for both accepted and dialed connections' read sides -- both go
    through [run_connection], so both get identical fault handling and identical connection
-   teardown by construction, not by accident of which side happens to have an outer guard. *)
-let reader_body t r =
+   teardown by construction, not by accident of which side happens to have an outer guard. This
+   also makes [authenticated_peer_id]'s use of [Tls_eio.epoch flow] correct on both sides
+   symmetrically: for an accepted connection [flow]'s [peer_certificate] is the dialer's (client)
+   certificate, and for a dialed connection it is the accepted peer's (server) certificate -- mutual
+   TLS means both sides always have one to report once the handshake has completed at all. *)
+let reader_body t flow r =
   try
+    let sender = authenticated_peer_id flow in
     while true do
       let payload = read_frame r in
-      Eio.Stream.add t.inbox payload
+      Eio.Stream.add t.inbox (payload, sender)
     done
   with
   | End_of_file -> ()
   | Eio.Io _ -> ()
   | (Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _) as exn ->
     Eio.traceln "Tcp: connection error: %s; dropping connection" (describe_exn exn)
+  | Unauthenticated_peer msg ->
+    Eio.traceln
+      "Tcp: connection error: peer's certificate does not authenticate a usable replica id: %s; \
+       dropping connection"
+      msg
   | Frame_too_large len ->
     Eio.traceln "Tcp: connection error: peer declared a frame of %d bytes (max %d); dropping connection"
       len max_message_size
@@ -258,7 +359,7 @@ let reader_body t r =
    than the one that died: one peer's death would kill the rest of the cluster.
 
    [Eio.Fiber.first] is what actually couples the two fibers: it runs [writer_body flow] and
-   [reader_body r] concurrently in a private cancellation sub-context, and as soon as EITHER one
+   [reader_body flow r] concurrently in a private cancellation sub-context, and as soon as EITHER one
    finishes (both are written to always return normally rather than raise, for exactly this
    reason), the other is cancelled and [first] returns. Only once both sides have therefore
    actually stopped does this function proceed to:
@@ -286,7 +387,7 @@ let run_connection t ~is_dialer ~owns_flow peer_id flow r =
   let writer_cell = ref None in
   Eio.Fiber.first
     (fun () -> writer_body t ~is_dialer peer_id flow writer_cell)
-    (fun () -> reader_body t r);
+    (fun () -> reader_body t flow r);
   (match !writer_cell, Hashtbl.find_opt t.writers peer_id with
    | Some w, Some w' when w == w' -> Hashtbl.remove t.writers peer_id
    | _ -> ());
@@ -317,7 +418,16 @@ let run_connection t ~is_dialer ~owns_flow peer_id flow r =
    A refused handshake is logged and swallowed rather than raised. It is not an error of this
    listener's: rejecting a peer whose certificate does not chain to this cluster's CA (or that
    presented none) is this module working exactly as intended, and letting it propagate would put
-   an attacker in control of how many consecutive "accept errors" the loop above counts. *)
+   an attacker in control of how many consecutive "accept errors" the loop above counts.
+
+   The preamble read below still exists, and [peer_id] read from it is still passed to
+   [run_connection] unchanged -- it is what [t.writers] gets keyed by for THIS connection (see the
+   [writers] field's own doc comment on [t] for why that is still merely claimed, not verified).
+   What no longer flows from the preamble is the sender attribution {!receive} reports:
+   [run_connection] independently decodes that straight from [tls_flow]'s own verified certificate
+   (via [reader_body]/[authenticated_peer_id]), so a connection's preamble claim and its
+   certificate-authenticated identity can now diverge -- [t.writers] would (still) be keyed by the
+   former, every message delivered over it attributed to the latter. *)
 let handle_accepted t ~clock raw_flow =
   match
     Eio.Time.with_timeout clock tls_handshake_timeout (fun () ->

@@ -83,7 +83,9 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
                   Eio.Switch.run (fun replica_sw ->
                       stop_fns.(i) <- Some (fun () -> Eio.Switch.fail replica_sw Replica_stopped);
                       let rec dispatch_loop () =
-                        let msg = Sim_transport.receive handles.(i) in
+                        (* [_sender] (the authenticated sender [receive] now also reports) is not
+                           yet consumed here -- see [transport_intf.ml]. *)
+                        let msg, _sender = Sim_transport.receive handles.(i) in
                         Replica.handle_message replica msg;
                         dispatch_loop ()
                       in
