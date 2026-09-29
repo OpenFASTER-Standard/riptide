@@ -164,8 +164,9 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     test's third phase (one [kv], a keystore and a materializer both built directly from it at once,
     a keystore [put] silently overwriting the materializer's own accumulator value at a colliding
     key, with the lock never once firing because no second [create] call is made for either
-    consumer -- pinning the THIRD consequence below). A DIFFERENT-tag pair, by contrast, is rejected at construction with this
-    keystore's data provably intact ([test_a_shared_kv_directory_is_rejected_at_construction],
+    consumer -- pinning the THIRD consequence below). A DIFFERENT-tag pair, by contrast, is
+    rejected at construction with this keystore's data provably intact
+    ([test_a_shared_kv_directory_is_rejected_at_construction],
     restructured (review finding I3) so the colliding [create] attempt runs only after the first
     handle's lock has been released -- otherwise Task 11's own lock, not the owner-tag comparison
     this test exists to exercise, would be what raises, as an earlier version of this test did); that
