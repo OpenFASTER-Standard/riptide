@@ -248,9 +248,9 @@ let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   go ()
 
 (* Acquires a pooled buffer, blits [data] into it (zero-padded out to [n] by
-   {!with_pooled_buffer}'s own fresh-zero-on-acquire), writes it, and releases the buffer --
-   all before returning. Factored out because every write call site below (WAL header, WAL
-   data, each superblock copy's header and data) does exactly this same
+   {!Riptide_storage.Aligned_buffer_pool.with_buffer}'s own fresh-zero-on-acquire), writes it, and
+   releases the buffer -- all before returning. Factored out because every write call site below
+   (WAL header, WAL data, each superblock copy's header and data) does exactly this same
    acquire-blit-write-release sequence, differing only in [data]/[n]/[offset]. *)
 let perform_write_from_string ~pool ~sw (h : file_handle) ~offset ~n data =
   Aligned_buffer_pool.with_buffer pool n (fun buf ->

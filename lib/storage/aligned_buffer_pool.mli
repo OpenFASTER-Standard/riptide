@@ -21,7 +21,19 @@ val create : buffer_count:int -> slot_size:int -> unit -> t
 (** [create ~buffer_count ~slot_size ()] allocates [buffer_count] real, page-aligned,
     [mmap]-backed buffers of exactly [slot_size] bytes each, up front, and returns a pool holding
     them. Never allocates again for the rest of [t]'s lifetime -- see {!with_buffer}, the only way
-    to get at a buffer afterwards. *)
+    to get at a buffer afterwards.
+
+    Raises [Invalid_argument] if [buffer_count <= 0] or [slot_size <= 0] (Task 10 review round 2,
+    Finding 5) -- both fail fast and clearly here rather than surfacing as either a silent,
+    permanent deadlock on the first {!with_buffer} call (a pool built with [buffer_count = 0] has
+    nothing to ever [Eio.Stream.take]) or a confusing failure deep inside [Eio.Stream.create]/
+    [Unix.map_file] that names neither this module nor which argument was wrong. Does not further
+    require [slot_size] to be a multiple of any particular alignment (e.g. the OS page size): the
+    page-ALIGNMENT guarantee {!with_buffer} depends on is a property of the mapping's start
+    address, not its length, and holds for any positive [slot_size]; a caller doing [O_DIRECT] I/O
+    is separately responsible for choosing a [slot_size] whose LENGTH also satisfies its own
+    filesystem's block-size-multiple requirement (both current callers document this at their own
+    [create] call sites). *)
 
 val with_buffer : ?zero:bool -> t -> int -> (Cstruct.t -> 'a) -> 'a
 (** [with_buffer ?zero t n f] acquires one buffer from [t] (blocking the calling fiber via

@@ -118,29 +118,35 @@ let open_flags_read = Uring.Open_flags.empty
    mechanism itself, and [file_storage.ml]'s top comment, "Task 10", for the VMA-leak bug both
    this file and that one used to have independently before sharing that module).
 
-   {b Sizing/concurrency rationale, this store's own} (corrected -- Task 10 review, Finding M3:
-   the previous version of this comment claimed {!Riptide_crypto.Redaction_store} as the relevant
-   consumer, driven from a single replica's own dispatch fiber; that was wrong on two counts.
-   First, [Redaction_store] never calls [File_kv_store.create] itself --
-   {!Riptide_crypto.Redaction_store.create} takes an already-built [kv] on faith (see that
-   module's own [.mli]), so it has no [create] call site of its own to reason about here at all.
-   Second, this store's actual live consumer today,
-   confirmed by grepping every real (non-[.mli]) call to [File_kv_store.create] in this repo, is
-   test-only: [test/test_dst_scenarios.ml]'s [Lww_materializer], built once per test via
-   [make_lww_materializer] and driven through {!Riptide_batch_commit.Batch_commit.materialize_up_to}
-   from the DST test driver's own top-level fiber -- as ONE handle shared across the whole
-   simulated cluster (every replica's committed writes fold into the same materializer), not one
-   per replica.
+   {b Sizing/concurrency rationale, this store's own} (corrected -- Task 10 review round 2,
+   Finding 1: the previous version of this comment (itself a correction of an earlier, differently
+   wrong version -- Finding M3) claimed a single, exclusive test-only consumer,
+   [test/test_dst_scenarios.ml]'s [Lww_materializer], "confirmed by grepping every real
+   (non-[.mli]) call to [File_kv_store.create]" -- that grep was never actually run broadly enough
+   to support the word "the" it used. Re-grepped for this correction: real (non-[.mli]) calls to
+   [File_kv_store.create] appear in seven test files, not one --
+   [test/test_file_kv_store.ml], [test/test_lattice_materialize_crypto_scenarios.ml],
+   [test/test_redaction.ml], [test/test_materializer.ml],
+   [test/test_batch_commit_materialize.ml], [test/test_batch_commit.ml], and
+   [test/test_dst_scenarios.ml] itself -- roughly 50 call sites total, dominated by the first two
+   (~19 each). Several of these ([test_redaction.ml], [test_batch_commit.ml],
+   [test_lattice_materialize_crypto_scenarios.ml]) construct a [File_kv_store.t] that then feeds
+   {!Riptide_crypto.Redaction_store} via [~owner:Redaction_store.owner_tag] -- [Redaction_store]
+   itself still never calls [File_kv_store.create] (it takes an already-built [kv] on faith, per
+   its own [.mli]), it is just one of several real downstream shapes a caller-built [t] takes.
 
-   The conclusion is unchanged despite the wrong reasoning: access into this store is still
-   strictly sequential in practice, just for a different reason than [file_storage.ml]'s own
-   one-fiber-per-replica argument -- the DST driver fiber runs one test step to completion (one
-   [materialize_up_to] call, or one [propose]/[settle]/[restart]) before starting the next, so
-   there is never more than one [get]/[put]/[delete] against a given [t] in flight at once in
-   today's only real usage. [pool_size = 4] gives the same headroom [file_storage.ml] gives
-   itself for anything this module's signature doesn't itself forbid from being concurrent (a
-   future stress test, a future non-test consumer), without needing a bigger pool for real usage
-   as it exists today.) *)
+   The conclusion is unchanged despite the narrower-than-claimed reasoning both previous versions
+   of this comment gave: access into this store is still strictly sequential in practice, for the
+   same reason across all of these -- every one of these call sites is a single-fiber test driver
+   (confirmed: none of these seven files forks a fiber that touches a [File_kv_store.t] concurrently
+   with another), each running one test step (one [get]/[put]/[delete], or one
+   [materialize_up_to]/[propose]/[settle]/[restart] call in the DST driver's case) to completion
+   before starting the next. There is no single "the" consumer of this store -- there are many,
+   spread across many test files -- but none of them is concurrent, which is the only property this
+   sizing rationale actually depends on. [pool_size = 4] gives the same headroom [file_storage.ml]
+   gives itself for anything this module's signature doesn't itself forbid from being concurrent (a
+   future stress test, a future non-test consumer), without needing a bigger pool for real usage as
+   it exists today.) *)
 let pool_size = 4
 
 let encode_header ~length ~checksum =
@@ -286,12 +292,14 @@ let tmp_suffix = ".put.tmp"
    Plain blocking [Unix] calls rather than [Eio_linux.Low_level]: [openat2] is a file-oriented
    helper here (this module's own [open_file_handle_read]/[open_file_handle_write] both set
    [~seekable:true] and read/write records) and the installed Eio 0.12 exposes no fsync at all, on
-   a path or an fd. Blocking briefly in a fiber is already this module's established practice --
-   [alloc_one_aligned_buffer] does [Unix.openfile]/[ftruncate]/[map_file] synchronously, same as
-   this. (Before Task 10, that call happened synchronously on every single read and write; now it
-   happens only [pool_size] times, once each, at [create] -- the blocking-in-a-fiber precedent
-   this sentence leans on still holds either way.) Errors deliberately propagate rather than
-   being swallowed, matching
+   a path or an fd. Blocking briefly in a fiber is already an established practice this module
+   shares with {!Riptide_storage.Aligned_buffer_pool}'s own [alloc_one_aligned_buffer] (not this
+   module's own code since the Task 10 extraction moved it there; not exposed by that module's
+   [.mli] either -- see its [.ml] instead), which does [Unix.openfile]/[ftruncate]/[map_file]
+   synchronously, same as this. (Before Task 10, that call
+   happened synchronously on every single read and write; now it happens only [pool_size] times,
+   once each, at [create] -- the blocking-in-a-fiber precedent this sentence leans on still holds
+   either way.) Errors deliberately propagate rather than being swallowed, matching
    [delete]'s narrow catch: a caller must be able to trust that a returning [put] or [delete] means
    the key really, durably is (or is not) there. *)
 let fsync_dir t =

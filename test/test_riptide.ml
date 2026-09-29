@@ -98,6 +98,7 @@ let () =
          ("sim_workload", Test_sim_workload.tests);
          ("file_storage", Test_file_storage.tests);
          ("file_kv_store", Test_file_kv_store.tests);
+         ("aligned_buffer_pool", Test_aligned_buffer_pool.tests);
          ("materializer", Test_materializer.tests);
          ("storage_shared_file_storage", Test_storage_shared.file_storage_tests);
          ("storage_shared_fault_injecting_storage", Test_storage_shared.fault_injecting_storage_tests);

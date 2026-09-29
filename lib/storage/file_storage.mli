@@ -2,15 +2,18 @@
     (op_number/length/checksum), backed by real [O_DIRECT]+[O_DSYNC]-durable writes via
     [eio_linux]'s low-level [io_uring] API where the underlying filesystem supports it, falling
     back to [O_DSYNC] alone automatically where it doesn't. Every read/write acquires a
-    guaranteed-page-aligned, [mmap]-backed buffer from a small, fixed-size pool owned by [t]
+    guaranteed-page-aligned, [mmap]-backed buffer -- the same allocate-aligned-buffer /
+    [O_DIRECT]-write / read alignment technique validated with 2500 real operations across both an
+    ext4 and an overlayfs mount with zero failures -- from a small, fixed-size pool owned by [t]
     (allocated once at [create], explicitly acquired/released around each read/write, never a
-    fresh [mmap] per I/O), validated with 2500 real operations across both an ext4 and an
-    overlayfs mount with zero failures. See {!Riptide_storage.File_storage}'s own [.ml] top
-    comment for: the exact on-disk ring/header layout; why Task 1's version of this module had to
-    drop [O_DIRECT] (a shared fixed-buffer pool with no alignment guarantee); how this version
-    makes [O_DIRECT] work for real; and (that same comment's own "Task 10" section) why the
-    buffers are drawn from a pool rather than [mmap]'d fresh per I/O -- the per-I/O version leaked
-    kernel VMA mappings with no bound, eventually crashing the process. *)
+    fresh [mmap] per I/O; the pooling arrangement itself is new as of Task 10 and post-dates that
+    2500-operation validation run, which exercised the alignment technique alone, one fresh
+    [mmap] per I/O). See {!Riptide_storage.File_storage}'s own [.ml] top comment for: the exact
+    on-disk ring/header layout; why Task 1's version of this module had to drop [O_DIRECT] (a
+    shared fixed-buffer pool with no alignment guarantee); how this version makes [O_DIRECT] work
+    for real; and (that same comment's own "Task 10" section) why the buffers are drawn from a
+    pool rather than [mmap]'d fresh per I/O -- the per-I/O version leaked kernel VMA mappings with
+    no bound, eventually crashing the process. *)
 
 include Storage_intf.S
 

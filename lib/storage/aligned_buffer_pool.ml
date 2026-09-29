@@ -30,7 +30,38 @@ let alloc_one_aligned_buffer n =
       let ba = Unix.map_file fd ~pos:0L Bigarray.char Bigarray.c_layout false [| n |] in
       Cstruct.of_bigarray (Bigarray.array1_of_genarray ba))
 
+(* Validate both arguments up front rather than letting a bad value reach [Eio.Stream.create]/
+   [alloc_one_aligned_buffer] below. Both current real callers ([File_storage], [File_kv_store])
+   pass safe, hardcoded values ([buffer_count = 4], [slot_size = 4096]), so this exists purely for
+   whoever the "future caller" this module documents itself as being reusable for turns out to
+   be -- three concretely bad failure modes otherwise, none of which name this module or the bad
+   argument at the point they surface:
+   - [buffer_count = 0]: [Eio.Stream.create 0] is a valid, empty rendezvous stream (no exception),
+     but the construction loop below that would normally push initial buffers never runs, so
+     every future [with_buffer] call blocks on [Eio.Stream.take] FOREVER -- a silent deadlock, not
+     an error, with nothing at the call site to explain why.
+   - [buffer_count < 0]: raises from deep inside [Eio.Stream.create] itself, with a message naming
+     neither this module nor which argument was wrong.
+   - [slot_size <= 0]: reaches [Unix.map_file] with a zero/invalid dimension and fails with an
+     equally unhelpful, deep [Unix.Unix_error]/[Invalid_argument] far from this call.
+
+   No additional lower bound (e.g. requiring [slot_size] to be a multiple of the OS page size) is
+   imposed here: [Unix.map_file]'s page-ALIGNMENT guarantee (see [alloc_one_aligned_buffer] above)
+   is a property of the mapping's starting ADDRESS, not its length, and holds for any positive
+   [slot_size] regardless of the page size. A separate constraint -- [O_DIRECT] requiring the
+   LENGTH of each individual read/write to be a multiple of the filesystem's logical block size --
+   is real, but it's a property of how a caller's own [Eio_linux.Low_level.readv]/[writev] calls
+   use the buffer, not of this allocation-only module; both real callers already size their own
+   [slot_alignment] (4096) to satisfy it, documented at their own call sites, per this module's own
+   [.mli] ("sizing ... is the caller's job, not this module's"). *)
 let create ~buffer_count ~slot_size () =
+  if buffer_count <= 0 then
+    invalid_arg
+      (Printf.sprintf "Aligned_buffer_pool.create: ~buffer_count must be positive, got %d"
+         buffer_count);
+  if slot_size <= 0 then
+    invalid_arg
+      (Printf.sprintf "Aligned_buffer_pool.create: ~slot_size must be positive, got %d" slot_size);
   let pool = Eio.Stream.create buffer_count in
   for _ = 1 to buffer_count do
     Eio.Stream.add pool (alloc_one_aligned_buffer slot_size)
