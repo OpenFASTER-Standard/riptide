@@ -8,18 +8,38 @@ external flock_exclusive_nonblocking : Unix.file_descr -> bool
 
 let lock_file_name = ".riptide-lock"
 
-let acquire ~sw ~caller dir_path =
+(* Review finding M4: this exact wording used to be independently duplicated in four places (here
+   plus three test files) -- any future wording change meant a four-way manual edit, with nothing
+   enforcing they stayed in sync. Exported (see the .mli) so every caller of [acquire] and every
+   test asserting against its failure message goes through this one function instead. *)
+let conflict_message ~caller ?owner dir_path =
+  let owner_clause =
+    match owner with
+    | None -> ""
+    | Some tag -> Printf.sprintf " -- currently claimed by owner tag %S" tag
+  in
+  Printf.sprintf
+    "%s: %s is already locked by another open handle%s (a real flock(2), not this codebase's \
+     separate logical owner-tag check -- see Riptide_storage.Dir_lock's own .mli)"
+    caller dir_path owner_clause
+
+let acquire ~sw ~caller ?describe_conflict dir_path =
   let path = Filename.concat dir_path lock_file_name in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
-  if flock_exclusive_nonblocking fd then Eio_unix.Fd.of_unix ~sw ~close_unix:true fd
-  else begin
+  match flock_exclusive_nonblocking fd with
+  | true -> Eio_unix.Fd.of_unix ~sw ~close_unix:true fd
+  | false ->
     (* Not yet registered with [sw] (the lock attempt failed), so this is a plain, synchronous
        [Unix.close] -- there is nothing an Eio switch needs to know about an fd this function is
        about to fully own for zero more instructions. *)
     (try Unix.close fd with Unix.Unix_error _ -> ());
-    invalid_arg
-      (Printf.sprintf
-         "%s: %s is already locked by another open handle (a real flock(2), not this codebase's \
-          separate logical owner-tag check -- see Riptide_storage.Dir_lock's own .mli)"
-         caller dir_path)
-  end
+    let owner = match describe_conflict with Some f -> f () | None -> None in
+    invalid_arg (conflict_message ~caller ?owner dir_path)
+  | exception exn ->
+    (* Review finding M2: [fd] was opened successfully above, but if [flock_exclusive_nonblocking]
+       itself raises [Unix.Unix_error] (anything other than EWOULDBLOCK, which is the plain [false]
+       case above, not an exception) -- e.g. a genuine I/O error -- [fd] was never registered with
+       [sw] and would otherwise leak: nothing else in this function, or in the caller who never gets
+       a value back, owns it. Close it explicitly before re-raising. *)
+    (try Unix.close fd with Unix.Unix_error _ -> ());
+    raise exn

@@ -20,10 +20,25 @@
     DO overlap -- two handles alive at the same instant, whether same-tag or different-tag -- this
     lock now also closes what {!Riptide_storage.File_kv_store.create}'s [~owner] check alone could
     not: a same-tag pair used to construct cleanly on both sides and then silently destroy shared
-    data (see [file_kv_store.mli]'s own "residual gap" section, updated to reflect this). What
-    remains genuinely open is strictly SEQUENTIAL reuse -- one handle fully closed (its lock
-    released) before a second, differently-purposed consumer opens the same directory under a tag
-    it copied or was handed -- which no lock scoped to a handle's own lifetime can see.
+    data (see [file_kv_store.mli]'s own "residual gap" section, updated to reflect this).
+
+    {b What remains genuinely open (review finding I2, 2026-09-29 -- an earlier version of this
+    disclosure narrowed it to "strictly sequential reuse" alone, which overclaims what a lock
+    scoped to one [acquire] call's own [t] can possibly reach):} two different shapes.
+
+    - {b Strictly SEQUENTIAL reuse}: one handle fully closed (its lock released) before a second,
+      differently-purposed consumer opens the same directory under a tag it copied or was handed.
+      This lock's scope is a live handle's own lifetime, so two handles that never overlap in time
+      are invisible to it by construction.
+    - {b SIMULTANEOUS use of a single, ALREADY-CONSTRUCTED handle by two different logical
+      consumers at once} -- e.g. one {!Riptide_storage.File_kv_store.t}, built via exactly one
+      [create] call (hence exactly one [acquire] call, one lock, held for that one [t]'s whole
+      lifetime), handed by its caller to both a {!Riptide_crypto.Redaction_store.t} and a
+      {!Riptide_materialize.Materializer.t}. This lock cannot see it because there is only ever one
+      [acquire] call in that shape -- nothing else ever contends for the same lock file, so nothing
+      ever gets refused. See [file_kv_store.mli]'s own "residual gap" section for the full account,
+      including the running test that demonstrates this shape specifically (not merely the
+      sequential one).
 
     {b Why flock(2), not [Unix.lockf] (POSIX/[fcntl] locks).} [fcntl] locks are associated with a
     (process, inode) pair, not an open file description: a SECOND [Unix.openfile] of the same path
@@ -38,7 +53,19 @@
     installed opam package in this switch exposes [flock(2)], so [riptide_flock_stubs.c] is a
     small, direct binding rather than a new dependency. *)
 
-val acquire : sw:Eio.Switch.t -> caller:string -> string -> Eio_unix.Fd.t
+val conflict_message : caller:string -> ?owner:string -> string -> string
+(** [conflict_message ~caller ?owner dir_path] builds the exact string {!acquire} raises (wrapped
+    in [Invalid_argument]) when [dir_path] is already locked -- exported as the single source of
+    truth for this wording (review finding M4: this string used to be independently duplicated in
+    four places -- this module plus three test files -- with nothing keeping them in sync; callers
+    asserting against {!acquire}'s failure now build the expected string through this function
+    instead of copying the literal). [owner], when supplied, folds in a human-readable hint about
+    who currently holds the lock (see {!acquire}'s own [describe_conflict] parameter, review
+    finding M3, for how a caller supplies one). *)
+
+val acquire :
+  sw:Eio.Switch.t -> caller:string -> ?describe_conflict:(unit -> string option) -> string ->
+  Eio_unix.Fd.t
 (** [acquire ~sw ~caller dir_path] takes a real, exclusive, non-blocking [flock(2)] lock on a
     dedicated [.riptide-lock] file inside [dir_path] (created if it does not already exist; the
     directory itself must already exist -- see each caller's own [create], which always [mkdir]s
@@ -50,7 +77,30 @@ val acquire : sw:Eio.Switch.t -> caller:string -> string -> Eio_unix.Fd.t
     point for the same reason those files expose none of their own: every real caller here relies
     on this same switch-scoped-fd pattern, not on an explicit close call.
 
+    {b Caller responsibility (review finding I1):} this function has no way to know whether the
+    [t] its caller's own [create] eventually returns will actually be constructed successfully --
+    it only knows the lock itself was acquired. If anything in the rest of that [create] raises
+    after a successful {!acquire}, before [create] returns a usable [t], the CALLER must release
+    this lock explicitly (e.g. via [Eio_unix.Fd.close]) on that exception path before re-raising --
+    otherwise the lock fd stays registered with [sw] for [sw]'s entire remaining lifetime even
+    though no live [t] is using it, spuriously refusing a later, legitimate [acquire] over the same
+    directory in the same switch. Both {!Riptide_storage.File_storage.create} and
+    {!Riptide_storage.File_kv_store.create} do this; see either one's own [create] for the pattern,
+    and [test_a_failed_create_releases_its_lock_before_reraising] in
+    [test/test_file_kv_store.ml] for the live regression test this closes.
+
+    @param describe_conflict called only if the lock is already held, to build a human-readable
+      hint about who holds it -- e.g. {!Riptide_storage.File_kv_store.create} passes a thunk that
+      reads its own owner-marker file (review finding M3: the conflicting handle's owner tag is
+      sitting right there on disk, and folding it into the message restores the diagnosability the
+      old owner-tag-first message used to have, for precisely the most likely real misuse -- two
+      subsystems accidentally pointed at the same directory). [Dir_lock] itself has and needs no
+      notion of "owner tags" or marker files; this keeps that convention entirely on the caller's
+      side. [describe_conflict] returning [None] (or being omitted, as
+      {!Riptide_storage.File_storage}, which has no owner concept of its own, always does) omits
+      the hint from the message.
+
     @raise Invalid_argument immediately -- before touching anything else in [dir_path] -- if
       another live open file description already holds this lock (an already-running handle from
-      this process or a different one). [caller] is folded into the message (e.g.
-      ["File_storage.create"]) to say which module's [create] refused. *)
+      this process or a different one). Built via {!conflict_message}; [caller] is folded into the
+      message (e.g. ["File_storage.create"]) to say which module's [create] refused. *)

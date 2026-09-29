@@ -377,15 +377,33 @@ let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
      mechanism of its own (unlike {!Riptide_storage.File_kv_store}), so this is its only
      construction-time guard against a shared directory. *)
   let lock = Dir_lock.acquire ~sw ~caller:"File_storage.create" dir_path in
-  let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
-  let superblocks =
-    Array.init superblock_copies (fun i ->
-        open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
-  in
-  let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
-  let t = { sw; lock; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
-  t.highest_op_number <- recover_highest_op_number t;
-  t
+  (* Task 11 review (finding I1): the lock's lifetime must track the SUCCESSFULLY CONSTRUCTED
+     handle's, not the "flock succeeded" attempt's. If anything below raises, [lock] must be
+     released HERE -- otherwise it stays registered with [sw] for [sw]'s entire remaining lifetime
+     even though this [create] returns no usable [t], spuriously refusing a later, legitimate
+     [create] over the same directory in the same switch. See
+     {!Riptide_storage.Dir_lock.acquire}'s own [.mli] for why [acquire] itself cannot do this on
+     its caller's behalf, and [test_file_kv_store.ml]'s
+     [test_a_failed_create_releases_its_lock_before_reraising] for the live regression test
+     (reproduced against [File_kv_store], which has a real post-lock failure mode to exercise;
+     this module's own analogous fix is the identical pattern, applied for the same reason even
+     though it has no owner-tag check of its own to fail on). *)
+  match
+    let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
+    let superblocks =
+      Array.init superblock_copies (fun i ->
+          open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
+    in
+    let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
+    let t = { sw; lock; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
+    t.highest_op_number <- recover_highest_op_number t;
+    t
+  with
+  | t -> t
+  | exception exn ->
+    let bt = Printexc.get_raw_backtrace () in
+    Eio_unix.Fd.close lock;
+    Printexc.raise_with_backtrace exn bt
 
 (* Subtask 3.7: does appending [op_number] destroy a live prior entry, and if so which one?
 

@@ -633,12 +633,10 @@ let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
    full rationale, including why this is a real [flock(2)] rather than [Unix.lockf] (POSIX [fcntl]
    locks, which would NOT conflict against a second [Unix.openfile] from the SAME process -- the
    exact shape the test right below needs to observe a conflict for). *)
-let expected_lock_message ~caller dir =
-  Invalid_argument
-    (Printf.sprintf
-       "%s: %s is already locked by another open handle (a real flock(2), not this codebase's \
-        separate logical owner-tag check -- see Riptide_storage.Dir_lock's own .mli)"
-       caller dir)
+(* Review finding M4: delegates to {!Dir_lock.conflict_message}, the single source of truth for
+   this exact wording, rather than duplicating the literal string here (this file used to be one
+   of four independent copies -- see that function's own [.mli] doc for the full account). *)
+let expected_lock_message ~caller dir = Invalid_argument (Dir_lock.conflict_message ~caller dir)
 
 let test_a_second_create_on_a_locked_directory_is_refused () =
   Eio_main.run @@ fun env ->
@@ -665,7 +663,9 @@ external test_only_flock_exclusive_nonblocking : Unix.file_descr -> bool
 
 let test_a_real_second_os_process_holding_the_lock_is_refused () =
   with_tmp_dir (fun dir ->
-      (try Unix.mkdir dir 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      (* [with_tmp_dir] already [Unix.mkdir]s [dir] itself (see this file's own definition above)
+         -- no need to redo it here (review finding M6: this used to re-[mkdir] redundantly, which
+         reads as if the directory's existence were in doubt at this point, when it never is). *)
       let lock_path = Filename.concat dir ".riptide-lock" in
       let ready_r, ready_w = Unix.pipe () in
       let release_r, release_w = Unix.pipe () in
@@ -674,21 +674,37 @@ let test_a_real_second_os_process_holding_the_lock_is_refused () =
         (* Child: hold a real flock(2) on the exact lock file [File_storage.create] itself would
            open, then wait to be told to let go. Never touches Eio, Alcotest, or anything else
            belonging to the parent's own test bookkeeping -- exits via [Unix._exit], never a plain
-           [exit], so no parent-side [at_exit] (including Alcotest's own reporting) runs twice. *)
-        Unix.close ready_r;
-        Unix.close release_w;
-        let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
-        if not (test_only_flock_exclusive_nonblocking fd) then Unix._exit 1;
-        ignore (Unix.write ready_w (Bytes.of_string "1") 0 1);
-        ignore (Unix.read release_r (Bytes.create 1) 0 1);
-        Unix._exit 0
+           [exit], so no parent-side [at_exit] (including Alcotest's own reporting) runs twice.
+
+           Review finding I4: the whole branch is now wrapped in a [try ... with _ -> Unix._exit 2]
+           guard. Without it, any exception here (e.g. [openfile] under fd exhaustion, a failed
+           pipe write) would escape uncaught, unwind through the PARENT's own [with_tmp_dir]
+           cleanup (rm -rf'ing [dir] out from under this still-running child), and fall through
+           into Alcotest itself -- which then re-runs the ENTIRE REST OF THE TEST SUITE a second
+           time, as an independent process sharing this one's stdout. Reproduced live (Task 11
+           review): deliberately breaking this child's [openfile] call produced one
+           [dune test --force] invocation that printed 729 [\[OK\]] lines and TWO complete "470
+           tests run" summaries. *)
+        (try
+           Unix.close ready_r;
+           Unix.close release_w;
+           let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+           if not (test_only_flock_exclusive_nonblocking fd) then Unix._exit 1;
+           ignore (Unix.write ready_w (Bytes.of_string "1") 0 1);
+           ignore (Unix.read release_r (Bytes.create 1) 0 1);
+           Unix._exit 0
+         with _ -> Unix._exit 2)
       | child_pid ->
         Unix.close ready_w;
         Unix.close release_r;
         Fun.protect
           ~finally:(fun () ->
             (try ignore (Unix.write release_w (Bytes.of_string "1") 0 1) with Unix.Unix_error _ -> ());
-            ignore (Unix.waitpid [] child_pid))
+            ignore (Unix.waitpid [] child_pid);
+            (* Review finding M5: [ready_r]/[release_w] (this parent's own ends of both pipes)
+               were never closed after this point -- a real fd leak, one pair per test run. *)
+            (try Unix.close ready_r with Unix.Unix_error _ -> ());
+            (try Unix.close release_w with Unix.Unix_error _ -> ()))
           (fun () ->
             let n = Unix.read ready_r (Bytes.create 1) 0 1 in
             Alcotest.(check int) "the child process actually acquired the real lock first" 1 n;
@@ -700,6 +716,42 @@ let test_a_real_second_os_process_holding_the_lock_is_refused () =
                   (expected_lock_message ~caller:"File_storage.create" dir)
                   (fun () ->
                     ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir)))))
+
+(* Review finding I1, live-reproduced: [Dir_lock.acquire] registers the lock fd with [sw] the
+   instant [flock(2)] succeeds -- but nothing released it if the REST of [create] then raised for
+   some other reason. [File_storage.create] itself has no post-lock construction-time check that
+   can fail on ordinary input the way [File_kv_store.create]'s owner-tag mismatch can (see
+   [test_file_kv_store.ml]'s own copy of this test for the live before/after RED/GREEN evidence
+   against that natural failure mode) -- so this test forces the same shape by hand: pre-creating a
+   DIRECTORY at the exact path [create] itself tries to [open_file_handle] the ring file at, so
+   [Eio_linux.Low_level.openat2] fails (EISDIR) whichever open-flags variant it retries with, and
+   the exception propagates out of [create] strictly AFTER [Dir_lock.acquire] has already
+   succeeded. Confirmed this reproduces the same bug shape by temporarily reverting
+   [file_storage.ml]'s [create] to the pre-fix version (lock acquired, then the rest of [create]
+   run unguarded) and observing the second, legitimate [create] below fail with
+   [expected_lock_message] even though the first attempt never returned a live [t] -- then
+   restoring the fix and confirming it passes. *)
+let test_a_failed_create_releases_its_lock_before_reraising () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      let fs = Eio.Stdenv.fs env in
+      Eio.Switch.run @@ fun sw ->
+      Unix.mkdir (Filename.concat dir "ring") 0o700;
+      let raised =
+        try
+          ignore (File_storage.create ~sw ~fs ~ring_capacity dir);
+          false
+        with _ -> true
+      in
+      Alcotest.(check bool)
+        "create fails (on the pre-created ring directory), for a reason other than the lock" true
+        raised;
+      (* THE regression this test exists to catch: a legitimate create, in the SAME switch, with
+         no live handle anywhere, must succeed immediately afterwards -- not be refused by a lock
+         the failed attempt above should have released. *)
+      Unix.rmdir (Filename.concat dir "ring");
+      let (_ : File_storage.t) = File_storage.create ~sw ~fs ~ring_capacity dir in
+      ())
 
 let tests =
   [
@@ -774,4 +826,7 @@ let tests =
     ( "Task 11: a create is refused while a REAL second OS process holds the real flock",
       `Quick,
       test_a_real_second_os_process_holding_the_lock_is_refused );
+    ( "Task 11 review (I1): a failed create releases its lock before re-raising",
+      `Quick,
+      test_a_failed_create_releases_its_lock_before_reraising );
   ]

@@ -109,43 +109,65 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
 
     {b What Task 11 changed:} {!Riptide_storage.File_kv_store.create} now also takes a real,
     OS-level {!Riptide_storage.Dir_lock} (a [flock(2)]) on the directory, strictly before the
-    marker check, and holds it for as long as the resulting [t] stays alive. If the two consumers'
-    [t]s are ever SIMULTANEOUSLY live -- the shape every consequence below, and both tests backing
-    it, originally reproduced -- the second [File_kv_store.create] now raises [Invalid_argument]
-    from the lock itself, before the marker is ever consulted, regardless of whether the tags
-    match. That closes the concurrent-handle instance of this gap for real, not merely for the
+    marker check, and holds it for as long as the resulting [t] stays alive. If two SEPARATE
+    [File_kv_store.create] calls over the same directory are ever SIMULTANEOUSLY live -- two
+    independently-opened [t]s, whichever tags they pass -- the second one now raises
+    [Invalid_argument] from the lock itself, before the marker is ever consulted. That closes
+    double construction of two separate handles over one directory, for real, not merely for the
     mismatched-tag case the marker alone could already catch.
 
-    {b What is still open:} strictly SEQUENTIAL reuse -- one consumer's [t] fully released (its
-    switch finished, its lock dropped) before the other's [create] runs. Neither guard can see that
-    shape: the lock's scope is a live handle's own lifetime, and the marker cannot tell "my own
-    store reopening" apart from "an unrelated consumer that happens to use my tag" once there is no
-    live handle left to conflict with. Both [t]s then come into existence, one after the other,
-    over one shared, flat key space, and destroy each other's data exactly as silently and exactly
-    as completely as before any of these guards existed -- so the three consequences below are
-    still a live description of what such a pair does today, just no longer reachable through two
-    handles alive at once.
+    {b What is still open, stated precisely (review finding I2, 2026-09-29 -- an earlier version of
+    this disclosure narrowed the remaining gap to "strictly sequential reuse" only, which overclaims
+    what the lock reaches: falsified live by a test that shares one already-built [kv] between this
+    keystore and a materializer and still silently destroys a wrapped DEK, with the lock never once
+    firing, since only one [File_kv_store.create] call is ever made):} two different shapes, neither
+    of which a lock scoped to one [create] call's own [t] can see:
+
+    - {b Strictly SEQUENTIAL reuse}: one consumer's [t] fully released (its switch finished, its
+      lock dropped) before the other's [create] runs. The marker cannot tell "my own store
+      reopening" apart from "an unrelated consumer that happens to use my tag" once there is no live
+      handle left to conflict with.
+    - {b SIMULTANEOUS use of a single, ALREADY-CONSTRUCTED [kv] by two different logical
+      consumers at once} -- [create] above takes [kv] on faith, exactly as stated at the top of
+      this doc comment; if the SAME [kv] (one [File_kv_store.create] call, one lock, one marker
+      check) is handed to both this keystore and a
+      {!Riptide_materialize.Materializer.Make.create}, the lock never gets a second call to
+      conflict with and the marker never gets a second tag to compare -- there is nothing for
+      either guard to catch, no matter how carefully [kv] itself was constructed. That is exactly
+      what "[kv] must be this keystore's alone", above, is asking a caller to guarantee by
+      discipline, because neither guard can guarantee it mechanically.
+
+    Both shapes destroy each other's data over one shared, flat key space exactly as silently and
+    exactly as completely as before any of these guards existed -- so the three consequences below
+    are still a live description of what such a pair does today, just no longer reachable through
+    two INDEPENDENTLY-opened handles alive at once.
 
     This narrower gap is a disclosed, deliberately out-of-scope limitation of subtask 4.8 rather
     than an oversight (the design spec's own Non-Goals: "No change to the marker-file mechanism").
-    A single per-directory owner tag structurally cannot distinguish "my own store reopening" from
-    "an unrelated consumer that happens to use my tag" once no live handle is around to physically
-    conflict; closing it needs a different mechanism -- per-consumer key prefixes, or some
-    persistent (not merely handle-lifetime-scoped) exclusivity record -- and is not attempted here.
+    Closing the sequential shape needs a different marker mechanism -- per-consumer key prefixes, or
+    some persistent (not merely handle-lifetime-scoped) exclusivity record. Closing the shared-handle
+    shape needs a guard neither this module nor {!Riptide_storage.File_kv_store} can provide at
+    construction time at all, since by the time either [create] runs, [kv] already exists and
+    neither function has any way to tell "the only consumer of this handle" from "one of several" --
+    that is a caller-discipline requirement, not something construction-time code can enforce.
 
-    Both sides of that boundary are backed by running code in
-    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof, restructured by
-    Task 11 so each handle involved is fully released before the next opens -- otherwise Task 11's
-    own lock, not the scenario under test, would be what raises): a DIFFERENT-tag pair is rejected
-    at construction with this keystore's data provably intact
-    ([test_a_shared_kv_directory_is_rejected_at_construction], now via the lock itself, which fires
-    before the tags are ever compared -- see that test's own updated comment), while a SAME-tag
-    pair, each handle opened only after the previous one has fully closed, still constructs cleanly
-    on both sides and then silently destroys a wrapped DEK
-    ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek], which pins the
-    first and third consequences below -- both silent directions). The second consequence is the
-    same collision with a partial [decode] and is described here without a dedicated test of its
-    own, since it differs only in the caller-supplied [decode] the first bullet already varies:
+    Both shapes are backed by running code in [test/test_lattice_materialize_crypto_scenarios.ml]:
+    the SEQUENTIAL shape in
+    [test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]'s first two phases (a
+    materializer's write, through its own, separately-opened handle, silently destroys a record a
+    now-closed keystore handle wrote earlier -- pinning the first and third consequences below), and
+    the SHARED-HANDLE shape in that same test's third phase (one [kv], a keystore and a materializer
+    both built directly from it at once, a keystore [put] silently overwriting the materializer's
+    own accumulator value at a colliding key, with the lock never once firing -- pinning the second
+    consequence below). A DIFFERENT-tag pair, by contrast, is rejected at construction with this
+    keystore's data provably intact ([test_a_shared_kv_directory_is_rejected_at_construction],
+    restructured (review finding I3) so the colliding [create] attempt runs only after the first
+    handle's lock has been released -- otherwise Task 11's own lock, not the owner-tag comparison
+    this test exists to exercise, would be what raises, as an earlier version of this test did); that
+    test demonstrates the ORIGINAL, still-fully-closed mismatched-tag gap, not either of the two
+    shapes described here. The second consequence below is the same collision with a partial
+    [decode] and is described here without a dedicated test of its own, since it differs only in the
+    caller-supplied [decode] the first bullet already varies:
 
     - {b A materialized write onto an existing [event_id] destroys that record, silently}, if the
       materializer's own [decode] is total (returns its lattice's bottom for bytes it cannot parse

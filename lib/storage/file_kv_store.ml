@@ -431,16 +431,42 @@ let create ~sw ~fs ~owner dir_path =
      of the "same tag, still destroys data" residual gap [check_or_write_owner_marker] alone
      leaves open (still real for two handles that never overlap in time -- see that function's own
      doc comment). *)
-  let lock = Dir_lock.acquire ~sw ~caller:"File_kv_store.create" dir_path in
-  check_or_write_owner_marker ~fs ~dir_path owner;
-  {
-    sw;
-    lock;
-    fs;
-    dir_path;
-    owner;
-    pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment ();
-  }
+  let lock =
+    Dir_lock.acquire ~sw ~caller:"File_kv_store.create"
+      ~describe_conflict:(fun () ->
+        (* Review finding M3: fold the conflicting handle's own owner tag into the lock's error
+           message when it's already sitting right there on disk -- this is precisely the most
+           likely real misuse (a keystore and a materializer both accidentally pointed at one
+           directory), so restoring this diagnosability matters. Reading the marker here, on the
+           failure path only, does not weaken "reject before touching anything else this module
+           manages": [acquire] is already about to raise, there is nothing left to protect by not
+           reading it. *)
+        try Some (Eio.Path.load Eio.Path.(fs / dir_path / owner_marker_name))
+        with Eio.Io _ -> None)
+      dir_path
+  in
+  (* Task 11 review (finding I1): the lock's lifetime must track the SUCCESSFULLY CONSTRUCTED
+     handle's, not the "flock succeeded" attempt's. The owner-tag mismatch check right below can
+     raise AFTER the lock above has already succeeded and been registered with [sw] -- if it does,
+     [lock] must be released HERE, or it stays registered with [sw] for [sw]'s entire remaining
+     lifetime even though this [create] returns no usable [t], spuriously refusing a later,
+     legitimate [create] over the same directory in the same switch (a real, live-reproduced bug:
+     see [test_a_failed_create_releases_its_lock_before_reraising] below for the RED/GREEN
+     evidence). *)
+  match check_or_write_owner_marker ~fs ~dir_path owner with
+  | () ->
+    {
+      sw;
+      lock;
+      fs;
+      dir_path;
+      owner;
+      pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment ();
+    }
+  | exception exn ->
+    let bt = Printexc.get_raw_backtrace () in
+    Eio_unix.Fd.close lock;
+    Printexc.raise_with_backtrace exn bt
 
 (* [check_or_write_owner_marker] above either confirms [owner] against the existing on-disk marker
    or writes a fresh one holding exactly [owner] -- it never resolves or hands back a tag of its

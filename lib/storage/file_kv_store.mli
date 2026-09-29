@@ -53,7 +53,10 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
       file, if [dir_path] is already locked by another live handle -- this process's own or a
       genuinely different OS process's. A PHYSICAL guard, independent of and in addition to the
       LOGICAL [~owner] guard described below; see {!Riptide_storage.Dir_lock}'s own [.mli] for the
-      full rationale and how the two guards' scopes differ.
+      full rationale and how the two guards' scopes differ. When the conflicting handle's owner tag
+      is already readable on disk (the marker {!Riptide_storage.Dir_lock} itself knows nothing
+      about), the message names it (review finding M3) via {!Riptide_storage.Dir_lock.acquire}'s
+      [describe_conflict] hook.
 
     {b [~owner], subtask 4.6's construction-time fix for a confirmed, real data-destruction bug,
     made mandatory by subtask 4.8 to close the gap an optional [?owner] left open}: this store's
@@ -90,21 +93,55 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     share one flat key space and destroy each other's data with nothing raised anywhere, exactly
     as before this guard existed.
 
-    {b Narrowed by Task 11:} this used to be open for a SIMULTANEOUSLY-live same-tag pair too (two
-    handles open over [dir_path] at once) -- that shape is now caught by
-    {!Riptide_storage.Dir_lock}'s own physical [flock(2)] guard (see [create]'s own doc comment
-    above), regardless of whether the two tags match, since the lock is taken before the marker is
-    ever consulted. What remains is strictly the SEQUENTIAL case: one handle fully released (its
-    switch finished, its lock dropped) before a second, differently-purposed consumer opens the
-    same directory under a copied or inherited tag -- a lock scoped to a live handle's own lifetime
-    has nothing to say about two handles that never overlap. See
-    {!Riptide_crypto.Redaction_store.create}'s own doc comment for the full account and for the
-    running test that demonstrates the destruction
-    ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek] in
-    [test/test_lattice_materialize_crypto_scenarios.ml], restructured by Task 11 to release each
-    handle before the next opens, since that is now the only reachable form of the collision).
-    Fixing this remaining, narrower gap means changing this marker mechanism itself, which subtask
-    4.8's design spec lists as an explicit Non-Goal. *)
+    {b Narrowed by Task 11, not closed:} this used to be open for a SIMULTANEOUSLY-live same-tag
+    pair reached through TWO SEPARATE [create] calls too (two independently-opened handles over
+    [dir_path] at once) -- that specific shape is now caught by {!Riptide_storage.Dir_lock}'s own
+    physical [flock(2)] guard (see [create]'s own doc comment above), regardless of whether the two
+    tags match, since the lock is taken before the marker is ever consulted. What Task 11's lock
+    actually closes is exactly that: double construction of two separate [t]s over one [dir_path],
+    whether from one process or two.
+
+    {b What remains genuinely open, stated precisely rather than narrowed further than the lock
+    actually reaches (review finding I2, 2026-09-29 -- an earlier version of this disclosure said
+    only "strictly sequential reuse" remained, which overclaimed what the lock reaches; falsified
+    live by a test that shares one already-built handle between two consumers and still silently
+    destroys data with the lock never once firing):} two different shapes, neither of which a lock
+    scoped to one [create] call's own [t] can see, since both involve at most ONE live [t] at the
+    lock's own granularity:
+
+    - {b Strictly SEQUENTIAL reuse over time}: one handle fully released (its switch finished, its
+      lock dropped) before a second, differently-purposed consumer opens the same directory under a
+      copied or inherited tag. The marker cannot tell "my own store reopening" apart from "an
+      unrelated consumer that happens to use my tag" once there is no live handle left to conflict
+      with.
+    - {b SIMULTANEOUS use of a single, ALREADY-CONSTRUCTED handle by two different logical
+      consumers at once} -- this module's own [create] above takes [~owner] and checks it against
+      the marker, but a caller that constructs exactly ONE [t] (one [create] call, one lock, one
+      marker check) and then hands that SAME [t] to two unrelated consumers has given neither guard
+      a second call to compare against: the lock is already held, for that one [t]'s whole
+      lifetime, by nothing that conflicts with itself, and the marker was only ever consulted once.
+      {!Riptide_crypto.Redaction_store.create}'s own [.mli] states the resulting requirement in
+      prose ("[kv] must be this keystore's alone"), not as anything construction-time code here can
+      enforce.
+
+    Both shapes destroy each other's data over one shared, flat key space exactly as silently and
+    exactly as completely as before either guard existed. Both are backed by running code, not just
+    this disclosure, in [test/test_lattice_materialize_crypto_scenarios.ml]'s
+    [test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]: its first two
+    phases demonstrate the SEQUENTIAL shape (a materializer's write, through its own,
+    separately-opened handle, silently destroys a record a now-closed keystore handle wrote
+    earlier), and its third phase demonstrates the SHARED-HANDLE shape directly (one [kv], a
+    keystore and a materializer both built from it at once, a keystore [put] silently overwriting
+    the materializer's own accumulator value at a colliding key -- the lock never once fires,
+    because only one [create] call is ever made). See
+    {!Riptide_crypto.Redaction_store.create}'s own doc comment for the full account. Fixing the
+    sequential gap means changing this marker mechanism itself (e.g. per-consumer key prefixes, or
+    a persistent, not merely handle-lifetime-scoped, exclusivity record); fixing the shared-handle
+    gap means a guard this module structurally cannot provide at all, since by the time [create]
+    receives (or, for {!Riptide_crypto.Redaction_store.create} and
+    {!Riptide_materialize.Materializer.Make.create}, is handed) a [kv], there is no way to tell "the
+    only consumer of this handle" from "one of several". Both are out of scope here, per subtask
+    4.8's design spec Non-Goal ("No change to the marker-file mechanism"). *)
 
 val owner : t -> string
 (** Restates {!Kv_store_intf.S.owner}'s own spec with this backend's more specific detail below;

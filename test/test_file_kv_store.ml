@@ -379,12 +379,13 @@ let test_owner_reads_back_the_tag_used_at_construction () =
    rationale, [File_kv_store.create] instead of [File_storage.create]) for the full account of the
    Critical finding this closes and why [flock(2)], not [Unix.lockf], is what makes the
    same-process test below actually observe a conflict. *)
-let expected_lock_message ~caller dir =
-  Invalid_argument
-    (Printf.sprintf
-       "%s: %s is already locked by another open handle (a real flock(2), not this codebase's \
-        separate logical owner-tag check -- see Riptide_storage.Dir_lock's own .mli)"
-       caller dir)
+(* Review finding M4: delegates to {!Dir_lock.conflict_message}, the single source of truth for
+   this exact wording, rather than duplicating the literal string here (this file used to be one
+   of four independent copies -- see that function's own [.mli] doc for the full account). [?owner]
+   forwards straight through to {!Dir_lock.conflict_message}'s own [?owner] -- see review finding
+   M3: the lock's message names the conflicting handle's owner tag when it's readable on disk. *)
+let expected_lock_message ~caller ?owner dir =
+  Invalid_argument (Dir_lock.conflict_message ~caller ?owner dir)
 
 let test_a_second_create_on_a_locked_directory_is_refused () =
   Eio_main.run @@ fun env ->
@@ -394,13 +395,61 @@ let test_a_second_create_on_a_locked_directory_is_refused () =
         File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"redaction-keystore" dir
       in
       (* Even a DIFFERENT owner tag is refused by the lock, before the marker is ever consulted --
-         the physical guard runs first and does not care what either side calls itself. *)
+         the physical guard runs first and does not care what either side calls itself. The first
+         handle's own tag ("redaction-keystore") is already durably on disk in the owner marker by
+         this point (written inside its own successful [create]), so the lock's failure message
+         names it (M3), regardless of what tag THIS second, refused attempt passes. *)
       Alcotest.check_raises
         "a second create on the same directory, while the first handle is still live, is refused \
          immediately regardless of the owner tag it passes"
-        (expected_lock_message ~caller:"File_kv_store.create" dir)
+        (expected_lock_message ~caller:"File_kv_store.create" ~owner:"redaction-keystore" dir)
         (fun () ->
           ignore (File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir)))
+
+(* Review finding I1, live-reproduced: [Dir_lock.acquire] registers the lock fd with [sw] the
+   instant [flock(2)] succeeds -- but nothing released it if the REST of [create] then raised for
+   some other reason. The reviewer reproduced this live: switch 1 creates+closes under
+   [owner-a]; switch 2 attempts [owner-b] (correctly rejected by the owner-tag check) and THEN, in
+   the SAME switch, attempts [owner-a] -- the rightful owner, with no live handle anywhere -- and
+   got spuriously refused with "already locked by another open handle". This falsified this test
+   file's own [test_an_empty_owner_is_rejected_at_construction] assertion ("a real tag on the very
+   same directory succeeds immediately afterwards"), which only happened to still hold there
+   because the EMPTY-tag check runs and raises {e before} [Dir_lock.acquire] is ever reached in
+   that specific case -- it would not have held for a check that runs after the lock, exactly the
+   owner-tag-mismatch shape this test reproduces directly. *)
+let test_a_failed_create_releases_its_lock_before_reraising () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      let fs = Eio.Stdenv.fs env in
+      (* Construct a first legitimate handle so the marker holds a real tag, then close it: the
+         failure below must come from the SECOND create's own OWNER-TAG mismatch, not from the
+         lock -- a live handle from THIS switch would make the lock fire first (as in
+         [test_a_second_create_on_a_locked_directory_is_refused] above), which would not exercise
+         finding I1's actual scenario at all. Two SEQUENTIAL (not nested) [Eio.Switch.run] calls,
+         matching the "release before reopening" pattern [test_owner_mismatch_is_rejected_at_construction]
+         above already uses -- not one switch nested inside the other, which does not reliably tear
+         the inner one down before the surrounding code continues. *)
+      (Eio.Switch.run @@ fun sw0 ->
+       let (_ : File_kv_store.t) = File_kv_store.create ~sw:sw0 ~fs ~owner:"redaction-keystore" dir in
+       ());
+      Eio.Switch.run @@ fun sw ->
+      (* This SUCCEEDS at the lock (no live handle holds it, [sw0] above is already closed), then
+         fails at the owner-tag check -- AFTER [Dir_lock.acquire] has already registered the lock
+         fd with [sw]. Before the I1 fix, that lock fd stayed registered with [sw] for [sw]'s
+         entire remaining lifetime even though this [create] raised and returned no [t]. *)
+      Alcotest.check_raises "the owner-tag mismatch fails construction, exactly as before"
+        (Invalid_argument
+           (Printf.sprintf
+              "File_kv_store.create: %s is owned by \"redaction-keystore\", not \"wrong-tag\"" dir))
+        (fun () -> ignore (File_kv_store.create ~sw ~fs ~owner:"wrong-tag" dir));
+      (* THE regression this test exists to catch: the rightful owner, in the SAME switch, with no
+         live handle anywhere, must succeed immediately -- not be refused by a lock the failed
+         attempt above should have released. *)
+      let t = File_kv_store.create ~sw ~fs ~owner:"redaction-keystore" dir in
+      Alcotest.(check string)
+        "and a legitimate create right afterwards, in the same switch, succeeds because the \
+         failed attempt's lock was released"
+        "redaction-keystore" (File_kv_store.owner t))
 
 (* Stronger evidence than the same-process double-handle above: a REAL second OS process -- see
    [Test_file_storage.test_a_real_second_os_process_holding_the_lock_is_refused] for the full
@@ -411,26 +460,39 @@ external test_only_flock_exclusive_nonblocking : Unix.file_descr -> bool
 
 let test_a_real_second_os_process_holding_the_lock_is_refused () =
   with_tmp_dir (fun dir ->
-      (try Unix.mkdir dir 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      (* [with_tmp_dir] already [Unix.mkdir]s [dir] itself (see this file's own definition above)
+         -- no need to redo it here (review finding M6: this used to re-[mkdir] redundantly, which
+         reads as if the directory's existence were in doubt at this point, when it never is). *)
       let lock_path = Filename.concat dir ".riptide-lock" in
       let ready_r, ready_w = Unix.pipe () in
       let release_r, release_w = Unix.pipe () in
       match Unix.fork () with
       | 0 ->
-        Unix.close ready_r;
-        Unix.close release_w;
-        let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
-        if not (test_only_flock_exclusive_nonblocking fd) then Unix._exit 1;
-        ignore (Unix.write ready_w (Bytes.of_string "1") 0 1);
-        ignore (Unix.read release_r (Bytes.create 1) 0 1);
-        Unix._exit 0
+        (* Review finding I4: the whole branch is now wrapped in a [try ... with _ -> Unix._exit 2]
+           guard -- see [Test_file_storage]'s own identical fix for the full rationale (an
+           unguarded exception here escapes into the parent's [with_tmp_dir] cleanup and then into
+           Alcotest itself, re-running the entire rest of the suite a second time; reproduced live
+           by deliberately breaking this exact [openfile] call). *)
+        (try
+           Unix.close ready_r;
+           Unix.close release_w;
+           let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+           if not (test_only_flock_exclusive_nonblocking fd) then Unix._exit 1;
+           ignore (Unix.write ready_w (Bytes.of_string "1") 0 1);
+           ignore (Unix.read release_r (Bytes.create 1) 0 1);
+           Unix._exit 0
+         with _ -> Unix._exit 2)
       | child_pid ->
         Unix.close ready_w;
         Unix.close release_r;
         Fun.protect
           ~finally:(fun () ->
             (try ignore (Unix.write release_w (Bytes.of_string "1") 0 1) with Unix.Unix_error _ -> ());
-            ignore (Unix.waitpid [] child_pid))
+            ignore (Unix.waitpid [] child_pid);
+            (* Review finding M5: [ready_r]/[release_w] (this parent's own ends of both pipes)
+               were never closed after this point -- a real fd leak, one pair per test run. *)
+            (try Unix.close ready_r with Unix.Unix_error _ -> ());
+            (try Unix.close release_w with Unix.Unix_error _ -> ()))
           (fun () ->
             let n = Unix.read ready_r (Bytes.create 1) 0 1 in
             Alcotest.(check int) "the child process actually acquired the real lock first" 1 n;
@@ -476,4 +538,7 @@ let tests =
     ( "Task 11: a create is refused while a REAL second OS process holds the real flock",
       `Quick,
       test_a_real_second_os_process_holding_the_lock_is_refused );
+    ( "Task 11 review (I1): a failed create releases its lock before re-raising",
+      `Quick,
+      test_a_failed_create_releases_its_lock_before_reraising );
   ]
