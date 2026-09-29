@@ -1117,11 +1117,18 @@
             "id": 16,
             "title": "[3.8] Temp files live in the target directory, not TMPDIR",
             "description": "Temp files live in the target directory, not TMPDIR",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Move alloc_aligned_buffer's and File_kv_store's put-path temp-file creation into the target storage directory itself, removing the hard cross-filesystem TMPDIR dependency and a latent rename-atomicity risk.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "1eccf43871a9bcab2f3d76943409b54c33b7f8bd",
+                "abb283075a407faf91108f2cc7454d0967cef0a0"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 17,
