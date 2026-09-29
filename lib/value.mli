@@ -53,7 +53,17 @@ type value =
     {b not} mean equal under OCaml's [=] or [compare]. In particular,
     [Float] is compared by raw IEEE-754 bit pattern, not by either of
     those (see {!scalar}'s [Float] case for exactly what that implies
-    for [0.0]/[-0.0] and for NaN). *)
+    for [0.0]/[-0.0] and for NaN).
+
+    Raises [Invalid_argument] if [v] contains a [Record] with two fields
+    sharing the same name, or a [Map] with two entries whose keys encode
+    to the same bytes - at any nesting depth, not just the top level. A
+    duplicate key has no well-defined position in the canonical (sorted)
+    order, so there is no single correct way to encode it; this is
+    rejected outright rather than silently picked by whichever entry
+    happened to sort first. This holds even for a [value] built directly
+    in memory, never round-tripped through {!canonical_decode} (which
+    enforces the same rule from the wire-bytes side). *)
 val canonical_encode : value -> string
 
 (** The structural inverse of {!canonical_encode}: decodes a [value] from
@@ -81,7 +91,20 @@ val canonical_encode : value -> string
     malformed or adversarial input (this decoder is intended for bytes
     arriving over a network with no integrity guarantee) raises cleanly
     rather than reading out of bounds, looping unboundedly, or crashing with
-    an unhandled exception. *)
+    an unhandled exception.
+
+    Also raises [Invalid_argument] if a [Record]'s fields, or a [Map]'s
+    entries, are not encoded in strict canonical order - each field name
+    (respectively, each entry's encoded key bytes) must compare strictly
+    greater than the previous one, by the same comparator
+    {!canonical_encode} sorts by. This rejects both a genuinely
+    out-of-order encoding and an exact duplicate key (which compares
+    equal to, rather than greater than, its predecessor) - see
+    {!canonical_encode}'s own doc comment for why a duplicate key has no
+    single valid encoding to begin with. Without this check, two
+    byte-different wire encodings could decode to values considered "the
+    same" but disagree on {!content_hash}, defeating the whole point of
+    calling this encoding "canonical". *)
 val canonical_decode : string -> value
 
 (** SHA-256 of {!canonical_encode}. *)

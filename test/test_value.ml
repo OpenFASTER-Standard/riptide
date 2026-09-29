@@ -483,6 +483,74 @@ let malformed_input_tests =
         Value.canonical_decode ("\x08" ^ u64_be 1 ^ len_prefixed key_encoded_plus_garbage ^ raw_int 7L))
   ]
 
+(* Task 6: canonical_decode enforces strict canonical ordering (Record
+   fields / Map keys must arrive strictly increasing per the same
+   comparator canonical_encode sorts by) and rejects duplicate keys
+   outright - two byte-different wire encodings must never decode to
+   values that could disagree on content_hash while representing "the same"
+   Record/Map. Reusing [expect_invalid_argument] (already typed for
+   [unit -> Value.value]) for the decode-side cases below; a separate,
+   generic helper for the encode-side cases, which never touch
+   canonical_decode at all. *)
+
+let test_decode_rejects_a_non_canonically_ordered_record () =
+  (* Fields deliberately reversed: "b" before "a". *)
+  let unsorted_wire = "\x05" ^ u64_be 2 ^ len_prefixed "b" ^ raw_bool false ^ len_prefixed "a" ^ raw_bool true in
+  Alcotest.check_raises "non-canonical Record field order is rejected on decode"
+    (Invalid_argument "canonical_decode: record fields are not in canonical order (\"a\" after \"b\")")
+    (fun () -> ignore (Value.canonical_decode unsorted_wire))
+
+let test_decode_rejects_a_duplicate_key_record () =
+  let dup_wire = "\x05" ^ u64_be 2 ^ len_prefixed "k" ^ raw_bool true ^ len_prefixed "k" ^ raw_bool false in
+  Alcotest.check_raises "duplicate Record field keys are rejected on decode"
+    (Invalid_argument "canonical_decode: duplicate record field key \"k\"")
+    (fun () -> ignore (Value.canonical_decode dup_wire))
+
+let test_decode_rejects_a_non_canonically_ordered_map () =
+  (* Map keys are stored as length-prefixed blobs of their own encoded
+     bytes (see test_decode_map above); "b"'s blob sorts after "a"'s, so
+     storing "b" first is out of canonical order. *)
+  let key_b = raw_string "b" and key_a = raw_string "a" in
+  let unsorted_wire =
+    "\x08" ^ u64_be 2 ^ len_prefixed key_b ^ raw_bool false ^ len_prefixed key_a ^ raw_bool true
+  in
+  Alcotest.check_raises "non-canonical Map key order is rejected on decode"
+    (Invalid_argument "canonical_decode: map entries are not in canonical (key-sorted) order")
+    (fun () -> ignore (Value.canonical_decode unsorted_wire))
+
+let test_decode_rejects_a_duplicate_key_map () =
+  let key_k = raw_string "k" in
+  let dup_wire = "\x08" ^ u64_be 2 ^ len_prefixed key_k ^ raw_int 1L ^ len_prefixed key_k ^ raw_int 2L in
+  Alcotest.check_raises "duplicate Map keys are rejected on decode"
+    (Invalid_argument "canonical_decode: duplicate map key")
+    (fun () -> ignore (Value.canonical_decode dup_wire))
+
+(* Generic version of [expect_invalid_argument] above, for callers whose
+   checked function doesn't return [Value.value] (here, [canonical_encode]
+   returns a [string]) - encode's own duplicate-key check must fire on a
+   [value] built directly in memory, never having gone anywhere near
+   [canonical_decode]. *)
+let expect_raises_invalid_argument name (f : unit -> unit) =
+  ( name,
+    `Quick,
+    fun () ->
+      try
+        f ();
+        Alcotest.failf "%s: expected Invalid_argument, but the call succeeded" name
+      with
+      | Invalid_argument _ -> ()
+      | exn -> Alcotest.failf "%s: expected Invalid_argument, got %s" name (Printexc.to_string exn) )
+
+let encode_duplicate_key_tests =
+  [ expect_raises_invalid_argument "canonical_encode rejects an in-memory duplicate Record key" (fun () ->
+        let v = Value.Record [ ("k", Value.Scalar (Value.Bool true)); ("k", Value.Scalar (Value.Bool false)) ] in
+        ignore (Value.canonical_encode v));
+    expect_raises_invalid_argument "canonical_encode rejects an in-memory duplicate Map key" (fun () ->
+        let k = Value.Scalar (Value.String "k") in
+        let v = Value.Map [ (k, Value.Scalar (Value.Int 1L)); (k, Value.Scalar (Value.Int 2L)) ] in
+        ignore (Value.canonical_encode v))
+  ]
+
 let round_trip_prop =
   QCheck2.Test.make ~name:"canonical_decode inverts canonical_encode (round-trips to the same bytes)" ~count:200
     value_gen (fun v ->
@@ -507,6 +575,12 @@ let tests =
     ("decode sum", `Quick, test_decode_sum);
     ("decode sequence", `Quick, test_decode_sequence);
     ("decode map", `Quick, test_decode_map);
+    ( "decode rejects a non-canonically ordered record",
+      `Quick,
+      test_decode_rejects_a_non_canonically_ordered_record );
+    ("decode rejects a duplicate key record", `Quick, test_decode_rejects_a_duplicate_key_record);
+    ("decode rejects a non-canonically ordered map", `Quick, test_decode_rejects_a_non_canonically_ordered_map);
+    ("decode rejects a duplicate key map", `Quick, test_decode_rejects_a_duplicate_key_map);
     ("20k-deep nested map keys decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
     ("20k-deep nested map keys encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
     ( "2-entries-per-level 1000-deep map key encode/hash residual bounded",
@@ -517,4 +591,4 @@ let tests =
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest round_trip_prop
   ]
-  @ malformed_input_tests
+  @ malformed_input_tests @ encode_duplicate_key_tests

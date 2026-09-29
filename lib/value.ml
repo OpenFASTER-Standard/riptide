@@ -137,6 +137,23 @@ let buf_add_len_prefixed buf s =
   write_u64_be buf (String.length s);
   Wbuf.add_string buf s
 
+(* Walks a list already sorted by [compare_key] and raises [Invalid_argument]
+   on the first pair of adjacent entries whose keys compare equal — i.e. a
+   duplicate key. Used by [encode_into]'s [Record]/[Map] cases so that a
+   duplicate key is rejected even when the [value] was built directly in
+   memory (never round-tripped through [canonical_decode], which enforces
+   the same rule from the wire-bytes side — see [decode_value] below). A
+   sorted list only ever needs an adjacent check: [List.stable_sort] groups
+   equal keys next to each other regardless of their original position. *)
+let reject_duplicate_keys ~what compare_key sorted =
+  let rec loop = function
+    | [] | [ _ ] -> ()
+    | a :: (b :: _ as rest) ->
+      if compare_key a b = 0 then invalid_arg (Printf.sprintf "canonical_encode: duplicate %s key" what);
+      loop rest
+  in
+  loop sorted
+
 let rec encode_into buf (v : value) =
   match v with
   | Scalar (Bool b) ->
@@ -164,6 +181,7 @@ let rec encode_into buf (v : value) =
   | Record fields ->
     Wbuf.add_char buf tag_record;
     let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
+    reject_duplicate_keys ~what:"record field" (fun (k1, _) (k2, _) -> String.compare k1 k2) sorted;
     write_u64_be buf (List.length sorted);
     List.iter
       (fun (k, v) ->
@@ -253,6 +271,7 @@ let rec encode_into buf (v : value) =
            entries
        in
        let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
+       reject_duplicate_keys ~what:"map" (fun (k1, _) (k2, _) -> String.compare k1 k2) sorted;
        List.iter
          (fun (kbytes, v) ->
             buf_add_len_prefixed buf kbytes;
@@ -333,6 +352,31 @@ let read_i64_payload s pos ~bound ~what =
 let read_bytes_exact s pos len =
   (String.sub s pos len, pos + len)
 
+(* Lexicographically compares the byte range [s.[a_pos], s.[a_pos+a_len))
+   against [s.[b_pos], s.[b_pos+b_len)) directly against the shared buffer
+   [s] — same semantics as [String.compare] on the two equivalent
+   substrings (shared-prefix bytes decide it; if one range is a strict
+   prefix of the other, the shorter one compares smaller), but without
+   allocating either substring. This matters specifically for [Map] key
+   blobs: they can themselves be arbitrarily large nested encodings (see
+   [decode_value]'s [Map] case and Task 5's in-place-decode fix above), so
+   comparing two of them via [String.sub]-then-[String.compare] would
+   reintroduce exactly the kind of copy this module's decode path was just
+   fixed to avoid. Used to check canonical (strictly increasing, duplicate-
+   free) key order on decode — see [decode_value]'s [Record]/[Map] cases —
+   mirroring the same [String.compare] ordering [encode_into] already
+   sorts by, so a canonically-encoded value can never fail its own
+   decode-order check. *)
+let compare_byte_range s ~a_pos ~a_len ~b_pos ~b_len =
+  let min_len = if a_len < b_len then a_len else b_len in
+  let rec loop i =
+    if i >= min_len then compare a_len b_len
+    else
+      let c = Char.compare s.[a_pos + i] s.[b_pos + i] in
+      if c <> 0 then c else loop (i + 1)
+  in
+  loop 0
+
 let rec decode_value s pos ~bound =
   if pos >= bound then invalid_arg "canonical_decode: unexpected end of input (expected a value tag byte)";
   let tag = s.[pos] in
@@ -363,15 +407,31 @@ let rec decode_value s pos ~bound =
     (Scalar (Bytes b), pos)
   else if tag = tag_record then
     let count, pos = read_len_prefix s pos ~bound ~what:"record field count" in
-    let rec loop i pos acc =
+    (* [prev_key] is the previously-decoded field name, if any: each new key
+       must compare strictly greater than it (per [String.compare], the same
+       comparator [encode_into] sorts fields by) or the wire bytes are not a
+       valid canonical encoding — either genuinely out of order, or an exact
+       duplicate (compares equal). Rejecting both here is what makes
+       [canonical_decode] a true inverse of [canonical_encode]: two
+       byte-different wire encodings must never decode to values that could
+       have distinct [content_hash]es despite representing "the same" record. *)
+    let rec loop i pos acc ~prev_key =
       if i = 0 then (List.rev acc, pos)
       else
         let klen, pos = read_len_prefix s pos ~bound ~what:"record field key" in
         let k, pos = read_bytes_exact s pos klen in
+        (match prev_key with
+         | Some pk ->
+           let c = String.compare pk k in
+           if c = 0 then invalid_arg (Printf.sprintf "canonical_decode: duplicate record field key %S" k)
+           else if c > 0 then
+             invalid_arg
+               (Printf.sprintf "canonical_decode: record fields are not in canonical order (%S after %S)" k pk)
+         | None -> ());
         let v, pos = decode_value s pos ~bound in
-        loop (i - 1) pos ((k, v) :: acc)
+        loop (i - 1) pos ((k, v) :: acc) ~prev_key:(Some k)
     in
-    let fields, pos = loop count pos [] in
+    let fields, pos = loop count pos [] ~prev_key:None in
     (Record fields, pos)
   else if tag = tag_sum then
     let tlen, pos = read_len_prefix s pos ~bound ~what:"sum tag" in
@@ -390,7 +450,15 @@ let rec decode_value s pos ~bound =
     (Sequence items, pos)
   else if tag = tag_map then
     let count, pos = read_len_prefix s pos ~bound ~what:"map entry count" in
-    let rec loop i pos acc =
+    (* [prev_kblob] tracks the previous entry's key blob as (start, len) into
+       [s] — not a copied string, see [compare_byte_range] above for why a
+       copy here would reintroduce the exact quadratic-in-depth cost Task 5
+       just removed. Each new key blob must compare strictly greater than
+       the previous one (byte-lexicographically, the same comparator
+       [encode_into]'s multi-entry Map path sorts encoded key bytes by) or
+       the wire bytes are rejected as either out of canonical order or an
+       exact duplicate key. *)
+    let rec loop i pos acc ~prev_kblob =
       if i = 0 then (List.rev acc, pos)
       else
         (* The asymmetry vs. Record: a Map entry's key is stored as a
@@ -420,13 +488,20 @@ let rec decode_value s pos ~bound =
            exactly as invalid as trailing garbage after the top-level input
            (see [canonical_decode] below). *)
         let kblob_len, pos = read_len_prefix s pos ~bound ~what:"map key blob" in
+        let kblob_start = pos in
         let kblob_end = pos + kblob_len in
-        let k, kpos = decode_value s pos ~bound:kblob_end in
+        (match prev_kblob with
+         | Some (prev_start, prev_len) ->
+           let c = compare_byte_range s ~a_pos:prev_start ~a_len:prev_len ~b_pos:kblob_start ~b_len:kblob_len in
+           if c = 0 then invalid_arg "canonical_decode: duplicate map key"
+           else if c > 0 then invalid_arg "canonical_decode: map entries are not in canonical (key-sorted) order"
+         | None -> ());
+        let k, kpos = decode_value s kblob_start ~bound:kblob_end in
         if kpos <> kblob_end then invalid_arg "canonical_decode: trailing bytes after map key value";
         let v, pos = decode_value s kblob_end ~bound in
-        loop (i - 1) pos ((k, v) :: acc)
+        loop (i - 1) pos ((k, v) :: acc) ~prev_kblob:(Some (kblob_start, kblob_len))
     in
-    let entries, pos = loop count pos [] in
+    let entries, pos = loop count pos [] ~prev_kblob:None in
     (Map entries, pos)
   else invalid_arg (Printf.sprintf "canonical_decode: unknown tag byte 0x%02x" (Char.code tag))
 
