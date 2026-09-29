@@ -1099,11 +1099,19 @@
             "id": 15,
             "title": "[3.7] Randomize File_kv_store's temp-file suffix per call",
             "description": "Randomize File_kv_store's temp-file suffix per call",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "tmp_suffix becomes unique per call instead of the fixed '.put.tmp', so concurrent same-key writers can no longer interleave writes into one shared temp file and produce a torn record.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "a1650fca0dbc01418a9aeadd67fccb71338176db",
+                "7bfca2b3cc59d081569eac5bbed4392fc17d51c5",
+                "aa38f155975b4228b8296b5b3fb134f95bce5233"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 16,
