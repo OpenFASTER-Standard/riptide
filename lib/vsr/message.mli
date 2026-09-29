@@ -144,7 +144,14 @@ exception Malformed_message of string
 
 val encode : t -> string
 (** [encode t] converts [t] to its [Value.Sum (tag, Value.Record [...])] wire shape (see
-    above) and canonically encodes that. *)
+    above) and canonically encodes that.
+
+    Can raise [Invalid_argument] (M4, task-6 review): unlike {!decode} below, which is
+    guaranteed never to, [encode] inherits {!Riptide.Value.canonical_encode}'s own raise
+    on a duplicate-keyed [Record]/[Map] anywhere in the encoded shape - reachable here
+    specifically via a caller-supplied payload [Value.value] (e.g. a [Prepare]'s or
+    [Commit]'s embedded event payload) that itself contains one, not from anything this
+    module constructs. *)
 
 val decode : string -> t
 (** [decode s] is the inverse of {!encode}. Raises {!Malformed_message} on any malformed

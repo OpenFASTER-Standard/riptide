@@ -33,6 +33,9 @@ let unwrap_dek t ~event_id wrapped =
 
 let encrypt_for_storage t ~event_id (v : Riptide.Value.value) =
   let dek = Dek.generate () in
+  (* M4 (task-6 review): can raise Invalid_argument, inherited from canonical_encode, if
+     [v] contains a duplicate-keyed Record/Map anywhere in it - before this task,
+     canonical_encode never raised at all. *)
   let ciphertext = Dek.encrypt dek (Riptide.Value.canonical_encode v) in
   (* Strictly before returning, hence strictly before the caller can write the ciphertext
      anywhere: a crash here loses an orphan DEK for a ciphertext that was never stored, whereas

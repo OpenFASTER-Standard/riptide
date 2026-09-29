@@ -69,13 +69,17 @@ val canonical_encode : value -> string
 (** The structural inverse of {!canonical_encode}: decodes a [value] from
     its canonical byte encoding.
 
-    Round-trip relationship: for any [v], [canonical_decode (canonical_encode
-    v)] reproduces [v]'s logical content, but {b not necessarily its exact
-    OCaml representation} — decoding re-encodes [Record] fields and [Map]
-    entries into the same canonical (sorted) order {!canonical_encode} would
-    have chosen, which is not necessarily the order the original value was
-    constructed with if that value's fields/entries were out of sorted order
-    to begin with. The property that actually holds unconditionally is
+    Round-trip relationship: for any [v] with no duplicate-keyed [Record] or
+    [Map] anywhere in it (a [v] that does have one makes {!canonical_encode}
+    itself raise [Invalid_argument] - see that function's own doc comment
+    above - so [canonical_decode] is never even reached for such a [v]),
+    [canonical_decode (canonical_encode v)] reproduces [v]'s logical
+    content, but {b not necessarily its exact OCaml representation} —
+    decoding re-encodes [Record] fields and [Map] entries into the same
+    canonical (sorted) order {!canonical_encode} would have chosen, which is
+    not necessarily the order the original value was constructed with if
+    that value's fields/entries were out of sorted order to begin with. The
+    property that actually holds for any such duplicate-key-free [v] is
     [canonical_encode (canonical_decode (canonical_encode v)) =
     canonical_encode v] - i.e. round-tripping through decode is a no-op once
     a value has already been through one canonical encoding.
@@ -107,7 +111,9 @@ val canonical_encode : value -> string
     calling this encoding "canonical". *)
 val canonical_decode : string -> value
 
-(** SHA-256 of {!canonical_encode}. *)
+(** SHA-256 of {!canonical_encode}. Inherits {!canonical_encode}'s own [Invalid_argument]
+    (M4, task-6 review): [v] containing a duplicate-keyed [Record] or [Map] anywhere in it
+    makes this raise rather than return a hash. *)
 val content_hash : value -> hash
 
 (** Renders a raw {!hash} as lowercase hex for display/logging. Raises

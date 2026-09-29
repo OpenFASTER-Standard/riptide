@@ -59,6 +59,12 @@ let bottom = { value = Riptide.Value.Sequence []; timestamp = Int64.min_int }
    walks a large value nor ever reaches a [Float] payload where [nan <> nan] could matter. *)
 let is_bottom (x : t) = Int64.equal x.timestamp bottom.timestamp && x.value = bottom.value
 
+(* M4 (task-6 review): [content_hash] inherits [Value.canonical_encode]'s own
+   [Invalid_argument] on a duplicate-keyed Record/Map anywhere in [a.value]/[b.value] - so
+   [join] on an arbitrary, caller-supplied [t] can now raise here rather than always
+   returning. Not a behavior change worth guarding against in this function (a duplicate-
+   keyed value is malformed regardless of what [join] does with it), just documenting a
+   raise path that did not exist before this module's Value dependency gained one. *)
 let join a b =
   if is_bottom a then b
   else if is_bottom b then a

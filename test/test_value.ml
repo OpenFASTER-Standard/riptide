@@ -140,13 +140,18 @@ let value_injective_prop =
     (fun (v1, v2) -> if Value.canonical_encode v1 = Value.canonical_encode v2 then canonical_equal v1 v2 else true)
 
 (* Keeps only the first entry for each distinct key. Permutation invariance
-   below is only claimed for maps/records with distinct keys: canonical_encode
-   sorts by key with List.stable_sort (L4), so if two entries share a key,
-   their relative order is a stable-sort tie-break that depends on their
-   order in the *input* list - shuffling the input can therefore legitimately
-   change the output bytes when duplicate keys are present. That is a
-   pre-existing, documented-as-open question about duplicate-key handling
-   (L4/final-review.md), not something this property is meant to test. *)
+   below is only claimed for maps/records with distinct keys: a value with a
+   duplicate key is no longer just an "order is a stable-sort tie-break"
+   open question (M6, task-6 review, correcting this comment's own earlier
+   claim) - Task 6 closed that question outright, and canonical_encode now
+   raises Invalid_argument on any duplicate-keyed Record/Map outright,
+   before any ordering could even matter. This generator still dedups its
+   own top-level output so these two properties can keep testing genuine
+   permutation invariance rather than merely re-deriving "duplicate keys
+   raise" (already covered directly by the encode_duplicate_key_tests
+   below); value_gen itself does not yet dedup at every nesting level, which
+   is what makes the four QCheck properties below it fail post-Task-6 - see
+   this task's report for why that's Task 7's scope, not this comment's. *)
 let dedup_by_key key_of entries =
   List.fold_left (fun acc x -> if List.exists (fun y -> key_of y = key_of x) acc then acc else acc @ [ x ]) [] entries
 
@@ -514,42 +519,86 @@ let test_decode_rejects_a_non_canonically_ordered_map () =
   let unsorted_wire =
     "\x08" ^ u64_be 2 ^ len_prefixed key_b ^ raw_bool false ^ len_prefixed key_a ^ raw_bool true
   in
+  (* M8 (task-6 review): the error now carries the offending entry's 0-based index and
+     byte offset (a Map key's raw bytes generally aren't printable the way a Record
+     field's `%S` name is) - computed here by hand from the wire layout above: tag(1) +
+     count(8) + [len_prefix(8) + key_b blob(10)] + raw_bool(2) puts key_a's blob (the
+     second entry, index 1) at byte offset 1+8+8+10+2+8 = 37. *)
   Alcotest.check_raises "non-canonical Map key order is rejected on decode"
-    (Invalid_argument "canonical_decode: map entries are not in canonical (key-sorted) order")
+    (Invalid_argument "canonical_decode: map entries are not in canonical (key-sorted) order (entry index 1, byte offset 37)")
     (fun () -> ignore (Value.canonical_decode unsorted_wire))
 
 let test_decode_rejects_a_duplicate_key_map () =
   let key_k = raw_string "k" in
   let dup_wire = "\x08" ^ u64_be 2 ^ len_prefixed key_k ^ raw_int 1L ^ len_prefixed key_k ^ raw_int 2L in
+  (* M8 (task-6 review): same offset-computation as the ordering test above, but both
+     entries here use key_k's blob (10 bytes), so the second entry (index 1) starts at
+     byte offset 1+8+8+10+9+8 = 44 (raw_int is 9 bytes, not raw_bool's 2). *)
   Alcotest.check_raises "duplicate Map keys are rejected on decode"
-    (Invalid_argument "canonical_decode: duplicate map key")
+    (Invalid_argument "canonical_decode: duplicate map key (entry index 1, byte offset 44)")
     (fun () -> ignore (Value.canonical_decode dup_wire))
 
-(* Generic version of [expect_invalid_argument] above, for callers whose
-   checked function doesn't return [Value.value] (here, [canonical_encode]
-   returns a [string]) - encode's own duplicate-key check must fire on a
-   [value] built directly in memory, never having gone anywhere near
-   [canonical_decode]. *)
-let expect_raises_invalid_argument name (f : unit -> unit) =
-  ( name,
-    `Quick,
-    fun () ->
-      try
-        f ();
-        Alcotest.failf "%s: expected Invalid_argument, but the call succeeded" name
-      with
-      | Invalid_argument _ -> ()
-      | exn -> Alcotest.failf "%s: expected Invalid_argument, got %s" name (Printexc.to_string exn) )
+(* Finding 1 (task-6 review): the four tests above are all REJECT-side coverage of the
+   new Map/Record ordering check. Before this test, no currently-passing test exercised
+   the ACCEPT side of the new Map check on a legitimate, multi-entry, correctly-ordered
+   Map: test_decode_map above has exactly one entry, so prev_kblob threading and
+   compare_byte_range are never walked across real multi-byte content by any green test.
+   (The four QCheck properties that *did* cover this - round_trip_prop,
+   value_injective_prop, record/map_permutation_invariance_prop - are the ones this task
+   correctly turns red, per this task's own report; they're not a substitute here.) A
+   future bug that made compare_byte_range (or the `c > 0` branch in decode_value's Map
+   arm) wrongly REJECT a legitimately-ordered Map would ship with a fully green suite
+   without this test.
 
-let encode_duplicate_key_tests =
-  [ expect_raises_invalid_argument "canonical_encode rejects an in-memory duplicate Record key" (fun () ->
-        let v = Value.Record [ ("k", Value.Scalar (Value.Bool true)); ("k", Value.Scalar (Value.Bool false)) ] in
-        ignore (Value.canonical_encode v));
-    expect_raises_invalid_argument "canonical_encode rejects an in-memory duplicate Map key" (fun () ->
-        let k = Value.Scalar (Value.String "k") in
-        let v = Value.Map [ (k, Value.Scalar (Value.Int 1L)); (k, Value.Scalar (Value.Int 2L)) ] in
-        ignore (Value.canonical_encode v))
-  ]
+   Keys are chosen to force compare_byte_range to actually walk a multi-byte shared
+   prefix rather than diverge at byte 0: Scalar (String "a")'s and Scalar (String "ab")'s
+   encoded blobs ([\x03][00 00 00 00 00 00 00 01]['a'] and
+   [\x03][00 00 00 00 00 00 00 02]['a']['b']) share their first 8 bytes (the tag plus 7
+   leading zero bytes of the big-endian length prefix) and diverge only at the 9th byte -
+   the one byte of the length prefix that actually encodes their differing lengths (0x01
+   vs 0x02). Scalar (Int 1L) diverges from both at byte 0 (a different tag byte
+   entirely), giving a second, trivial case in the same Map. Building the wire bytes via
+   [Value.canonical_encode] itself (rather than hand-rolling them, unlike the reject-side
+   tests above) is deliberate: it's the only way to also pin the round-trip fixpoint this
+   task's whole guarantee rests on and which, before this test, had no passing coverage
+   for any value at all - [canonical_encode (canonical_decode (canonical_encode v)) =
+   canonical_encode v]. *)
+let test_decode_accepts_a_correctly_ordered_multi_entry_map () =
+  let v =
+    Value.Map
+      [ (Value.Scalar (Value.String "a"), Value.Scalar (Value.Bool true));
+        (Value.Scalar (Value.Int 1L), Value.Scalar (Value.Bool false));
+        (Value.Scalar (Value.String "ab"), Value.Scalar (Value.Bool true))
+      ]
+  in
+  let encoded = Value.canonical_encode v in
+  let decoded = Value.canonical_decode encoded in
+  Alcotest.(check bool)
+    "decode accepts a correctly-ordered, multi-entry Map (does not wrongly reject it) and \
+     reproduces its logical content"
+    true (canonical_equal decoded v);
+  Alcotest.(check string)
+    "canonical_encode (canonical_decode (canonical_encode v)) = canonical_encode v"
+    encoded (Value.canonical_encode decoded)
+
+(* M5 (task-6 review): this used to be a bespoke helper (matching only [Invalid_argument
+   _], no message check) because [canonical_encode : value -> string] doesn't fit
+   [expect_invalid_argument]'s [unit -> Value.value] signature above. That was
+   unnecessary - [Alcotest.check_raises] already fits any [unit -> unit] thunk directly -
+   and weaker than the decode-side tests right below, which are message-exact. These two
+   are now written the same way, matching that style. *)
+let test_encode_rejects_an_in_memory_duplicate_key_record () =
+  let v = Value.Record [ ("k", Value.Scalar (Value.Bool true)); ("k", Value.Scalar (Value.Bool false)) ] in
+  Alcotest.check_raises "canonical_encode rejects an in-memory duplicate Record key"
+    (Invalid_argument "canonical_encode: duplicate record field key")
+    (fun () -> ignore (Value.canonical_encode v))
+
+let test_encode_rejects_an_in_memory_duplicate_key_map () =
+  let k = Value.Scalar (Value.String "k") in
+  let v = Value.Map [ (k, Value.Scalar (Value.Int 1L)); (k, Value.Scalar (Value.Int 2L)) ] in
+  Alcotest.check_raises "canonical_encode rejects an in-memory duplicate Map key"
+    (Invalid_argument "canonical_encode: duplicate map key")
+    (fun () -> ignore (Value.canonical_encode v))
 
 let round_trip_prop =
   QCheck2.Test.make ~name:"canonical_decode inverts canonical_encode (round-trips to the same bytes)" ~count:200
@@ -581,6 +630,11 @@ let tests =
     ("decode rejects a duplicate key record", `Quick, test_decode_rejects_a_duplicate_key_record);
     ("decode rejects a non-canonically ordered map", `Quick, test_decode_rejects_a_non_canonically_ordered_map);
     ("decode rejects a duplicate key map", `Quick, test_decode_rejects_a_duplicate_key_map);
+    ( "decode accepts a correctly-ordered multi-entry map",
+      `Quick,
+      test_decode_accepts_a_correctly_ordered_multi_entry_map );
+    ("encode rejects an in-memory duplicate key record", `Quick, test_encode_rejects_an_in_memory_duplicate_key_record);
+    ("encode rejects an in-memory duplicate key map", `Quick, test_encode_rejects_an_in_memory_duplicate_key_map);
     ("20k-deep nested map keys decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
     ("20k-deep nested map keys encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
     ( "2-entries-per-level 1000-deep map key encode/hash residual bounded",
@@ -591,4 +645,4 @@ let tests =
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest round_trip_prop
   ]
-  @ malformed_input_tests @ encode_duplicate_key_tests
+  @ malformed_input_tests

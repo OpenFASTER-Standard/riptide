@@ -154,6 +154,19 @@ let reject_duplicate_keys ~what compare_key sorted =
   in
   loop sorted
 
+(* Sorts [entries] by [compare_key] (stable, matching [encode_into]'s own historical
+   sort behavior) and then rejects a duplicate key against that exact same comparator.
+   Defined once and shared by both the [Record] and [Map] encode arms below so the
+   comparator governing canonical order and the comparator governing "is this a
+   duplicate" can never independently drift apart - each call site passes one
+   [compare_key] value that does both jobs, instead of writing out the same
+   comparator lambda twice per site and relying on the two copies staying in sync by
+   hand (finding 2, task-6 review). *)
+let sort_and_reject_duplicate_keys ~what compare_key entries =
+  let sorted = List.stable_sort compare_key entries in
+  reject_duplicate_keys ~what compare_key sorted;
+  sorted
+
 let rec encode_into buf (v : value) =
   match v with
   | Scalar (Bool b) ->
@@ -180,8 +193,8 @@ let rec encode_into buf (v : value) =
     buf_add_len_prefixed buf b
   | Record fields ->
     Wbuf.add_char buf tag_record;
-    let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
-    reject_duplicate_keys ~what:"record field" (fun (k1, _) (k2, _) -> String.compare k1 k2) sorted;
+    let compare_by_key (k1, _) (k2, _) = String.compare k1 k2 in
+    let sorted = sort_and_reject_duplicate_keys ~what:"record field" compare_by_key fields in
     write_u64_be buf (List.length sorted);
     List.iter
       (fun (k, v) ->
@@ -270,8 +283,8 @@ let rec encode_into buf (v : value) =
            (Wbuf.contents kb, v))
            entries
        in
-       let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
-       reject_duplicate_keys ~what:"map" (fun (k1, _) (k2, _) -> String.compare k1 k2) sorted;
+       let compare_by_key (k1, _) (k2, _) = String.compare k1 k2 in
+       let sorted = sort_and_reject_duplicate_keys ~what:"map" compare_by_key encoded_entries in
        List.iter
          (fun (kbytes, v) ->
             buf_add_len_prefixed buf kbytes;
@@ -370,7 +383,7 @@ let read_bytes_exact s pos len =
 let compare_byte_range s ~a_pos ~a_len ~b_pos ~b_len =
   let min_len = if a_len < b_len then a_len else b_len in
   let rec loop i =
-    if i >= min_len then compare a_len b_len
+    if i >= min_len then Int.compare a_len b_len
     else
       let c = Char.compare s.[a_pos + i] s.[b_pos + i] in
       if c <> 0 then c else loop (i + 1)
@@ -490,11 +503,26 @@ let rec decode_value s pos ~bound =
         let kblob_len, pos = read_len_prefix s pos ~bound ~what:"map key blob" in
         let kblob_start = pos in
         let kblob_end = pos + kblob_len in
+        (* M8 (task-6 review): unlike the Record case just above, a Map key's raw bytes are
+           an arbitrary, generally non-printable encoded blob - there's no analogue of the
+           Record error's `%S` to put in the message. Report the entry's 0-based index and
+           its byte offset into the input instead, so a real cross-replica ordering
+           disagreement is locatable from a single log line rather than only "a map entry,
+           somewhere". *)
+        let entry_index = count - i in
         (match prev_kblob with
          | Some (prev_start, prev_len) ->
            let c = compare_byte_range s ~a_pos:prev_start ~a_len:prev_len ~b_pos:kblob_start ~b_len:kblob_len in
-           if c = 0 then invalid_arg "canonical_decode: duplicate map key"
-           else if c > 0 then invalid_arg "canonical_decode: map entries are not in canonical (key-sorted) order"
+           if c = 0 then
+             invalid_arg
+               (Printf.sprintf "canonical_decode: duplicate map key (entry index %d, byte offset %d)" entry_index
+                  kblob_start)
+           else if c > 0 then
+             invalid_arg
+               (Printf.sprintf
+                  "canonical_decode: map entries are not in canonical (key-sorted) order (entry index %d, byte \
+                   offset %d)"
+                  entry_index kblob_start)
          | None -> ());
         let k, kpos = decode_value s kblob_start ~bound:kblob_end in
         if kpos <> kblob_end then invalid_arg "canonical_decode: trailing bytes after map key value";
