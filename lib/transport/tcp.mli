@@ -35,11 +35,13 @@
     the handshake preamble's claim, unverified against the certificate on that same connection --
     see the {!create} implementation's [writers] field for the precise, current boundary. So a
     cluster member can still cause its {e own} outbound traffic to be routed onto a connection an
-    attacker holds (a routing-table poisoning, not a message-attribution forgery), and a second
-    connection claiming an id already routed silently replaces the first. The gap {!receive}'s
-    fix closes is the one that mattered most for message provenance: an arbitrary party on the
-    network can no longer inject, read, tamper with, or (as of this fix) falsely attribute cluster
-    traffic. What remains is narrower, and is a separate, later fix.
+    attacker holds (a routing-table poisoning, not a message-attribution forgery). A second
+    connection claiming an id already routed is now {b rejected} rather than silently replacing the
+    first: the new connection's writer fiber exits with a logged "connection error" and the first
+    connection's entry in the routing table remains untouched. The gap {!receive}'s fix closes is
+    the one that mattered most for message provenance: an arbitrary party on the network can no
+    longer inject, read, tamper with, or (as of this fix) falsely attribute cluster traffic. What
+    remains is narrower, and is a separate, later fix.
 
     {2 Wire format}
 

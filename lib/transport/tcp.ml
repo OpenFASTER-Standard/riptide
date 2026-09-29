@@ -91,6 +91,14 @@ exception Frame_too_large of int
    the wrong place. Never escapes this module: [create] converts it to the documented [Failure]. *)
 exception Tls_handshake_failed of exn
 
+(* Raised by [register_writer] when a connection attempts to claim a peer id already present
+   in the writers table -- see [register_writer] below. Never escapes this module: [writer_body]
+   catches it and closes the connection, so this exists as a named exception purely so a
+   [Tcp: connection error] log line can say *why* a connection was dropped rather than looking
+   identical to an ordinary disconnect, the same discipline as [Frame_too_large] and
+   [Unauthenticated_peer] above. *)
+exception Duplicate_connection_id of int
+
 (* [Printexc.to_string] renders [Tls_eio]'s two exceptions as bare constructor names with no
    payload ("Tls_eio.Tls_failure(_)"), which is useless in a log line or an error message when the
    whole question is *why* a handshake was refused. Both carry a printable payload; this uses it.
@@ -98,6 +106,8 @@ exception Tls_handshake_failed of exn
 let describe_exn = function
   | Tls_eio.Tls_failure f -> "TLS failure: " ^ Fmt.to_to_string Tls.Engine.pp_failure f
   | Tls_eio.Tls_alert a -> "TLS alert from peer: " ^ Tls.Packet.alert_type_to_string a
+  | Duplicate_connection_id peer_id ->
+    Printf.sprintf "a second connection claiming peer id %d (already connected)" peer_id
   | exn -> Printexc.to_string exn
 
 type t = {
@@ -238,8 +248,11 @@ let authenticated_peer_id flow =
                  (Printf.sprintf "certificate SAN %S: replica id does not fit an OCaml int" name)))))
 
 let register_writer t peer_id w =
-  Hashtbl.replace t.writers peer_id w;
-  Eio.Condition.broadcast t.writer_added
+  match Hashtbl.find_opt t.writers peer_id with
+  | Some _ -> raise (Duplicate_connection_id peer_id)
+  | None ->
+    Hashtbl.replace t.writers peer_id w;
+    Eio.Condition.broadcast t.writer_added
 
 (* The write side of one connection's lifetime. Always returns [unit] -- every fault this function
    knows how to handle is caught internally, never re-raised -- so that it composes correctly with
@@ -284,6 +297,9 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
   | End_of_file -> ()
   | Eio.Io _ -> ()
   | Failure _ -> ()
+  | Duplicate_connection_id peer_id ->
+    Eio.traceln "Tcp: connection error: %s; dropping connection"
+      (describe_exn (Duplicate_connection_id peer_id))
   | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> ()
 
 (* The read side of one connection's lifetime: decodes the connection's own authenticated sender
