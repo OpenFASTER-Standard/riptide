@@ -251,6 +251,75 @@ let test_decode_map () =
   let expected = Value.Map [ (Value.Scalar (Value.String "k"), Value.Scalar (Value.Int 7L)) ] in
   Alcotest.(check bool) "decodes Map" true (Value.canonical_decode raw = expected)
 
+(* Hand-constructs the wire bytes for a value nested [depth] levels deep via
+   Map keys: a Map whose single entry's key is itself a Map whose single
+   entry's key is itself a Map ... bottoming out at a plain Scalar Int, each
+   level's (throwaway) value a cheap Scalar Bool. Built directly from raw
+   bytes, not via [Value.canonical_encode], because constructing the
+   equivalent in-memory [Value.value] first would itself take O(depth) stack
+   frames of unavoidable but unrelated overhead at this depth - the point is
+   to isolate decode's own cost.
+
+   Levels nest as: level_i = tag_map ++ count(1) ++ len_prefixed(level_(i-1))
+   ++ dummy_value, bottoming out at level_0 = raw_int 0L. Expanding that
+   recurrence gives level_depth = P_depth ++ P_(depth-1) ++ ... ++ P_1 ++
+   level_0 ++ dummy_value * depth, where P_i is level_i's fixed-size header
+   (tag + count + inner length prefix, 17 bytes) - which lets this be built
+   with one O(depth) pass (each level's required length prefix computed
+   directly from the known linear-growth formula, not by re-measuring an
+   already-built string) instead of restaging an O(depth^2) copy in the test
+   helper itself. *)
+let build_nested_map_key_wire_bytes ~depth =
+  let innermost = raw_int 0L in
+  let dummy_value = raw_bool true in
+  let header_len = 1 + 8 + 8 (* tag + count(1) prefix + inner length prefix *) in
+  let per_level_growth = header_len + String.length dummy_value in
+  let buf = Buffer.create (String.length innermost + (per_level_growth * depth)) in
+  for i = depth downto 1 do
+    let inner_len = String.length innermost + (per_level_growth * (i - 1)) in
+    Buffer.add_char buf '\x08';
+    Buffer.add_string buf (u64_be 1);
+    Buffer.add_string buf (u64_be inner_len)
+  done;
+  Buffer.add_string buf innermost;
+  for _ = 1 to depth do
+    Buffer.add_string buf dummy_value
+  done;
+  Buffer.contents buf
+
+(* Builds the equivalent in-memory [Value.value] (same shape as
+   [build_nested_map_key_wire_bytes] above, but as a real value tree rather
+   than raw bytes) via an O(depth) tail-recursive loop, bottom-up - no deep
+   *construction*-time recursion, so this isolates encode's own cost the
+   same way the wire-bytes helper isolates decode's. *)
+let build_nested_map_key_value ~depth =
+  let rec loop i acc = if i = 0 then acc else loop (i - 1) (Value.Map [ (acc, Value.Scalar (Value.Bool true)) ]) in
+  loop depth (Value.Scalar (Value.Int 0L))
+
+let test_deeply_nested_map_keys_encode_in_linear_time () =
+  let v = build_nested_map_key_value ~depth:20_000 in
+  let start = Unix.gettimeofday () in
+  let encoded = Value.canonical_encode v in
+  let elapsed = Unix.gettimeofday () -. start in
+  Alcotest.(check bool) "20k-deep nested map key encodes in well under 1s"
+    true (elapsed < 1.0);
+  (* Timing alone can't catch an off-by-one in the new [size_value]-precomputed
+     length prefixes (the fast path skips materializing key bytes entirely,
+     trusting [size_value]'s arithmetic instead - a mismatch there would
+     silently produce a corrupt frame with a wrong length prefix, only
+     surfacing as a decode failure). Cross-check against the independently
+     hand-built wire bytes for the exact same structure, byte for byte. *)
+  Alcotest.(check string) "encodes to the same bytes as the hand-built wire format"
+    (build_nested_map_key_wire_bytes ~depth:20_000) encoded
+
+let test_deeply_nested_map_keys_decode_in_linear_time () =
+  let wire = build_nested_map_key_wire_bytes ~depth:20_000 in
+  let start = Unix.gettimeofday () in
+  ignore (Value.canonical_decode wire);
+  let elapsed = Unix.gettimeofday () -. start in
+  Alcotest.(check bool) "20k-deep nested map key decodes in well under 1s, not 1.6s+"
+    true (elapsed < 1.0)
+
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
    unhandled exception. *)
@@ -312,6 +381,8 @@ let tests =
     ("decode sum", `Quick, test_decode_sum);
     ("decode sequence", `Quick, test_decode_sequence);
     ("decode map", `Quick, test_decode_map);
+    ("20k-deep nested map keys decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
+    ("20k-deep nested map keys encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;

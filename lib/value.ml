@@ -37,75 +37,160 @@ let tag_sum = '\x06'
 let tag_sequence = '\x07'
 let tag_map = '\x08'
 
-let rec encode_into buf v =
+let write_u64_be buf (n : int) =
+  for i = 7 downto 0 do
+    Buffer.add_char buf (Char.chr ((n lsr (8 * i)) land 0xff))
+  done
+
+(* An auxiliary tree, shaped exactly like [value], but where every node
+   additionally carries [size]: the exact byte length [encode_into] below
+   would produce for that node's own subtree. [size_value] computes this
+   bottom-up in a single pass over the input [value] - each node visited,
+   and its size computed from its already-computed children's sizes, EXACTLY
+   ONCE - and [encode_into] then reads [size] as a plain field lookup
+   wherever it needs a subtree's length, rather than ever re-deriving it.
+
+   This exists specifically so [encode_into]'s [Map] case (see there) can
+   write a single-entry key's length prefix without first materializing
+   that key's bytes into a throwaway buffer just to measure them. An
+   earlier version of this fix used a plain [encoded_size : value -> int]
+   function called directly from [encode_into] instead of this precomputed
+   tree - that was still wrong in the same way the original bug was: called
+   once per nesting level on that level's (already large) subtree, it
+   re-walked the entire subtree from scratch at every level, which is
+   O(depth) work repeated at each of O(depth) levels - O(depth^2) again,
+   just moved from byte-copying into size-recomputation. Precomputing once,
+   bottom-up, over the whole tree is the actual fix: every node's size is
+   derived from its children's sizes in O(1), so the whole pass is
+   O(total nodes), independent of how deep any one chain of nesting goes. *)
+type sized_value = { size : int; shape : sized_shape }
+
+and sized_shape =
+  | SScalar of scalar
+  | SRecord of (string * sized_value) list
+  | SSum of string * sized_value
+  | SSequence of sized_value list
+  | SMap of (sized_value * sized_value) list
+
+let rec size_value (v : value) : sized_value =
   match v with
-  | Scalar (Bool b) ->
+  | Scalar s ->
+    let size =
+      match s with
+      | Bool _ -> 2
+      | Int _ | Float _ -> 9
+      | String s -> 9 + String.length s
+      | Bytes b -> 9 + String.length b
+    in
+    { size; shape = SScalar s }
+  | Record fields ->
+    let sized = List.map (fun (k, v) -> (k, size_value v)) fields in
+    let size = 9 + List.fold_left (fun acc (k, sv) -> acc + 8 + String.length k + sv.size) 0 sized in
+    { size; shape = SRecord sized }
+  | Sum (tag, v) ->
+    let sv = size_value v in
+    { size = 9 + String.length tag + sv.size; shape = SSum (tag, sv) }
+  | Sequence items ->
+    let sized = List.map size_value items in
+    let size = 9 + List.fold_left (fun acc sv -> acc + sv.size) 0 sized in
+    { size; shape = SSequence sized }
+  | Map entries ->
+    let sized = List.map (fun (k, v) -> (size_value k, size_value v)) entries in
+    let size = 9 + List.fold_left (fun acc (sk, sv) -> acc + 8 + sk.size + sv.size) 0 sized in
+    { size; shape = SMap sized }
+
+let rec encode_into buf (sv : sized_value) =
+  match sv.shape with
+  | SScalar (Bool b) ->
     Buffer.add_char buf tag_scalar_bool;
     Buffer.add_char buf (if b then '\x01' else '\x00')
-  | Scalar (Int i) ->
+  | SScalar (Int i) ->
     Buffer.add_char buf tag_scalar_int;
     for shift = 56 downto 0 do
       if shift mod 8 = 0 then
         Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical i shift) 0xffL)))
     done
-  | Scalar (Float f) ->
+  | SScalar (Float f) ->
     Buffer.add_char buf tag_scalar_float;
     let bits = Int64.bits_of_float f in
     for shift = 56 downto 0 do
       if shift mod 8 = 0 then
         Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits shift) 0xffL)))
     done
-  | Scalar (String s) ->
+  | SScalar (String s) ->
     Buffer.add_char buf tag_scalar_string;
     buf_add_len_prefixed buf s
-  | Scalar (Bytes b) ->
+  | SScalar (Bytes b) ->
     Buffer.add_char buf tag_scalar_bytes;
     buf_add_len_prefixed buf b
-  | Record fields ->
+  | SRecord fields ->
     Buffer.add_char buf tag_record;
     let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
-    let count = List.length sorted in
-    for i = 7 downto 0 do
-      Buffer.add_char buf (Char.chr ((count lsr (8 * i)) land 0xff))
-    done;
+    write_u64_be buf (List.length sorted);
     List.iter
-      (fun (k, v) ->
+      (fun (k, sv) ->
          buf_add_len_prefixed buf k;
-         encode_into buf v)
+         encode_into buf sv)
       sorted
-  | Sum (tag, v) ->
+  | SSum (tag, sv) ->
     Buffer.add_char buf tag_sum;
     buf_add_len_prefixed buf tag;
-    encode_into buf v
-  | Sequence items ->
+    encode_into buf sv
+  | SSequence items ->
     Buffer.add_char buf tag_sequence;
-    let count = List.length items in
-    for i = 7 downto 0 do
-      Buffer.add_char buf (Char.chr ((count lsr (8 * i)) land 0xff))
-    done;
+    write_u64_be buf (List.length items);
     List.iter (encode_into buf) items
-  | Map entries ->
+  | SMap entries ->
     Buffer.add_char buf tag_map;
-    let encoded_entries = List.map (fun (k, v) ->
-        let kb = Buffer.create 16 in
-        encode_into kb k;
-        (Buffer.contents kb, v))
-        entries
-    in
-    let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
-    let count = List.length sorted in
-    for i = 7 downto 0 do
-      Buffer.add_char buf (Char.chr ((count lsr (8 * i)) land 0xff))
-    done;
-    List.iter
-      (fun (kbytes, v) ->
-         buf_add_len_prefixed buf kbytes;
-         encode_into buf v)
-      sorted
+    write_u64_be buf (List.length entries);
+    (match entries with
+     | [] -> ()
+     | [ (sk, sv) ] ->
+       (* Exactly one entry: there is nothing to sort (a single-element
+          order is already "sorted" by definition), so this key can be
+          written straight into [buf] - length prefix from [sk.size]
+          (already computed by [size_value], a plain field read, no bytes
+          touched here), then the key's own bytes via a direct
+          [encode_into buf sk] - instead of the general multi-entry path
+          below, which must materialize full key bytes into a throwaway
+          per-entry buffer to compare them. That materialize-then-discard
+          buffer is exactly the shape that turned quadratic with nesting
+          depth for a chain of single-entry Map keys (each level's *entire*
+          already-built accumulated bytes gets copied out via
+          [Buffer.contents] and copied in again via [Buffer.add_string] at
+          every level above it - the same doubling that made
+          [decode_value]'s old [String.sub]-and-recurse-into-the-copy
+          approach quadratic, just on the write side instead of the read
+          side). Writing directly here means every byte of a deep
+          single-entry chain is written to its final position exactly
+          once, giving O(depth) instead of O(depth^2). *)
+       write_u64_be buf sk.size;
+       encode_into buf sk;
+       encode_into buf sv
+     | _ :: _ :: _ ->
+       (* Two or more entries genuinely need their full encoded key bytes to
+          determine sort order, so this path still materializes each key
+          via its own buffer - that cost is bounded by the sibling keys' own
+          sizes at this one level, not compounded across nesting depth,
+          since it only runs once per Map node reached, not once per
+          ancestor above every node. *)
+       let encoded_entries = List.map (fun (sk, sv) ->
+           let kb = Buffer.create sk.size in
+           encode_into kb sk;
+           (Buffer.contents kb, sv))
+           entries
+       in
+       let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
+       List.iter
+         (fun (kbytes, sv) ->
+            buf_add_len_prefixed buf kbytes;
+            encode_into buf sv)
+         sorted)
 
 let canonical_encode v =
-  let buf = Buffer.create 64 in
-  encode_into buf v;
+  let sv = size_value v in
+  let buf = Buffer.create sv.size in
+  encode_into buf sv;
   Buffer.contents buf
 
 (* ---- Decoding ----
@@ -123,36 +208,43 @@ let canonical_encode v =
    section is [Invalid_argument], matching this module's established
    convention (see [hash_to_hex]). *)
 
+(* Every reader below takes an explicit [bound]: the exclusive end offset
+   into [s] that the *current* decode is allowed to see, which is [String.length
+   s] for a top-level decode but a narrower, key-blob-local end offset while
+   decoding a [Map] key in place (see [decode_value]'s [Map] case) — a
+   nested decode must never be able to read past its own bound and "borrow"
+   bytes that actually belong to the outer stream, even though those bytes
+   are still physically present (and in-bounds for [s] itself) beyond it. *)
+
 (* Reads an 8-byte big-endian length/count prefix at [pos] and validates it
-   against the bytes actually remaining in [s] after the prefix itself —
-   this one check covers both "truncated prefix" (fewer than 8 bytes left
-   to read the prefix from) and "claimed length/count exceeds remaining
-   input" (the prefix decodes fine but names more bytes/entries than [s]
-   could possibly contain). [what] is used only to make the raised message
-   descriptive (e.g. "string length", "record field count").
+   against the bytes actually remaining before [bound] after the prefix
+   itself — this one check covers both "truncated prefix" (fewer than 8
+   bytes left before [bound] to read the prefix from) and "claimed
+   length/count exceeds remaining input" (the prefix decodes fine but names
+   more bytes/entries than are available before [bound]). [what] is used
+   only to make the raised message descriptive (e.g. "string length",
+   "record field count").
    The intermediate accumulation is done in [Int64] specifically so a
    maliciously large 8-byte prefix (top bit set, or otherwise unrepresentable
    as a native non-negative [int]) is rejected by the [v64 < 0L] / [v64 >
    Int64.of_int remaining] comparisons themselves, rather than silently
    wrapping into some smaller (and wrong) native [int] first. *)
-let read_len_prefix s pos ~what =
-  let n = String.length s in
-  if pos + 8 > n then invalid_arg (Printf.sprintf "canonical_decode: truncated %s length prefix" what);
+let read_len_prefix s pos ~bound ~what =
+  if pos + 8 > bound then invalid_arg (Printf.sprintf "canonical_decode: truncated %s length prefix" what);
   let v64 = ref 0L in
   for i = 0 to 7 do
     v64 := Int64.logor (Int64.shift_left !v64 8) (Int64.of_int (Char.code s.[pos + i]))
   done;
   let pos = pos + 8 in
-  let remaining = n - pos in
+  let remaining = bound - pos in
   if !v64 < 0L || !v64 > Int64.of_int remaining then
     invalid_arg (Printf.sprintf "canonical_decode: %s length %Ld exceeds remaining input (%d bytes)" what !v64 remaining);
   (Int64.to_int !v64, pos)
 
 (* Reads a raw 8-byte big-endian [int64] payload (used for [Int] and
    [Float], whose bit pattern is stored verbatim per [encode_into]). *)
-let read_i64_payload s pos ~what =
-  let n = String.length s in
-  if pos + 8 > n then invalid_arg (Printf.sprintf "canonical_decode: truncated %s" what);
+let read_i64_payload s pos ~bound ~what =
+  if pos + 8 > bound then invalid_arg (Printf.sprintf "canonical_decode: truncated %s" what);
   let v = ref 0L in
   for i = 0 to 7 do
     v := Int64.logor (Int64.shift_left !v 8) (Int64.of_int (Char.code s.[pos + i]))
@@ -166,13 +258,12 @@ let read_i64_payload s pos ~what =
 let read_bytes_exact s pos len =
   (String.sub s pos len, pos + len)
 
-let rec decode_value s pos =
-  let n = String.length s in
-  if pos >= n then invalid_arg "canonical_decode: unexpected end of input (expected a value tag byte)";
+let rec decode_value s pos ~bound =
+  if pos >= bound then invalid_arg "canonical_decode: unexpected end of input (expected a value tag byte)";
   let tag = s.[pos] in
   let pos = pos + 1 in
   if tag = tag_scalar_bool then begin
-    if pos >= n then invalid_arg "canonical_decode: truncated bool payload";
+    if pos >= bound then invalid_arg "canonical_decode: truncated bool payload";
     let v =
       match s.[pos] with
       | '\x00' -> false
@@ -182,82 +273,86 @@ let rec decode_value s pos =
     (Scalar (Bool v), pos + 1)
   end
   else if tag = tag_scalar_int then
-    let i, pos = read_i64_payload s pos ~what:"int payload" in
+    let i, pos = read_i64_payload s pos ~bound ~what:"int payload" in
     (Scalar (Int i), pos)
   else if tag = tag_scalar_float then
-    let bits, pos = read_i64_payload s pos ~what:"float payload" in
+    let bits, pos = read_i64_payload s pos ~bound ~what:"float payload" in
     (Scalar (Float (Int64.float_of_bits bits)), pos)
   else if tag = tag_scalar_string then
-    let len, pos = read_len_prefix s pos ~what:"string" in
+    let len, pos = read_len_prefix s pos ~bound ~what:"string" in
     let str, pos = read_bytes_exact s pos len in
     (Scalar (String str), pos)
   else if tag = tag_scalar_bytes then
-    let len, pos = read_len_prefix s pos ~what:"bytes" in
+    let len, pos = read_len_prefix s pos ~bound ~what:"bytes" in
     let b, pos = read_bytes_exact s pos len in
     (Scalar (Bytes b), pos)
   else if tag = tag_record then
-    let count, pos = read_len_prefix s pos ~what:"record field count" in
+    let count, pos = read_len_prefix s pos ~bound ~what:"record field count" in
     let rec loop i pos acc =
       if i = 0 then (List.rev acc, pos)
       else
-        let klen, pos = read_len_prefix s pos ~what:"record field key" in
+        let klen, pos = read_len_prefix s pos ~bound ~what:"record field key" in
         let k, pos = read_bytes_exact s pos klen in
-        let v, pos = decode_value s pos in
+        let v, pos = decode_value s pos ~bound in
         loop (i - 1) pos ((k, v) :: acc)
     in
     let fields, pos = loop count pos [] in
     (Record fields, pos)
   else if tag = tag_sum then
-    let tlen, pos = read_len_prefix s pos ~what:"sum tag" in
+    let tlen, pos = read_len_prefix s pos ~bound ~what:"sum tag" in
     let t, pos = read_bytes_exact s pos tlen in
-    let v, pos = decode_value s pos in
+    let v, pos = decode_value s pos ~bound in
     (Sum (t, v), pos)
   else if tag = tag_sequence then
-    let count, pos = read_len_prefix s pos ~what:"sequence element count" in
+    let count, pos = read_len_prefix s pos ~bound ~what:"sequence element count" in
     let rec loop i pos acc =
       if i = 0 then (List.rev acc, pos)
       else
-        let v, pos = decode_value s pos in
+        let v, pos = decode_value s pos ~bound in
         loop (i - 1) pos (v :: acc)
     in
     let items, pos = loop count pos [] in
     (Sequence items, pos)
   else if tag = tag_map then
-    let count, pos = read_len_prefix s pos ~what:"map entry count" in
+    let count, pos = read_len_prefix s pos ~bound ~what:"map entry count" in
     let rec loop i pos acc =
       if i = 0 then (List.rev acc, pos)
       else
         (* The asymmetry vs. Record: a Map entry's key is stored as a
            length-prefixed blob containing the key's OWN recursively
            encoded bytes (see [encode_into]'s [Map] case), not encoded
-           inline the way a Record field name is. So: read a
-           length-prefixed blob from the OUTER stream, then recursively
-           decode THAT blob (from position 0, requiring it to be consumed
-           exactly) back into a [value] — never decode the key directly
-           from the outer stream. *)
-        let kblob_len, pos = read_len_prefix s pos ~what:"map key blob" in
-        let kblob, pos = read_bytes_exact s pos kblob_len in
-        let k = decode_value_exact kblob in
-        let v, pos = decode_value s pos in
+           inline the way a Record field name is. Previously this blob was
+           [String.sub]-copied out of [s] and then recursively decoded from
+           position 0 of the copy — at nesting depth N that copies the
+           (already-copied) inner N-1 levels again at every level, making
+           both time and simultaneously-live memory O(N^2) in the nesting
+           depth. Instead: read only the blob's length, decode the key
+           directly against the OUTER buffer [s] starting at the current
+           position, bounding that nested decode to end exactly at
+           [kblob_end] (never bound - the tighter of the two, so a nested
+           decode can never read past either its own key blob or the
+           overall input) — no copy, no allocation proportional to nesting
+           depth. Requiring the nested decode to land on exactly
+           [kblob_end] (not merely `<= kblob_end`) is what makes this
+           equivalent to the old "decode the blob and require it fully
+           consumed" check: trailing garbage inside a key blob (a key blob
+           claiming more bytes than one complete encoded value needs) is
+           exactly as invalid as trailing garbage after the top-level input
+           (see [canonical_decode] below). *)
+        let kblob_len, pos = read_len_prefix s pos ~bound ~what:"map key blob" in
+        let kblob_end = pos + kblob_len in
+        let k, kpos = decode_value s pos ~bound:kblob_end in
+        if kpos <> kblob_end then invalid_arg "canonical_decode: trailing bytes after map key value";
+        let v, pos = decode_value s kblob_end ~bound in
         loop (i - 1) pos ((k, v) :: acc)
     in
     let entries, pos = loop count pos [] in
     (Map entries, pos)
   else invalid_arg (Printf.sprintf "canonical_decode: unknown tag byte 0x%02x" (Char.code tag))
 
-(* Decodes a complete value from [blob] and requires every byte of [blob]
-   to be consumed — used for Map keys, whose blob must contain exactly one
-   recursively-encoded value and nothing else (trailing garbage inside a
-   key blob is exactly as invalid as trailing garbage after the top-level
-   input, see [canonical_decode] below). *)
-and decode_value_exact blob =
-  let v, pos = decode_value blob 0 in
-  if pos <> String.length blob then invalid_arg "canonical_decode: trailing bytes after map key value";
-  v
-
 let canonical_decode s =
   if String.length s = 0 then invalid_arg "canonical_decode: empty input";
-  let v, pos = decode_value s 0 in
+  let v, pos = decode_value s 0 ~bound:(String.length s) in
   if pos <> String.length s then invalid_arg "canonical_decode: trailing bytes after decoded value";
   v
 
