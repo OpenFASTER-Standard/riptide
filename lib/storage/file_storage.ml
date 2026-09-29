@@ -576,3 +576,40 @@ let superblock_write t data = Array.iter (fun h -> write_superblock_copy t h dat
 let superblock_read t =
   let verified = List.filter_map (read_superblock_copy t) (Array.to_list t.superblocks) in
   List.find_opt (fun x -> List.length (List.filter (String.equal x) verified) >= 2) verified
+
+(* Task 13 (audit-remediation): the repair action for {!Riptide_vsr.Replica.restart}'s own
+   fail-stop guard -- see [storage_intf.ml]'s own doc comment on [superblock_rebuild_from_wal] for
+   the full contract and the field-by-field reasoning behind what gets reconstructed. Two
+   implementation notes specific to THIS backend:
+
+   - The WAL scan is [recover_highest_op_number] itself, called fresh here rather than trusting
+     [t.highest_op_number] -- that field should already agree (nothing touches the ring between a
+     lost superblock and this call), but a fresh scan costs nothing extra and does not depend on
+     that agreement continuing to hold.
+   - The reconstructed bytes are encoded with the exact field names and shapes
+     {!Riptide_vsr.Replica}'s own [superblock_encode] uses ([commit_number], [last_normal_view],
+     [op_number], [view_number], each a [Value.Int]), via {!Riptide.Value.canonical_encode} --
+     DUPLICATED here, not shared, because [riptide_storage] cannot depend on [riptide_vsr] (the
+     real dependency runs the other way: [riptide_vsr] depends on [riptide_storage]). If
+     [Replica]'s own superblock schema ever changes, this encoding must change with it by hand;
+     nothing enforces that mechanically beyond [test_vsr_replica_recovery.ml]'s own end-to-end
+     test, which drives the result of this exact function through a real
+     {!Riptide_vsr.Replica.restart} rather than merely checking that [superblock_read] returns
+     [Some]. *)
+let superblock_rebuild_from_wal t =
+  if superblock_read t <> None then
+    invalid_arg
+      "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over an \
+       already-usable superblock";
+  let op_number = recover_highest_op_number t in
+  let int_field name i = (name, Riptide.Value.Scalar (Riptide.Value.Int (Int64.of_int i))) in
+  let data =
+    Riptide.Value.canonical_encode
+      (Riptide.Value.Record
+         [ int_field "commit_number" 0;
+           int_field "last_normal_view" 0;
+           int_field "op_number" op_number;
+           int_field "view_number" 0
+         ])
+  in
+  superblock_write t data

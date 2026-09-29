@@ -260,3 +260,15 @@ let for_test_lose_superblock (T r) =
   let module U = (val r.module_) in
   U.superblock_write r.value torn_superblock_marker;
   r.superblock_lost <- true
+
+(* Task 13: delegates straight to the wrapped backend's own implementation, including its own
+   precondition guard -- see [storage_intf.ml]'s doc comment on [superblock_rebuild_from_wal] for
+   the full contract. Clearing [superblock_lost] afterward keeps this wrapper's own masking in
+   sync with reality: [U]'s call either raised (leaving both sides exactly as they were) or
+   succeeded, in which case the wrapped backend is readable again for real and this wrapper must
+   stop masking it -- the same "an untorn write repairs a previously torn one" property
+   [superblock_write] above already documents. *)
+let superblock_rebuild_from_wal (T r) =
+  let module U = (val r.module_) in
+  U.superblock_rebuild_from_wal r.value;
+  r.superblock_lost <- false

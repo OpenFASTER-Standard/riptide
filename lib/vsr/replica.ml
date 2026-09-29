@@ -915,6 +915,15 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    It is the same failure shape this branch already accepts, deliberately, for the pinned
    ring-capacity finding: stop rather than destroy.
 
+   TASK 13 (audit-remediation): "whatever rebuilds the superblock" above used to name no actual
+   entry point -- this guard could detect the state and refuse, but nothing existed to repair it,
+   so a replica caught here stayed down permanently even though its WAL had everything needed to
+   recover. {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal} (concretely,
+   {!Riptide_storage.File_storage.superblock_rebuild_from_wal} for a real deployment) is that
+   entry point now: call it on the same backend, then retry this constructor. The message below
+   names it by name for exactly this reason -- an operator hitting this state in a log should not
+   have to go spelunking through this comment to learn what to run.
+
    The guard is conditioned on the WAL, not on the superblock alone, and that is load-bearing:
    an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
    still yield exactly [create]'s [Init] state -- otherwise [restart] stops being usable as a
@@ -928,8 +937,10 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
        refusing to start. Coming up with op_number = 0 over a WAL that still holds entries would \
        make this replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack \
        quorum turns into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is \
-       intact and untouched; recovering this replica needs the superblock rebuilt or the backend \
-       discarded wholesale, neither of which restart can decide on its own.";
+       intact and untouched; recovering this replica needs the superblock rebuilt (Task 13: call \
+       this backend's own Storage_intf.S.superblock_rebuild_from_wal, e.g. \
+       Riptide_storage.File_storage.superblock_rebuild_from_wal, then retry Replica.restart) or \
+       the backend discarded wholesale, neither of which restart can decide on its own.";
   let view_number, last_normal_view, op_number, commit_number =
     match durable with
     | Some (v, lnv, n, k) -> (v, lnv, n, k)

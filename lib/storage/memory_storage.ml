@@ -46,6 +46,32 @@ let wal_highest_op_number t = t.highest
 let superblock_write t data = t.superblock <- Some data
 let superblock_read t = t.superblock
 
+(* Task 13: the same repair action as [File_storage.superblock_rebuild_from_wal] -- see that
+   module's own comment, and [storage_intf.ml]'s shared doc comment on
+   [superblock_rebuild_from_wal], for the full field-by-field contract and reasoning. Trivial
+   here, by construction: this backend keeps [t.highest] as a live in-memory counter already
+   (there is no separate on-disk WAL to re-scan), and it has no torn-superblock-write failure mode
+   of its own -- the only way [t.superblock] is ever [None] with a non-empty WAL here is the
+   [for_test_lose_superblock] hook below. Same precondition, same conservative-zero fields, same
+   postcondition as [File_storage]'s version: [superblock_read] returns [Some] of a record
+   {!Riptide_vsr.Replica.restart} can actually use afterward. *)
+let superblock_rebuild_from_wal t =
+  if superblock_read t <> None then
+    invalid_arg
+      "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over an \
+       already-usable superblock";
+  let int_field name i = (name, Riptide.Value.Scalar (Riptide.Value.Int (Int64.of_int i))) in
+  let data =
+    Riptide.Value.canonical_encode
+      (Riptide.Value.Record
+         [ int_field "commit_number" 0;
+           int_field "last_normal_view" 0;
+           int_field "op_number" t.highest;
+           int_field "view_number" 0
+         ])
+  in
+  superblock_write t data
+
 let for_test_corrupt t ~op_number =
   if op_number >= 1 && op_number <= t.highest then Hashtbl.replace t.corrupt op_number ()
 

@@ -451,6 +451,53 @@ let test_superblock_none_without_majority () =
       Alcotest.(check (option string)) "2 of 3 corrupted -- no majority, honest None" None
         (File_storage.superblock_read t2))
 
+(* Task 13: the repair action for the exact state [Riptide_vsr.Replica.restart]'s own fail-stop
+   guard exists to catch -- a superblock unreadable over an otherwise fully intact WAL (final-
+   review finding C1). Matches [test_superblock_none_without_majority]'s own direct-file-
+   corruption pattern above, but tears all 3 copies (not just 2) to put beyond doubt that
+   [superblock_read] genuinely returns [None] before the rebuild is attempted, not merely "no
+   majority from a lucky surviving pair". *)
+let test_superblock_rebuild_recovers_from_an_unreadable_superblock_over_an_intact_wal () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+       for op = 1 to 5 do
+         File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
+       done;
+       File_storage.superblock_write t "some prior superblock content");
+      (* The crash: all 3 superblock copies are torn/destroyed out from under the WAL, which is
+         left completely untouched -- exactly what an ordinary crash partway through
+         [superblock_write]'s 3 sequential, non-atomic copy writes produces on its own. *)
+      List.iter
+        (fun i ->
+          let oc = open_out_bin (Filename.concat dir (Printf.sprintf "superblock-%d" i)) in
+          output_string oc "garbage, wrong length and checksum"; close_out oc)
+        [ 0; 1; 2 ];
+      Eio.Switch.run @@ fun sw ->
+      let t2 = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      Alcotest.(check int) "the WAL survived the torn superblock untouched" 5
+        (File_storage.wal_highest_op_number t2);
+      Alcotest.(check (option string)) "precondition: the superblock really is gone" None
+        (File_storage.superblock_read t2);
+      File_storage.superblock_rebuild_from_wal t2;
+      Alcotest.(check bool) "superblock_read now returns Some" true
+        (Option.is_some (File_storage.superblock_read t2)))
+
+(* The precondition guard: rebuilding must never be allowed to clobber a superblock that is
+   already perfectly readable -- this function exists to REPAIR a lost superblock, never to
+   silently overwrite a good one. *)
+let test_superblock_rebuild_refuses_when_superblock_is_already_readable () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      File_storage.superblock_write t "a perfectly good superblock";
+      Alcotest.check_raises "refuses to rebuild over an already-usable superblock"
+        (Invalid_argument
+           "superblock_rebuild_from_wal: superblock_read is not None -- refusing to rebuild over \
+            an already-usable superblock") (fun () -> File_storage.superblock_rebuild_from_wal t))
+
 (* ============================================================================================
    SUBTASK 3.7: the [?may_evict] eviction gate.
 
@@ -841,6 +888,12 @@ let tests =
     ( "superblock read returns None without a majority (2 of 3 corrupted)",
       `Quick,
       test_superblock_none_without_majority );
+    ( "Task 13: superblock_rebuild_from_wal recovers an unreadable superblock over an intact WAL",
+      `Quick,
+      test_superblock_rebuild_recovers_from_an_unreadable_superblock_over_an_intact_wal );
+    ( "Task 13: superblock_rebuild_from_wal refuses when the superblock is already readable",
+      `Quick,
+      test_superblock_rebuild_refuses_when_superblock_is_already_readable );
     ( "3.7: ?may_evict refuses a genuine eviction, raising the classifiable message",
       `Quick,
       test_may_evict_blocks_a_genuine_eviction );

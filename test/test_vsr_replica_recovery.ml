@@ -547,8 +547,10 @@ let restart_refusal_message =
    to start. Coming up with op_number = 0 over a WAL that still holds entries would make this \
    replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack quorum turns \
    into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is intact and \
-   untouched; recovering this replica needs the superblock rebuilt or the backend discarded \
-   wholesale, neither of which restart can decide on its own."
+   untouched; recovering this replica needs the superblock rebuilt (Task 13: call this backend's \
+   own Storage_intf.S.superblock_rebuild_from_wal, e.g. \
+   Riptide_storage.File_storage.superblock_rebuild_from_wal, then retry Replica.restart) or the \
+   backend discarded wholesale, neither of which restart can decide on its own."
 
 (* A replica with two durable entries, one of them committed, whose superblock then goes missing
    entirely -- [superblock_read] returning [None], the exact shape [File_storage] produces when
@@ -597,6 +599,59 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
   Alcotest.check_raises "an undecodable superblock is refused exactly like a missing one"
     (Invalid_argument restart_refusal_message) (fun () ->
       ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 ()))
+
+(* TASK 13 (audit-remediation): the actual repair action the message above now names by name,
+   proven end-to-end -- not merely that [superblock_read] flips from [None] to [Some] (that is
+   [test_file_storage.ml]'s own, storage-layer-only test), but that the REBUILT superblock is one
+   [Replica.restart] can actually decode and use afterward, over a real, previously-committed log.
+
+   Two durable entries, the first committed, exactly [test_restart_refuses_a_lost_superblock_over_a_non_empty_wal]'s
+   own setup -- then, instead of stopping at the refusal, this test carries the recovery all the
+   way through: [Memory_storage.superblock_rebuild_from_wal], then a SECOND [Replica.restart] that
+   must now succeed. *)
+let test_superblock_rebuild_from_wal_lets_restart_recover_after_the_fail_stop_refusal () =
+  let send, _sent = capturing_send () in
+  let backend, storage = fresh_storage () in
+  let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.handle_message t ~sender:3
+    (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3
+    (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
+  Alcotest.(check int) "precondition: op 1 is committed and durable" 1 (Replica.commit_number t);
+  Alcotest.(check int) "precondition: two durable entries" 2 (Replica.op_number t);
+  Riptide_storage.Memory_storage.for_test_lose_superblock backend;
+  let send2, _sent2 = capturing_send () in
+  let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
+  Alcotest.check_raises "restart still refuses before the repair is applied"
+    (Invalid_argument restart_refusal_message) (fun () ->
+      ignore (Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send2 ~storage:storage2 ()));
+  (* THE REPAIR. *)
+  Riptide_storage.Memory_storage.superblock_rebuild_from_wal backend;
+  Alcotest.(check bool) "the rebuilt superblock is readable again" true
+    (Riptide_storage.Memory_storage.superblock_read backend <> None);
+  let send3, _sent3 = capturing_send () in
+  let storage3 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
+  let t' = Replica.restart ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send:send3 ~storage:storage3 () in
+  (* [op_number] is real, verified WAL knowledge -- fully recovered, not merely "not zero". *)
+  Alcotest.(check int) "op_number recovered in full from the WAL scan" 2 (Replica.op_number t');
+  Alcotest.(check bool) "both entries are readable, not just op_number counted" true
+    (Replica.entries t' = [ v "a"; v "b" ]);
+  (* [commit_number]/[view_number]/[last_normal_view] are NOT recoverable from the WAL alone, so
+     the rebuild deliberately does not guess -- see [storage_intf.ml]'s own doc comment on
+     [superblock_rebuild_from_wal] for why 0 is the safe choice even though op 1 really was
+     committed before the crash: a replica that under-claims relearns via the ordinary protocol
+     (Commit/StartView), which costs liveness, never safety; over-claiming would be unsound. *)
+  Alcotest.(check int) "commit_number is NOT reinvented -- conservative 0, relearned via the protocol"
+    0 (Replica.commit_number t');
+  Alcotest.(check int) "view_number: conservative 0" 0 (Replica.view_number t');
+  Alcotest.(check int) "last_normal_view: conservative 0" 0 (Replica.last_normal_view t');
+  Alcotest.(check bool) "status reconstructs as Normal (view_number <= last_normal_view)" true
+    (Replica.status t' = Replica.Normal);
+  (* And it is a genuinely WORKING replica afterward, not merely a constructed one: it accepts the
+     next Prepare in sequence. *)
+  Replica.handle_message t' ~sender:3
+    (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 1; source = 3 }));
+  Alcotest.(check int) "the next legitimate Prepare is accepted after recovery" 3 (Replica.op_number t')
 
 (* THE OTHER SIDE OF THE GUARD, and the reason it is conditioned on the WAL rather than on the
    superblock alone: first boot. A genuinely empty backend -- no superblock, no WAL -- is not a
@@ -827,6 +882,7 @@ module Raising_backend : Riptide_storage.Storage_intf.S with type t = unit -> un
   let wal_highest_op_number _ = 0
   let superblock_write _ _ = ()
   let superblock_read _ = None
+  let superblock_rebuild_from_wal _ = ()
 end
 
 let test_refusal_storage_fault_out_of_memory_is_counted_as_its_own_shape () =
@@ -954,6 +1010,9 @@ module Flaky_then_memory_backend = struct
   let wal_highest_op_number t = Riptide_storage.Memory_storage.wal_highest_op_number t.underlying
   let superblock_write t s = Riptide_storage.Memory_storage.superblock_write t.underlying s
   let superblock_read t = Riptide_storage.Memory_storage.superblock_read t.underlying
+
+  let superblock_rebuild_from_wal t =
+    Riptide_storage.Memory_storage.superblock_rebuild_from_wal t.underlying
 end
 
 let test_a_storage_fault_clears_and_the_same_op_number_succeeds_on_retry () =
@@ -1000,6 +1059,7 @@ module Unhelpful_backend : Riptide_storage.Storage_intf.S with type t = unit = s
   let wal_highest_op_number () = 0
   let superblock_write () _ = ()
   let superblock_read () = None
+  let superblock_rebuild_from_wal () = ()
 end
 
 let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed () =
@@ -1404,6 +1464,9 @@ let tests =
     ( "C1: a genuinely empty backend still restarts cleanly as Init (first boot keeps working)",
       `Quick,
       test_restart_still_accepts_a_genuinely_empty_backend );
+    ( "Task 13: superblock_rebuild_from_wal lets restart recover after the fail-stop refusal",
+      `Quick,
+      test_superblock_rebuild_from_wal_lets_restart_recover_after_the_fail_stop_refusal );
     ( "I2: a faults_max-exceeded refusal is counted as its own shape",
       `Quick,
       test_refusal_fault_injection_cap_is_counted_as_its_own_shape );

@@ -293,7 +293,12 @@ val restart :
     the log is left exactly as it was found — so whatever rebuilds the superblock (or replaces the
     backend wholesale and lets a [StartView] refill it) still has everything to work from.
     Choosing between those is an operator/deployment decision this constructor deliberately does
-    not make on its caller's behalf.
+    not make on its caller's behalf. {b The former is now a real, callable entry point} (Task 13,
+    audit-remediation): {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal} (concretely
+    {!Riptide_storage.File_storage.superblock_rebuild_from_wal}) reconstructs a fresh, usable
+    superblock from the same backend's own WAL and durably writes it — call it on the SAME
+    backend this constructor was just given, then retry {!restart}. See its own doc comment for
+    exactly what gets reconstructed and why.
 
     {b DURABLE, recovered here} (VSR.tla:592-596): the log (from the WAL), [op_number],
     [commit_number], [view_number], [last_normal_view]. The last two are Decision 4's whole point

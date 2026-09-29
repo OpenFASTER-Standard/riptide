@@ -71,4 +71,42 @@ module type S = sig
   (** [None] if no superblock was ever written, or if fewer than a majority
       of copies agree (see Task 3). *)
   val superblock_read : t -> string option
+
+  (** [superblock_rebuild_from_wal t] reconstructs a fresh, usable superblock purely from
+      whatever this backend can still determine about its own WAL, and durably writes it via
+      {!superblock_write} -- the repair action for the state
+      {!Riptide_vsr.Replica.restart}'s own fail-stop guard exists to catch (audit-remediation
+      Task 13): a superblock unreadable (fewer than a majority of copies verify and agree, or the
+      record does not decode) over a WAL that is otherwise completely intact. A torn superblock
+      write never touches the WAL itself, so nothing durable is actually lost in that state --
+      only the small, separately-stored record a restart needs before it can trust the rest.
+
+      {b Precondition: only callable when [superblock_read t = None].}
+      @raise Invalid_argument if [superblock_read t] already returns [Some] -- this function
+        exists to REPAIR a lost superblock, never to silently overwrite one that is still
+        perfectly good.
+
+      {b Postcondition: [superblock_read t] returns [Some] afterward}, of a record
+      {!Riptide_vsr.Replica.restart} can actually decode and use -- not merely "some bytes".
+
+      {b What gets reconstructed, and why each field is what it is} (this is the one place this
+      contract has to say something about {!Riptide_vsr.Replica}'s own superblock schema, even
+      though this library has no code dependency on [riptide_vsr] -- see
+      {!Riptide_storage.File_storage}'s own [.ml], "Task 13", for the full reasoning and why the
+      encoding is necessarily duplicated rather than shared). The durable WAL is the only source
+      of truth a rebuild has, and it can only speak to [op_number] -- the highest op-number whose
+      header and data both still verify, exactly what a fresh {!Riptide_storage.File_storage.create}
+      already recovers by scanning the same WAL. Every OTHER field a real VSR superblock carries
+      ([view_number], [last_normal_view], [commit_number]) is NOT recoverable from the WAL at all,
+      and guessing wrong at any of them is worse than an honest admission of ignorance -- so each
+      is set to the same conservative value {!Riptide_vsr.Replica.create}'s own [Init] uses, [0],
+      never invented. [commit_number = 0 <= op_number] always holds, so the reconstructed record
+      is unconditionally well-formed; [view_number = last_normal_view = 0] reconstructs as
+      {!Riptide_vsr.Replica.Normal} status, same as first boot. A replica recovered this way is
+      behind on view/commit bookkeeping exactly the way a freshly-caught-up backup is -- it
+      relearns both from the ordinary protocol (a later, higher-view [Start_view], and the normal
+      commit path) -- but it is never WRONG in a direction that could cost safety: it never claims
+      to know a view or a commit it cannot independently prove, and it never discards an
+      op-number it can still verify. *)
+  val superblock_rebuild_from_wal : t -> unit
 end
