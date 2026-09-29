@@ -1961,6 +1961,17 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
    pair of tests is what draws the real boundary of subtask 4.6+4.8's protection, and neither one
    alone states it honestly. *)
 
+(* Task 11 note: the keystore's own [kv] handle (built inside [Redaction_store.create] below) stays
+   live for this whole test -- [store]'s later non-vacuity checks need it -- so the exploit attempt
+   further down, which shares [sw] with it, now collides with {!Riptide_storage.Dir_lock}'s real
+   [flock(2)] BEFORE the [~owner] marker is ever consulted, regardless of which tag it passes. That
+   is a strictly STRONGER guarantee than the tag comparison alone (Task 11's own [.mli] updates
+   explain why: it now also closes the concurrent-handle instance of the "same tag" residual gap,
+   not just the mismatched-tag case this test originally targeted) -- so the expected exception
+   below is now the lock's own message, and the assertion text is updated to say so. The
+   owner-mismatch check itself is directly, separately exercised (with each handle fully released
+   before the next opens, so the lock does not shadow it) by
+   [test_owner_mismatch_is_rejected_at_construction] in [test/test_file_kv_store.ml]. *)
 let test_a_shared_kv_directory_is_rejected_at_construction () =
   Eio_main.run @@ fun env ->
   with_tmp_dir @@ fun shared_dir ->
@@ -1992,12 +2003,17 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
      worth catching.
      Note also that the raise comes from strictly inside [make_materializer]: the [kv] argument is
      evaluated before [Materializer.create] is entered, so no materializer, no decode strategy and
-     no [M.write] ever exists to do damage. *)
+     no [M.write] ever exists to do damage -- true of Task 11's lock rejection here exactly as it
+     was of the tag-mismatch rejection this test originally hit. *)
   Alcotest.check_raises
-    "building a real materializer over the keystore's own directory is rejected at construction"
+    "building a real materializer over the keystore's own directory, while the keystore's own \
+     handle is still live, is rejected at construction (now by Task 11's physical lock, which \
+     fires before either side's owner tag is ever consulted)"
     (Invalid_argument
-       (Printf.sprintf "File_kv_store.create: %s is owned by \"redaction-keystore\", not \
-                         \"materializer\""
+       (Printf.sprintf
+          "File_kv_store.create: %s is already locked by another open handle (a real flock(2), \
+           not this codebase's separate logical owner-tag check -- see Riptide_storage.Dir_lock's \
+           own .mli)"
           shared_dir))
     (fun () -> ignore (make_materializer ~sw ~fs shared_dir));
   (* Non-vacuity: the keystore and the record it already holds are completely untouched by the
@@ -2012,95 +2028,129 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
 
 (* ---------------------------------------------------------------------------------------------
    THE SAME HAZARD, STILL LIVE FOR A PAIR THAT AGREES ON ONE TAG -- the running proof of the
-   residual gap redaction_store.mli and file_kv_store.mli both now disclose in prose: every
-   ownership check this branch added compares two tags, so none of them can see a directory claimed
-   twice under the SAME tag.
+   residual gap redaction_store.mli and file_kv_store.mli both now disclose in prose. Every
+   TAG-based check this branch added compares two tags, so none of them can see a directory claimed
+   twice under the SAME tag -- but Task 11's {!Riptide_storage.Dir_lock} guard is not tag-based at
+   all, and it now closes this gap for the one shape the original version of this test used to
+   demonstrate it with: two handles alive AT THE SAME TIME. A same-tag pair with overlapping
+   lifetimes now collides on the lock itself, before either side's marker is ever consulted --
+   exactly like the different-tag pair in [test_a_shared_kv_directory_is_rejected_at_construction]
+   above.
 
-   Why that state is reachable rather than contrived. [File_kv_store]'s marker mechanism has exactly
-   one legitimate reason to accept a second [create] on a claimed directory -- a subsystem reopening
-   its own store -- and it cannot tell that apart from an unrelated consumer arriving with the same
-   string, because a tag is all the evidence it has. So a copy-pasted [~owner:Redaction_store
-   .owner_tag] (an exported, public constant, which is exactly what makes it easy to reach for), a
-   refactor that unifies two "duplicate" literals, or a caller handed a tag by configuration is
-   enough. Materializer.create adds nothing here: its [~owner] is checked against [KV.owner kv], and
-   the same caller supplies both, so a caller consistent with itself always passes regardless of
-   whether the tag it chose is the right one for its use.
+   {b What is left, and what this test was rewritten (Task 11) to demonstrate instead:} strictly
+   SEQUENTIAL reuse. Each handle below is opened, used, and its switch fully closed (its lock
+   dropped) before the next one opens -- the "reopening my own store" shape the marker mechanism
+   exists to allow at all. [File_kv_store]'s marker has exactly one legitimate reason to accept a
+   [create] on an already-claimed directory once no live handle remains to conflict with -- a
+   subsystem reopening its own store -- and it cannot tell that apart from an unrelated consumer
+   arriving later with the same string, because a tag is all the evidence it has by then. So a
+   copy-pasted [~owner:Redaction_store.owner_tag] (an exported, public constant, which is exactly
+   what makes it easy to reach for), a refactor that unifies two "duplicate" literals, or a caller
+   handed a tag by configuration is enough, provided the two consumers' handles never overlap in
+   time. [Materializer.create] adds nothing here: its [~owner] is checked against [KV.owner kv],
+   and the same caller supplies both, so a caller consistent with itself always passes regardless
+   of whether the tag it chose is the right one for its use.
 
-   Read this as the negative control for [test_a_shared_kv_directory_is_rejected_at_construction]
-   above: same directory-sharing setup, same collision, the only difference being that the
-   materializer side passes the keystore's tag instead of its own -- and the outcome flips from
-   "rejected at construction, data provably intact" back to "silent, total destruction with nothing
-   raising anywhere", even though BOTH sides are correctly, mandatorily tagged. That contrast is
-   what shows the protection comes from the two tags DIFFERING, not from ownership being declared.
-
-   This is a disclosed, out-of-scope limitation of subtask 4.8, not a bug this test is waiting on a
-   fix for: the design spec's own Non-Goals include "No change to the marker-file mechanism", and
-   closing it needs a different mechanism entirely (per-consumer key prefixes, or exclusivity
-   enforced somewhere other than a tag both sides supply). Both directions of the destruction are
-   asserted below, exactly as this file's original, pre-guard reproduction did.
-   --------------------------------------------------------------------------------------------- *)
+   This narrower gap is a disclosed, out-of-scope limitation of subtask 4.8 (unchanged by Task 11):
+   the design spec's own Non-Goals include "No change to the marker-file mechanism", and closing it
+   needs a different mechanism entirely (per-consumer key prefixes, or some persistent, not merely
+   handle-lifetime-scoped, exclusivity record). Both directions of the destruction are asserted
+   below, exactly as this file's original, pre-guard reproduction did -- just reached sequentially,
+   across several fully-closed-then-reopened handles, rather than through several live at once. *)
 
 let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () =
   Eio_main.run @@ fun env ->
   with_tmp_dir @@ fun shared_dir ->
-  Eio.Switch.run @@ fun sw ->
   let fs = Eio.Stdenv.fs env in
-  let store =
-    Redaction_store.create
-      ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir)
-      ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32))
+  let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+  (* Shared by the materializer views built in phases 2 and 3 below -- bound once so both phases
+     agree on exactly the same round-trip, matching [make_same_tag_lenient_materializer]'s own
+     lenient [decode] (bottom, not a raise, for bytes it cannot parse -- see this file's own
+     comment on that helper for why that choice is what makes the collision silent). *)
+  let decode_lenient s =
+    try G_set.of_value (Riptide.Value.canonical_decode s) with Invalid_argument _ -> G_set.bottom
   in
-  let replica = create_solo () in
-  let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
-  Batch_commit.propose replica ~idempotency_key:"k1" ~encryption:(enc_sink store) [ write_of payload ];
-  let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
-  Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0" event_id;
-  Alcotest.(check bool) "the record really is recoverable before the collision" true
-    (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload
-    = Some (canonical payload));
-  (* FIRST HALF OF THE FINDING: both consumers construct FINE over the one shared directory. The
-     marker already holds this tag, so [File_kv_store.create] treats the second claim as a reopen;
-     [M.create]'s own check then compares that tag against the identical one passed here. Nothing
-     raises, and a usable materializer exists over the keystore's own key space. *)
-  let mat = make_same_tag_lenient_materializer ~sw ~fs shared_dir in
-  Alcotest.(check (list string))
-    "the materializer is fully constructed and reads its own (empty) accumulator" []
-    (G_set.elements (M.read mat ~merge_key:"some-unrelated-key"));
-  (* DIRECTION 1, the silent one: an ordinary materialized write whose [merge_key] happens to equal
-     that [event_id]. Not a redaction, not a fault, not an error -- and with a total [decode], not
-     even a raise. *)
-  M.write mat ~merge_key:event_id (G_set.of_list [ "innocent-accumulator-value" ]);
+  let encode_g g = Riptide.Value.canonical_encode (G_set.to_value g) in
+  let colliding_key = "2:k2#0" in
+  (* PHASE 1 (its own switch, closed at the end): the keystore alone, over a fresh directory. *)
+  let event_id, envelope, replica =
+    Eio.Switch.run @@ fun sw ->
+    let store =
+      Redaction_store.create
+        ~kv:(File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir)
+        ~kek
+    in
+    let replica = create_solo () in
+    let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
+    Batch_commit.propose replica ~idempotency_key:"k1" ~encryption:(enc_sink store)
+      [ write_of payload ];
+    let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
+    Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0"
+      event_id;
+    Alcotest.(check bool) "the record really is recoverable before the collision" true
+      (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload
+      = Some (canonical payload));
+    (event_id, envelope, replica)
+  in
+  (* PHASE 2 (its own switch, closed at the end): the keystore's handle from phase 1 is now fully
+     released (its lock dropped), so this second consumer -- built with the SAME owner tag --
+     constructs FINE, exactly as a legitimate reopen would: the marker already holds this tag, so
+     [File_kv_store.create] treats the claim as a reopen, and [M.create]'s own check compares that
+     tag against the identical one passed here. Nothing raises, and a usable materializer exists
+     over the keystore's own key space. *)
+  let accumulator_bytes_before =
+    Eio.Switch.run @@ fun sw ->
+    let kv = File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir in
+    let mat =
+      M.create ~kv ~owner:Redaction_store.owner_tag ~decode:decode_lenient ~encode:encode_g
+    in
+    Alcotest.(check (list string))
+      "the materializer is fully constructed and reads its own (empty) accumulator" []
+      (G_set.elements (M.read mat ~merge_key:"some-unrelated-key"));
+    (* DIRECTION 1, the silent one: an ordinary materialized write whose [merge_key] happens to
+       equal that [event_id]. Not a redaction, not a fault, not an error -- and with a total
+       [decode], not even a raise. The consequence (the keystore's record becomes unreadable) is
+       checked in phase 3 below, once the keystore itself is reopened -- durably true the instant
+       this [M.write] returns, whether or not anything reopens the keystore to notice. *)
+    M.write mat ~merge_key:event_id (G_set.of_list [ "innocent-accumulator-value" ]);
+    Alcotest.(check (list string)) "while the accumulator write itself succeeded normally"
+      [ "innocent-accumulator-value" ]
+      (G_set.elements (M.read mat ~merge_key:event_id));
+    Alcotest.(check int) "and the committed log still holds the (now unopenable) record" 1
+      (List.length (Batch_commit.committed_envelopes replica));
+    (* DIRECTION 2's setup, silent in the other direction and true for ANY [decode]: the
+       keystore's own [put] never reads first, so encrypting a record whose derived [event_id]
+       collides with an EXISTING [merge_key] overwrites that accumulator with wrapped-DEK bytes,
+       with no error and no read (asserted once the keystore is reopened, in phase 3).
+
+       One [merge_key] literal, bound once above and used for this write and every later read, so
+       the collision cannot be broken on one side only: desyncing it from the [event_id] "k2"
+       derives would make the "silently gone" assertion in phase 3 pass vacuously against a
+       never-written key instead of for real. *)
+    M.write mat ~merge_key:colliding_key (G_set.of_list [ "accumulated-before-the-collision" ]);
+    (* Reads the raw stored bytes directly off [kv] -- the same handle [mat] itself is built on,
+       not a separate, third simultaneously-live handle the way the pre-Task-11 version of this
+       test used (that shape is exactly what the lock now forbids) -- so the emptiness asserted in
+       phase 3 can be told apart from the emptiness of a key that was never written. *)
+    let accumulator_bytes = File_kv_store.get kv ~key:colliding_key in
+    Alcotest.(check bool) "the accumulator's own encoding really is on disk first" true
+      (accumulator_bytes <> None);
+    Alcotest.(check (list string)) "the accumulator really does hold that value first"
+      [ "accumulated-before-the-collision" ]
+      (G_set.elements (M.read mat ~merge_key:colliding_key));
+    accumulator_bytes
+  in
+  (* PHASE 3 (its own switch): both keystore and materializer views reopened fresh, over the same
+     SAME-tag-claimed directory, once more proving the reopen is legitimate-looking regardless of
+     which of the two logical consumers is doing it -- then the collision's full, silent damage
+     (both directions) is confirmed against what is actually durable on disk. *)
+  Eio.Switch.run @@ fun sw ->
+  let kv = File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir in
+  let store = Redaction_store.create ~kv ~kek in
+  let mat = M.create ~kv ~owner:Redaction_store.owner_tag ~decode:decode_lenient ~encode:encode_g in
   Alcotest.(check bool)
     "the encrypted record is now permanently unreadable, and nothing raised to say so" true
     (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = None);
-  (* Non-vacuity, and the reason this is silent rather than merely destructive: everything else
-     looks perfectly healthy afterwards. The accumulator holds exactly what it was asked to hold,
-     and the committed log is untouched -- the loss is indistinguishable from a deliberate
-     redaction of that one record. *)
-  Alcotest.(check (list string)) "while the accumulator write itself succeeded normally"
-    [ "innocent-accumulator-value" ]
-    (G_set.elements (M.read mat ~merge_key:event_id));
-  Alcotest.(check int) "and the committed log still holds the (now unopenable) record" 1
-    (List.length (Batch_commit.committed_envelopes replica));
-  (* DIRECTION 2, silent in the other direction and true for ANY [decode]: the keystore's own [put]
-     never reads first, so encrypting a record whose derived [event_id] collides with an EXISTING
-     [merge_key] overwrites that accumulator with wrapped-DEK bytes, with no error and no read.
-
-     One [merge_key] literal, bound once and used for the write and both reads, so the collision
-     cannot be broken on one side only: desyncing it from the [event_id] "k2" derives makes the
-     "silently gone" assertion below fail rather than pass vacuously against a never-written key. *)
-  let colliding_key = "2:k2#0" in
-  M.write mat ~merge_key:colliding_key (G_set.of_list [ "accumulated-before-the-collision" ]);
-  (* A third handle on the same directory -- accepted for exactly the reason under test, the tag
-     matches -- used only to read the raw stored bytes, so the emptiness asserted below can be told
-     apart from the emptiness of a key that was never written. *)
-  let inspect = File_kv_store.create ~sw ~fs ~owner:Redaction_store.owner_tag shared_dir in
-  let accumulator_bytes = File_kv_store.get inspect ~key:colliding_key in
-  Alcotest.(check bool) "the accumulator's own encoding really is on disk first" true
-    (accumulator_bytes <> None);
-  Alcotest.(check (list string)) "the accumulator really does hold that value first"
-    [ "accumulated-before-the-collision" ]
-    (G_set.elements (M.read mat ~merge_key:colliding_key));
   Batch_commit.propose replica ~idempotency_key:"k2" ~encryption:(enc_sink store)
     [ write_of (secret_payload_with "RIPTIDE-COLLISION-VICTIM-2") ];
   Alcotest.(check (list string))
@@ -2109,11 +2159,11 @@ let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () 
   (* Non-vacuity for that emptiness specifically: [] here is the LENIENT [decode] of bytes that are
      still very much present -- a wrapped DEK -- not the [bottom] of a key with nothing at it.
      Asserted against the raw stored bytes, through the store rather than through the lattice. *)
-  let after_bytes = File_kv_store.get inspect ~key:colliding_key in
+  let accumulator_bytes_after = File_kv_store.get kv ~key:colliding_key in
   Alcotest.(check bool) "the key was overwritten, not deleted -- bytes are still there" true
-    (after_bytes <> None);
+    (accumulator_bytes_after <> None);
   Alcotest.(check bool) "...and they are no longer the accumulator's own encoding" true
-    (after_bytes <> accumulator_bytes);
+    (accumulator_bytes_after <> accumulator_bytes_before);
   Alcotest.(check bool) "...while that record itself decrypts perfectly well" true
     (Redaction_store.decrypt_value store ~event_id:colliding_key
        (List.assoc colliding_key (Batch_commit.committed_envelopes_keyed replica))

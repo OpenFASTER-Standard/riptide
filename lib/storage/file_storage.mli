@@ -50,6 +50,18 @@ val create :
     (currently 4096 bytes), since each slot holds exactly one entry's data, zero-padded to the
     slot's fixed size.
 
+    {b Task 11: a real, OS-level lock, not merely this module's own file-open calls.} [create]
+    takes a real [flock(2)] on [dir_path] (via {!Riptide_storage.Dir_lock.acquire}) before opening
+    any of its own files, held for the returned [t]'s entire lifetime.
+
+    @raise Invalid_argument immediately, before touching any file this module itself manages, if
+      [dir_path] is already locked by another live handle -- this process's own, from an earlier
+      [create] of the same directory that hasn't gone out of scope yet, or a genuinely different
+      OS process's. This is a PHYSICAL guard against concurrent construction, independent of
+      anything a caller above this module tracks logically; see
+      {!Riptide_storage.Dir_lock}'s own [.mli] for the full rationale and how it differs from
+      {!Riptide_storage.File_kv_store.create}'s [~owner] marker.
+
     {2 [?may_evict] — the caller's veto over an eviction}
 
     [?may_evict] makes the silent data loss described above {e refusable} rather than merely

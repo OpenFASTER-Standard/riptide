@@ -1,3 +1,6 @@
 (library
  (name riptide_storage)
- (libraries riptide riptide_sim eio eio.unix eio_linux uring optint))
+ (libraries riptide riptide_sim eio eio.unix eio_linux uring optint)
+ (foreign_stubs
+  (language c)
+  (names riptide_flock_stubs)))

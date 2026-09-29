@@ -87,6 +87,17 @@
    not required to reproduce the above evidence, but costs nothing to keep as a safety net for
    filesystems this box's own mounts don't happen to cover.
 
+   {b Task 11: [create] now takes a real, OS-level lock on [dir_path].} Before this, nothing
+   stopped two genuinely separate OS processes from both legitimately constructing a [t] over the
+   SAME directory at once and silently interleaving writes -- the audit that produced this task
+   reproduced it live (26-31% of WAL entries left permanently unreadable, and in one run an
+   unrecoverable superblock). {!Riptide_storage.Dir_lock.acquire} takes a real [flock(2)] on a
+   dedicated [.riptide-lock] file in [dir_path], held for [t]'s entire lifetime and released when
+   its switch finishes; a second [create] against an already-locked directory raises
+   [Invalid_argument] immediately, before touching any of this module's own files. See that
+   module's own [.mli] for the full rationale, including why this is a PHYSICAL guard and not a
+   substitute for any logical guard a caller layers on top.
+
    {b Everything below this point is carried over verbatim from Task 1's own experiment trail
    (still true, unchanged by the ring rewrite):}
 
@@ -121,6 +132,14 @@ type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_c
 
 type t = {
   sw : Eio.Switch.t;
+  lock : Eio_unix.Fd.t;
+      (* Task 11: a real, OS-level [flock(2)] on the directory, held for [t]'s entire lifetime via
+         [sw] and released automatically when [sw] finishes -- see {!Riptide_storage.Dir_lock}'s
+         own [.mli] for the full rationale (in particular why this is a PHYSICAL guard against
+         concurrent processes/handles, separate from and in addition to any logical guard a
+         caller layers on top). Never read again after [create] stores it here; the field exists
+         only so the lock's lifetime is visibly tied to [t]'s own, the same as [ring]/[superblocks]
+         below. *)
   ring : file_handle;
   ring_capacity : int;
   mutable highest_op_number : int;
@@ -350,13 +369,21 @@ let recover_highest_op_number t =
    decision impossible to inherit by accident. *)
 let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
+  (* Task 11: the physical guard, taken as early as possible -- strictly before this call opens
+     any of ITS OWN files ([ring]/superblocks) -- so a second [create] racing a live handle over
+     the same directory is refused before it can touch anything, not merely before it returns a
+     usable [t]. See {!Riptide_storage.Dir_lock}'s own [.mli] for why this does not replace any
+     logical guard a caller layers on top; [File_storage] itself has no logical owner-tag
+     mechanism of its own (unlike {!Riptide_storage.File_kv_store}), so this is its only
+     construction-time guard against a shared directory. *)
+  let lock = Dir_lock.acquire ~sw ~caller:"File_storage.create" dir_path in
   let ring = open_file_handle ~sw (Filename.concat dir_path ring_file_name) in
   let superblocks =
     Array.init superblock_copies (fun i ->
         open_file_handle ~sw (Filename.concat dir_path (superblock_file_name i)))
   in
   let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
-  let t = { sw; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
+  let t = { sw; lock; ring; ring_capacity; highest_op_number = 0; pool; superblocks; may_evict } in
   t.highest_op_number <- recover_highest_op_number t;
   t
 

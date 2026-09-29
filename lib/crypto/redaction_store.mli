@@ -98,31 +98,50 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     any consumer, requires a real owner tag, and a directory can no longer be pointed at without
     one.
 
-    {b A REAL, STILL-OPEN RESIDUAL GAP, stated plainly rather than claimed closed.} Every check
-    described above catches only a MISMATCHED tag. Two consumers sharing one directory under the
-    SAME owner tag -- this keystore and a {!Riptide_materialize.Materializer} both built with
-    [~owner:owner_tag], whether through copy-paste, a refactor, or a caller talked into agreeing on
-    one tag -- pass every check this codebase performs: the marker file matches, so
-    {!Riptide_storage.File_kv_store.create} succeeds for both, and each consumer's own
+    {b A REAL, STILL-OPEN RESIDUAL GAP, stated plainly rather than claimed closed -- narrowed by
+    Task 11, not eliminated.} Every check described above catches only a MISMATCHED tag. Two
+    consumers sharing one directory under the SAME owner tag -- this keystore and a
+    {!Riptide_materialize.Materializer} both built with [~owner:owner_tag], whether through
+    copy-paste, a refactor, or a caller talked into agreeing on one tag -- pass every TAG-based
+    check this codebase performs: the marker file matches, so each consumer's own
     construction-time owner check ([create] above, and
-    {!Riptide_materialize.Materializer.Make.create}) sees the tag it expects. Both [t]s then come
-    into existence over one shared, flat key space and destroy each other's data exactly as
-    silently and exactly as completely as before any of these guards existed. So the three
-    consequences below are a live description of what such a pair still does today -- not a
-    historical record of something construction-time rejection replaced.
+    {!Riptide_materialize.Materializer.Make.create}) sees the tag it expects.
 
-    This is a disclosed, deliberately out-of-scope limitation of subtask 4.8 rather than an
-    oversight (the design spec's own Non-Goals: "No change to the marker-file mechanism"). A single
-    per-directory owner tag structurally cannot distinguish "my own store reopening" from "an
-    unrelated consumer that happens to use my tag"; closing it needs a different mechanism --
-    per-consumer key prefixes, or directory exclusivity enforced somewhere other than a tag both
-    sides supply -- and is not attempted here.
+    {b What Task 11 changed:} {!Riptide_storage.File_kv_store.create} now also takes a real,
+    OS-level {!Riptide_storage.Dir_lock} (a [flock(2)]) on the directory, strictly before the
+    marker check, and holds it for as long as the resulting [t] stays alive. If the two consumers'
+    [t]s are ever SIMULTANEOUSLY live -- the shape every consequence below, and both tests backing
+    it, originally reproduced -- the second [File_kv_store.create] now raises [Invalid_argument]
+    from the lock itself, before the marker is ever consulted, regardless of whether the tags
+    match. That closes the concurrent-handle instance of this gap for real, not merely for the
+    mismatched-tag case the marker alone could already catch.
+
+    {b What is still open:} strictly SEQUENTIAL reuse -- one consumer's [t] fully released (its
+    switch finished, its lock dropped) before the other's [create] runs. Neither guard can see that
+    shape: the lock's scope is a live handle's own lifetime, and the marker cannot tell "my own
+    store reopening" apart from "an unrelated consumer that happens to use my tag" once there is no
+    live handle left to conflict with. Both [t]s then come into existence, one after the other,
+    over one shared, flat key space, and destroy each other's data exactly as silently and exactly
+    as completely as before any of these guards existed -- so the three consequences below are
+    still a live description of what such a pair does today, just no longer reachable through two
+    handles alive at once.
+
+    This narrower gap is a disclosed, deliberately out-of-scope limitation of subtask 4.8 rather
+    than an oversight (the design spec's own Non-Goals: "No change to the marker-file mechanism").
+    A single per-directory owner tag structurally cannot distinguish "my own store reopening" from
+    "an unrelated consumer that happens to use my tag" once no live handle is around to physically
+    conflict; closing it needs a different mechanism -- per-consumer key prefixes, or some
+    persistent (not merely handle-lifetime-scoped) exclusivity record -- and is not attempted here.
 
     Both sides of that boundary are backed by running code in
-    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof): a
-    DIFFERENT-tag pair is rejected at construction with this keystore's data provably intact
-    ([test_a_shared_kv_directory_is_rejected_at_construction]), while a SAME-tag pair constructs
-    cleanly on both sides and then silently destroys a wrapped DEK
+    [test/test_lattice_materialize_crypto_scenarios.ml] (Task 9's end-to-end proof, restructured by
+    Task 11 so each handle involved is fully released before the next opens -- otherwise Task 11's
+    own lock, not the scenario under test, would be what raises): a DIFFERENT-tag pair is rejected
+    at construction with this keystore's data provably intact
+    ([test_a_shared_kv_directory_is_rejected_at_construction], now via the lock itself, which fires
+    before the tags are ever compared -- see that test's own updated comment), while a SAME-tag
+    pair, each handle opened only after the previous one has fully closed, still constructs cleanly
+    on both sides and then silently destroys a wrapped DEK
     ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek], which pins the
     first and third consequences below -- both silent directions). The second consequence is the
     same collision with a partial [decode] and is described here without a dedicated test of its

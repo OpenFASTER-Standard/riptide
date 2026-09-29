@@ -625,6 +625,82 @@ let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
         (Invalid_argument "wal_append: eviction blocked for op_number 1")
         (fun () -> File_storage.wal_append t2 ~op_number:3 "c"))
 
+(* Task 11: the PHYSICAL guard -- a real [flock(2)] on the target directory, held for the whole
+   lifetime of the handle [create] returns, closing a real, live-reproduced Critical finding (two
+   genuinely separate OS processes both constructing a store over the same directory at once could
+   silently interleave writes and corrupt data at the filesystem level; the audit measured 26-31%
+   of WAL entries left permanently unreadable). See [Riptide_storage.Dir_lock]'s own [.mli] for the
+   full rationale, including why this is a real [flock(2)] rather than [Unix.lockf] (POSIX [fcntl]
+   locks, which would NOT conflict against a second [Unix.openfile] from the SAME process -- the
+   exact shape the test right below needs to observe a conflict for). *)
+let expected_lock_message ~caller dir =
+  Invalid_argument
+    (Printf.sprintf
+       "%s: %s is already locked by another open handle (a real flock(2), not this codebase's \
+        separate logical owner-tag check -- see Riptide_storage.Dir_lock's own .mli)"
+       caller dir)
+
+let test_a_second_create_on_a_locked_directory_is_refused () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let (_ : File_storage.t) = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir in
+      Alcotest.check_raises
+        "a second create on the same directory, while the first handle is still live, is refused \
+         immediately"
+        (expected_lock_message ~caller:"File_storage.create" dir)
+        (fun () -> ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir)))
+
+(* Stronger evidence than the same-process double-handle above: a REAL second OS process, forked
+   BEFORE this test's [Eio_main.run] even starts (so there is no live io_uring/epoll state for the
+   child to inherit into an unsafe mid-flight condition -- the child never touches Eio at all, only
+   plain blocking [Unix] calls), mirroring exactly the shape the audit itself used to reproduce the
+   underlying corruption: two genuinely separate OS processes against the same directory. The child
+   takes the real lock via the SAME C symbol [Dir_lock] itself calls (declared locally here, not
+   exposed by [Dir_lock]'s own [.mli] -- an [external] only needs the C symbol name to match, not
+   the declaring module, so this does not require weakening that module's public interface for a
+   test). *)
+external test_only_flock_exclusive_nonblocking : Unix.file_descr -> bool
+  = "riptide_flock_exclusive_nonblocking"
+
+let test_a_real_second_os_process_holding_the_lock_is_refused () =
+  with_tmp_dir (fun dir ->
+      (try Unix.mkdir dir 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      let lock_path = Filename.concat dir ".riptide-lock" in
+      let ready_r, ready_w = Unix.pipe () in
+      let release_r, release_w = Unix.pipe () in
+      match Unix.fork () with
+      | 0 ->
+        (* Child: hold a real flock(2) on the exact lock file [File_storage.create] itself would
+           open, then wait to be told to let go. Never touches Eio, Alcotest, or anything else
+           belonging to the parent's own test bookkeeping -- exits via [Unix._exit], never a plain
+           [exit], so no parent-side [at_exit] (including Alcotest's own reporting) runs twice. *)
+        Unix.close ready_r;
+        Unix.close release_w;
+        let fd = Unix.openfile lock_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+        if not (test_only_flock_exclusive_nonblocking fd) then Unix._exit 1;
+        ignore (Unix.write ready_w (Bytes.of_string "1") 0 1);
+        ignore (Unix.read release_r (Bytes.create 1) 0 1);
+        Unix._exit 0
+      | child_pid ->
+        Unix.close ready_w;
+        Unix.close release_r;
+        Fun.protect
+          ~finally:(fun () ->
+            (try ignore (Unix.write release_w (Bytes.of_string "1") 0 1) with Unix.Unix_error _ -> ());
+            ignore (Unix.waitpid [] child_pid))
+          (fun () ->
+            let n = Unix.read ready_r (Bytes.create 1) 0 1 in
+            Alcotest.(check int) "the child process actually acquired the real lock first" 1 n;
+            Eio_main.run (fun env ->
+                Eio.Switch.run @@ fun sw ->
+                Alcotest.check_raises
+                  "a create from THIS process is refused immediately while a genuinely different \
+                   OS process holds the real flock"
+                  (expected_lock_message ~caller:"File_storage.create" dir)
+                  (fun () ->
+                    ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity dir)))))
+
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
@@ -692,4 +768,10 @@ let tests =
     ( "3.7: ?may_evict after a reopen gates against the recovered highest_op_number",
       `Quick,
       test_may_evict_applies_after_a_reopen_against_the_recovered_op_number );
+    ( "Task 11: a second create on an already-locked directory is refused immediately",
+      `Quick,
+      test_a_second_create_on_a_locked_directory_is_refused );
+    ( "Task 11: a create is refused while a REAL second OS process holds the real flock",
+      `Quick,
+      test_a_real_second_os_process_holding_the_lock_is_refused );
   ]

@@ -87,6 +87,12 @@ type file_handle = { path : string; mutable fd : Eio_unix.Fd.t; mutable direct_c
 
 type t = {
   sw : Eio.Switch.t;
+  lock : Eio_unix.Fd.t;
+      (* Task 11: a real, OS-level [flock(2)] on [dir_path], held for [t]'s entire lifetime via
+         [sw] and released automatically when [sw] finishes -- see
+         {!Riptide_storage.Dir_lock}'s own [.mli] for the full rationale, in particular why this
+         is a PHYSICAL guard that exists ALONGSIDE, not instead of, [owner]/[check_or_write_owner_marker]
+         below (a purely LOGICAL guard). Never read again after [create] stores it here. *)
   fs : Eio.Fs.dir_ty Eio.Path.t;
   dir_path : string;
   owner : string;
@@ -366,11 +372,15 @@ let durable_read t path =
    ownership -- subtask 4.6's construction-time fix for a confirmed, real data-destruction bug:
    sharing one [dir_path] between a [Redaction_store] keystore and a [Materializer] accumulator
    silently destroys data in three distinct ways. It catches a MISMATCHED tag only: a shared
-   directory claimed twice under the SAME tag still destroys data exactly as before, which
-   [test_lattice_materialize_crypto_scenarios.ml] pins as a running negative control
-   ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]) alongside the
-   different-tag rejection this mechanism does catch. See [redaction_store.mli]'s own [create] doc
-   comment for the full account of both. Named
+   directory claimed twice under the SAME tag still destroys data, exactly as before, {b for two
+   handles that never overlap in time} -- Task 11's {!Riptide_storage.Dir_lock} guard (run strictly
+   before this function, see [create] above) now catches the same-tag case too whenever a second
+   [create] is attempted while an earlier handle over [dir_path] is still live, which is what
+   [test_lattice_materialize_crypto_scenarios.ml]'s own negative control
+   ([test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]) demonstrates by
+   fully releasing each handle before the next one opens -- the only shape of same-tag collision
+   left standing. See [redaction_store.mli]'s own [create] doc comment for the full account of
+   both guards and the boundary between them. Named
    with a leading dot so [Eio.Path.read_dir] callers (none exist on this store today, but the
    convention is cheap) don't confuse it for a real key file -- real key files are always exactly
    64 lowercase hex characters ([path_for]'s [hash_to_hex] output), which this name can never
@@ -413,9 +423,19 @@ let create ~sw ~fs ~owner dir_path =
   if String.length owner = 0 then
     invalid_arg "File_kv_store.create: ~owner must be a non-empty tag";
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
+  (* Task 11: the PHYSICAL guard, taken as early as possible -- strictly before the LOGICAL
+     owner-marker check below, and before anything else this module manages. A directory already
+     locked by a live handle is refused immediately regardless of what tag the new caller passes,
+     the same "reject before doing anything else" precedence [~owner:""] already gets above. See
+     {!Riptide_storage.Dir_lock}'s own [.mli] for why this closes the concurrent-handle instance
+     of the "same tag, still destroys data" residual gap [check_or_write_owner_marker] alone
+     leaves open (still real for two handles that never overlap in time -- see that function's own
+     doc comment). *)
+  let lock = Dir_lock.acquire ~sw ~caller:"File_kv_store.create" dir_path in
   check_or_write_owner_marker ~fs ~dir_path owner;
   {
     sw;
+    lock;
     fs;
     dir_path;
     owner;
