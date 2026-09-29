@@ -425,8 +425,11 @@ let test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for
   let replica_count = 3 in
   let replicas = Array.make replica_count None in
   let silent_send ~to_:_ (_ : string) = () in
+  (* Only ever installed as replica 1's (the primary's) own [~send] -- see
+     test_batch_commit.ml's own identical pattern for why [~sender:1] is real here, not a
+     placeholder. *)
   let primary_send ~to_ bytes =
-    match replicas.(to_ - 1) with Some r -> Replica.handle_message r bytes | None -> ()
+    match replicas.(to_ - 1) with Some r -> Replica.handle_message r ~sender:1 bytes | None -> ()
   in
   replicas.(0) <-
     Some

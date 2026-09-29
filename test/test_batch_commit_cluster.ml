@@ -83,10 +83,17 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
                   Eio.Switch.run (fun replica_sw ->
                       stop_fns.(i) <- Some (fun () -> Eio.Switch.fail replica_sw Replica_stopped);
                       let rec dispatch_loop () =
-                        (* [_sender] (the authenticated sender [receive] now also reports) is not
-                           yet consumed here -- see [transport_intf.ml]. *)
-                        let msg, _sender = Sim_transport.receive handles.(i) in
-                        Replica.handle_message replica msg;
+                        (* [sender] is [receive]'s own authenticated-sender report (Task 1),
+                           consumed by [handle_message]'s new sender cross-check (Task 3): every
+                           message in this test file is a genuine, non-adversarial delivery, so
+                           [sender] always matches the message's own claimed sender and this check
+                           is a no-op in practice here -- but a mismatch is a real, expected
+                           [Invalid_argument] (see replica.mli), so this loop absorbs it exactly
+                           like [Cluster.run]'s own dispatch loop does, to stay total. *)
+                        let msg, sender = Sim_transport.receive handles.(i) in
+                        (match Replica.handle_message replica ~sender msg with
+                        | () -> ()
+                        | exception Invalid_argument _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

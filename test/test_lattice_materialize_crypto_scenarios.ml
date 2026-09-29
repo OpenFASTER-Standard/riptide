@@ -374,7 +374,10 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
   (* Every byte any replica ever hands to the transport: real encoded VSR messages carrying real
      committed batch values. The application-level half of (d). *)
   let sent_bytes = Buffer.create 65536 in
-  let inflight : (int * string) Queue.t = Queue.create () in
+  (* [inflight]'s middle element is the SENDING replica's own id -- each replica's [~send] closure
+     below closes over its own [i + 1], playing the role a real transport's authenticated
+     connection plays for [handle_message]'s new [~sender] cross-check (Task 3). *)
+  let inflight : (int * int * string) Queue.t = Queue.create () in
   let replicas =
     Array.init replica_count (fun i ->
         let storage =
@@ -384,7 +387,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
         in
         Replica.create ~storage ~my_id:(i + 1) ~replica_count ~svc_limit:3 ~send:(fun ~to_ bytes ->
             Buffer.add_string sent_bytes bytes;
-            Queue.add (to_, bytes) inflight) ())
+            Queue.add (to_, i + 1, bytes) inflight) ())
   in
   (* Same pin, for the same reason, as every cluster harness in this repo (see
      test_redaction.ml's own [with_store_and_cluster]): at view 0 the primary would be
@@ -396,10 +399,10 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
 
   let deliver ~drop_probability =
     while not (Queue.is_empty inflight) do
-      let to_, bytes = Queue.pop inflight in
+      let to_, sender, bytes = Queue.pop inflight in
       if Riptide_sim.Prng.bool prng drop_probability then
         result := { !result with messages_dropped = !result.messages_dropped + 1 }
-      else Replica.handle_message replicas.(to_ - 1) bytes
+      else Replica.handle_message replicas.(to_ - 1) ~sender bytes
     done
   in
 
@@ -786,7 +789,9 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
   with_tmp_dir @@ fun mat_root ->
   Eio.Switch.run @@ fun sw ->
   let fs = Eio.Stdenv.fs env in
-  let inflight : (int * string) Queue.t = Queue.create () in
+  (* [inflight]'s middle element is the SENDING replica's own id -- see the identical pattern's own
+     comment earlier in this file (Task 3's [~sender] cross-check). *)
+  let inflight : (int * int * string) Queue.t = Queue.create () in
   let fault_storages =
     Array.init replica_count (fun i ->
         Fault_injecting_storage.create
@@ -800,7 +805,7 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
         Replica.create
           ~storage:(Replica.storage_of_module (module Fault_injecting_storage) fault_storages.(i))
           ~my_id:(i + 1) ~replica_count ~svc_limit:3
-          ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight) ())
+          ~send:(fun ~to_ bytes -> Queue.add (to_, i + 1, bytes) inflight) ())
   in
   Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
   let primary = replicas.(0) in
@@ -812,8 +817,8 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
   in
   let deliver () =
     while not (Queue.is_empty inflight) do
-      let to_, bytes = Queue.pop inflight in
-      Replica.handle_message replicas.(to_ - 1) bytes
+      let to_, sender, bytes = Queue.pop inflight in
+      Replica.handle_message replicas.(to_ - 1) ~sender bytes
     done
   in
   let propose_batch n =
@@ -1047,7 +1052,9 @@ let with_watermark_cluster ~env ~sw ~wiring f =
       rm_rf wal_root;
       rm_rf mat_root)
   @@ fun () ->
-  let inflight : (int * string) Queue.t = Queue.create () in
+  (* [inflight]'s middle element is the SENDING replica's own id -- see this file's other, identical
+     harnesses' own comment (Task 3's [~sender] cross-check). *)
+  let inflight : (int * int * string) Queue.t = Queue.create () in
   let asks = ref [] in
   let watermarks = Array.init replica_count (fun _ -> ref 0) in
   let stalled = Array.init replica_count (fun _ -> ref false) in
@@ -1109,7 +1116,7 @@ let with_watermark_cluster ~env ~sw ~wiring f =
           Replica.create ?on_commit_advanced
             ~storage:(Replica.storage_of_module (module File_storage) storages.(i))
             ~my_id:(i + 1) ~replica_count ~svc_limit:3
-            ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight)
+            ~send:(fun ~to_ bytes -> Queue.add (to_, i + 1, bytes) inflight)
             ()
         in
         slots.(i) := Some r;
@@ -1144,9 +1151,9 @@ let with_watermark_cluster ~env ~sw ~wiring f =
   let tap = ref [] in
   let deliver () =
     while not (Queue.is_empty inflight) do
-      let to_, bytes = Queue.pop inflight in
+      let to_, sender, bytes = Queue.pop inflight in
       tap := (to_, bytes) :: !tap;
-      Replica.handle_message replicas.(to_ - 1) bytes
+      Replica.handle_message replicas.(to_ - 1) ~sender bytes
     done
   in
   let propose n =
@@ -1474,7 +1481,7 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
      all over again, leaving the identical traceless no-op. Without this, "the retry succeeded"
      would be equally consistent with the gate having become inert. *)
   ctx.wm_watermarks.(follower) := watermark_at_stall;
-  Replica.handle_message follower_r prepare_bytes;
+  Replica.handle_message follower_r ~sender:1 prepare_bytes;
   Alcotest.(check int)
     "negative control: redelivered to a consumer still behind, the SAME bytes are refused again"
     (refusals_before_retry + 1)
@@ -1487,7 +1494,7 @@ let test_a_followers_ring_eviction_is_gated_by_its_own_watermark () =
   let refusals_before_retry = refusal_count follower_r "eviction_blocked" in
   let asks_before_retry = List.length !(ctx.wm_asks) in
   (* THE RETRY: byte-identical redelivery, one message, no other stimulus. *)
-  Replica.handle_message follower_r prepare_bytes;
+  Replica.handle_message follower_r ~sender:1 prepare_bytes;
   ctx.wm_deliver () (* let the [Prepare_ok] it now sends reach the primary, as normal *);
   Alcotest.(check bool)
     (Printf.sprintf

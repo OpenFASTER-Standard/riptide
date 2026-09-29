@@ -942,7 +942,9 @@ let propose t (v : Value.value) =
       Replica_log.append t.log ~op_number:n v;
       t.op_number <- n;
       persist_superblock t;
-      let bytes = Message.encode (Message.Prepare { view = t.view_number; n; v; k = t.commit_number }) in
+      let bytes =
+        Message.encode (Message.Prepare { view = t.view_number; n; v; k = t.commit_number; source = t.my_id })
+      in
       for peer = 1 to t.replica_count do
         if peer <> t.my_id then t.send ~to_:peer bytes
       done;
@@ -1478,7 +1480,10 @@ let try_send_sv t =
                  View_change], so reaching this point IS a real View_change -> Normal transition. *);
               t.status <- Normal (* VSR.tla:510 *);
               persist_superblock t;
-              let bytes = Message.encode (Message.Start_view { v = t.view_number; log = new_log; n = l; k = new_k }) in
+              let bytes =
+                Message.encode
+                  (Message.Start_view { v = t.view_number; log = new_log; n = l; k = new_k; source = t.my_id })
+              in
               (* VSR.tla:512-513's own [Broadcast(..., r)] -- every OTHER replica, never self
                  (VSR.tla:177's [replicas \ {source}]). *)
               for peer = 1 to t.replica_count do
@@ -1810,15 +1815,55 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
        direction the model was never checked against. Do not "fix" it. *)
   end
 
-let handle_message t (bytes : string) =
+(* Every message type's claimed sender, cross-checked against [~sender] -- the
+   transport-authenticated identity of whoever actually holds the connection these [bytes] arrived
+   on (Task 1's [Transport_intf.S.receive : t -> string * int], threaded through by every real
+   caller; see cluster.ml's dispatch loop). [source] on [Prepare]/[Start_view] and [i] on
+   [Prepare_ok]/[Start_view_change]/[Do_view_change] are otherwise just payload bytes an adversary
+   who does NOT control the authenticated connection could still write -- so a mismatch here is
+   proof the sender is lying about who it is, not routine protocol noise (an out-of-order [n], a
+   stale [view]) the rest of this module already drops silently. Checked BEFORE any
+   message-type-specific logic runs (mirroring [classify_append_refusal]'s own "guard failure before
+   mutation" discipline), by raising [Invalid_argument] -- a genuinely different signal from every
+   in-dispatch guard below, which stays a silent no-op: those guards reject well-attributed but
+   protocol-stale messages (the normal, expected cost of an unreliable network), while THIS guard
+   rejects a message whose very identity claim cannot be trusted, which callers should be able to
+   observe/log/count as a security event rather than have it vanish the same way a merely-late
+   Prepare does. See replica.mli's own doc comment on [handle_message] for the full rationale and
+   {!Riptide_dst.Cluster}'s dispatch loop for how a caller stays total in the face of it. *)
+let handle_message t ~(sender : int) (bytes : string) =
   match Message.decode bytes with
   | exception Message.Malformed_message _ -> ()
-  | Message.Prepare { view; n; v; k } -> handle_prepare t ~view ~n ~v ~k
-  | Message.Prepare_ok { view; n; i } -> handle_prepare_ok t ~view ~n ~i
-  | Message.Start_view_change { v; i } -> handle_start_view_change t ~v ~i
+  | Message.Prepare { view; n; v; k; source } ->
+    if source <> sender then
+      invalid_arg
+        (Printf.sprintf "handle_message: Prepare claims source %d but the transport-authenticated sender is %d"
+           source sender)
+    else handle_prepare t ~view ~n ~v ~k
+  | Message.Prepare_ok { view; n; i } ->
+    if i <> sender then
+      invalid_arg
+        (Printf.sprintf "handle_message: PrepareOk claims i %d but the transport-authenticated sender is %d" i
+           sender)
+    else handle_prepare_ok t ~view ~n ~i
+  | Message.Start_view_change { v; i } ->
+    if i <> sender then
+      invalid_arg
+        (Printf.sprintf "handle_message: StartViewChange claims i %d but the transport-authenticated sender is %d" i
+           sender)
+    else handle_start_view_change t ~v ~i
   | Message.Do_view_change { v; entries; nacks; last_normal_view; n; k; i } ->
-    handle_do_view_change t ~v ~entries ~nacks ~last_normal_view ~n ~k ~i
-  | Message.Start_view { v; log; n; k } -> handle_start_view t ~v ~log ~n ~k
+    if i <> sender then
+      invalid_arg
+        (Printf.sprintf "handle_message: DoViewChange claims i %d but the transport-authenticated sender is %d" i
+           sender)
+    else handle_do_view_change t ~v ~entries ~nacks ~last_normal_view ~n ~k ~i
+  | Message.Start_view { v; log; n; k; source } ->
+    if source <> sender then
+      invalid_arg
+        (Printf.sprintf "handle_message: StartView claims source %d but the transport-authenticated sender is %d"
+           source sender)
+    else handle_start_view t ~v ~log ~n ~k
 
 (* ---- Test-support surface (continued): read-only views of the two view-change accumulators ----
    [recv_dvc]/[recv_svc] are private, and the protocol itself never needs to expose them -- but

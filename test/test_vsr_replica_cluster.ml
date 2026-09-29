@@ -142,11 +142,17 @@ let with_cluster ?(replica_count = default_replica_count)
                    message, dispatch it, repeat -- the exact shape replica.mli's own doc comment
                    sketches. Never returns on its own; torn down via Eio.Switch.fail below. *)
                 let rec dispatch_loop () =
-                  (* [_sender] (the authenticated sender [receive] now also reports) is not yet
-                     consumed here -- see [transport_intf.ml]; cross-checking it against the
-                     message's own claimed identity is a later task's job. *)
-                  let msg, _sender = Sim_transport.receive handles.(i) in
-                  Replica.handle_message replica msg;
+                  (* [sender] is [receive]'s own authenticated-sender report (Task 1), consumed by
+                     [handle_message]'s new sender cross-check (Task 3). Every message this test
+                     file's clusters produce is a genuine, non-adversarial delivery, so [sender]
+                     always matches the message's own claimed sender and the check is a no-op in
+                     practice -- but a real mismatch is now an [Invalid_argument] (see
+                     replica.mli), so this loop absorbs it, matching Cluster.run's own dispatch
+                     loop, to stay total. *)
+                  let msg, sender = Sim_transport.receive handles.(i) in
+                  (match Replica.handle_message replica ~sender msg with
+                  | () -> ()
+                  | exception Invalid_argument _ -> ());
                   dispatch_loop ()
                 in
                 dispatch_loop ()))

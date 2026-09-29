@@ -48,8 +48,8 @@ let test_truncate_wal_below_commit_number_is_rejected () =
   (* A backup at view 0 (Primary(0) = 3 at replica_count = 3), driven to op_number = 2 /
      commit_number = 1 by two real Prepares. *)
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Alcotest.(check int) "op_number = 2 after two Prepares" 2 (Replica.op_number t);
   Alcotest.(check int) "commit_number = 1 after two Prepares" 1 (Replica.commit_number t);
   Alcotest.check_raises "truncate below commit_number is rejected"
@@ -85,10 +85,10 @@ let test_out_of_range_nack_is_a_total_no_op () =
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   Alcotest.(check bool) "this replica is Primary(5) at replica_count = 3" true (Replica.is_primary t);
   (* Non-positive nacks: op-numbers are 1-indexed (VSR.tla's [ops == 1..MaxOp]). *)
-  Replica.handle_message t (dvc_msg ~v:5 ~entries:[] ~nacks:[ 0 ] ~last_normal_view:2 ~n:0 ~k:0 ~i:1);
-  Replica.handle_message t (dvc_msg ~v:5 ~entries:[] ~nacks:[ -7 ] ~last_normal_view:2 ~n:0 ~k:0 ~i:1);
+  Replica.handle_message t ~sender:1 (dvc_msg ~v:5 ~entries:[] ~nacks:[ 0 ] ~last_normal_view:2 ~n:0 ~k:0 ~i:1);
+  Replica.handle_message t ~sender:1 (dvc_msg ~v:5 ~entries:[] ~nacks:[ -7 ] ~last_normal_view:2 ~n:0 ~k:0 ~i:1);
   (* A nack AT or BELOW the sender's own op-number: contradicts its own [n]. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[ 2 ] ~last_normal_view:2 ~n:2 ~k:1 ~i:1);
   Alcotest.(check (list int)) "every malformed-nack DVC was dropped wholesale" []
     (Replica.for_test_recv_dvc_senders t);
@@ -98,7 +98,7 @@ let test_out_of_range_nack_is_a_total_no_op () =
   (* A nack far outside any real log range is NOT malformed (it is above the sender's own [n],
      so the sender really can prove it absent) -- it must be accepted and then be provably inert,
      never crash or index anything. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[] ~nacks:[ 1_000_000_000 ] ~last_normal_view:2 ~n:0 ~k:0 ~i:1);
   Alcotest.(check (list int)) "the huge-but-valid nack DVC is accepted" [ 1 ]
     (Replica.for_test_recv_dvc_senders t);
@@ -119,16 +119,16 @@ let test_dvc_quorum_counts_distinct_senders_not_messages () =
   (* Sender 1 speaks twice, exactly as a mid-view-change restart makes it: first with both
      entries readable, then (after a slot faulted to corrupt) with only one. Two DISTINCT
      records, one replica. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:1);
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:1);
   Alcotest.(check (list int)) "one sender, one entry" [ 1 ] (Replica.for_test_recv_dvc_senders t);
   Alcotest.(check bool) "no StartView: two messages from ONE replica are not an f+1 = 2 quorum" true
     (sent () = []);
   Alcotest.(check bool) "still in View_change" true (Replica.status t = Replica.View_change);
   (* A genuinely different sender completes the real quorum of 2 distinct senders. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:3);
   Alcotest.(check bool) "completed once TWO DISTINCT senders reported" true (Replica.status t = Replica.Normal);
   Alcotest.(check bool) "and the completion carries both entries" true (Replica.entries t = [ v "a"; v "b" ])
@@ -145,12 +145,12 @@ let test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it () =
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* Sender 1: the WINNER by (last_normal_view, n) -- n = 3 -- but it can only READ ops 1 and 2
      (op 3's slot is corrupt on its disk), so op 3 is neither fillable nor, yet, proven absent. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5
        ~entries:[ (1, v "a"); (2, v "b") ]
        ~nacks:[] ~last_normal_view:2 ~n:3 ~k:0 ~i:1);
   (* Sender 3: n = 2, so it proves ops 3.. absent. One nack is below the f+1 = 2 quorum. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:3);
   Alcotest.(check (list int)) "an f+1 = 2 DVC quorum has been reached" [ 1; 3 ]
     (Replica.for_test_recv_dvc_senders t);
@@ -158,7 +158,7 @@ let test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it () =
   Alcotest.(check bool) "still View_change" true (Replica.status t = Replica.View_change);
   (* This replica's own DVC (VSR.tla:262-263's "including itself"): n = 2, the second nack for
      op 3, which reaches the f+1 = 2 nack quorum and makes op 3 PROVEN ABSENT. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:2
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:2);
   Alcotest.(check bool) "the sequence completes once op 3 is proven absent" true (Replica.status t = Replica.Normal);
   Alcotest.(check int) "CompletionPoint is 2 -- the longest admissible log" 2 (Replica.op_number t);
@@ -166,7 +166,8 @@ let test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it () =
     (Replica.entries t = [ v "a"; v "b" ]);
   Alcotest.(check bool) "the truncation is durable too" true (Replica.for_test_wal_read t ~op_number:3 = None);
   Alcotest.(check bool) "StartView carries the completed log"
-    (List.for_all (fun (_, m) -> m = Message.Start_view { v = 5; log = [ v "a"; v "b" ]; n = 2; k = 0 })
+    (List.for_all
+       (fun (_, m) -> m = Message.Start_view { v = 5; log = [ v "a"; v "b" ]; n = 2; k = 0; source = 2 })
        (decoded_sent sent))
     true
 
@@ -181,9 +182,9 @@ let test_forfeit_view_change_when_quorum_cannot_complete () =
   let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* The same permanently-contested shape as above, minus the resolving third DVC. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[ (1, v "a"); (2, v "b") ] ~nacks:[] ~last_normal_view:2 ~n:3 ~k:0 ~i:1);
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:(full_entries [ v "a"; v "b" ]) ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:3);
   Alcotest.(check bool) "wedged: quorum held, nothing sent" true (sent () = []);
   Replica.check_timeout t;
@@ -203,7 +204,7 @@ let test_no_forfeit_below_a_dvc_quorum () =
   Alcotest.(check bool) "this replica is Primary(7) at replica_count = 5" true (Replica.is_primary t);
   (* One DVC only -- far below f+1 = 3. VSR.tla:528-531: forfeiting early would abandon an
      attempt that was still making progress, so the timer must NOT forfeit here. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:7 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:3 ~k:0 ~i:1);
   Replica.check_timeout t;
   Alcotest.(check int) "view_number unchanged: no forfeit below a DVC quorum" 7 (Replica.view_number t);
@@ -220,8 +221,8 @@ let test_corrupt_slot_is_neither_shipped_nor_nacked () =
   let send, sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0; source = 3 }));
   Alcotest.(check bool) "both entries are durable before the fault" true
     (Replica.for_test_wal_read t ~op_number:1 = Some (v "a")
     && Replica.for_test_wal_read t ~op_number:2 = Some (v "b"));
@@ -230,7 +231,7 @@ let test_corrupt_slot_is_neither_shipped_nor_nacked () =
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:1;
   (* Drive a real SendDVC (VSR.tla:376-389) out of this replica. *)
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
-  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
   match List.rev (decoded_sent sent) with
   | (_, Message.Do_view_change { entries; nacks; n; _ }) :: _ ->
     Alcotest.(check int) "the DVC still claims the durable op_number" 2 n;
@@ -246,11 +247,11 @@ let test_restart_preserves_durable_state_and_reconstructs_view_change_status () 
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   (* Enter a view change for real, and accumulate the volatile bookkeeping a restart must lose. *)
   Replica.check_timeout t;
-  Replica.handle_message t (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Start_view_change { v = 1; i = 3 }));
   Alcotest.(check (list int)) "recv_svc populated before the crash" [ 3 ] (Replica.for_test_recv_svc_senders t);
   Alcotest.(check bool) "mid-view-change before the crash" true (Replica.status t = Replica.View_change);
   let view_before = Replica.view_number t and lnv_before = Replica.last_normal_view t in
@@ -272,7 +273,7 @@ let test_restart_outside_a_view_change_reconstructs_normal_status () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Alcotest.(check bool) "Normal before the crash" true (Replica.status t = Replica.Normal);
   let send2, _ = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
@@ -310,8 +311,8 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
      replica.ml:930's own comment in fix round 1 instead of being checked against VSR.tla, and
      replica.ml's copy is wrong too), so the pre-crash replica really does reach
      [commit_number = 1] rather than merely appending. *)
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Alcotest.(check int) "pre-crash: real, non-zero committed progress exists to be recovered" 1
     (Replica.commit_number t);
   (* The restart, with a hook attached from the very first instant of this replica's life. *)
@@ -341,7 +342,7 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
      [k > t.commit_number && k < op_number t] -- but note it rejects only the [k] FIELD's effect at
      [k >= n]; the Prepare itself is still appended and still acked (see replica.ml:953-955). Here
      [k = 2] is inside that bound, so this commits op 2 and moves commit_number 1 -> 2. *)
-  Replica.handle_message t' (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 2 }));
+  Replica.handle_message t' ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 2; source = 3 }));
   Alcotest.(check int) "the next real advance landed" 2 (Replica.commit_number t');
   Alcotest.(check (list (pair int int)))
     "the FIRST callback this restarted replica ever makes is that next real advance, and its \
@@ -356,8 +357,8 @@ let test_restart_discovering_a_corrupt_slot_still_refuses_to_nack_it () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:2;
   let send2, sent2 = capturing_send () in
   let storage2 = Replica.storage_of_module (module Riptide_storage.Memory_storage) backend in
@@ -365,7 +366,7 @@ let test_restart_discovering_a_corrupt_slot_still_refuses_to_nack_it () =
   Alcotest.(check int) "op_number still 2 -- it comes from the superblock, not from readable slots" 2
     (Replica.op_number t');
   Replica.for_test_set_view t' ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
-  Replica.handle_message t' (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
+  Replica.handle_message t' ~sender:3 (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
   (match List.rev (decoded_sent sent2) with
   | (_, Message.Do_view_change { entries; nacks; n; _ }) :: _ ->
     Alcotest.(check int) "DVC's n is the durable op_number" 2 n;
@@ -381,8 +382,8 @@ let test_readable_entries_are_not_merely_a_prefix () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0; source = 3 }));
   (* The FIRST slot faults, not the last -- so a prefix-only scan would ship nothing at all. *)
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:1;
   let send2, sent2 = capturing_send () in
@@ -391,7 +392,7 @@ let test_readable_entries_are_not_merely_a_prefix () =
   Alcotest.(check int) "op_number is still the full durable 2" 2 (Replica.op_number t');
   Alcotest.(check bool) "the in-memory log IS only the readable prefix -- here, empty" true (Replica.entries t' = []);
   Replica.for_test_set_view t' ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
-  Replica.handle_message t' (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
+  Replica.handle_message t' ~sender:3 (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
   match List.rev (decoded_sent sent2) with
   | (_, Message.Do_view_change { entries; nacks; n; _ }) :: _ ->
     Alcotest.(check int) "n is the durable op_number, not the readable count" 2 n;
@@ -410,10 +411,10 @@ let test_an_unreadable_winner_entry_is_filled_from_a_same_log_view_peer () =
   let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
   (* The winner by (last_normal_view, n) cannot read its own op 1. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[ (2, v "b") ] ~nacks:[] ~last_normal_view:2 ~n:2 ~k:1 ~i:1);
   (* A peer at the SAME log_view supplies it. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:3);
   Alcotest.(check bool) "the view change completed without truncating" true (Replica.status t = Replica.Normal);
   Alcotest.(check int) "nothing was dropped: CompletionPoint is the winner's own n" 2 (Replica.op_number t);
@@ -424,7 +425,7 @@ let test_an_unreadable_winner_entry_is_filled_from_a_same_log_view_peer () =
     && Replica.for_test_wal_read t ~op_number:2 = Some (v "b"));
   Alcotest.(check bool) "StartView carries the repaired log" true
     (List.for_all
-       (fun (_, m) -> m = Message.Start_view { v = 5; log = [ v "a"; v "b" ]; n = 2; k = 1 })
+       (fun (_, m) -> m = Message.Start_view { v = 5; log = [ v "a"; v "b" ]; n = 2; k = 1; source = 2 })
        (decoded_sent sent))
 
 (* The other half of the same rule: a DVC from a LOWER log_view is NOT an admissible source
@@ -435,10 +436,10 @@ let test_a_lower_log_view_dvc_is_not_an_admissible_entry_source () =
   let _backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Replica.for_test_set_view t ~status:Replica.View_change ~view_number:5 ~last_normal_view:2;
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[ (2, v "b") ] ~nacks:[] ~last_normal_view:3 ~n:2 ~k:0 ~i:1);
   (* Same op 1 on offer as the test above, but from log_view 2 < the winner's 3. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:[ (1, v "stale") ] ~nacks:[] ~last_normal_view:2 ~n:2 ~k:0 ~i:3);
   Alcotest.(check (list int)) "a full f+1 = 2 quorum is present" [ 1; 3 ] (Replica.for_test_recv_dvc_senders t);
   Alcotest.(check bool) "no completion: op 1 has no admissible source and no nack quorum" true
@@ -456,11 +457,11 @@ let test_forged_huge_n_does_not_hang () =
      op above their own [n] absent -- so every op from 1_000_000_000 down to 2 really IS
      proven-absent evidence the completion arithmetic would have to consider. A scan over that
      range is a hang, not a slow path. *)
-  Replica.handle_message t
+  Replica.handle_message t ~sender:1
     (dvc_msg ~v:5 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:1_000_000_000 ~k:0 ~i:1);
-  Replica.handle_message t
+  Replica.handle_message t ~sender:2
     (dvc_msg ~v:5 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:1 ~k:0 ~i:2);
-  Replica.handle_message t
+  Replica.handle_message t ~sender:3
     (dvc_msg ~v:5 ~entries:[ (1, v "a") ] ~nacks:[] ~last_normal_view:2 ~n:1 ~k:0 ~i:3);
   (* It completes, at CompletionPoint = 1: op 1 is fillable, and every op above it is proven
      absent by the two honest senders. The point of the test is that it gets there in constant
@@ -482,8 +483,8 @@ let test_primary_does_not_commit_an_op_it_cannot_read () =
   Alcotest.(check int) "proposed, not yet committed" 0 (Replica.commit_number t);
   (* Its own durable copy faults before the acks arrive. *)
   Riptide_storage.Memory_storage.for_test_corrupt backend ~op_number:1;
-  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 2 }));
-  Replica.handle_message t (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 3 }));
+  Replica.handle_message t ~sender:2 (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 2 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 3 }));
   Alcotest.(check int)
     "NOT committed: an f+1 quorum that counts an unreadable copy is only f readable copies" 0
     (Replica.commit_number t)
@@ -498,7 +499,7 @@ let test_restart_discards_wal_entries_the_superblock_never_saw () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Alcotest.(check int) "one durable, acknowledged entry" 1 (Replica.op_number t);
   (* The torn write: op 2's bytes landed, the superblock update did not. *)
   Riptide_storage.Memory_storage.wal_append backend ~op_number:2 "never acknowledged";
@@ -511,7 +512,7 @@ let test_restart_discards_wal_entries_the_superblock_never_saw () =
   Alcotest.(check int) "the unacknowledged entry was discarded" 1
     (Riptide_storage.Memory_storage.wal_highest_op_number backend);
   (* The real consequence: the replica can still take part in the protocol afterwards. *)
-  Replica.handle_message t' (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
+  Replica.handle_message t' ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0; source = 3 }));
   Alcotest.(check int) "the next legitimate Prepare is accepted" 2 (Replica.op_number t');
   Alcotest.(check bool) "and acknowledged" true
     (List.exists (fun (_, m) -> m = Message.Prepare_ok { view = 0; n = 2; i = 1 }) (decoded_sent sent2));
@@ -556,8 +557,8 @@ let test_restart_refuses_a_lost_superblock_over_a_non_empty_wal () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Alcotest.(check int) "precondition: op 1 is committed and durable" 1 (Replica.commit_number t);
   Riptide_storage.Memory_storage.for_test_lose_superblock backend;
   Alcotest.(check bool) "precondition: the superblock really is gone" true
@@ -587,7 +588,7 @@ let test_restart_refuses_an_undecodable_superblock_over_a_non_empty_wal () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Riptide_storage.Memory_storage.superblock_write backend "not a superblock record at all";
   Alcotest.(check bool) "precondition: storage hands back bytes, they just are not usable" true
     (Riptide_storage.Memory_storage.superblock_read backend <> None);
@@ -613,7 +614,7 @@ let test_restart_still_accepts_a_genuinely_empty_backend () =
   Alcotest.(check bool) "Init: status" true (Replica.status t = Replica.Normal);
   Alcotest.(check bool) "Init: empty log" true (Replica.entries t = []);
   (* And it is a WORKING replica, not merely a constructed one. *)
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Alcotest.(check int) "it accepts a Prepare like any freshly created replica" 1 (Replica.op_number t)
 
 (* ============================================================================================
@@ -654,7 +655,7 @@ let test_refusal_fault_injection_cap_is_counted_as_its_own_shape () =
   in
   let storage = Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) backend in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Alcotest.(check (list (pair string int)))
     "counted as fault_injection_cap, and as nothing else"
     [ ("fault_injection_cap", 1); ("entry_rejected", 0); ("out_of_sequence", 0);
@@ -672,10 +673,10 @@ let test_refusal_out_of_sequence_is_counted_as_its_own_shape () =
   let send, _sent = capturing_send () in
   let backend, storage = fresh_storage () in
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
   Riptide_storage.Memory_storage.wal_truncate_after backend ~op_number:0;
-  Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 1 }));
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 1; source = 3 }));
   Alcotest.(check (list (pair string int)))
     "counted as out_of_sequence, and as nothing else"
     [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 1);
@@ -704,7 +705,7 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
       (* Comfortably past one 4096-byte data slot once canonically encoded. *)
       let oversized = v (String.make 5000 'x') in
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = oversized; k = 0 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = oversized; k = 0; source = 3 }));
       Alcotest.(check (list (pair string int)))
         "counted as entry_rejected, and as nothing else"
         [ ("fault_injection_cap", 0); ("entry_rejected", 1); ("out_of_sequence", 0);
@@ -713,7 +714,7 @@ let test_refusal_entry_rejected_is_counted_as_its_own_shape () =
       Alcotest.(check int) "the oversized op was NOT taken on" 0 (Replica.op_number t);
       Alcotest.(check bool) "and NOT acknowledged" true (decoded_sent sent = []);
       (* Still a working replica: the refusal is per-entry, not terminal. *)
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
       Alcotest.(check int) "a normal-sized op right afterwards is accepted" 1 (Replica.op_number t))
 
 (* [eviction_blocked] (SUBTASK 3.7): a real {!Riptide_storage.File_storage}, constructed with a real
@@ -749,8 +750,8 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
       let send, sent = capturing_send () in
       let storage = Replica.storage_of_module (module Riptide_storage.File_storage) backend in
       let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 }));
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 0; source = 3 }));
       Alcotest.(check int) "the ring-filling prefix was taken on normally" 2 (Replica.op_number t);
       Alcotest.(check (list (pair string int)))
         "and refused nothing on the way"
@@ -758,7 +759,7 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
           ("eviction_blocked", 0) ]
         (refusals t);
       let before = decoded_sent sent in
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0; source = 3 }));
       Alcotest.(check (list (pair string int)))
         "counted as eviction_blocked, and as nothing else"
         [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
@@ -782,7 +783,7 @@ let test_refusal_eviction_blocked_is_counted_as_its_own_shape () =
          directs the caller to [restart] -- C1's own guard. Re-driving the same replica is both
          legal and a closer model of the real consumer anyway.) *)
       materialized_through := 1;
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0 }));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 0; source = 3 }));
       Alcotest.(check (list (pair string int)))
         "the identical op_number is refused no further times once eviction is permitted"
         [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
@@ -816,7 +817,7 @@ let test_an_unrecognized_backend_refusal_propagates_rather_than_being_swallowed 
   let t = Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
   Alcotest.check_raises "an unclassifiable backend exception is not laundered into 'not durable'"
     (Invalid_argument "something else entirely") (fun () ->
-      Replica.handle_message t (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0 })));
+      Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 })));
   Alcotest.(check (list (pair string int)))
     "and it is not counted as any known refusal shape either"
     [ ("fault_injection_cap", 0); ("entry_rejected", 0); ("out_of_sequence", 0);
@@ -948,10 +949,15 @@ let with_cluster_and_storage ~replica_count ~svc_limit
                   Eio.Switch.run (fun replica_sw ->
                       stop_fns.(i) <- Some (fun () -> Eio.Switch.fail replica_sw Replica_stopped);
                       let rec dispatch_loop () =
-                        (* [_sender] (the authenticated sender [receive] now also reports) is not
-                           yet consumed here -- see [transport_intf.ml]. *)
-                        let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
-                        Replica.handle_message replica msg;
+                        (* [sender] is [receive]'s own authenticated-sender report (Task 1), fed
+                           into [handle_message]'s new sender cross-check (Task 3) -- see
+                           test_vsr_replica_cluster.ml's own dispatch loop for why this file's own
+                           genuine, non-adversarial deliveries never actually trip the check, and
+                           why the loop still absorbs [Invalid_argument] to stay total. *)
+                        let msg, sender = Riptide_sim.Sim_transport.receive handles.(i) in
+                        (match Replica.handle_message replica ~sender msg with
+                        | () -> ()
+                        | exception Invalid_argument _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

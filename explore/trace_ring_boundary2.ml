@@ -93,8 +93,10 @@ let () =
            (fun i _ ->
              Eio.Fiber.fork ~sw:sw2 (fun () ->
                  let rec loop () =
-                   let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
-                   Riptide_vsr.Replica.handle_message replicas.(i) msg;
+                   let msg, sender = Riptide_sim.Sim_transport.receive handles.(i) in
+                   (match Riptide_vsr.Replica.handle_message replicas.(i) ~sender msg with
+                   | () -> ()
+                   | exception Invalid_argument _ -> ());
                    decr inflight;
                    loop ()
                  in

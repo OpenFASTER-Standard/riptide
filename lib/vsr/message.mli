@@ -8,7 +8,11 @@
     to `Send`/`Broadcast` in `spec/tla/VSR.tla` (checked directly against that file, not
     from memory) — [Prepare] from [ReceiveClientRequest], [Prepare_ok] from
     [ReceivePrepareMsg], [Start_view_change] from [TimerSendSVC], [Do_view_change] from
-    [SendDVC], [Start_view] from [SendSV].
+    [SendDVC], [Start_view] from [SendSV] — {b with one deliberate exception as of
+    audit-remediation Task 3}: [Prepare] and [Start_view] each gained a [source : int]
+    field neither has in the TLA+ model, closing the audit's single highest-severity
+    finding (no sender authentication at all on either message type). See each
+    constructor's own doc comment below for why.
 
     {b [dest] is deliberately omitted from every constructor here.} It exists in the TLA+
     spec only because TLA+'s message-bag delivery model needs an explicit destination
@@ -17,7 +21,8 @@
     carries the destination, so encoding it a second time inside the message body would be
     redundant. A reader
     checking this module's field lists against the TLA+ spec's record literals should
-    expect every constructor here to be missing exactly that one field and no other.
+    expect every constructor here to be missing exactly that one field (plus the two
+    deliberate [source] additions just above) and no other.
 
     {2 Wire tags}
 
@@ -50,11 +55,24 @@
     that call site. *)
 
 type t =
-  | Prepare of { view : int; n : int; v : Riptide.Value.value; k : int }
+  | Prepare of { view : int; n : int; v : Riptide.Value.value; k : int; source : int }
       (** Tag ["Prepare"]. [v] is the client's proposed value (an arbitrary
           {!Riptide.Value.value}, not a numeric field — this is VSR.tla's own overloading of
           the name "v" for two different things: the client value here, vs. a view number
-          in the other four constructors below). *)
+          in the other four constructors below).
+
+          {b [source] is NOT transcribed from `spec/tla/VSR.tla`'s own [ReceiveClientRequest]
+          record literal} — the abstract model has no need for it (its message-bag delivery
+          already carries provenance implicitly). It is a deliberate, implementation-only
+          addition (audit-remediation Task 3) closing the single highest-severity finding of
+          the 2026-09-29 audit: with no sender field at all, a forged [Prepare] could rewrite
+          any backup's log with no cross-check possible. [source] is always the sending
+          replica's own id ({!Riptide_vsr.Replica.t}'s [my_id]) — {!Riptide_vsr.Replica.handle_message}
+          cross-checks it against the transport-authenticated sender the underlying connection
+          actually belongs to (see {!Riptide_transport.Transport_intf.S.receive}) before ANY
+          per-message-type logic runs, exactly like the [i] field on [Prepare_ok]/
+          [Start_view_change]/[Do_view_change] below is now also cross-checked, even though
+          those already existed pre-Task-3. *)
   | Prepare_ok of { view : int; n : int; i : int }  (** Tag ["PrepareOk"]. *)
   | Start_view_change of { v : int; i : int }  (** Tag ["StartViewChange"]. [v] is a view number. *)
   | Do_view_change of {
@@ -87,9 +105,16 @@ type t =
           - [n] is still the sender's own op-number, which it knows from durable superblock state
             even when some slot bodies are unreadable — so [n] is NOT the length of [entries],
             and a receiver must not check it as if it were. *)
-  | Start_view of { v : int; log : Riptide.Value.value list; n : int; k : int }
-      (** Tag ["StartView"]. [v] is a view number. Deliberately has no [i] field — the TLA+
-          spec's own [StartView] record literal (in [SendSV]) has none either. *)
+  | Start_view of { v : int; log : Riptide.Value.value list; n : int; k : int; source : int }
+      (** Tag ["StartView"]. [v] is a view number. The TLA+ spec's own [StartView] record
+          literal (in [SendSV]) has no [i]/sender field either — but, exactly like [Prepare]'s
+          own [source] above, this module adds one anyway (audit-remediation Task 3): a forged
+          [Start_view] with no sender-authentication at all was the audit's single
+          highest-severity finding (proven live to rewrite an entire cluster's committed log
+          from one forged message), and [Start_view] is precisely the message type with the
+          most to gain from spoofing since a receiver adopts its [log]/[n]/[k] wholesale. Always
+          the sending replica's own id; cross-checked by {!Riptide_vsr.Replica.handle_message}
+          against the transport-authenticated sender the same way [source] on [Prepare] is. *)
 
 exception Malformed_message of string
 (** Raised by {!decode} on any input that is not a well-formed encoding of one of the five

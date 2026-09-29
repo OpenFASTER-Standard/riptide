@@ -224,10 +224,15 @@ let with_cluster ~replica_count ~svc_limit
                          (this one replica only, via Replica_stopped) or, for whichever replicas are
                          still running at test end, by the outer switch's own Cluster_test_done. *)
                       let rec dispatch_loop () =
-                        (* [_sender] (the authenticated sender [receive] now also reports) is not
-                           yet consumed here -- see [transport_intf.ml]. *)
-                        let msg, _sender = Sim_transport.receive handles.(i) in
-                        Replica.handle_message replica msg;
+                        (* [sender] is [receive]'s own authenticated-sender report (Task 1), fed
+                           into [handle_message]'s new sender cross-check (Task 3) -- see
+                           test_vsr_replica_cluster.ml's own dispatch loop for why this file's own
+                           genuine, non-adversarial deliveries never actually trip the check, and
+                           why the loop still absorbs [Invalid_argument] to stay total. *)
+                        let msg, sender = Sim_transport.receive handles.(i) in
+                        (match Replica.handle_message replica ~sender msg with
+                        | () -> ()
+                        | exception Invalid_argument _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

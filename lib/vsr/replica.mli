@@ -601,8 +601,37 @@ val check_timeout : t -> unit
     mechanism; this call only has an observable effect in the degenerate [replica_count = 1]
     ([f = 0]) cluster (see [replica.ml]'s own comment on [try_send_dvc] for why). *)
 
-val handle_message : t -> string -> unit
-(** [handle_message t bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and dispatches:
+val handle_message : t -> sender:int -> string -> unit
+(** [handle_message t ~sender bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and
+    dispatches.
+
+    {b [sender] (audit-remediation Task 3) is the transport-authenticated identity of whoever
+    actually holds the connection [bytes] arrived on} — Task 1's
+    {!Riptide_transport.Transport_intf.S.receive}'s own [string * int] result, threaded through
+    unmodified by every real caller (see {!Riptide_dst.Cluster}'s dispatch loop). Before ANY of
+    the per-message-type dispatch described below runs, [handle_message] cross-checks [sender]
+    against that message's OWN claimed sender — [source] on [Prepare]/[Start_view], [i] on
+    [Prepare_ok]/[Start_view_change]/[Do_view_change] — and {b raises [Invalid_argument] on a
+    mismatch, as a total no-op: no state mutation, no reply sent}, for every message type, not
+    just the two ([Prepare]/[Start_view]) that gained a sender field specifically for this. This
+    closes the audit's single highest-severity finding: previously [Prepare]/[Start_view] carried
+    no sender claim to even check, and even the message types that DID carry one ([i] on the three
+    above) had nothing cross-checking that claim against who actually sent the bytes, so one
+    legitimate replica could spoof another's [i] to manufacture a fake commit/view-change quorum,
+    or (with [Start_view] previously uncheckable at all) a single forged message could rewrite the
+    entire cluster's committed log.
+
+    This is deliberately a RAISE, not the silent drop every in-dispatch guard below uses for a
+    protocol-stale-but-honestly-attributed message (a late [Prepare], a wrong-view [Prepare_ok]):
+    those guards reject the normal, expected cost of an unreliable network, while a sender
+    mismatch means the identity claim itself cannot be trusted — a caller should be able to
+    observe it as a distinct, exceptional condition rather than have it vanish indistinguishably
+    from ordinary staleness. A caller whose dispatch loop must stay total in the face of
+    adversarial input (e.g. {!Riptide_dst.Cluster}'s fault-injecting simulation) catches
+    [Invalid_argument] around this call, the same way it already absorbs
+    {!Riptide_vsr.Message.Malformed_message} for an undecodable payload.
+
+    The per-message-type dispatch itself, once the sender check above has passed:
 
     - A [Prepare] message drives VSR.tla's [ReceivePrepareMsg] (VSR.tla:110-123): a backup-side
       handler ([IsNormalBackup(r)] == [status[r] = "Normal" /\ Primary(View(r)) # r], VSR.tla:49 —

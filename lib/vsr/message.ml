@@ -4,7 +4,7 @@ open Riptide
    -- see message.mli for the full cross-check against that file, including why [dest] is
    deliberately omitted from every constructor. *)
 type t =
-  | Prepare of { view : int; n : int; v : Value.value; k : int }
+  | Prepare of { view : int; n : int; v : Value.value; k : int; source : int }
   | Prepare_ok of { view : int; n : int; i : int }
   | Start_view_change of { v : int; i : int }
   | Do_view_change of {
@@ -16,7 +16,7 @@ type t =
       k : int;
       i : int;
     }
-  | Start_view of { v : int; log : Value.value list; n : int; k : int }
+  | Start_view of { v : int; log : Value.value list; n : int; k : int; source : int }
 
 exception Malformed_message of string
 
@@ -48,8 +48,11 @@ let int_list_field name l : string * Value.value =
 
 let to_value (t : t) : Value.value =
   match t with
-  | Prepare { view; n; v; k } ->
-    Value.Sum (tag_prepare, Value.Record [ int_field "view" view; int_field "n" n; ("v", v); int_field "k" k ])
+  | Prepare { view; n; v; k; source } ->
+    Value.Sum
+      ( tag_prepare,
+        Value.Record
+          [ int_field "view" view; int_field "n" n; ("v", v); int_field "k" k; int_field "source" source ] )
   | Prepare_ok { view; n; i } ->
     Value.Sum (tag_prepare_ok, Value.Record [ int_field "view" view; int_field "n" n; int_field "i" i ])
   | Start_view_change { v; i } ->
@@ -67,9 +70,11 @@ let to_value (t : t) : Value.value =
             int_field "k" k;
             int_field "i" i;
           ] )
-  | Start_view { v; log; n; k } ->
+  | Start_view { v; log; n; k; source } ->
     Value.Sum
-      (tag_start_view, Value.Record [ int_field "v" v; log_field log; int_field "n" n; int_field "k" k ])
+      ( tag_start_view,
+        Value.Record
+          [ int_field "v" v; log_field log; int_field "n" n; int_field "k" k; int_field "source" source ] )
 
 (* ---- wire-integrity checksum (subtask 3.6) ----
    Accidental-corruption detection only, not a security boundary: VSR is a crash-fault-tolerant
@@ -150,6 +155,7 @@ let of_value (v : Value.value) : t =
           n = int_of_field tag fields "n";
           v = field_exn tag fields "v";
           k = int_of_field tag fields "k";
+          source = int_of_field tag fields "source";
         }
     else if tag = tag_prepare_ok then
       Prepare_ok
@@ -174,6 +180,7 @@ let of_value (v : Value.value) : t =
           log = value_list_of_field tag fields "log";
           n = int_of_field tag fields "n";
           k = int_of_field tag fields "k";
+          source = int_of_field tag fields "source";
         }
     else raise (Malformed_message (Printf.sprintf "unknown message tag %S" tag))
   | _ -> raise (Malformed_message "expected a Sum value at the top level")

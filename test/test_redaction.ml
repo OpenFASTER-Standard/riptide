@@ -416,11 +416,15 @@ let with_store_and_cluster ~replica_count f =
           dir
       in
       let store = Redaction_store.create ~kv ~kek:(Kek.of_raw (Mirage_crypto_rng.generate 32)) in
-      let inflight : (int * string) Queue.t = Queue.create () in
+      (* Carries the SENDING replica's own id alongside [to_]/[bytes] -- each replica's [~send]
+         closure below closes over its own [i + 1], the real (in-process, but genuine) identity of
+         whoever is calling [send], exactly the role a real transport's authenticated connection
+         plays for [handle_message]'s new [~sender] cross-check (Task 3). *)
+      let inflight : (int * int * string) Queue.t = Queue.create () in
       let replicas =
         Array.init replica_count (fun i ->
             Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:(i + 1) ~replica_count
-              ~svc_limit:3 ~send:(fun ~to_ bytes -> Queue.add (to_, bytes) inflight) ())
+              ~svc_limit:3 ~send:(fun ~to_ bytes -> Queue.add (to_, i + 1, bytes) inflight) ())
       in
       (* Same reason every cluster harness in this repo does this (see test_batch_commit_cluster.ml
          and Riptide_dst.Cluster): a fresh replica starts at view 0, where Primary(0) =
@@ -430,8 +434,8 @@ let with_store_and_cluster ~replica_count f =
       Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
       let deliver_all () =
         while not (Queue.is_empty inflight) do
-          let to_, bytes = Queue.pop inflight in
-          Replica.handle_message replicas.(to_ - 1) bytes
+          let to_, sender, bytes = Queue.pop inflight in
+          Replica.handle_message replicas.(to_ - 1) ~sender bytes
         done
       in
       f ~store ~replicas ~deliver_all)

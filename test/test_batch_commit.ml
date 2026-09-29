@@ -300,7 +300,12 @@ let test_uncommitted_tail_is_excluded () =
   let replica_count = 3 in
   let replicas = Array.make replica_count None in
   let silent_send ~to_:_ (_ : string) = () in
-  let primary_send ~to_ bytes = match replicas.(to_ - 1) with Some r -> Replica.handle_message r bytes | None -> ()  in
+  (* Only ever installed as replica 1's (the primary's) own [~send], so every delivery through it
+     really did come from replica 1 -- [~sender:1] here is a real transport-authenticated identity
+     in miniature, not a placeholder, matching [handle_message]'s new cross-check (Task 3). *)
+  let primary_send ~to_ bytes =
+    match replicas.(to_ - 1) with Some r -> Replica.handle_message r ~sender:1 bytes | None -> ()
+  in
   replicas.(0) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count ~svc_limit:3 ~send:primary_send ());
   replicas.(1) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count ~svc_limit:3 ~send:silent_send ());
   replicas.(2) <- Some (Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:3 ~replica_count ~svc_limit:3 ~send:silent_send ());

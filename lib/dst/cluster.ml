@@ -494,12 +494,13 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
           (fun i _replica ->
             Eio.Fiber.fork ~sw (fun () ->
                 let rec dispatch_loop () =
-                  (* [receive] now also reports the authenticated sender (subtask/Task 1 of the
-                     audit-remediation plan) -- not yet consumed here: [Replica.handle_message]
-                     still takes only the payload, and cross-checking the sender against the
-                     message's own claimed identity is a later task's job (see
-                     [docs/superpowers/plans/2026-09-29-audit-remediation.md], Task 3). *)
-                  let msg, _sender = Riptide_sim.Sim_transport.receive handles.(i) in
+                  (* [receive] reports the authenticated sender (Task 1) alongside the payload;
+                     Task 3 is what actually consumes it here, passing it straight into
+                     [Replica.handle_message]'s new [~sender] so its own sender-cross-check has a
+                     real transport-authenticated identity to check the message's claimed one
+                     against, exactly as [docs/superpowers/plans/2026-09-29-audit-remediation.md]'s
+                     Task 3 requires. *)
+                  let msg, sender = Riptide_sim.Sim_transport.receive handles.(i) in
                   (* [replicas.(i)], read fresh on every message rather than captured once at fork
                      time: [restart] SWAPS the array element, and a fiber holding the pre-crash
                      value would keep feeding the dead replica forever -- the restart would appear
@@ -507,11 +508,28 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
                      entirely; the message is discarded, exactly as a message to a machine that is
                      not running is.
 
-                     [decr] in a [Fun.protect]-free tail position is deliberate: [handle_message]
-                     is total on adversarial input (replica.mli's own guarantee), so it does not
-                     raise, and a counter that leaked on an exception would hang [settle] rather
-                     than surface it. *)
-                  if alive.(i) then Riptide_vsr.Replica.handle_message replicas.(i) msg;
+                     [decr] in a [Fun.protect]-free tail position used to be safe unconditionally
+                     because [handle_message] was total on adversarial input and never raised. As
+                     of Task 3 that is no longer quite true: a message whose claimed sender
+                     mismatches [sender] now makes [handle_message] raise [Invalid_argument] (a
+                     DELIBERATE change -- see replica.mli's own doc comment on why that guard alone
+                     is a raise, not a silent drop, unlike every other guard in that dispatch). This
+                     loop still needs to stay total in the face of adversarial/corrupted input the
+                     same way it always has, so it absorbs exactly that one exception here, right
+                     next to the decoded-payload case [handle_message] itself already swallows
+                     internally ([Message.Malformed_message]) -- both are "this delivery cannot be
+                     trusted, drop it and keep running", just raised one guard later than the wire
+                     shape check is. In practice this fires vanishingly rarely from
+                     [flip_one_byte]'s own corruption fault (a single flipped byte almost always
+                     breaks {!Riptide_vsr.Message.decode}'s own whole-body checksum first, per its
+                     own doc comment, so [Malformed_message] is what actually fires for
+                     corruption); this catch exists for genuine spoofing attempts (a real, if
+                     currently synthetic-only, adversarial-replica scenario) and defense in depth. *)
+                  if alive.(i) then begin
+                    match Riptide_vsr.Replica.handle_message replicas.(i) ~sender msg with
+                    | () -> ()
+                    | exception Invalid_argument _ -> ()
+                  end;
                   decr inflight;
                   dispatch_loop ()
                 in

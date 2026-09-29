@@ -12,7 +12,7 @@ let sample_log () =
    this beyond hand-picked examples). ---- *)
 
 let test_round_trip_prepare () =
-  let m = Message.Prepare { view = 3; n = 7; v = sample_value (); k = 5 } in
+  let m = Message.Prepare { view = 3; n = 7; v = sample_value (); k = 5; source = 1 } in
   Alcotest.(check bool) "Prepare round-trips" true (Message.decode (Message.encode m) = m)
 
 let test_round_trip_prepare_ok () =
@@ -48,7 +48,7 @@ let test_round_trip_do_view_change_with_empty_evidence () =
     (Message.decode (Message.encode m) = m)
 
 let test_round_trip_start_view () =
-  let m = Message.Start_view { v = 4; log = sample_log (); n = 7; k = 5 } in
+  let m = Message.Start_view { v = 4; log = sample_log (); n = 7; k = 5; source = 1 } in
   Alcotest.(check bool) "Start_view round-trips" true (Message.decode (Message.encode m) = m)
 
 (* ---- wire-integrity checksum (subtask 3.6): decode must reject a corrupted encoding rather than
@@ -58,14 +58,22 @@ let test_round_trip_start_view () =
    corrupted before retransmission) and keeps DST's own fault-injection testing meaningful. ---- *)
 
 let test_decode_rejects_a_corrupted_encoding () =
-  let msg = Message.Prepare { view = 1; n = 1; v = Value.Scalar (Value.String "x"); k = 0 } in
+  let msg = Message.Prepare { view = 1; n = 1; v = Value.Scalar (Value.String "x"); k = 0; source = 1 } in
   let encoded = Message.encode msg in
-  (* Flip one byte roughly in the middle of the encoding -- avoids the length-prefix bytes at the
-     very start most canonical encodings carry, so this is a real content-corruption test, not a
-     length-field corruption test (a different failure mode). *)
+  (* Flip the LAST byte of the checksummed BODY (i.e. the byte right before the 8-byte trailing
+     checksum {!Message.encode} appends) -- the last thing any canonical encoder writes for a
+     record is real field content, never a length prefix (those always precede the bytes they
+     measure), so this reliably lands on content and reproduces the checksum-mismatch path this
+     test is actually about, unlike a fixed "middle" offset (this record's own byte layout shifted
+     once audit-remediation Task 3 added the `source` field, and "the middle" landed on a
+     length-prefix byte instead, producing a decode error from THAT, a different and less specific
+     failure mode than the one this test names). *)
   let corrupted = Bytes.of_string encoded in
-  let mid = Bytes.length corrupted / 2 in
-  Bytes.set corrupted mid (Char.chr (Char.code (Bytes.get corrupted mid) lxor 0xFF));
+  (* 8 = the trailing checksum's own length (message.mli's "Wire-integrity checksum" section) --
+     not exposed as a value from this module, so restated here as the same literal that section
+     documents. *)
+  let target = String.length encoded - 8 - 1 in
+  Bytes.set corrupted target (Char.chr (Char.code (Bytes.get corrupted target) lxor 0xFF));
   let corrupted = Bytes.to_string corrupted in
   (* This codebase's own established convention for asserting on an exception carrying a payload
      (see test_redaction.ml's test_encryption_with_merge_key_is_rejected) is to assert the real,
@@ -157,6 +165,40 @@ let malformed_input_tests =
                     ] ))));
     expect_malformed "Start_view_change missing the 'i' field" (fun () ->
         Message.decode (enc (Value.Sum ("StartViewChange", Value.Record [ ("v", Value.Scalar (Value.Int 4L)) ]))));
+    (* ---- Review Focus (audit-remediation Task 3): a Prepare/Start_view encoded in the OLD,
+       pre-Task-3 shape (every field this constructor carried before [source] was added, but no
+       [source] field at all) must fail decode LOUDLY as Malformed_message, not silently default
+       [source] to some placeholder (e.g. 0) and let a stale/replayed old-format message sail
+       through the new sender cross-check by accident. [int_of_field]'s own [field_exn] call
+       already makes a missing field a hard [Malformed_message] for every OTHER field on every
+       other constructor (see the 'k' and 'i' cases above) -- these two pin that the newly added
+       [source] field gets exactly the same treatment, not an accidental default via e.g.
+       [List.assoc_opt ... |> Option.value ~default:0]. *)
+    expect_malformed "old-shaped Prepare (pre-Task-3, no 'source' field) is rejected, not silently accepted" (fun () ->
+        Message.decode
+          (enc
+             (Value.Sum
+                ( "Prepare",
+                  Value.Record
+                    [
+                      ("view", Value.Scalar (Value.Int 3L));
+                      ("n", Value.Scalar (Value.Int 7L));
+                      ("v", sample_value ());
+                      ("k", Value.Scalar (Value.Int 5L));
+                    ] ))));
+    expect_malformed "old-shaped Start_view (pre-Task-3, no 'source' field) is rejected, not silently accepted"
+      (fun () ->
+        Message.decode
+          (enc
+             (Value.Sum
+                ( "StartView",
+                  Value.Record
+                    [
+                      ("v", Value.Scalar (Value.Int 4L));
+                      ("log", Value.Sequence (sample_log ()));
+                      ("n", Value.Scalar (Value.Int 7L));
+                      ("k", Value.Scalar (Value.Int 5L));
+                    ] ))));
   ]
 
 (* ---- QCheck2 round-trip property, one generator per constructor, matching Task 1's own
@@ -184,8 +226,8 @@ let message_gen =
   oneof
     [
       map
-        (fun (view, n, v, k) -> Message.Prepare { view; n; v; k })
-        (tup4 nonneg_int_gen nonneg_int_gen small_value_gen nonneg_int_gen);
+        (fun (view, n, v, k, source) -> Message.Prepare { view; n; v; k; source })
+        (tup5 nonneg_int_gen nonneg_int_gen small_value_gen nonneg_int_gen nonneg_int_gen);
       map (fun (view, n, i) -> Message.Prepare_ok { view; n; i }) (tup3 nonneg_int_gen nonneg_int_gen nonneg_int_gen);
       map (fun (v, i) -> Message.Start_view_change { v; i }) (pair nonneg_int_gen nonneg_int_gen);
       map
@@ -201,8 +243,9 @@ let message_gen =
               i;
             })
         (tup6 nonneg_int_gen log_gen nonneg_int_gen nonneg_int_gen nonneg_int_gen nonneg_int_gen);
-      map (fun (v, log, n, k) -> Message.Start_view { v; log; n; k })
-        (tup4 nonneg_int_gen log_gen nonneg_int_gen nonneg_int_gen);
+      map
+        (fun (v, log, n, k, source) -> Message.Start_view { v; log; n; k; source })
+        (tup5 nonneg_int_gen log_gen nonneg_int_gen nonneg_int_gen nonneg_int_gen);
     ]
 
 let round_trip_prop =
