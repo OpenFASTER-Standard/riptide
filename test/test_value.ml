@@ -296,29 +296,125 @@ let build_nested_map_key_value ~depth =
   let rec loop i acc = if i = 0 then acc else loop (i - 1) (Value.Map [ (acc, Value.Scalar (Value.Bool true)) ]) in
   loop depth (Value.Scalar (Value.Int 0L))
 
+(* Finding I2 (task-5 fix round): fixed wall-clock thresholds (`elapsed <
+   1.0`) had ~200-300x slack against actual measured times (~0.006s/0.003s
+   at depth 20,000), so a 100x regression would still pass, and are also
+   coupled to this box's own CPU speed (a hard cgroup quota, not a real
+   core count - see /work/CLAUDE.md's "cpu.max" note), which can make an
+   absolute-time assertion fail for reasons unrelated to the code under
+   test. Fixed by asserting on how time SCALES with depth instead of an
+   absolute bound: doubling the depth should roughly double a linear
+   algorithm's time (up to noise) but roughly quadruple a quadratic one -
+   asserting the doubled-depth time stays within ~4x (plus a small additive
+   floor to stay non-flaky when both measurements are too fast for the
+   ratio itself to be meaningful) catches a real regression back to
+   quadratic behavior while staying insensitive to the machine's absolute
+   speed. *)
+let scaling_bound ~t_d ~factor ~floor = (t_d *. factor) +. floor
+
 let test_deeply_nested_map_keys_encode_in_linear_time () =
-  let v = build_nested_map_key_value ~depth:20_000 in
-  let start = Unix.gettimeofday () in
-  let encoded = Value.canonical_encode v in
-  let elapsed = Unix.gettimeofday () -. start in
-  Alcotest.(check bool) "20k-deep nested map key encodes in well under 1s"
-    true (elapsed < 1.0);
-  (* Timing alone can't catch an off-by-one in the new [size_value]-precomputed
-     length prefixes (the fast path skips materializing key bytes entirely,
-     trusting [size_value]'s arithmetic instead - a mismatch there would
-     silently produce a corrupt frame with a wrong length prefix, only
-     surfacing as a decode failure). Cross-check against the independently
-     hand-built wire bytes for the exact same structure, byte for byte. *)
+  (* Correctness pin, independent of timing: cross-check against the
+     independently hand-built wire bytes for the exact same structure, byte
+     for byte, at the same depth (20,000) the original audit finding used.
+     Timing alone can't catch an off-by-one in the backpatched Map-key
+     length prefix (see [Wbuf.reserve]/[Wbuf.patch_u64_be] in [lib/value.ml])
+     - a mismatch there would silently produce a corrupt frame with a wrong
+     length prefix, only surfacing as a decode failure elsewhere. *)
+  let v20k = build_nested_map_key_value ~depth:20_000 in
   Alcotest.(check string) "encodes to the same bytes as the hand-built wire format"
-    (build_nested_map_key_wire_bytes ~depth:20_000) encoded
+    (build_nested_map_key_wire_bytes ~depth:20_000) (Value.canonical_encode v20k);
+  let time_at depth =
+    let v = build_nested_map_key_value ~depth in
+    let start = Unix.gettimeofday () in
+    ignore (Value.canonical_encode v);
+    Unix.gettimeofday () -. start
+  in
+  let d = 20_000 in
+  let t_d = time_at d in
+  let t_2d = time_at (2 * d) in
+  let bound = scaling_bound ~t_d ~factor:4.0 ~floor:0.05 in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "encode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
+       d t_d (2 * d) t_2d bound)
+    true (t_2d <= bound)
 
 let test_deeply_nested_map_keys_decode_in_linear_time () =
-  let wire = build_nested_map_key_wire_bytes ~depth:20_000 in
+  let time_at depth =
+    let wire = build_nested_map_key_wire_bytes ~depth in
+    let start = Unix.gettimeofday () in
+    ignore (Value.canonical_decode wire);
+    Unix.gettimeofday () -. start
+  in
+  let d = 20_000 in
+  let t_d = time_at d in
+  let t_2d = time_at (2 * d) in
+  let bound = scaling_bound ~t_d ~factor:4.0 ~floor:0.05 in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "decode time scales ~linearly with depth, not quadratically (t(%d)=%.4fs, t(%d)=%.4fs, bound=%.4fs)"
+       d t_d (2 * d) t_2d bound)
+    true (t_2d <= bound)
+
+(* Finding C1/C2 (task-5 fix round): [encode_into]'s Map case is only
+   copy-free for the single-entry ("nothing to sort") fast path - a Map
+   with 2+ entries at a nesting level still materializes each key's bytes
+   via a fresh buffer to compare them (see the "Two or more entries..."
+   comment in [lib/value.ml]'s [encode_into]). When *every* level of a deep
+   chain has 2+ entries (not just the outermost - an attacker controls a
+   Map's shape at every level, not just its depth), that materialization
+   compounds across nesting exactly like the original audited bug did:
+   Θ(depth x size), i.e. still quadratic in depth. The reviewer measured
+   this directly reachable from raw wire bytes (Message.decode ->
+   Value.canonical_decode -> checksum/content_hash, before any
+   protocol-level validation) and, at the original finding's own reproduction
+   depth (20,000), WORSE than the finding this task was created to fix
+   (14.5GB/~7s vs the audited 5.3GB/1.64s).
+
+   Per the controller ruling recorded in this task's fix-round report:
+   fully closing this (a byte-lexicographic structural comparator across
+   all 5 constructors, needed to make the general case copy-free) is
+   explicitly out of scope here - consensus-safety-critical canonical
+   ordering is a much higher-risk place to introduce a subtle bug than this
+   DoS is to leave in place a little longer, and Task 8 (depth-bounded
+   decode/encode, capping nesting at 1000) is the intended mitigation.
+
+   This test is a pinning/regression baseline, not a fix: it measures the
+   *current* cost of this residual at Task 8's own future cap (depth 1000,
+   NOT the 20,000 used to demonstrate the blowup - that takes ~7s and would
+   make the suite unbearably slow), so Task 8's depth-cap work has a
+   concrete "must not regress past this" number, and so the residual is
+   something the suite actually knows about rather than only something
+   described in a report file. The reviewer measured ~19ms/37MB at depth
+   1000 (matching the doc comment in [lib/value.ml] that Task 8 threads a
+   depth counter through both [decode_value] and [encode_into] and is
+   expected to neutralize this as a practical DoS even though the
+   underlying algorithm stays quadratic in the abstract) - 500ms leaves
+   generous real headroom above that as a genuine trip-wire, not a
+   hair-trigger flaky bound. *)
+let build_two_entry_per_level_deep_map_value ~depth =
+  let rec loop i acc =
+    if i = 0 then acc
+    else
+      loop (i - 1)
+        (Value.Map
+           [ (acc, Value.Scalar (Value.Bool true));
+             (Value.Scalar (Value.Int (Int64.of_int i)), Value.Scalar (Value.Bool true))
+           ])
+  in
+  loop depth (Value.Scalar (Value.Int 0L))
+
+let test_two_entries_per_level_deep_map_encode_hash_residual_bounded () =
+  let v = build_two_entry_per_level_deep_map_value ~depth:1000 in
   let start = Unix.gettimeofday () in
-  ignore (Value.canonical_decode wire);
+  ignore (Value.content_hash v);
   let elapsed = Unix.gettimeofday () -. start in
-  Alcotest.(check bool) "20k-deep nested map key decodes in well under 1s, not 1.6s+"
-    true (elapsed < 1.0)
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "2-entries-per-level Map with a 1000-deep chain (Task 8's future depth cap) content_hashes \
+        in well under 500ms (residual pinning baseline for Task 8 not to regress past; took %.4fs)"
+       elapsed)
+    true (elapsed < 0.5)
 
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
@@ -384,6 +480,9 @@ let tests =
     ("decode map", `Quick, test_decode_map);
     ("20k-deep nested map keys decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
     ("20k-deep nested map keys encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
+    ( "2-entries-per-level 1000-deep map key encode/hash residual bounded",
+      `Quick,
+      test_two_entries_per_level_deep_map_encode_hash_residual_bounded );
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;

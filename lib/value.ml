@@ -20,13 +20,6 @@ type value =
    never be mistaken for the encoding of a third. Every constructor also
    gets a distinct 1-byte tag so different shapes never collide either. *)
 
-let buf_add_len_prefixed buf s =
-  let len = String.length s in
-  for i = 7 downto 0 do
-    Buffer.add_char buf (Char.chr ((len lsr (8 * i)) land 0xff))
-  done;
-  Buffer.add_string buf s
-
 let tag_scalar_bool = '\x00'
 let tag_scalar_int = '\x01'
 let tag_scalar_float = '\x02'
@@ -37,161 +30,232 @@ let tag_sum = '\x06'
 let tag_sequence = '\x07'
 let tag_map = '\x08'
 
+(* A minimal growable byte buffer, like [Buffer.t], but additionally
+   supporting in-place patching of already-written bytes at a fixed offset
+   ([reserve]/[patch_u64_be] below). [Buffer.t] itself has no supported way
+   to mutate bytes once added (its own [blit] only copies *out* of a
+   buffer, never into one), which is exactly the capability [encode_into]'s
+   [Map] single-entry case (see there) needs to write a key's 8-byte length
+   prefix *before* the key's own bytes without first measuring those bytes
+   in a separate buffer.
+
+   History: the first version of this fix (see git history) instead
+   precomputed a full parallel [sized_value] tree ([size] on every node,
+   mirroring [value]'s own shape) in one eager pass ahead of encoding, so
+   [encode_into] could read a subtree's size as a plain field instead of
+   measuring it. That worked - it made a single-entry Map-key chain's
+   length prefixes O(1) each instead of re-measuring per level - but it
+   held an entire second copy of the value's shape (one [sized_value]
+   record + one [sized_shape] block per input node) live in memory
+   *simultaneously* with both the input [value] and the output buffer, for
+   every value encoded, not just ones with deep Map-key chains. Measured
+   live on an ordinary 2-million-element [Sequence] of [Bool] (3.8MB
+   encoded, no [Map] anywhere in it): live heap for the value tree alone
+   was 107.5 MiB, but peak heap during [canonical_encode] reached 237.2
+   MiB - a +117% regression on the exact memory axis this task exists to
+   improve, paid by every caller, unconditionally (audit finding I1).
+
+   [Wbuf] removes the shadow tree entirely: [encode_into] walks the real
+   [value] tree once, writing directly into the growable output buffer,
+   and gets a length it needs *before* the corresponding bytes exist yet
+   (the single-entry Map-key case) by reserving 8 zero bytes at the
+   current write position, encoding the key directly after that
+   reservation, then patching the reserved bytes with the actual length
+   once it's known (the buffer's own tracked length minus the position
+   right after the reservation). This costs O(1) extra bookkeeping per
+   reservation (an int offset, implicitly held on the OCaml call stack via
+   [encode_into]'s own recursion) instead of O(total nodes) of persistent
+   shadow-tree memory. *)
+module Wbuf = struct
+  type t = { mutable bytes : Bytes.t; mutable len : int }
+
+  let create n = { bytes = Bytes.create (max n 16); len = 0 }
+
+  let ensure t extra =
+    let needed = t.len + extra in
+    if needed > Bytes.length t.bytes then begin
+      let new_cap = ref (max 16 (Bytes.length t.bytes)) in
+      while !new_cap < needed do
+        new_cap := !new_cap * 2
+      done;
+      let new_bytes = Bytes.create !new_cap in
+      Bytes.blit t.bytes 0 new_bytes 0 t.len;
+      t.bytes <- new_bytes
+    end
+
+  let add_char t c =
+    ensure t 1;
+    Bytes.set t.bytes t.len c;
+    t.len <- t.len + 1
+
+  let add_string t s =
+    let n = String.length s in
+    ensure t n;
+    Bytes.blit_string s 0 t.bytes t.len n;
+    t.len <- t.len + n
+
+  let length t = t.len
+
+  (* Writes [n] zero bytes at the current position and returns the offset
+     they start at, so a caller can go back and fill them in later via
+     [patch_u64_be] once it knows what belongs there. *)
+  let reserve t n =
+    let off = t.len in
+    ensure t n;
+    Bytes.fill t.bytes off n '\x00';
+    t.len <- t.len + n;
+    off
+
+  (* Overwrites the 8 bytes at [off] (which must already have been written,
+     typically via [reserve]) with [n] as a big-endian u64. Safe to call
+     after further bytes have been appended past [off] - and, crucially,
+     after the underlying [bytes] array has been reallocated by [ensure]
+     one or more times in between, since this always writes through the
+     buffer's *current* [t.bytes], not a reference captured at reserve
+     time. *)
+  let patch_u64_be t off (n : int) =
+    for i = 0 to 7 do
+      Bytes.set t.bytes (off + i) (Char.chr ((n lsr (8 * (7 - i))) land 0xff))
+    done
+
+  let contents t = Bytes.sub_string t.bytes 0 t.len
+end
+
 let write_u64_be buf (n : int) =
   for i = 7 downto 0 do
-    Buffer.add_char buf (Char.chr ((n lsr (8 * i)) land 0xff))
+    Wbuf.add_char buf (Char.chr ((n lsr (8 * i)) land 0xff))
   done
 
-(* An auxiliary tree, shaped exactly like [value], but where every node
-   additionally carries [size]: the exact byte length [encode_into] below
-   would produce for that node's own subtree. [size_value] computes this
-   bottom-up in a single pass over the input [value] - each node visited,
-   and its size computed from its already-computed children's sizes, EXACTLY
-   ONCE - and [encode_into] then reads [size] as a plain field lookup
-   wherever it needs a subtree's length, rather than ever re-deriving it.
+let buf_add_len_prefixed buf s =
+  write_u64_be buf (String.length s);
+  Wbuf.add_string buf s
 
-   This exists specifically so [encode_into]'s [Map] case (see there) can
-   write a single-entry key's length prefix without first materializing
-   that key's bytes into a throwaway buffer just to measure them. An
-   earlier version of this fix used a plain [encoded_size : value -> int]
-   function called directly from [encode_into] instead of this precomputed
-   tree - that was still wrong in the same way the original bug was: called
-   once per nesting level on that level's (already large) subtree, it
-   re-walked the entire subtree from scratch at every level, which is
-   O(depth) work repeated at each of O(depth) levels - O(depth^2) again,
-   just moved from byte-copying into size-recomputation. Precomputing once,
-   bottom-up, over the whole tree is the actual fix: every node's size is
-   derived from its children's sizes in O(1), so the whole pass is
-   O(total nodes), independent of how deep any one chain of nesting goes. *)
-type sized_value = { size : int; shape : sized_shape }
-
-and sized_shape =
-  | SScalar of scalar
-  | SRecord of (string * sized_value) list
-  | SSum of string * sized_value
-  | SSequence of sized_value list
-  | SMap of (sized_value * sized_value) list
-
-let rec size_value (v : value) : sized_value =
+let rec encode_into buf (v : value) =
   match v with
-  | Scalar s ->
-    let size =
-      match s with
-      | Bool _ -> 2
-      | Int _ | Float _ -> 9
-      | String s -> 9 + String.length s
-      | Bytes b -> 9 + String.length b
-    in
-    { size; shape = SScalar s }
-  | Record fields ->
-    let sized = List.map (fun (k, v) -> (k, size_value v)) fields in
-    let size = 9 + List.fold_left (fun acc (k, sv) -> acc + 8 + String.length k + sv.size) 0 sized in
-    { size; shape = SRecord sized }
-  | Sum (tag, v) ->
-    let sv = size_value v in
-    { size = 9 + String.length tag + sv.size; shape = SSum (tag, sv) }
-  | Sequence items ->
-    let sized = List.map size_value items in
-    let size = 9 + List.fold_left (fun acc sv -> acc + sv.size) 0 sized in
-    { size; shape = SSequence sized }
-  | Map entries ->
-    let sized = List.map (fun (k, v) -> (size_value k, size_value v)) entries in
-    let size = 9 + List.fold_left (fun acc (sk, sv) -> acc + 8 + sk.size + sv.size) 0 sized in
-    { size; shape = SMap sized }
-
-let rec encode_into buf (sv : sized_value) =
-  match sv.shape with
-  | SScalar (Bool b) ->
-    Buffer.add_char buf tag_scalar_bool;
-    Buffer.add_char buf (if b then '\x01' else '\x00')
-  | SScalar (Int i) ->
-    Buffer.add_char buf tag_scalar_int;
+  | Scalar (Bool b) ->
+    Wbuf.add_char buf tag_scalar_bool;
+    Wbuf.add_char buf (if b then '\x01' else '\x00')
+  | Scalar (Int i) ->
+    Wbuf.add_char buf tag_scalar_int;
     for shift = 56 downto 0 do
       if shift mod 8 = 0 then
-        Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical i shift) 0xffL)))
+        Wbuf.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical i shift) 0xffL)))
     done
-  | SScalar (Float f) ->
-    Buffer.add_char buf tag_scalar_float;
+  | Scalar (Float f) ->
+    Wbuf.add_char buf tag_scalar_float;
     let bits = Int64.bits_of_float f in
     for shift = 56 downto 0 do
       if shift mod 8 = 0 then
-        Buffer.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits shift) 0xffL)))
+        Wbuf.add_char buf (Char.chr (Int64.to_int (Int64.logand (Int64.shift_right_logical bits shift) 0xffL)))
     done
-  | SScalar (String s) ->
-    Buffer.add_char buf tag_scalar_string;
+  | Scalar (String s) ->
+    Wbuf.add_char buf tag_scalar_string;
     buf_add_len_prefixed buf s
-  | SScalar (Bytes b) ->
-    Buffer.add_char buf tag_scalar_bytes;
+  | Scalar (Bytes b) ->
+    Wbuf.add_char buf tag_scalar_bytes;
     buf_add_len_prefixed buf b
-  | SRecord fields ->
-    Buffer.add_char buf tag_record;
+  | Record fields ->
+    Wbuf.add_char buf tag_record;
     let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) fields in
     write_u64_be buf (List.length sorted);
     List.iter
-      (fun (k, sv) ->
+      (fun (k, v) ->
          buf_add_len_prefixed buf k;
-         encode_into buf sv)
+         encode_into buf v)
       sorted
-  | SSum (tag, sv) ->
-    Buffer.add_char buf tag_sum;
+  | Sum (tag, v) ->
+    Wbuf.add_char buf tag_sum;
     buf_add_len_prefixed buf tag;
-    encode_into buf sv
-  | SSequence items ->
-    Buffer.add_char buf tag_sequence;
+    encode_into buf v
+  | Sequence items ->
+    Wbuf.add_char buf tag_sequence;
     write_u64_be buf (List.length items);
     List.iter (encode_into buf) items
-  | SMap entries ->
-    Buffer.add_char buf tag_map;
+  | Map entries ->
+    Wbuf.add_char buf tag_map;
     write_u64_be buf (List.length entries);
     (match entries with
      | [] -> ()
-     | [ (sk, sv) ] ->
+     | [ (k, v) ] ->
        (* Exactly one entry: there is nothing to sort (a single-element
           order is already "sorted" by definition), so this key can be
-          written straight into [buf] - length prefix from [sk.size]
-          (already computed by [size_value], a plain field read, no bytes
-          touched here), then the key's own bytes via a direct
-          [encode_into buf sk] - instead of the general multi-entry path
-          below, which must materialize full key bytes into a throwaway
-          per-entry buffer to compare them. That materialize-then-discard
-          buffer is exactly the shape that turned quadratic with nesting
-          depth for a chain of single-entry Map keys (each level's *entire*
-          already-built accumulated bytes gets copied out via
+          written straight into [buf]: reserve 8 zero bytes for its length
+          prefix, encode the key directly after them (writing straight into
+          the real output buffer, not a throwaway one), then patch the
+          reservation with the number of bytes the key actually took -
+          instead of the general multi-entry path below, which must
+          materialize full key bytes into a separate buffer to compare
+          them. That materialize-then-discard buffer is exactly the shape
+          that turned quadratic with nesting depth for a chain of
+          single-entry Map keys in the original audited bug (each level's
+          *entire* already-built accumulated bytes gets copied out via
           [Buffer.contents] and copied in again via [Buffer.add_string] at
           every level above it - the same doubling that made
           [decode_value]'s old [String.sub]-and-recurse-into-the-copy
           approach quadratic, just on the write side instead of the read
-          side). Writing directly here means every byte of a deep
-          single-entry chain is written to its final position exactly
-          once, giving O(depth) instead of O(depth^2). *)
-       write_u64_be buf sk.size;
-       encode_into buf sk;
-       encode_into buf sv
+          side). Writing directly here, with the length backfilled after
+          the fact, means every byte of a deep single-entry chain is
+          written to its final position exactly once, giving O(depth) for
+          this shape instead of O(depth^2), with no extra shadow data
+          structure needed to know the length up front (see [Wbuf]'s own
+          doc comment for why that matters). *)
+       let len_off = Wbuf.reserve buf 8 in
+       let key_start = Wbuf.length buf in
+       encode_into buf k;
+       Wbuf.patch_u64_be buf len_off (Wbuf.length buf - key_start);
+       encode_into buf v
      | _ :: _ :: _ ->
        (* Two or more entries genuinely need their full encoded key bytes to
-          determine sort order, so this path still materializes each key
-          via its own buffer - that cost is bounded by the sibling keys' own
-          sizes at this one level, not compounded across nesting depth,
-          since it only runs once per Map node reached, not once per
-          ancestor above every node. *)
-       let encoded_entries = List.map (fun (sk, sv) ->
-           let kb = Buffer.create sk.size in
-           encode_into kb sk;
-           (Buffer.contents kb, sv))
+          determine sort order, so this path still materializes each key via
+          its own buffer.
+
+          Honest cost of this path, corrected (this comment previously
+          claimed the cost here "is bounded by the sibling keys' own sizes
+          at this one level, not compounded across nesting depth" - that is
+          FALSE and was never actually measured before being written down;
+          see the correction and the depth-1000 pinning test below in
+          test_value.ml). When every level of a deep chain has 2+ entries
+          (not just the outermost), encoding one level materializes its
+          child key's full bytes via [Wbuf.contents]-equivalent copy
+          (below, [encode_into] into a fresh [kb] then read out via
+          [contents]) - and that child key is itself a 2+-entry Map one
+          level down, so producing ITS bytes recurses into this same case
+          again, one level deeper. The copy-out cost at each of the
+          O(depth) levels is proportional to that level's subtree size,
+          which is itself O(depth) for a chain - O(depth) levels x O(depth)
+          copy each = Θ(depth x size), i.e. still quadratic in depth for
+          this 2+-entries-per-level shape. This is the same shape as the
+          bug this task exists to fix, just not eliminated by this task's
+          in-place rewrite, because that rewrite only made the *single*-key
+          fast path above copy-free - it did not (and, per the sorting
+          requirement, structurally cannot without a byte-lexicographic
+          structural comparator - see the note below) do the same for the
+          general multi-key case.
+
+          This remains quadratic in depth for Maps with 2+ entries per
+          nesting level - see
+          docs/superpowers/plans/2026-09-29-audit-remediation.md Task 8,
+          which threads a depth counter through BOTH [decode_value] and
+          [encode_into] (capping nesting at 1000) and is the intended
+          mitigation for this residual. Do not silently narrow Task 8's
+          scope to [decode_value] only. *)
+       let encoded_entries = List.map (fun (k, v) ->
+           let kb = Wbuf.create 64 in
+           encode_into kb k;
+           (Wbuf.contents kb, v))
            entries
        in
        let sorted = List.stable_sort (fun (k1, _) (k2, _) -> String.compare k1 k2) encoded_entries in
        List.iter
-         (fun (kbytes, sv) ->
+         (fun (kbytes, v) ->
             buf_add_len_prefixed buf kbytes;
-            encode_into buf sv)
+            encode_into buf v)
          sorted)
 
 let canonical_encode v =
-  let sv = size_value v in
-  let buf = Buffer.create sv.size in
-  encode_into buf sv;
-  Buffer.contents buf
+  let buf = Wbuf.create 256 in
+  encode_into buf v;
+  Wbuf.contents buf
 
 (* ---- Decoding ----
 
@@ -252,9 +316,13 @@ let read_i64_payload s pos ~bound ~what =
   (!v, pos + 8)
 
 (* Slices out exactly [len] bytes at [pos]. Callers only ever pass a [len]
-   already validated by [read_len_prefix] against the same [s], so
-   [pos + len <= String.length s] is already guaranteed here — no separate
-   check is needed to stay in bounds. *)
+   already validated by [read_len_prefix] against [bound] — not directly
+   against [String.length s] — but [bound] is always [<= String.length s]
+   (every caller derives it either from [String.length s] itself, at the
+   top level, or from a narrower, already-in-bounds key-blob end offset;
+   see the [bound] doc comment above), so [pos + len <= bound <=
+   String.length s] holds transitively, and no separate check is needed
+   here to stay in bounds. *)
 let read_bytes_exact s pos len =
   (String.sub s pos len, pos + len)
 
@@ -329,10 +397,15 @@ let rec decode_value s pos ~bound =
            depth. Instead: read only the blob's length, decode the key
            directly against the OUTER buffer [s] starting at the current
            position, bounding that nested decode to end exactly at
-           [kblob_end] (never bound - the tighter of the two, so a nested
-           decode can never read past either its own key blob or the
-           overall input) — no copy, no allocation proportional to nesting
-           depth. Requiring the nested decode to land on exactly
+           [kblob_end] — never the outer [bound] — so a nested decode can
+           never read past either its own key blob or the overall input.
+           [kblob_end <= bound] unconditionally: [read_len_prefix] just
+           above already validated [kblob_len] against [bound] (the
+           "claimed length exceeds remaining input" check), which is
+           exactly what guarantees [pos + kblob_len (= kblob_end) <=
+           bound] before [kblob_end] is ever used as a bound itself — no
+           copy, no allocation proportional to nesting depth. Requiring the
+           nested decode to land on exactly
            [kblob_end] (not merely `<= kblob_end`) is what makes this
            equivalent to the old "decode the blob and require it fully
            consumed" check: trailing garbage inside a key blob (a key blob
