@@ -144,15 +144,20 @@ let with_cluster ?(replica_count = default_replica_count)
                 let rec dispatch_loop () =
                   (* [sender] is [receive]'s own authenticated-sender report (Task 1), consumed by
                      [handle_message]'s new sender cross-check (Task 3). Every message this test
-                     file's clusters produce is a genuine, non-adversarial delivery, so [sender]
-                     always matches the message's own claimed sender and the check is a no-op in
-                     practice -- but a real mismatch is now an [Invalid_argument] (see
-                     replica.mli), so this loop absorbs it, matching Cluster.run's own dispatch
-                     loop, to stay total. *)
+                     file's own clusters normally produce is a genuine, non-adversarial delivery,
+                     so [sender] always matches the message's own claimed sender and the check is
+                     a no-op in practice -- but a real mismatch is now a [Replica.Sender_mismatch]
+                     (see replica.mli; NOT the blanket [Invalid_argument] -- Finding 1 of the
+                     audit-remediation Task 3 fix round split that out specifically so it no
+                     longer also catches [durable_append]'s unrelated backend-refusal escape), so
+                     this loop absorbs it, matching Cluster.run's own dispatch loop, to stay
+                     total. [test_cluster_dispatch_drops_a_sender_mismatched_delivery] below is
+                     what actually drives a genuine mismatch through this exact loop, via [net]
+                     directly rather than any replica's own [Sim_transport.send]. *)
                   let msg, sender = Sim_transport.receive handles.(i) in
                   (match Replica.handle_message replica ~sender msg with
                   | () -> ()
-                  | exception Invalid_argument _ -> ());
+                  | exception Replica.Sender_mismatch _ -> ());
                   dispatch_loop ()
                 in
                 dispatch_loop ()))
@@ -386,8 +391,65 @@ let test_five_replica_cluster_needs_two_real_acks_before_committing () =
       Alcotest.(check int) "the two redundant acks do not advance commit_number past op_number" 1
         (Replica.commit_number primary))
 
+(* ---- Finding 2, audit-remediation Task 3 fix round: the [| exception Sender_mismatch _ -> ()]
+   absorption arm (this file's own dispatch loop above, and [lib/dst/cluster.ml]'s identical one)
+   had ZERO test coverage anywhere -- because [Sim_transport.send] stamps sender attribution BY
+   CONSTRUCTION (sim_transport.ml's own [send], which tags every outgoing message with [t.me]
+   regardless of what the payload bytes themselves claim), so no cluster traffic any REPLICA ever
+   generates through the normal API can produce a mismatch. The only way to exercise the arm for
+   its real purpose is to inject a forged delivery below the [Sim_transport.send] layer, directly
+   through the underlying [net] this file's own [with_cluster] already exposes to test bodies. ---- *)
+let test_cluster_dispatch_drops_a_sender_mismatched_delivery () =
+  with_cluster (fun ~replicas ~settle ~net ->
+      let primary = replicas.(0) and backup2 = replicas.(1) in
+      (* A [Prepare] that backup 2 would otherwise accept without question: [view = 1] (every
+         replica in this cluster is pinned there), [n = 1] (backup 2's own [op_number + 1]),
+         [k = 0], and [source = 1] -- replica 1 really is [Primary(1)], so this is not even a
+         Finding-3-style AUTHORIZATION forgery, only an ATTRIBUTION one: the claim "I am replica
+         1" arriving over a connection that is really replica 3's.
+
+         Delivered via [Network.send] DIRECTLY -- deliberately bypassing [Sim_transport.send],
+         which would stamp this delivery's sender tag with whatever [Sim_transport.t] sent it,
+         making a genuine mismatch unreachable through that API (see this test's own header
+         comment). [Fun.id] as the corruption function matches what [with_cluster]'s own
+         [Sim_transport.create net (i + 1)] calls use (no [~corrupt] override), so this delivery
+         looks, at the [Network] layer, exactly like one [Sim_transport.send] would have produced
+         -- except for the one thing under test: the tagged sender (3) does not match the
+         payload's own claimed [source] (1). *)
+      let forged =
+        Message.encode (Message.Prepare { view = 1; n = 1; v = record_value "forged"; k = 0; source = 1 })
+      in
+      Network.send Fun.id net ~from_:"3" ~to_:"2" (forged, 3);
+      settle ();
+      (* TOTAL NO-OP: the forged Prepare must leave backup 2 exactly as it was. *)
+      Alcotest.(check int) "backup 2's op_number is untouched by the forged delivery" 0 (Replica.op_number backup2);
+      check_entries "backup 2's log is untouched by the forged delivery" [] (Replica.entries backup2);
+      Alcotest.(check int) "backup 2's commit_number is untouched by the forged delivery" 0
+        (Replica.commit_number backup2);
+      (* THE CLUSTER KEEPS RUNNING: backup 2's dispatch fiber absorbed the exception and looped
+         back to [receive], rather than dying or wedging -- proven by observation, not assumed,
+         via a real propose afterward that still replicates normally to every replica, including
+         the one that just absorbed the forgery. *)
+      let v1 = record_value "v1" in
+      Replica.propose primary v1;
+      settle ();
+      check_entries "backup 2 still replicates real traffic after absorbing the forged delivery" [ v1 ]
+        (Replica.entries backup2);
+      Alcotest.(check int) "backup 2's commit_number still advances normally afterward" 0
+        (Replica.commit_number backup2)
+      (* (0, not 1: matches this file's own documented backup-commit-lag finding above -- one
+         propose alone never advances a backup's commit_number, a second Prepare's [k] field is
+         needed. Asserting the FAMILIAR lag value here, rather than skipping the check, is itself
+         part of the "cluster keeps running CORRECTLY" proof: if the forged delivery had left any
+         stray state behind, this exact value is exactly where a discrepancy would first show.) *))
+
 let tests =
-  [ ( "single propose: real replication over Sim_transport, primary commits, backup commit-lag \
+  [ ( "cluster dispatch loop: a sender-mismatched delivery injected directly through the network \
+       (bypassing Sim_transport.send's own attribution stamping) is dropped as a total no-op, and \
+       the targeted replica's dispatch fiber keeps running normally afterward",
+      `Quick,
+      test_cluster_dispatch_drops_a_sender_mismatched_delivery );
+    ( "single propose: real replication over Sim_transport, primary commits, backup commit-lag \
        finding proven and then resolved by a second propose",
       `Quick,
       test_single_propose_replicates_then_second_propose_advances_backup_commit );

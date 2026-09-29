@@ -116,6 +116,22 @@ type t =
           the sending replica's own id; cross-checked by {!Riptide_vsr.Replica.handle_message}
           against the transport-authenticated sender the same way [source] on [Prepare] is. *)
 
+val claimed_sender : t -> int
+(** [claimed_sender t] is the sending replica's own id as [t] itself claims it: [source] for
+    [Prepare]/[Start_view], [i] for [Prepare_ok]/[Start_view_change]/[Do_view_change]. Added
+    (audit-remediation Task 3 fix round, finding M2) to replace five near-identical, independently
+    maintained inline projections that used to live at each of
+    {!Riptide_vsr.Replica.handle_message}'s per-message-type cross-check branches. {b The match
+    inside is deliberately EXHAUSTIVE, with no wildcard arm}: that is the actual point of this
+    function, not just where it happens to live — a future sixth constructor added to {!t} without
+    extending this match is a compile error, not a silent "which field is the sender?" decision
+    deferred to whichever call site remembers to ask it. Every current caller of this needs
+    exactly this value for exactly one purpose ({!Riptide_vsr.Replica.handle_message}'s
+    attribution cross-check against the transport-authenticated sender), so keeping the projection
+    itself total and centralized is what makes that guarantee -- "every message type's claimed
+    sender is checked, none silently skipped" -- structural rather than a convention a reviewer
+    has to re-verify by hand at every call site. *)
+
 exception Malformed_message of string
 (** Raised by {!decode} on any input that is not a well-formed encoding of one of the five
     constructors above: bytes that don't decode as a {!Riptide.Value.value} at all (wraps

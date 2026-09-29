@@ -990,15 +990,25 @@ let create_in_view_change ~my_id ~replica_count ~view_number ~last_normal_view ~
    genuine MISMATCH between [~sender] and the payload's own claim -- has no coverage anywhere else
    in this file (nor in test_vsr_replica_cluster.ml/test_vsr_replica_recovery.ml/
    test_vsr_replica_view_change.ml, which all pass matching values too), so it is pinned here, once
-   per message type: [Invalid_argument] is raised, and the rejection is a TOTAL no-op -- no state
-   mutation, no reply sent -- exactly like [test_handle_message_malformed_bytes_dropped] above pins
-   for an undecodable payload, just one guard later. *)
+   per message type: {!Replica.Sender_mismatch} is raised, and the rejection is a TOTAL no-op -- no
+   state mutation, no reply sent -- exactly like [test_handle_message_malformed_bytes_dropped] above
+   pins for an undecodable payload, just one guard later.
 
-let expect_handle_message_invalid_arg name (f : unit -> unit) =
-  match f () with
-  | () -> Alcotest.failf "%s: expected Invalid_argument, but handle_message returned normally" name
-  | exception Invalid_argument _ -> ()
-  | exception exn -> Alcotest.failf "%s: expected Invalid_argument, got %s" name (Printexc.to_string exn)
+   Every one of the five in this section constructs a message whose OWN [source]/[i] field really
+   is that message type's legitimate sender for the receiving replica's current state (e.g. the
+   [Prepare] below claims [source = 1], and replica 1 really is [Primary(1)] for the replica_count
+   and view this test uses) -- so what each pins is ATTRIBUTION forgery specifically (a real
+   claimed identity, delivered over the wrong connection), never conflated with Finding 3's
+   separate ROLE check (a correctly-attributed sender that simply is not entitled to send that
+   message type at all -- see this file's own "Finding 3" tests further down for that). *)
+
+(* M1, fix round: this repo's own established convention for asserting on an exception carrying a
+   payload (see test_vsr_message.ml's [test_decode_rejects_a_corrupted_encoding]) is to assert the
+   REAL, exact message via [Alcotest.check_raises], not a placeholder -- a generic
+   "any Sender_mismatch will do" helper could pass even if the wrong branch (wrong claimed field,
+   wrong reported sender) raised it. *)
+let expect_handle_message_sender_mismatch name expected_message (f : unit -> unit) =
+  Alcotest.check_raises name (Replica.Sender_mismatch expected_message) f
 
 let test_handle_message_rejects_a_sender_mismatched_prepare () =
   let send, sent = capturing_send () in
@@ -1006,7 +1016,8 @@ let test_handle_message_rejects_a_sender_mismatched_prepare () =
   (* Well-formed Prepare claiming source = 1 (the real primary) -- but delivered over a connection
      transport-authenticated as replica 3, simulating a forged/relayed message. *)
   let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "x"; k = 0; source = 1 }) in
-  expect_handle_message_invalid_arg "mismatched Prepare (source=1, sender=3) is rejected" (fun () ->
+  expect_handle_message_sender_mismatch "mismatched Prepare (source=1, sender=3) is rejected"
+    "handle_message: Prepare claims source 1 but the transport-authenticated sender is 3" (fun () ->
       Replica.handle_message t ~sender:3 prepare);
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "log unchanged" true (Replica.entries t = []);
@@ -1020,7 +1031,8 @@ let test_handle_message_rejects_a_sender_mismatched_prepare_ok () =
   let sent_before = sent () in
   (* Well-formed PrepareOk claiming i = 2, delivered over a connection authenticated as replica 3. *)
   let prepare_ok = Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 2 }) in
-  expect_handle_message_invalid_arg "mismatched PrepareOk (i=2, sender=3) is rejected" (fun () ->
+  expect_handle_message_sender_mismatch "mismatched PrepareOk (i=2, sender=3) is rejected"
+    "handle_message: PrepareOk claims i 2 but the transport-authenticated sender is 3" (fun () ->
       Replica.handle_message t ~sender:3 prepare_ok);
   Alcotest.(check int) "commit_number unchanged (no quorum credited to the forged ack)" 0
     (Replica.commit_number t);
@@ -1032,7 +1044,8 @@ let test_handle_message_rejects_a_sender_mismatched_start_view_change () =
   (* Well-formed StartViewChange claiming i = 2, delivered over a connection authenticated as
      replica 3. *)
   let svc = Message.encode (Message.Start_view_change { v = 5; i = 2 }) in
-  expect_handle_message_invalid_arg "mismatched StartViewChange (i=2, sender=3) is rejected" (fun () ->
+  expect_handle_message_sender_mismatch "mismatched StartViewChange (i=2, sender=3) is rejected"
+    "handle_message: StartViewChange claims i 2 but the transport-authenticated sender is 3" (fun () ->
       Replica.handle_message t ~sender:3 svc);
   Alcotest.(check bool) "status unchanged (still Normal): the higher view was never adopted" true
     (Replica.status t = Replica.Normal);
@@ -1046,7 +1059,8 @@ let test_handle_message_rejects_a_sender_mismatched_do_view_change () =
   (* Well-formed DoViewChange claiming i = 2, delivered over a connection authenticated as
      replica 3. *)
   let dvc = dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:2 in
-  expect_handle_message_invalid_arg "mismatched DoViewChange (i=2, sender=3) is rejected" (fun () ->
+  expect_handle_message_sender_mismatch "mismatched DoViewChange (i=2, sender=3) is rejected"
+    "handle_message: DoViewChange claims i 2 but the transport-authenticated sender is 3" (fun () ->
       Replica.handle_message t ~sender:3 dvc);
   Alcotest.(check bool) "nothing accumulated into recv_dvc" true (Replica.for_test_recv_dvc_senders t = []);
   Alcotest.(check bool) "status unchanged (still View_change)" true (Replica.status t = Replica.View_change);
@@ -1058,11 +1072,63 @@ let test_handle_message_rejects_a_sender_mismatched_start_view () =
   (* Well-formed StartView claiming source = 1, delivered over a connection authenticated as
      replica 3 -- the highest-severity forgery per replica.mli's own doc comment: a receiver
      adopts a StartView's log/n/k wholesale, so this must never be reachable via a spoofed
-     sender. *)
+     sender. [v:1] keeps [source:1] a genuinely correct claim too (Primary(1) = 1 at
+     replica_count = 3), so this test's rejection is purely about the sender/source ATTRIBUTION
+     mismatch (source=1 vs. sender=3), not about Finding 3's separate role check. *)
   let sv = sv_msg ~source:1 ~v:1 ~log:[ v "forged" ] ~n:1 ~k:1 in
-  expect_handle_message_invalid_arg "mismatched StartView (source=1, sender=3) is rejected" (fun () ->
+  expect_handle_message_sender_mismatch "mismatched StartView (source=1, sender=3) is rejected"
+    "handle_message: StartView claims source 1 but the transport-authenticated sender is 3" (fun () ->
       Replica.handle_message t ~sender:3 sv);
   Alcotest.(check bool) "status unchanged (still Normal)" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number unchanged" 0 (Replica.view_number t);
+  Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
+  Alcotest.(check bool) "log unchanged (the forged entry was NOT adopted)" true (Replica.entries t = []);
+  Alcotest.(check bool) "no messages sent" true (sent () = [])
+
+(* ---- Finding 3 (audit-remediation Task 3 fix round): source/i authenticated correctly, but from
+   a replica with no ROLE-based right to send that message type ----
+
+   The five tests just above pin ATTRIBUTION forgery: [source]/[sender] disagree, so [handle_message]
+   itself rejects before any per-message-type logic runs. The two tests below pin the OTHER half of
+   the audit's single highest-severity finding, closed separately: a message whose [source]/[sender]
+   genuinely AGREE (a real, credentialed replica, honestly identifying itself) but which names a
+   replica that is simply not entitled to send THIS message type at all -- not Primary of the
+   relevant view. Per the controller's own ruling on this finding, sender-authentication ALONE does
+   NOT close finding 4d (one forged Start_view rewriting the whole cluster's log): a genuine cluster
+   member, under its own true identity, could still send a Start_view/Prepare it has no business
+   sending, and every guard before this fix accepted it. Both are silent no-ops (a role violation is
+   ordinary protocol-safety territory, like a wrong-view Prepare -- not the "identity cannot be
+   trusted at all" signal {!Replica.Sender_mismatch} exists for), never raising. *)
+
+let test_handle_message_rejects_a_prepare_from_a_correctly_attributed_non_primary () =
+  let send, sent = capturing_send () in
+  (* Primary(1) = 1 at replica_count = 3 -- replica 3 is a real, ordinary backup, not the primary,
+     of this view. *)
+  let t = create_at_view_1 ~my_id:2 ~replica_count:3 ~send in
+  (* A well-formed Prepare, correctly self-attributed (source = 3 = sender = 3 -- no attribution
+     forgery here at all), but replica 3 is not Primary(1); only replica 1 is. *)
+  let prepare = Message.encode (Message.Prepare { view = 1; n = 1; v = v "x"; k = 0; source = 3 }) in
+  Replica.handle_message t ~sender:3 prepare;
+  Alcotest.(check int) "op_number unchanged: a non-primary's Prepare is a total no-op" 0
+    (Replica.op_number t);
+  Alcotest.(check bool) "log unchanged" true (Replica.entries t = []);
+  Alcotest.(check int) "commit_number unchanged" 0 (Replica.commit_number t);
+  Alcotest.(check bool) "no reply sent" true (sent () = [])
+
+let test_handle_message_rejects_a_start_view_from_a_correctly_attributed_non_primary () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
+  (* Primary(2) = 2 at replica_count = 3 -- replica 3 is a real, ordinary cluster member, but has
+     no right to announce a StartView for view 2; only replica 2 does. Correctly self-attributed
+     (source = 3 = sender = 3), and otherwise entirely well-formed (log/n/k all internally
+     consistent) -- the ONLY thing wrong with this message is WHO is sending it. This is the exact
+     reproduction of the audit's own single highest-severity finding that attribution-checking
+     alone does not close: replica 3, under its own true, un-spoofed identity, attempting to
+     rewrite this replica's entire committed log. *)
+  let sv = sv_msg ~source:3 ~v:2 ~log:[ v "forged" ] ~n:1 ~k:1 in
+  Replica.handle_message t ~sender:3 sv;
+  Alcotest.(check bool) "status unchanged (still Normal): a non-primary's StartView is a total no-op"
+    true (Replica.status t = Replica.Normal);
   Alcotest.(check int) "view_number unchanged" 0 (Replica.view_number t);
   Alcotest.(check int) "op_number unchanged" 0 (Replica.op_number t);
   Alcotest.(check bool) "log unchanged (the forged entry was NOT adopted)" true (Replica.entries t = []);
@@ -1466,8 +1532,10 @@ let test_receive_sv_adopts_log_view_and_returns_to_normal () =
   Alcotest.(check bool) "mid-view-change at view 2" true
     (Replica.status t = Replica.View_change && Replica.view_number t = 2);
   (* The new primary's StartView carries a DIFFERENT log tail (c instead of b) -- adoption is
-     WHOLESALE (VSR.tla:296), not a merge or an append. *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+     WHOLESALE (VSR.tla:296), not a merge or an append. [source:2], not [1] (Finding 3, fix
+     round): Primary(2) = 2 at replica_count = 3, so replica 2, not 1, is who genuinely gets to
+     announce view 2 -- see [primary_of_view]'s own doc comment. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
   Alcotest.(check bool) "the log is replaced wholesale by the StartView's own log" true
     (Replica.entries t = [ v "a"; v "c" ]);
   Alcotest.(check int) "op_number follows the adopted log's length (= m.n)" 2 (Replica.op_number t);
@@ -1488,8 +1556,9 @@ let test_receive_sv_accepts_equal_view_and_rejects_lower () =
   Alcotest.(check int) "a higher-view StartView is adopted" 1 (Replica.view_number t);
   Alcotest.(check bool) "with its log" true (Replica.entries t = [ v "p" ]);
   Replica.for_test_set_view_number t 3;
-  (* EQUAL view, while already Normal: accepted (no status conjunct, and [>=] includes equality). *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:3 ~log:[ v "x" ] ~n:1 ~k:0);
+  (* EQUAL view, while already Normal: accepted (no status conjunct, and [>=] includes equality).
+     [source:3], not [1] (Finding 3, fix round): Primary(3) = 3 at replica_count = 3. *)
+  Replica.handle_message t ~sender:3 (sv_msg ~source:3 ~v:3 ~log:[ v "x" ] ~n:1 ~k:0);
   Alcotest.(check bool) "an EQUAL-view StartView is accepted and re-applied" true (Replica.entries t = [ v "x" ]);
   Alcotest.(check int) "view_number stays at the same view" 3 (Replica.view_number t);
   (* Strictly LOWER view: not enabled, dropped wholesale. *)
@@ -1536,14 +1605,17 @@ let test_receive_sv_refuses_to_truncate_below_commit_number () =
   Alcotest.(check int) "commit_number 2, op_number 3" 2 (Replica.commit_number t);
   (* A StartView whose whole log is SHORTER than this replica's committed prefix. Adopting it would
      discard committed entries outright, and (with the monotonic rule above keeping commit_number at
-     2) would leave commit_number > op_number. Dropped wholesale instead. *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[ v "z" ] ~n:1 ~k:1);
+     2) would leave commit_number > op_number. Dropped wholesale instead. [source:2], not [1]
+     (Finding 3, fix round): Primary(2) = 2 at replica_count = 3 -- using the REAL primary here
+     keeps this test genuinely exercising the "shorter than commit_number" guard itself, rather
+     than being short-circuited earlier by the unrelated primary-role check. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[ v "z" ] ~n:1 ~k:1);
   Alcotest.(check bool) "the committed log is NOT truncated" true (Replica.entries t = [ v "a"; v "b"; v "c" ]);
   Alcotest.(check int) "view_number untouched (dropped wholesale, not partially applied)" 1 (Replica.view_number t);
   Alcotest.(check int) "commit_number untouched" 2 (Replica.commit_number t);
   Alcotest.(check bool) "status untouched" true (Replica.status t = Replica.Normal);
   (* Boundary: a log exactly AS LONG as the committed prefix is still legal and still accepted. *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[ v "a"; v "b" ] ~n:2 ~k:2);
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[ v "a"; v "b" ] ~n:2 ~k:2);
   Alcotest.(check bool) "n = commit_number (the shortest legal log) is accepted" true
     (Replica.entries t = [ v "a"; v "b" ]);
   Alcotest.(check int) "and the view is adopted" 2 (Replica.view_number t)
@@ -1568,8 +1640,12 @@ let test_receive_sv_forged_fields_rejected () =
       ("negative v", sv_msg ~source:1 ~v:(-1) ~log:[] ~n:0 ~k:0);
     ];
   (* The last ACCEPTED values: k = n exactly (a fully-committed view is legitimate here, unlike a
-     Prepare's strict k < n) at the lowest legal v. *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:0 ~log:[ v "a" ] ~n:1 ~k:1);
+     Prepare's strict k < n) at the lowest legal v. [source:3], not [1] (Finding 3, fix round):
+     Primary(0) = replica_count = 3 (see [primary_of_view]'s own doc comment on why view 0's
+     primary is NOT replica 1), and [t]'s own view_number is still 0 here (every message in the
+     list above was correctly rejected before ever advancing it), so [v = 0]'s real primary is
+     replica 3. *)
+  Replica.handle_message t ~sender:3 (sv_msg ~source:3 ~v:0 ~log:[ v "a" ] ~n:1 ~k:1);
   Alcotest.(check bool) "the boundary-valid StartView (k = n, v = View(r)) IS accepted" true
     (Replica.entries t = [ v "a" ]);
   Alcotest.(check int) "commit_number = k = n" 1 (Replica.commit_number t)
@@ -1596,7 +1672,13 @@ let test_receive_sv_does_not_reset_recv_dvc_or_recv_svc () =
     (Replica.for_test_recv_svc_senders t);
   Alcotest.(check (list int)) "recv_dvc populated before the StartView" [ 5 ]
     (Replica.for_test_recv_dvc_senders t);
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[] ~n:0 ~k:0);
+  (* [source:2], not [1] (Finding 3, fix round): Primary(2) = 2 at replica_count = 5, per this
+     test's own comment above -- [t] itself (my_id = 2) is who genuinely gets to announce view 2,
+     so this StartView is mechanically a self-addressed delivery (nothing in [handle_start_view]
+     excludes that, unlike [Start_view_change]'s own explicit self-exclusion), standing in for
+     "some other real path this replica's own SendSV never took because its DVC quorum never
+     completed" -- the test's own point either way. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[] ~n:0 ~k:0);
   Alcotest.(check bool) "ReceiveSV returned this replica to Normal" true (Replica.status t = Replica.Normal);
   Alcotest.(check (list int))
     "recv_svc is deliberately NOT reset by ReceiveSV -- VSR.tla:304's own UNCHANGED" [ 3; 4 ]
@@ -1616,7 +1698,8 @@ let test_new_view_change_episode_resets_recv_dvc_and_recv_svc () =
   Replica.check_timeout t;
   Replica.handle_message t ~sender:3 (Message.encode (Message.Start_view_change { v = 2; i = 3 }));
   Replica.handle_message t ~sender:5 (dvc_msg ~v:2 ~log:[] ~last_normal_view:1 ~n:0 ~k:0 ~i:5);
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[] ~n:0 ~k:0);
+  (* [source:2], not [1] (Finding 3, fix round): Primary(2) = 2 at replica_count = 5. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[] ~n:0 ~k:0);
   Alcotest.(check (list int)) "carried over past ReceiveSV" [ 5 ] (Replica.for_test_recv_dvc_senders t);
   (* Path 1: TimerSendSVC (VSR.tla:168-169). *)
   Replica.check_timeout t;
@@ -1660,8 +1743,12 @@ let test_receive_sv_resets_svc_count_only_on_a_real_transition () =
   Alcotest.(check int) "both permitted timeouts have been spent (view 2)" 2 (Replica.view_number u);
   (* Three duplicate StartViews for the view this replica is already Normal in. Each is genuinely
      ACCEPTED (m.v >= View(r), no status conjunct) and re-applies its log/view/status -- what it
-     must NOT do is reset svc_count. *)
-  List.iter (fun () -> Replica.handle_message u ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[] ~n:0 ~k:0)) [ (); (); () ];
+     must NOT do is reset svc_count. [source:2], not [1] (Finding 3, fix round): Primary(2) = 2 at
+     replica_count = 3 -- using the real primary keeps these genuinely ACCEPTED, as the comment
+     above claims, rather than silently dropped by the unrelated primary-role check (which would
+     leave the assertions below vacuously true for the wrong reason: state already matched before
+     these duplicates were even delivered). *)
+  List.iter (fun () -> Replica.handle_message u ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[] ~n:0 ~k:0)) [ (); (); () ];
   Alcotest.(check bool) "the duplicates were accepted (status Normal at the same view)" true
     (Replica.status u = Replica.Normal && Replica.view_number u = 2);
   Replica.check_timeout u;
@@ -1762,7 +1849,8 @@ let test_on_commit_advanced_fires_from_receive_sv () =
   Replica.handle_message t ~sender:1 (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1; source = 1 }));
   Alcotest.(check (list (pair int int))) "handle_prepare's own site fired 0 -> 1" [ (0, 1) ] !observed;
   Replica.check_timeout t;
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+  (* [source:2], not [1] (Finding 3, fix round): Primary(2) = 2 at replica_count = 3. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
   Alcotest.(check int) "ReceiveSV really did advance commit_number to m.k" 2 (Replica.commit_number t);
   Alcotest.(check (list (pair int int))) "and ReceiveSV's own site fired 1 -> 2" [ (1, 2); (0, 1) ] !observed
 
@@ -1831,8 +1919,9 @@ let test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup () =
     (Replica.commit_number t);
   status_inside_callback := None;
   (* A higher-view StartView delivered directly to that still-Normal backup. No [check_timeout], no
-     Start_view_change, no view-change activity of any kind on this replica beforehand. *)
-  Replica.handle_message t ~sender:1 (sv_msg ~source:1 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
+     Start_view_change, no view-change activity of any kind on this replica beforehand. [source:2],
+     not [1] (Finding 3, fix round): Primary(2) = 2 at replica_count = 3. *)
+  Replica.handle_message t ~sender:2 (sv_msg ~source:2 ~v:2 ~log:[ v "a"; v "c" ] ~n:2 ~k:2);
   Alcotest.(check int) "a GENUINE commit advance really happened through handle_start_view" 2
     (Replica.commit_number t);
   Alcotest.(check (list (pair int int))) "and the hook fired for it, 1 -> 2" [ (1, 2); (0, 1) ] !observed;
@@ -1920,21 +2009,28 @@ let tests =
     ("handle_message: malformed bytes are silently dropped, never raise", `Quick, test_handle_message_malformed_bytes_dropped);
     ("handle_message: a DoViewChange failing ValidDvc changes nothing at all", `Quick, test_do_view_change_wrong_view_dropped);
     (* Task 3: handle_message's sender cross-check *)
-    ( "handle_message: a sender-mismatched Prepare is rejected (Invalid_argument, total no-op)",
+    ( "handle_message: a sender-mismatched Prepare is rejected (Sender_mismatch, total no-op)",
       `Quick,
       test_handle_message_rejects_a_sender_mismatched_prepare );
-    ( "handle_message: a sender-mismatched PrepareOk is rejected (Invalid_argument, total no-op)",
+    ( "handle_message: a sender-mismatched PrepareOk is rejected (Sender_mismatch, total no-op)",
       `Quick,
       test_handle_message_rejects_a_sender_mismatched_prepare_ok );
-    ( "handle_message: a sender-mismatched StartViewChange is rejected (Invalid_argument, total no-op)",
+    ( "handle_message: a sender-mismatched StartViewChange is rejected (Sender_mismatch, total no-op)",
       `Quick,
       test_handle_message_rejects_a_sender_mismatched_start_view_change );
-    ( "handle_message: a sender-mismatched DoViewChange is rejected (Invalid_argument, total no-op)",
+    ( "handle_message: a sender-mismatched DoViewChange is rejected (Sender_mismatch, total no-op)",
       `Quick,
       test_handle_message_rejects_a_sender_mismatched_do_view_change );
-    ( "handle_message: a sender-mismatched StartView is rejected (Invalid_argument, total no-op)",
+    ( "handle_message: a sender-mismatched StartView is rejected (Sender_mismatch, total no-op)",
       `Quick,
       test_handle_message_rejects_a_sender_mismatched_start_view );
+    (* Finding 3 (audit-remediation Task 3 fix round): correctly-attributed but non-primary sender *)
+    ( "Finding 3: a correctly-attributed Prepare from a non-primary replica is a silent no-op",
+      `Quick,
+      test_handle_message_rejects_a_prepare_from_a_correctly_attributed_non_primary );
+    ( "Finding 3: a correctly-attributed StartView from a non-primary replica is a silent no-op",
+      `Quick,
+      test_handle_message_rejects_a_start_view_from_a_correctly_attributed_non_primary );
     (* Fix-round L2 (task-1-review.md): svc_limit boundary *)
     ("Fix-round L2: svc_limit = 1 (the smallest legal value) is accepted", `Quick, test_svc_limit_boundary_one_is_accepted);
     (* Task 2: check_timeout (TimerSendSVC) *)

@@ -316,12 +316,25 @@ val restart :
     so {!op_number} can legitimately exceed [List.length (entries t)] after a restart that
     discovered corruption. See {!op_number}. *)
 
+val primary_of_view : replica_count:int -> int -> int
+(** [primary_of_view ~replica_count v] is VSR.tla's own [Primary(v) == 1 + ((v-1) % ReplicaCount)]
+    (VSR.tla:18) for an ARBITRARY view [v] — not necessarily any particular replica's own current
+    {!view_number}. {!primary} below is the common case (a replica's own current view) expressed
+    as a thin wrapper over this. Added for audit-remediation Task 3's Finding 3: a [Start_view]
+    message names its OWN view [v] in its [v] field, which need not equal the receiving replica's
+    current {!view_number} (VSR.tla:295's guard is [m.v >= View(r)], not [m.v = View(r)] — see
+    {!handle_message}'s [Start_view] case), so checking "is the sender really Primary of the view
+    THIS MESSAGE is about" requires computing [Primary] of the message's own [v], not of the
+    receiver's. See {!primary}'s own doc comment for the Euclidean-vs-truncating-modulo trap this
+    is normalized against. *)
+
 val primary : t -> int
-(** [primary t] is VSR.tla's own [Primary(View(r)) == 1 + ((View(r)-1) % ReplicaCount)]
-    (VSR.tla:18) evaluated against [t]'s current {!view_number} — a pure, computed function of
-    state, never a stored field. See this module's own top-level scope note for the Euclidean-vs-
-    truncating-modulo trap this implementation is normalized against, and for why [view_number =
-    0]'s primary is [replica_count], not [1]. *)
+(** [primary t] is [primary_of_view ~replica_count:t.replica_count (view_number t)] — VSR.tla's
+    own [Primary(View(r)) == 1 + ((View(r)-1) % ReplicaCount)] (VSR.tla:18) evaluated against
+    [t]'s current {!view_number} — a pure, computed function of state, never a stored field. See
+    this module's own top-level scope note for the Euclidean-vs-truncating-modulo trap this
+    implementation is normalized against, and for why [view_number = 0]'s primary is
+    [replica_count], not [1]. *)
 
 val is_primary : t -> bool
 (** [is_primary t] is VSR.tla's own [r = Primary(View(r))] test — exactly [t.my_id = primary t]. *)
@@ -601,6 +614,18 @@ val check_timeout : t -> unit
     mechanism; this call only has an observable effect in the degenerate [replica_count = 1]
     ([f = 0]) cluster (see [replica.ml]'s own comment on [try_send_dvc] for why). *)
 
+exception Sender_mismatch of string
+(** Raised by {!handle_message} — see its own doc comment for exactly when and why — on a mismatch
+    between a decoded message's own claimed sender and the transport-authenticated [~sender] it
+    actually arrived from. {b Audit-remediation Task 3, Finding 1 of the fix round}: this used to
+    be a bare [Invalid_argument], overloading the same exception {!durable_append}'s own escape
+    hatch uses for a completely different condition (an unclassified backend refusal that must
+    NEVER be laundered into "the protocol declined an op" — see [replica.ml]'s comment at that
+    raise site). A caller whose dispatch loop absorbs [Invalid_argument] to stay total against a
+    sender mismatch (see below) could not, with one shared exception type, avoid ALSO absorbing a
+    genuine backend-contract violation — this distinct exception is what lets a caller catch
+    exactly the sender-mismatch case and let everything else propagate unchanged. *)
+
 val handle_message : t -> sender:int -> string -> unit
 (** [handle_message t ~sender bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and
     dispatches.
@@ -611,15 +636,20 @@ val handle_message : t -> sender:int -> string -> unit
     unmodified by every real caller (see {!Riptide_dst.Cluster}'s dispatch loop). Before ANY of
     the per-message-type dispatch described below runs, [handle_message] cross-checks [sender]
     against that message's OWN claimed sender — [source] on [Prepare]/[Start_view], [i] on
-    [Prepare_ok]/[Start_view_change]/[Do_view_change] — and {b raises [Invalid_argument] on a
+    [Prepare_ok]/[Start_view_change]/[Do_view_change] — and {b raises {!Sender_mismatch} on a
     mismatch, as a total no-op: no state mutation, no reply sent}, for every message type, not
     just the two ([Prepare]/[Start_view]) that gained a sender field specifically for this. This
-    closes the audit's single highest-severity finding: previously [Prepare]/[Start_view] carried
-    no sender claim to even check, and even the message types that DID carry one ([i] on the three
-    above) had nothing cross-checking that claim against who actually sent the bytes, so one
-    legitimate replica could spoof another's [i] to manufacture a fake commit/view-change quorum,
-    or (with [Start_view] previously uncheckable at all) a single forged message could rewrite the
-    entire cluster's committed log.
+    closes one major piece of the audit's single highest-severity finding: previously
+    [Prepare]/[Start_view] carried no sender claim to even check, and even the message types that
+    DID carry one ([i] on the three above) had nothing cross-checking that claim against who
+    actually sent the bytes, so one legitimate replica could spoof another's [i] to manufacture a
+    fake commit/view-change quorum, or (with [Start_view] previously uncheckable at all) a single
+    forged message could rewrite the entire cluster's committed log.
+
+    {b This closes attribution forgery, but NOT role forgery} — see Finding 3, described on
+    [Prepare] and [Start_view] below, for the other half: a real, correctly-attributed sender
+    that simply has no business sending that message type at all (not the current view's primary)
+    is a separate, independently-checked condition.
 
     This is deliberately a RAISE, not the silent drop every in-dispatch guard below uses for a
     protocol-stale-but-honestly-attributed message (a late [Prepare], a wrong-view [Prepare_ok]):
@@ -628,7 +658,7 @@ val handle_message : t -> sender:int -> string -> unit
     observe it as a distinct, exceptional condition rather than have it vanish indistinguishably
     from ordinary staleness. A caller whose dispatch loop must stay total in the face of
     adversarial input (e.g. {!Riptide_dst.Cluster}'s fault-injecting simulation) catches
-    [Invalid_argument] around this call, the same way it already absorbs
+    {!Sender_mismatch} around this call, the same way it already absorbs
     {!Riptide_vsr.Message.Malformed_message} for an undecodable payload.
 
     The per-message-type dispatch itself, once the sender check above has passed:
@@ -638,7 +668,17 @@ val handle_message : t -> sender:int -> string -> unit
       a no-op if [status t <> Normal] OR if [t] IS the primary; an earlier, normal-case-only plan's
       version only checked the primary half), gated on [m.view = view_number t] and, per VSR.tla's
       own strict-order guard [rep_op_number[r] + 1 = m.n] (VSR.tla:115), on the message's [n]
-      being exactly [op_number t + 1]. {b An out-of-order [Prepare] (too high, too low, or a gap)
+      being exactly [op_number t + 1]. {b Also gated (Finding 3, audit-remediation Task 3 fix
+      round) on [source] equaling {!primary} t}: [handle_message]'s own cross-check above only
+      proves [source] is who transport-authenticated [sender] really is, never that this real,
+      credentialed replica had any business sending a [Prepare] at all — a [Prepare] is only ever
+      legitimate from the CURRENT view's primary, and this closes the other half of the audit's
+      highest-severity finding (a genuine cluster member, under its own true identity, sending a
+      message type it has no role-based right to send). [primary t], not [primary_of_view] of the
+      message's own [view] field, is the right comparison specifically because the [m.view =
+      view_number t] guard just above already forces them equal for anything that reaches this
+      point. A message failing this is dropped, total no-op, exactly like the out-of-order case
+      just below. {b An out-of-order [Prepare] (too high, too low, or a gap)
       is silently dropped} — log unchanged, no [Prepare_ok] sent, no exception raised to the
       caller — exactly matching VSR.tla's own behavior of simply not enabling this action for a
       mismatched [n]: there is no buffering, reordering, or retry logic anywhere in this module's
@@ -814,7 +854,19 @@ val handle_message : t -> sender:int -> string -> unit
       adopted log committed off one corrupted integer).
     - A [Start_view] message drives VSR.tla's [ReceiveSV] (VSR.tla:292-305). Guard: [m.v >= View(r)]
       — {b [>=], not [>]}, and with no status conjunct, so a [StartView] for the view this replica is
-      already in is accepted and re-applied; only a strictly lower [m.v] is dropped. Effect: adopts
+      already in is accepted and re-applied; only a strictly lower [m.v] is dropped. {b Also gated
+      (Finding 3, audit-remediation Task 3 fix round) on [source] equaling [primary_of_view
+      ~replica_count v] — [Primary] of the message's OWN [v], not of [t]'s current
+      {!view_number}}: this is the exact reproduction of the audit's single highest-severity
+      finding that [handle_message]'s attribution cross-check alone does NOT close — a real,
+      correctly-attributed cluster member that simply is not Primary of the view it claims to be
+      announcing could otherwise rewrite this replica's entire log with one well-formed
+      [StartView], no spoofing required. [primary_of_view], not {!primary}, because a legitimate
+      [StartView] routinely announces a view AHEAD of [t]'s own current one (that is the whole
+      point of [>=] above) — checking against {!primary}'s value (Primary of the OLD view) would
+      wrongly reject every genuine one. Checked before [n]/[log]/[k] are inspected at all; a
+      message failing it is dropped, total no-op, before the guards described next even run.
+      Effect: adopts
       [m.log] (and hence [m.n]) wholesale, sets [view_number] and [last_normal_view] to [m.v],
       returns [status] to [Normal], resets [svc_count] {b only on a real [View_change → Normal]
       transition} (see {!check_timeout}), and advances [commit_number] to [m.k]
@@ -825,8 +877,7 @@ val handle_message : t -> sender:int -> string -> unit
       [StartView] whose log is SHORTER than this replica's own [commit_number] is refused outright,
       since adopting it would discard already-committed entries (TLC-confirmed inert for correct
       traffic: no reachable state of `spec/tla/VSR.tla` has a receivable, view-eligible [StartView]
-      with [m.n < rep_commit_number[r]]). Note [Start_view] carries no [i] field at all (neither does
-      the spec's own record literal), so there is no sender to range-check.
+      with [m.n < rep_commit_number[r]]).
 
       {b [recv_dvc] and [recv_svc] are deliberately NOT reset here} — VSR.tla:304 lists both as
       UNCHANGED, and `spec/tla/README.md` has the detailed, TLC-backed argument for why the stale

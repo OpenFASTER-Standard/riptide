@@ -88,12 +88,15 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
                            message in this test file is a genuine, non-adversarial delivery, so
                            [sender] always matches the message's own claimed sender and this check
                            is a no-op in practice here -- but a mismatch is a real, expected
-                           [Invalid_argument] (see replica.mli), so this loop absorbs it exactly
-                           like [Cluster.run]'s own dispatch loop does, to stay total. *)
+                           [Replica.Sender_mismatch] (see replica.mli; NOT the blanket
+                           [Invalid_argument] -- Finding 1 of the fix round split that out so it
+                           no longer also catches [durable_append]'s unrelated backend-refusal
+                           escape), so this loop absorbs it exactly like [Cluster.run]'s own
+                           dispatch loop does, to stay total. *)
                         let msg, sender = Sim_transport.receive handles.(i) in
                         (match Replica.handle_message replica ~sender msg with
                         | () -> ()
-                        | exception Invalid_argument _ -> ());
+                        | exception Replica.Sender_mismatch _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

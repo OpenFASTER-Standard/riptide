@@ -511,24 +511,37 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
                      [decr] in a [Fun.protect]-free tail position used to be safe unconditionally
                      because [handle_message] was total on adversarial input and never raised. As
                      of Task 3 that is no longer quite true: a message whose claimed sender
-                     mismatches [sender] now makes [handle_message] raise [Invalid_argument] (a
-                     DELIBERATE change -- see replica.mli's own doc comment on why that guard alone
-                     is a raise, not a silent drop, unlike every other guard in that dispatch). This
-                     loop still needs to stay total in the face of adversarial/corrupted input the
-                     same way it always has, so it absorbs exactly that one exception here, right
-                     next to the decoded-payload case [handle_message] itself already swallows
-                     internally ([Message.Malformed_message]) -- both are "this delivery cannot be
-                     trusted, drop it and keep running", just raised one guard later than the wire
-                     shape check is. In practice this fires vanishingly rarely from
-                     [flip_one_byte]'s own corruption fault (a single flipped byte almost always
-                     breaks {!Riptide_vsr.Message.decode}'s own whole-body checksum first, per its
-                     own doc comment, so [Malformed_message] is what actually fires for
-                     corruption); this catch exists for genuine spoofing attempts (a real, if
-                     currently synthetic-only, adversarial-replica scenario) and defense in depth. *)
+                     mismatches [sender] now makes [handle_message] raise
+                     [Riptide_vsr.Replica.Sender_mismatch] (a DELIBERATE change -- see
+                     replica.mli's own doc comment on why that guard alone is a raise, not a
+                     silent drop, unlike every other guard in that dispatch). This loop still
+                     needs to stay total in the face of adversarial/corrupted input the same way
+                     it always has, so it absorbs exactly that one exception here, right next to
+                     the decoded-payload case [handle_message] itself already swallows internally
+                     ([Message.Malformed_message]) -- both are "this delivery cannot be trusted,
+                     drop it and keep running", just raised one guard later than the wire shape
+                     check is. In practice this fires vanishingly rarely from [flip_one_byte]'s
+                     own corruption fault (a single flipped byte almost always breaks
+                     {!Riptide_vsr.Message.decode}'s own whole-body checksum first, per its own
+                     doc comment, so [Malformed_message] is what actually fires for corruption);
+                     this catch exists for genuine spoofing attempts (a real, if currently
+                     synthetic-only, adversarial-replica scenario) and defense in depth.
+
+                     FIX-ROUND FINDING 1 (audit-remediation Task 3): this used to catch the
+                     blanket [Invalid_argument], which is ALSO what [Replica.durable_append]
+                     re-raises for an unclassified backend refusal ([replica.ml]'s own comment at
+                     that raise site is explicit that it must NEVER be laundered into "the
+                     protocol declined an op") -- reached from here via [handle_prepare] at a real
+                     [Prepare]. A blanket catch silently absorbed that too, turning a real backend
+                     fault inside a DST run into a quiet, incorrectly green drop instead of a
+                     propagating failure. Catching the distinct [Sender_mismatch] instead fixes
+                     this: only a genuine sender-mismatch is absorbed here, and a backend contract
+                     violation now propagates out of this dispatch loop exactly as it did before
+                     Task 3 ever added a sender field to check. *)
                   if alive.(i) then begin
                     match Riptide_vsr.Replica.handle_message replicas.(i) ~sender msg with
                     | () -> ()
-                    | exception Invalid_argument _ -> ()
+                    | exception Riptide_vsr.Replica.Sender_mismatch _ -> ()
                   end;
                   decr inflight;
                   dispatch_loop ()

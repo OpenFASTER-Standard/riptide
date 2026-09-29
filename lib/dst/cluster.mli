@@ -188,6 +188,18 @@ val run :
     everything is wired, then unwinds the whole switch (stopping every dispatch fiber) once [body]
     returns.
 
+    {b Finding 2, audit-remediation Task 3 fix round: this dispatch loop silently DROPS a
+    sender-mismatched delivery rather than crashing the cluster.} Since Task 3,
+    [Replica.handle_message] raises {!Riptide_vsr.Replica.Sender_mismatch} when a decoded
+    message's own claimed sender disagrees with who transport-authenticated it (see
+    {!Riptide_vsr.Replica.handle_message}'s own doc comment); this loop catches exactly that
+    exception, right next to the [Message.Malformed_message] case it already absorbs internally,
+    and otherwise keeps running. {b This is deliberate DST-harness behavior, not an oversight}: it
+    matches what a real, [Tcp]-backed deployment would also do at the same point (drop the one
+    untrustworthy delivery, keep serving every other connection) — a forged/misrouted message
+    from one adversarial or buggy peer must never be allowed to take down an otherwise-healthy
+    replica's whole dispatch loop, in a simulated cluster any more than in a real one.
+
     {b [replicas.(i)] is replica [i + 1]}, matching every existing cluster-test harness in this
     repo ([with_cluster], [with_cluster_and_storage]). {b Every replica's [view_number] is pinned
     to [1] before [body] runs} (via [Replica.for_test_set_view_number], same as

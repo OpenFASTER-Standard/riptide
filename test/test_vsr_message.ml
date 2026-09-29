@@ -60,19 +60,19 @@ let test_round_trip_start_view () =
 let test_decode_rejects_a_corrupted_encoding () =
   let msg = Message.Prepare { view = 1; n = 1; v = Value.Scalar (Value.String "x"); k = 0; source = 1 } in
   let encoded = Message.encode msg in
-  (* Flip the LAST byte of the checksummed BODY (i.e. the byte right before the 8-byte trailing
-     checksum {!Message.encode} appends) -- the last thing any canonical encoder writes for a
-     record is real field content, never a length prefix (those always precede the bytes they
-     measure), so this reliably lands on content and reproduces the checksum-mismatch path this
-     test is actually about, unlike a fixed "middle" offset (this record's own byte layout shifted
-     once audit-remediation Task 3 added the `source` field, and "the middle" landed on a
-     length-prefix byte instead, producing a decode error from THAT, a different and less specific
-     failure mode than the one this test names). *)
+  (* M3, audit-remediation Task 3 fix round: flip the very LAST byte of the whole encoding --
+     guaranteed to land INSIDE the trailing checksum itself (whose own length is nonzero) no
+     matter what record layout the checksummed body happens to have, so this is structurally
+     immune to the exact defect this replaced: a byte-offset computed against the body's own
+     length (`- 8 - 1`) that silently landed on a DIFFERENT byte, and therefore a DIFFERENT,
+     less-specific failure mode than the one this test names, the moment audit-remediation Task 3
+     added the `source` field and shifted the record's own layout. [decode] recomputes the
+     checksum over the (untouched, still well-formed) body and compares it against these now-wrong
+     trailing bytes -- a mismatch regardless of which body byte the checksum actually covers, so
+     this reproduces the checksum-mismatch path this test is about without depending on record
+     layout, field order, or {!Message.checksum_length}'s own value at all. *)
   let corrupted = Bytes.of_string encoded in
-  (* 8 = the trailing checksum's own length (message.mli's "Wire-integrity checksum" section) --
-     not exposed as a value from this module, so restated here as the same literal that section
-     documents. *)
-  let target = String.length encoded - 8 - 1 in
+  let target = String.length encoded - 1 in
   Bytes.set corrupted target (Char.chr (Char.code (Bytes.get corrupted target) lxor 0xFF));
   let corrupted = Bytes.to_string corrupted in
   (* This codebase's own established convention for asserting on an exception carrying a payload
@@ -100,6 +100,16 @@ let expect_malformed name (f : unit -> Message.t) =
       | (_ : Message.t) -> Alcotest.failf "%s: expected Malformed_message, but decode succeeded" name
       | exception Message.Malformed_message _ -> ()
       | exception exn -> Alcotest.failf "%s: expected Malformed_message, got %s" name (Printexc.to_string exn) )
+
+(* M4, audit-remediation Task 3 fix round: [expect_malformed] above only checks for
+   [Malformed_message _] GENERICALLY -- enough to prove decode failed loudly rather than crashing
+   or silently succeeding, but not enough to prove WHICH shape defect it failed on, or that it went
+   through the specific [field_exn] path a test claims to cover rather than tripping some earlier,
+   less-specific check by coincidence. This asserts the real, exact message, matching this
+   codebase's own established convention (this file's own [test_decode_rejects_a_corrupted_encoding]
+   above; test_redaction.ml's [test_encryption_with_merge_key_is_rejected]). *)
+let expect_malformed_exact name expected_message (f : unit -> Message.t) =
+  (name, `Quick, fun () -> Alcotest.check_raises name (Message.Malformed_message expected_message) (fun () -> ignore (f ())))
 
 (* [decode] strips the LAST 8 bytes of whatever it is given as a claimed checksum before doing
    anything else (see message.mli's "Wire-integrity checksum" section). A bare
@@ -174,7 +184,8 @@ let malformed_input_tests =
        other constructor (see the 'k' and 'i' cases above) -- these two pin that the newly added
        [source] field gets exactly the same treatment, not an accidental default via e.g.
        [List.assoc_opt ... |> Option.value ~default:0]. *)
-    expect_malformed "old-shaped Prepare (pre-Task-3, no 'source' field) is rejected, not silently accepted" (fun () ->
+    expect_malformed_exact "old-shaped Prepare (pre-Task-3, no 'source' field) is rejected, not silently accepted"
+      (Printf.sprintf "Prepare: missing field %S" "source") (fun () ->
         Message.decode
           (enc
              (Value.Sum
@@ -186,8 +197,8 @@ let malformed_input_tests =
                       ("v", sample_value ());
                       ("k", Value.Scalar (Value.Int 5L));
                     ] ))));
-    expect_malformed "old-shaped Start_view (pre-Task-3, no 'source' field) is rejected, not silently accepted"
-      (fun () ->
+    expect_malformed_exact "old-shaped Start_view (pre-Task-3, no 'source' field) is rejected, not silently accepted"
+      (Printf.sprintf "StartView: missing field %S" "source") (fun () ->
         Message.decode
           (enc
              (Value.Sum

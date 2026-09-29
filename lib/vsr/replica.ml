@@ -483,15 +483,25 @@ let create ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage (
   persist_superblock t;
   t
 
-(* [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18). TLA+'s [%] is Euclidean (floored)
-   modulo, always non-negative; OCaml's [mod] follows the sign of the DIVIDEND, so [(v-1) mod
-   replica_count] can itself be negative when [v = 0] (or any [v <= 0]). Normalized to the
-   Euclidean result via [(x mod n + n) mod n] -- computationally verified against TLC's own
-   already-established values (both in the TLA+ spec plan and again for this plan) before being
-   written here: at [replica_count = 3], this formula gives [Primary(0) = 3], [Primary(1) = 1],
-   [Primary(2) = 2]. See replica.mli's own note on why [Primary(0) = 3], NOT [1], is the trap this
-   normalization exists to avoid. *)
-let primary t = 1 + (((t.view_number - 1) mod t.replica_count + t.replica_count) mod t.replica_count)
+(* [Primary(v) == 1 + ((v-1) % ReplicaCount)] (VSR.tla:18), for an ARBITRARY view [v] -- not
+   necessarily this replica's own {!view_number}. Finding 3 of the audit-remediation Task 3 fix
+   round needs exactly this: [handle_start_view]'s message carries its OWN [v] field (the view
+   being switched TO, which need not equal the receiver's current {!view_number} -- VSR.tla:295's
+   guard is [m.v >= View(r)], not [m.v = View(r)]), so checking "is the sender really Primary of
+   the view this message is ABOUT" requires computing [Primary] of that message's [v], not of
+   [t]'s own current one. [primary] below is now a thin wrapper over this for the common case
+   (checking against THIS replica's own current view).
+
+   TLA+'s [%] is Euclidean (floored) modulo, always non-negative; OCaml's [mod] follows the sign
+   of the DIVIDEND, so [(v-1) mod replica_count] can itself be negative when [v = 0] (or any [v <=
+   0]). Normalized to the Euclidean result via [(x mod n + n) mod n] -- computationally verified
+   against TLC's own already-established values (both in the TLA+ spec plan and again for this
+   plan) before being written here: at [replica_count = 3], this formula gives [Primary(0) = 3],
+   [Primary(1) = 1], [Primary(2) = 2]. See replica.mli's own note on why [Primary(0) = 3], NOT
+   [1], is the trap this normalization exists to avoid. *)
+let primary_of_view ~replica_count v = 1 + (((v - 1) mod replica_count + replica_count) mod replica_count)
+
+let primary t = primary_of_view ~replica_count:t.replica_count t.view_number
 
 let is_primary t = t.my_id = primary t
 let op_number t = t.op_number
@@ -954,10 +964,24 @@ let propose t (v : Value.value) =
 
 (* ---- ReceivePrepareMsg (VSR.tla:104-123) ---- *)
 
-let handle_prepare t ~view ~n ~(v : Value.value) ~k =
+let handle_prepare t ~view ~n ~(v : Value.value) ~k ~source =
   if t.status <> Normal then () (* IsNormalBackup(r) guard: not enabled outside status="Normal" *)
   else if is_primary t then () (* IsNormalBackup(r) guard's other conjunct: not enabled for the primary itself *)
   else if view <> t.view_number then ()
+  else if source <> primary t then
+    () (* Finding 3 of the audit-remediation Task 3 fix round: [handle_message]'s own cross-check
+          (below) only proves [source] IS who transport-authenticated [sender] really is -- it says
+          nothing about whether that real, credentialed replica had any business sending a
+          [Prepare] at all. A [Prepare] is only ever legitimate from THIS view's primary
+          (VSR.tla's own [IsNormalBackup(r)] conjunct on the SENDING side, mirrored by
+          [primary_execute_op]/[propose] only ever being reachable for [is_primary t]), so any
+          other credentialed replica sending one -- under its own true identity, no spoofing
+          required -- must be rejected exactly the way a wrong-view or out-of-order one already
+          is. [primary t], not [primary_of_view ~replica_count:t.replica_count view], is the right
+          comparison here specifically BECAUSE the guard just above already forces [view =
+          t.view_number]: a [Prepare] for any other view never reaches this line, so there is no
+          "the message's own view differs from mine" case for this handler the way there is for
+          [handle_start_view] below. *)
   else if n <> t.op_number + 1 then
     () (* VSR.tla:251's own [rep_op_number[r] + 1 = m.n]: backups process PREPARE strictly in
           op-number order. Checked against the DURABLE op-number here (and re-checked structurally
@@ -1746,13 +1770,30 @@ let handle_do_view_change t ~(v : int) ~(entries : (int * Value.value) list) ~(n
   end
 
 (* ---- ReceiveSV (VSR.tla:292-305) ---- *)
-let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : int) =
+let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : int) ~source =
   if v < 0 then () (* [rep_view_number] is typed [Nat] (VSR.tla:30, 326) *)
   else if v < t.view_number then
     () (* VSR.tla:295's own guard is [m.v >= View(r)] -- [>=], NOT [>]: a StartView for the view
           this replica is ALREADY in is accepted and re-applied (that is what makes the conditional
           [svc_count] reset below necessary, per task-3-brief.md's resolved decision 3). Only a
           strictly LOWER view is dropped. There is deliberately no status conjunct either. *)
+  else if source <> primary_of_view ~replica_count:t.replica_count v then
+    () (* Finding 3 of the audit-remediation Task 3 fix round -- the reproduction of the audit's
+          own single highest-severity finding that sender-authentication ALONE does not close:
+          [handle_message]'s cross-check only proves [source] is who transport-authenticated
+          [sender] genuinely is, never that this real, credentialed replica had any business
+          announcing a [StartView] for view [v] at all. Any OTHER real cluster member -- no
+          identity spoofing needed, just its own true id -- could otherwise rewrite this replica's
+          entire committed log by sending a well-formed [StartView] under itself. [primary_of_view
+          v], not [primary t]: unlike [handle_prepare]'s check above, [v] here is the message's
+          OWN claimed view, not necessarily [t.view_number] (VSR.tla:295's guard is [m.v >=
+          View(r)], so a [StartView] for a view strictly ahead of this replica's own is exactly
+          the normal, expected case a lagging replica must accept -- checking [source] against
+          [primary t] would wrongly reject every legitimate such message, since [primary t] is
+          Primary of the OLD view, not the one actually being announced). Checked here, before
+          [n]/[log]/[k] are even inspected, so a message from a real-but-wrong-view-primary sender
+          is dropped as a total no-op exactly like every other guard in this function, never
+          adopting so much as one byte of the log it carries. *)
   else if n < 0 || n <> List.length log then
     () (* Same [LogLengthMatchesOpNumber] check, same reason, as [handle_do_view_change]'s: this
           log is adopted wholesale and its length BECOMES this replica's op_number. TLC-confirmed
@@ -1815,6 +1856,19 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
        direction the model was never checked against. Do not "fix" it. *)
   end
 
+(* Finding 1 of the audit-remediation Task 3 fix round: this used to be [invalid_arg], overloading
+   the SAME exception [durable_append] above (line ~714/720) already uses for a genuinely different
+   condition -- an unclassified backend refusal escaping [durable_append] on purpose, precisely so
+   it is NEVER laundered into "the protocol declined an op" (see that function's own comment). A
+   caller that must stay total in the face of BOTH (e.g. {!Riptide_dst.Cluster}'s dispatch loop)
+   could not tell the two apart by exception type alone, so a blanket [Invalid_argument] catch there
+   -- added for the sender-mismatch case below -- silently absorbed a real backend-contract
+   violation too, exactly the laundering that comment warns against. A distinct exception fixes
+   this: nothing else in this module raises it, so a caller catching it exactly (not [Invalid_argument])
+   absorbs ONLY a sender-mismatch, and [durable_append]'s own [Invalid_argument] propagates
+   unchanged, same as before this task existed. *)
+exception Sender_mismatch of string
+
 (* Every message type's claimed sender, cross-checked against [~sender] -- the
    transport-authenticated identity of whoever actually holds the connection these [bytes] arrived
    on (Task 1's [Transport_intf.S.receive : t -> string * int], threaded through by every real
@@ -1824,46 +1878,57 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
    proof the sender is lying about who it is, not routine protocol noise (an out-of-order [n], a
    stale [view]) the rest of this module already drops silently. Checked BEFORE any
    message-type-specific logic runs (mirroring [classify_append_refusal]'s own "guard failure before
-   mutation" discipline), by raising [Invalid_argument] -- a genuinely different signal from every
+   mutation" discipline), by raising {!Sender_mismatch} -- a genuinely different signal from every
    in-dispatch guard below, which stays a silent no-op: those guards reject well-attributed but
    protocol-stale messages (the normal, expected cost of an unreliable network), while THIS guard
    rejects a message whose very identity claim cannot be trusted, which callers should be able to
    observe/log/count as a security event rather than have it vanish the same way a merely-late
    Prepare does. See replica.mli's own doc comment on [handle_message] for the full rationale and
-   {!Riptide_dst.Cluster}'s dispatch loop for how a caller stays total in the face of it. *)
+   {!Riptide_dst.Cluster}'s dispatch loop for how a caller stays total in the face of it.
+
+   Once a message's claimed sender has passed this cross-check, [handle_prepare]/[handle_start_view]
+   run a SECOND, independent check of their own (Finding 3): that the now-trusted [source] is
+   actually entitled to send THIS message type at all -- i.e. is really Primary of the relevant view,
+   not just some real, credentialed replica sending under its own true identity. Passing [source]
+   (not [sender] -- the two are equal by construction past this point, but [source] is the name the
+   message's own field carries and what those functions' own doc comments describe checking) lets
+   each handler make that determination with exactly the information VSR.tla's own [IsNormalBackup]/
+   [Primary] conjuncts require. *)
+(* M2, audit-remediation Task 3 fix round: the cross-check itself used to be five independently
+   typed-out [if <> then raise (Sender_mismatch (Printf.sprintf ...)) else ...] blocks, one per
+   message-type branch below -- easy to drift (a future edit fixing a typo in one copy but not the
+   other four) and, per the reviewer's own note, the real risk is a FUTURE sixth message type
+   arriving here without anyone deciding what its sender field even is. [Message.claimed_sender]
+   (message.mli) now owns that decision, with an exhaustive match that makes skipping a new
+   constructor a compile error there, not a silently-missing branch here; this function is just the
+   one place the check itself runs, parameterized by the two strings each branch's own error text
+   needs. *)
+let check_claimed_sender (msg : Message.t) ~(sender : int) ~(kind : string) ~(field : string) =
+  let claimed = Message.claimed_sender msg in
+  if claimed <> sender then
+    raise
+      (Sender_mismatch
+         (Printf.sprintf "handle_message: %s claims %s %d but the transport-authenticated sender is %d" kind field
+            claimed sender))
+
 let handle_message t ~(sender : int) (bytes : string) =
   match Message.decode bytes with
   | exception Message.Malformed_message _ -> ()
-  | Message.Prepare { view; n; v; k; source } ->
-    if source <> sender then
-      invalid_arg
-        (Printf.sprintf "handle_message: Prepare claims source %d but the transport-authenticated sender is %d"
-           source sender)
-    else handle_prepare t ~view ~n ~v ~k
-  | Message.Prepare_ok { view; n; i } ->
-    if i <> sender then
-      invalid_arg
-        (Printf.sprintf "handle_message: PrepareOk claims i %d but the transport-authenticated sender is %d" i
-           sender)
-    else handle_prepare_ok t ~view ~n ~i
-  | Message.Start_view_change { v; i } ->
-    if i <> sender then
-      invalid_arg
-        (Printf.sprintf "handle_message: StartViewChange claims i %d but the transport-authenticated sender is %d" i
-           sender)
-    else handle_start_view_change t ~v ~i
-  | Message.Do_view_change { v; entries; nacks; last_normal_view; n; k; i } ->
-    if i <> sender then
-      invalid_arg
-        (Printf.sprintf "handle_message: DoViewChange claims i %d but the transport-authenticated sender is %d" i
-           sender)
-    else handle_do_view_change t ~v ~entries ~nacks ~last_normal_view ~n ~k ~i
-  | Message.Start_view { v; log; n; k; source } ->
-    if source <> sender then
-      invalid_arg
-        (Printf.sprintf "handle_message: StartView claims source %d but the transport-authenticated sender is %d"
-           source sender)
-    else handle_start_view t ~v ~log ~n ~k
+  | Message.Prepare { view; n; v; k; source } as msg ->
+    check_claimed_sender msg ~sender ~kind:"Prepare" ~field:"source";
+    handle_prepare t ~view ~n ~v ~k ~source
+  | Message.Prepare_ok { view; n; i } as msg ->
+    check_claimed_sender msg ~sender ~kind:"PrepareOk" ~field:"i";
+    handle_prepare_ok t ~view ~n ~i
+  | Message.Start_view_change { v; i } as msg ->
+    check_claimed_sender msg ~sender ~kind:"StartViewChange" ~field:"i";
+    handle_start_view_change t ~v ~i
+  | Message.Do_view_change { v; entries; nacks; last_normal_view; n; k; i } as msg ->
+    check_claimed_sender msg ~sender ~kind:"DoViewChange" ~field:"i";
+    handle_do_view_change t ~v ~entries ~nacks ~last_normal_view ~n ~k ~i
+  | Message.Start_view { v; log; n; k; source } as msg ->
+    check_claimed_sender msg ~sender ~kind:"StartView" ~field:"source";
+    handle_start_view t ~v ~log ~n ~k ~source
 
 (* ---- Test-support surface (continued): read-only views of the two view-change accumulators ----
    [recv_dvc]/[recv_svc] are private, and the protocol itself never needs to expose them -- but

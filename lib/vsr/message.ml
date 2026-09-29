@@ -18,6 +18,18 @@ type t =
     }
   | Start_view of { v : int; log : Value.value list; n : int; k : int; source : int }
 
+(* M2, audit-remediation Task 3 fix round: the five [t -> int] projections below used to be
+   re-derived independently, inline, at each of {!Riptide_vsr.Replica.handle_message}'s five
+   near-identical cross-check branches -- see message.mli's own doc comment on why an EXHAUSTIVE
+   match here (no wildcard arm) is the load-bearing property, not merely a style preference. *)
+let claimed_sender (t : t) : int =
+  match t with
+  | Prepare { source; _ } -> source
+  | Prepare_ok { i; _ } -> i
+  | Start_view_change { i; _ } -> i
+  | Do_view_change { i; _ } -> i
+  | Start_view { source; _ } -> source
+
 exception Malformed_message of string
 
 (* ---- wire tags (message.mli documents these as the actual, stable wire format) ---- *)

@@ -127,7 +127,12 @@ let run_scenario ~env ~seed ~replica_count ~ring_capacity ~rounds ~ops_per_round
                let msg, sender = Riptide_sim.Sim_transport.receive handles.(i) in
                (match Replica.handle_message replica ~sender msg with
                | () -> ()
-               | exception Invalid_argument _ -> ());
+               (* Catches exactly [Replica.Sender_mismatch] (audit-remediation Task 3), not the
+                  blanket [Invalid_argument] -- see replica.mli / lib/dst/cluster.ml's own
+                  dispatch loop for why: [Invalid_argument] is also what [durable_append]
+                  re-raises for an unclassified backend refusal, which must propagate here
+                  rather than be swallowed. *)
+               | exception Replica.Sender_mismatch _ -> ());
                decr inflight;
                dispatch ()
              in

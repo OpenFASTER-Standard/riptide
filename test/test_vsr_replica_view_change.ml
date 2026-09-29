@@ -228,11 +228,14 @@ let with_cluster ~replica_count ~svc_limit
                            into [handle_message]'s new sender cross-check (Task 3) -- see
                            test_vsr_replica_cluster.ml's own dispatch loop for why this file's own
                            genuine, non-adversarial deliveries never actually trip the check, and
-                           why the loop still absorbs [Invalid_argument] to stay total. *)
+                           why the loop still absorbs [Replica.Sender_mismatch] (Finding 1 of the
+                           fix round: NOT the blanket [Invalid_argument] -- that also matches
+                           [durable_append]'s own unrelated backend-contract-violation escape,
+                           which must propagate rather than be swallowed here) to stay total. *)
                         let msg, sender = Sim_transport.receive handles.(i) in
                         (match Replica.handle_message replica ~sender msg with
                         | () -> ()
-                        | exception Invalid_argument _ -> ());
+                        | exception Replica.Sender_mismatch _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())
