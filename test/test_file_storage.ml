@@ -1016,8 +1016,21 @@ let test_a_failed_create_releases_its_lock_before_reraising () =
       let (_ : File_storage.t) = File_storage.create ~sw ~fs ~ring_capacity dir in
       ())
 
+let test_create_rejects_a_non_positive_ring_capacity () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      Alcotest.check_raises
+        "ring_capacity <= 0 is rejected at create, not at first append"
+        (Invalid_argument "ring_capacity must be >= 1")
+        (fun () ->
+          ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:0 dir)))
+
 let tests =
   [
+    ( "Task 14: create rejects ring_capacity <= 0",
+      `Quick,
+      test_create_rejects_a_non_positive_ring_capacity );
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
       (* `Slow`, not `Quick` (M10, Task 10 review): this and its `File_kv_store` counterpart
          roughly doubled this suite's runtime (~17s -> ~29s) driving thousands of real

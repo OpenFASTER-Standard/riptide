@@ -422,6 +422,8 @@ let recover_highest_durable_op_number t =
    it had accepted. Making it explicit costs every call site one argument and makes the sizing
    decision impossible to inherit by accident. *)
 let create ~sw ~fs ~ring_capacity ?may_evict dir_path =
+  if ring_capacity < 1 then
+    invalid_arg "ring_capacity must be >= 1";
   (try Eio.Path.mkdir ~perm:0o700 Eio.Path.(fs / dir_path) with Eio.Io _ -> ());
   (* Task 11: the physical guard, taken as early as possible -- strictly before this call opens
      any of ITS OWN files ([ring]/superblocks) -- so a second [create] racing a live handle over
