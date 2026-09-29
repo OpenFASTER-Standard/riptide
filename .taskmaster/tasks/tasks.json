@@ -988,11 +988,20 @@
             "id": 9,
             "title": "[3.1] Replace per-I/O mmap with a reusable aligned-buffer pool",
             "description": "Replace per-I/O mmap with a reusable aligned-buffer pool",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "alloc_aligned_buffer (file_storage.ml:141-151, file_kv_store.ml:106-116) allocates a throwaway-file mmap per I/O with no explicit release. Replace with a small fixed pool of aligned buffers owned by t, acquired/released explicitly.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "cd49e57956dd2a31715a0239add88dcf8ea9c834",
+                "0684b72635a7f1e097963d13b86fcc265426c78e",
+                "a616416a1d96c7be8cf2d2fb5c643ab6f46931ca",
+                "39f842641c10e04d3f13cdec10d99a87a9566a66"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 10,
