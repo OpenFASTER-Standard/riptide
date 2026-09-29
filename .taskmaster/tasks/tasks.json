@@ -933,11 +933,19 @@
             "id": 6,
             "title": "[2.2] canonical_decode enforces strict canonical ordering and rejects duplicates",
             "description": "canonical_decode enforces strict canonical ordering and rejects duplicates",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Record fields and Map entries must decode in strictly increasing key order; a duplicate or out-of-order key raises Invalid_argument. canonical_encode gains a matching duplicate check for in-memory-constructed values.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "8da083ca7a6e40ee42cf3ad340f1bf5bdf8af023",
+                "5754a56913f031ff1f40872b4092b35931b871c0",
+                "21c7515027bb602077ba45d5a21504b092731b17"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 7,
