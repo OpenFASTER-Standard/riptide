@@ -459,6 +459,16 @@ external test_only_flock_exclusive_nonblocking : Unix.file_descr -> bool
   = "riptide_flock_exclusive_nonblocking"
 
 let test_a_real_second_os_process_holding_the_lock_is_refused () =
+  (* Review finding 3 (re-review, round 2) -- see
+     [Test_file_storage.test_a_real_second_os_process_holding_the_lock_is_refused]'s own,
+     identical fix and comment for the full rationale and the live standalone-run RED/GREEN
+     evidence (exit 141 == SIGPIPE without this, a clean reported failure with it): if the forked
+     child below exits early, its end of [release_r] closes with it, and the parent's own
+     unconditional write to [release_w] inside [Fun.protect]'s [~finally] then has no reader left
+     at all -- fatal SIGPIPE by default disposition, invisible to any [Unix.Unix_error] guard
+     around that write, only masked in a full suite run by some earlier test's own [Eio_main.run]
+     already having set this process-wide as a side effect. *)
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   with_tmp_dir (fun dir ->
       (* [with_tmp_dir] already [Unix.mkdir]s [dir] itself (see this file's own definition above)
          -- no need to redo it here (review finding M6: this used to re-[mkdir] redundantly, which

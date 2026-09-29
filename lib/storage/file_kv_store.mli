@@ -129,11 +129,16 @@ val create : sw:Eio.Switch.t -> fs:Eio.Fs.dir_ty Eio.Path.t -> owner:string -> s
     this disclosure, in [test/test_lattice_materialize_crypto_scenarios.ml]'s
     [test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]: its first two
     phases demonstrate the SEQUENTIAL shape (a materializer's write, through its own,
-    separately-opened handle, silently destroys a record a now-closed keystore handle wrote
-    earlier), and its third phase demonstrates the SHARED-HANDLE shape directly (one [kv], a
-    keystore and a materializer both built from it at once, a keystore [put] silently overwriting
-    the materializer's own accumulator value at a colliding key -- the lock never once fires,
-    because only one [create] call is ever made). See
+    freshly-[create]d handle opened only after the phase-1 keystore handle's switch has fully
+    closed, silently destroys a record that now-closed handle wrote earlier), and its third phase
+    demonstrates the SHARED-HANDLE shape directly (one [kv], a keystore and a materializer both
+    built from it at once, a keystore [put] silently overwriting the materializer's own accumulator
+    value at a colliding key -- the lock never once fires, because no second, CONCURRENT [create]
+    call is ever made for either consumer sharing that one [kv]; the sequential phases each DO call
+    [create] afresh, one after the previous handle has fully closed, so "only one call is ever
+    made" would itself be a false claim about this same test -- what actually defeats the lock in
+    the shared-handle phase is that no two calls ever overlap in time, not that there is only one
+    call in the whole test). See
     {!Riptide_crypto.Redaction_store.create}'s own doc comment for the full account. Fixing the
     sequential gap means changing this marker mechanism itself (e.g. per-consumer key prefixes, or
     a persistent, not merely handle-lifetime-scoped, exclusivity record); fixing the shared-handle

@@ -120,8 +120,12 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     this disclosure narrowed the remaining gap to "strictly sequential reuse" only, which overclaims
     what the lock reaches: falsified live by a test that shares one already-built [kv] between this
     keystore and a materializer and still silently destroys a wrapped DEK, with the lock never once
-    firing, since only one [File_kv_store.create] call is ever made):} two different shapes, neither
-    of which a lock scoped to one [create] call's own [t] can see:
+    firing for that pairing, since {e no two} [File_kv_store.create] calls are ever CONCURRENT
+    against it -- the sequential-reuse phases each do call [File_kv_store.create] afresh, one after
+    the previous handle's switch has fully closed, so "only one call is ever made" would itself be a
+    false claim about this same test; what actually defeats the lock is that no two of those calls
+    ever overlap in time, which is a different, narrower property than "there is only one call"):}
+    two different shapes, neither of which a lock scoped to one [create] call's own [t] can see:
 
     - {b Strictly SEQUENTIAL reuse}: one consumer's [t] fully released (its switch finished, its
       lock dropped) before the other's [create] runs. The marker cannot tell "my own store
@@ -154,12 +158,13 @@ val create : kv:Riptide_storage.File_kv_store.t -> kek:Kek.t -> t
     Both shapes are backed by running code in [test/test_lattice_materialize_crypto_scenarios.ml]:
     the SEQUENTIAL shape in
     [test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek]'s first two phases (a
-    materializer's write, through its own, separately-opened handle, silently destroys a record a
-    now-closed keystore handle wrote earlier -- pinning the first and third consequences below), and
-    the SHARED-HANDLE shape in that same test's third phase (one [kv], a keystore and a materializer
-    both built directly from it at once, a keystore [put] silently overwriting the materializer's
-    own accumulator value at a colliding key, with the lock never once firing -- pinning the second
-    consequence below). A DIFFERENT-tag pair, by contrast, is rejected at construction with this
+    materializer's write, through its own, freshly-[create]d handle opened only after the phase-1
+    keystore handle's switch has fully closed, silently destroys a record that now-closed handle
+    wrote earlier -- pinning the FIRST consequence below), and the SHARED-HANDLE shape in that same
+    test's third phase (one [kv], a keystore and a materializer both built directly from it at once,
+    a keystore [put] silently overwriting the materializer's own accumulator value at a colliding
+    key, with the lock never once firing because no second [create] call is made for either
+    consumer -- pinning the THIRD consequence below). A DIFFERENT-tag pair, by contrast, is rejected at construction with this
     keystore's data provably intact ([test_a_shared_kv_directory_is_rejected_at_construction],
     restructured (review finding I3) so the colliding [create] attempt runs only after the first
     handle's lock has been released -- otherwise Task 11's own lock, not the owner-tag comparison

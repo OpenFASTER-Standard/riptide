@@ -662,6 +662,33 @@ external test_only_flock_exclusive_nonblocking : Unix.file_descr -> bool
   = "riptide_flock_exclusive_nonblocking"
 
 let test_a_real_second_os_process_holding_the_lock_is_refused () =
+  (* Review finding 3 (re-review, round 2), live-reproduced: if the forked child below exits
+     EARLY (e.g. the I4 exception guard's own [Unix._exit 2], triggered by some real failure in
+     the child before it ever writes to [ready_w]), the child's own end of [release_r] is closed
+     the instant the child process exits -- the kernel closes every fd a process still held on
+     exit. If that was the ONLY open read end of that pipe (it always is here: the parent already
+     closed its own [release_r] just below), the parent's later, unconditional write to
+     [release_w] inside [Fun.protect]'s [~finally] then has no reader left at all, which raises
+     SIGPIPE -- fatal by DEFAULT disposition, not something any [Unix.Unix_error] guard around
+     that write can catch, because the process is killed before the write syscall ever returns an
+     error to the OCaml runtime for an exception to be raised from. Reproduced live: with the
+     child's own [openfile] call broken (see the historical I4 comment below for exactly how) and
+     this SIGPIPE fix removed, running this one test STANDALONE (not as part of the full suite)
+     exits with code 141 (128 + [SIGPIPE]'s signal number 13 -- the classic shell signature of a
+     process killed by an uncaught signal) and zero further output after the "actually acquired
+     the real lock first" assertion fails -- a real crash, not a reported test failure. It does
+     NOT reproduce inside a full [dune test --force] run, because some earlier test's own
+     [Eio_main.run] has, by then, already set [SIGPIPE]'s disposition to ignored process-wide as a
+     side effect (Eio's own io_uring/epoll setup does this) -- an ACCIDENTAL mask that happens to
+     cover this bug in the full suite, not a real fix, which is exactly why this needs its own
+     explicit, local disposition rather than relying on suite ordering. Setting this BEFORE
+     [Unix.fork] below means the child inherits the same ignored disposition too (harmless, and
+     protects the child's own write to [ready_w] from the same class of failure if the parent
+     ever gives up early). With [Sys.Signal_ignore] in place, the write instead fails with a
+     real, catchable [Unix.Unix_error (Unix.EPIPE, ...)] -- already handled by the existing
+     [with Unix.Unix_error _ -> ()] guard around that write, below -- so the test now fails
+     cleanly (reporting the real underlying problem) instead of taking the whole process down. *)
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   with_tmp_dir (fun dir ->
       (* [with_tmp_dir] already [Unix.mkdir]s [dir] itself (see this file's own definition above)
          -- no need to redo it here (review finding M6: this used to re-[mkdir] redundantly, which
@@ -737,15 +764,30 @@ let test_a_failed_create_releases_its_lock_before_reraising () =
       let fs = Eio.Stdenv.fs env in
       Eio.Switch.run @@ fun sw ->
       Unix.mkdir (Filename.concat dir "ring") 0o700;
-      let raised =
-        try
-          ignore (File_storage.create ~sw ~fs ~ring_capacity dir);
-          false
-        with _ -> true
-      in
-      Alcotest.(check bool)
-        "create fails (on the pre-created ring directory), for a reason other than the lock" true
-        raised;
+      (* Review finding 4 (re-review, round 2): the original version of this assertion used
+         [try ... with _ -> true] to catch the expected failure, which passes for literally ANY
+         exception -- including, e.g., a future regression that made this [create] fail via THE
+         LOCK ITSELF ([Dir_lock]'s own [Invalid_argument] conflict message, the exact wording
+         [expected_lock_message] above builds) instead of the intended, unrelated EISDIR failure
+         this test is actually meant to exercise. That is the same weakness class Task 11's own I3
+         finding was filed against a different test for: a test that cannot actually distinguish
+         the regression it claims to guard against. Fixed by positively asserting the SPECIFIC
+         shape this failure has -- a real [Eio.Io] exception (confirmed live: printing the raised
+         exception here showed [Eio.Io Unix_error (Is a directory, "openat2", "")], from
+         [open_file_handle]'s second, unguarded [openat2] retry once the pre-created "ring"
+         directory makes both open-flag variants fail with EISDIR) -- which structurally can never
+         be [Dir_lock]'s own [Invalid_argument], so a future change that accidentally routed this
+         failure through the lock instead of EISDIR would now show up here as a genuine, specific
+         mismatch rather than silently passing. *)
+      (match File_storage.create ~sw ~fs ~ring_capacity dir with
+      | (_ : File_storage.t) ->
+        Alcotest.fail "expected create to fail on the pre-created ring directory, but it succeeded"
+      | exception Eio.Io _ -> ()
+      | exception e ->
+        Alcotest.failf
+          "create failed, but not with the expected Eio.Io (EISDIR) shape -- got %s instead (this \
+           must not be Dir_lock's own Invalid_argument conflict message)"
+          (Printexc.to_string e));
       (* THE regression this test exists to catch: a legitimate create, in the SAME switch, with
          no live handle anywhere, must succeed immediately afterwards -- not be refused by a lock
          the failed attempt above should have released. *)

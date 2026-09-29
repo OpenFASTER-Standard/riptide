@@ -445,24 +445,36 @@ let create ~sw ~fs ~owner dir_path =
         with Eio.Io _ -> None)
       dir_path
   in
-  (* Task 11 review (finding I1): the lock's lifetime must track the SUCCESSFULLY CONSTRUCTED
-     handle's, not the "flock succeeded" attempt's. The owner-tag mismatch check right below can
-     raise AFTER the lock above has already succeeded and been registered with [sw] -- if it does,
-     [lock] must be released HERE, or it stays registered with [sw] for [sw]'s entire remaining
-     lifetime even though this [create] returns no usable [t], spuriously refusing a later,
-     legitimate [create] over the same directory in the same switch (a real, live-reproduced bug:
-     see [test_a_failed_create_releases_its_lock_before_reraising] below for the RED/GREEN
-     evidence). *)
-  match check_or_write_owner_marker ~fs ~dir_path owner with
-  | () ->
-    {
-      sw;
-      lock;
-      fs;
-      dir_path;
-      owner;
-      pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment ();
-    }
+  (* Task 11 review (finding I1, and re-review finding 1): the lock's lifetime must track the
+     SUCCESSFULLY CONSTRUCTED handle's, not the "flock succeeded" attempt's -- and that means
+     EVERY step between [Dir_lock.acquire] succeeding and [t] actually being returned has to sit
+     inside this same guarded scrutinee, not just [check_or_write_owner_marker]. The I1 fix's
+     first cut only wrapped the owner-marker check and left [Aligned_buffer_pool.create] (a real
+     mmap-backed allocation that does genuine syscalls per pooled buffer, and can genuinely raise
+     under fd/disk/memory pressure) sitting in the success branch's own body, OUTSIDE the
+     [exception exn -> ...] handler's reach -- in a [match e with | pat -> body | exception exn ->
+     handler] expression, [exception exn] only catches exceptions raised while evaluating [e]
+     itself, never ones raised while evaluating [body]. A live-reproduced RED/GREEN check
+     confirmed this: injecting a failure at the (then-unwrapped) pool-creation call reproduced the
+     EXACT SAME bug I1 was meant to fix -- a subsequent, entirely legitimate [create] over the same
+     directory in the same switch got spuriously refused with "already locked by another open
+     handle". Folding both [check_or_write_owner_marker] AND the pool allocation AND the final
+     record construction into ONE scrutinee (mirroring [file_storage.ml]'s own [create], whose
+     analogous fix already covers its entire post-lock body this same way) closes that gap: ANY
+     exception anywhere in this block now goes through the same [exception exn -> ...] handler
+     below. See [test_a_failed_create_releases_its_lock_before_reraising] below for the
+     owner-tag-mismatch-shaped RED/GREEN evidence this fix already had; the pool-creation-shaped
+     RED/GREEN check for this specific gap was done manually (temporarily forcing pool creation to
+     fail, confirming the leak, restoring) rather than left as a permanent test, since
+     [Aligned_buffer_pool.create]'s buffer count/slot size aren't parameters a test can control
+     from this module's own public surface -- see this task's own review-round-2 report for the
+     exact commands and output. *)
+  match
+    check_or_write_owner_marker ~fs ~dir_path owner;
+    let pool = Aligned_buffer_pool.create ~buffer_count:pool_size ~slot_size:slot_alignment () in
+    { sw; lock; fs; dir_path; owner; pool }
+  with
+  | t -> t
   | exception exn ->
     let bt = Printexc.get_raw_backtrace () in
     Eio_unix.Fd.close lock;

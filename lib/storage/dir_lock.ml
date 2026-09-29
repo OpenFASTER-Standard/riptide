@@ -40,6 +40,17 @@ let acquire ~sw ~caller ?describe_conflict dir_path =
        itself raises [Unix.Unix_error] (anything other than EWOULDBLOCK, which is the plain [false]
        case above, not an exception) -- e.g. a genuine I/O error -- [fd] was never registered with
        [sw] and would otherwise leak: nothing else in this function, or in the caller who never gets
-       a value back, owns it. Close it explicitly before re-raising. *)
+       a value back, owns it. Close it explicitly before re-raising.
+
+       Review finding 5 (re-review, round 2): capture the backtrace BEFORE running [Unix.close]
+       below (any exception, even a caught-and-ignored one, can perturb what a plain [raise exn]
+       would otherwise report) and re-raise with [Printexc.raise_with_backtrace] rather than a bare
+       [raise exn] -- [raise exn] re-raises [exn] as a NEW raise, discarding the original
+       backtrace, which is exactly the inconsistency this finding named: the other two
+       exception-handling sites this same Task 11 review round added (the I1 fixes in
+       [file_storage.ml]/[file_kv_store.ml]) already both preserve the original backtrace this
+       way; this site, doing the identical "clean up an owned resource, then re-raise" thing, is
+       now consistent with both. *)
+    let bt = Printexc.get_raw_backtrace () in
     (try Unix.close fd with Unix.Unix_error _ -> ());
-    raise exn
+    Printexc.raise_with_backtrace exn bt
