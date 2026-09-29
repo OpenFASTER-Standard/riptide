@@ -1026,11 +1026,30 @@ let test_create_rejects_a_non_positive_ring_capacity () =
         (fun () ->
           ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:0 dir)))
 
+(* Task 14 review (Minor): the zero case above is the one the audit's own
+   Division_by_zero reproduction used, but the brief also names a second,
+   distinct escape shape for negative values (an EINVAL-shaped Eio.Io from a
+   negative data_offset) -- pin that case with its own running test too,
+   rather than resting on "the same `< 1` comparison also covers it" by
+   inspection alone. *)
+let test_create_rejects_a_negative_ring_capacity () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      Alcotest.check_raises
+        "a negative ring_capacity is rejected at create too, not just zero"
+        (Invalid_argument "ring_capacity must be >= 1")
+        (fun () ->
+          ignore (File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:(-1) dir)))
+
 let tests =
   [
     ( "Task 14: create rejects ring_capacity <= 0",
       `Quick,
       test_create_rejects_a_non_positive_ring_capacity );
+    ( "Task 14: create rejects a negative ring_capacity too",
+      `Quick,
+      test_create_rejects_a_negative_ring_capacity );
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
       (* `Slow`, not `Quick` (M10, Task 10 review): this and its `File_kv_store` counterpart
          roughly doubled this suite's runtime (~17s -> ~29s) driving thousands of real
