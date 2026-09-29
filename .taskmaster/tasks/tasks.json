@@ -1064,11 +1064,18 @@
             "id": 13,
             "title": "[3.5] Validate ring_capacity >= 1 at create",
             "description": "Validate ring_capacity >= 1 at create",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "File_storage.create raises Invalid_argument for ring_capacity <= 0, closing the Division_by_zero/negative-offset escapes at configuration time instead of first-request time.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "da3237c1ee9fb48b7df674bb9134efdd69fb83eb",
+                "6d7fe5b0ad46c623c0a12777b0faa5cc30434921"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 14,
