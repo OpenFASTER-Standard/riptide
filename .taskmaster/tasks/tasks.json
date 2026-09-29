@@ -885,12 +885,13 @@
             "description": "Prepare/Start_view gain a real sender field; Replica.handle_message cross-checks it",
             "status": "done",
             "dependencies": [],
-            "details": "Add source : int to Prepare and Start_view on the wire. Replica.handle_message takes the transport-authenticated sender alongside payload bytes and rejects any message whose claimed sender (i or source) disagrees with it, via Invalid_argument (counted, total no-op).",
+            "details": "Add source : int to Prepare and Start_view on the wire. Replica.handle_message takes the transport-authenticated sender alongside payload bytes and rejects any message whose claimed sender (i or source) disagrees with it, via a distinct Replica.Sender_mismatch exception (counted, total no-op) -- kept distinct from Invalid_argument (fix round, commit 56a10f0) specifically so durable_append's own unrelated backend-refusal Invalid_argument keeps propagating instead of being laundered into a dropped message. Also checks (fix round, same commit) that the sender is actually entitled to send that message type at all -- Primary(view) for a Start_view's own claimed view, or the current primary for a Prepare -- since sender authentication alone does not stop a real, correctly-attributed cluster member from sending a message it has no role-based right to send.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
             "parentId": "undefined",
             "evidence": {
               "commits": [
-                "2dd96e247e4bad0188126eace8d61badd5b49fe5"
+                "2dd96e247e4bad0188126eace8d61badd5b49fe5",
+                "56a10f0d27c31630c78eb5bfbbb7a84873eae674"
               ],
               "prs": []
             }
