@@ -5,8 +5,13 @@
     {!Riptide_storage.File_storage}'s own [.ml] top comment for: the exact on-disk ring/header
     layout; why Task 1's version of this module had to drop [O_DIRECT] (a shared fixed-buffer
     pool with no alignment guarantee); and how this version makes [O_DIRECT] work for real (a
-    self-allocated, [mmap]-backed, guaranteed-page-aligned buffer per read/write, validated with
-    2500 real operations across both an ext4 and an overlayfs mount with zero failures). *)
+    guaranteed-page-aligned, [mmap]-backed buffer per read/write, validated with 2500 real
+    operations across both an ext4 and an overlayfs mount with zero failures). Task 10 changed
+    how those buffers are obtained -- a small, fixed-size pool owned by [t], allocated once at
+    [create] and explicitly acquired/released around each read/write, rather than a fresh
+    [mmap] per I/O -- without changing the alignment technique or guarantee itself; see that
+    same top comment's own "Task 10" section for why (the per-I/O version leaked kernel VMA
+    mappings with no bound, eventually crashing the process). *)
 
 include Storage_intf.S
 
