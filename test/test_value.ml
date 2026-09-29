@@ -148,8 +148,9 @@ let value_injective_prop =
    before any ordering could even matter. This generator still dedups its
    own top-level output so these two properties can keep testing genuine
    permutation invariance rather than merely re-deriving "duplicate keys
-   raise" (already covered directly by the encode_duplicate_key_tests
-   below); value_gen itself does not yet dedup at every nesting level, which
+   raise" (already covered directly by
+   test_encode_rejects_an_in_memory_duplicate_key_record/_map below);
+   value_gen itself does not yet dedup at every nesting level, which
    is what makes the four QCheck properties below it fail post-Task-6 - see
    this task's report for why that's Task 7's scope, not this comment's. *)
 let dedup_by_key key_of entries =
