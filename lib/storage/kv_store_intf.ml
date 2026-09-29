@@ -24,9 +24,18 @@ module type S = sig
 
   val put : t -> key:string -> string -> unit
   (** Durably writes [key]'s value, overwriting any previous value. The overwrite itself is
-      atomic: a crash during a [put] can never leave [key] readable as a torn mix of the old
-      and new values -- a subsequent [get] sees either the value from the last successful
-      [put], in full, or (if this [put] itself completed) the new one, in full. *)
+      atomic against crashes: a crash during a [put] can never leave [key] readable as a torn
+      mix of the old and new values -- a subsequent [get] sees either the value from the last
+      successful [put], in full, or (if this [put] itself completed) the new one, in full.
+
+      {b Task 16: concurrent writers to the same key are handled per-backend.} For backends that
+      support concurrent same-key writes (e.g., {!Riptide_storage.File_kv_store}, which uses
+      unique-per-call temp files under {!Riptide_storage.Dir_lock}'s protection), concurrent
+      [put] calls to the same key produce an undefined winner (whichever writer finishes last is
+      observed), but never a torn mix or phantom [None]. For backends that do not support
+      concurrent same-key writes, concurrent [put]s to the same key are undefined (reading the
+      backend's own [.mli] or code comments is required to determine which backends make
+      concurrency guarantees). *)
 
   val delete : t -> key:string -> unit
   (** Durably removes [key]. Durable across a reopen — a deleted key must

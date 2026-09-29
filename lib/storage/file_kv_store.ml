@@ -432,14 +432,18 @@ let owner_marker_name = ".riptide-kv-owner"
 (* Suffix for the owner marker's own temp file, written by [check_or_write_owner_marker] before
    it atomically [rename]s onto [owner_marker_name] -- the same write-temp-then-rename shape
    [durable_write] above uses for per-key records, applied here to the marker instead. Fixed, not
-   randomized, for the same reason [tmp_suffix] above is: [Dir_lock] already serializes every
-   [create] over one [dir_path] that could otherwise race for this name (see [create]'s own Task
-   11 comment), so this only needs to survive a crash mid-write, not race a second writer.
+   randomized, for the following reason: [Dir_lock] (Task 11) already serializes every [create]
+   over one [dir_path] by holding an exclusive OS-level [flock(2)] -- see [create]'s own Task 11
+   comment. Any second [create] call attempting to acquire [Dir_lock] must wait until the first
+   [create]'s own switch closes and [Dir_lock] is released, so there is no actual race for this
+   name -- this suffix only needs to survive a crash mid-write, not race a second concurrent
+   writer (unlike per-key temp files, which are now randomized per-call via [tmp_suffix_for_call]
+   to handle concurrent writers to the SAME key, an internal race that Task 11's [Dir_lock]
+   doesn't protect against).
 
-   Just [".tmp"], matching [tmp_suffix]'s own convention above (per-key temp files end in
-   [".put.tmp"], not [".<key-hash>.put.tmp"]) -- an earlier version of this suffix was
-   [".owner.tmp"], which produced [".riptide-kv-owner.owner.tmp"] once appended to
-   [owner_marker_name]: "owner" twice, redundantly (Task 15 review, Minor finding M7). *)
+   Just [".tmp"] -- an earlier version of this suffix was [".owner.tmp"], which produced
+   [".riptide-kv-owner.owner.tmp"] once appended to [owner_marker_name]: "owner" twice,
+   redundantly (Task 15 review, Minor finding M7). *)
 let owner_marker_tmp_suffix = ".tmp"
 
 (* Enforces that at most one distinct [owner] tag ever claims [dir_path], across every [create] of
@@ -497,6 +501,46 @@ let check_or_write_owner_marker ~fs ~dir_path tag =
     Eio.Path.rename tmp_path marker_path;
     fsync_dir ~dir_path
 
+(* Task 16: sweep stale temporary files from a crashed/interrupted [put] that leave behind
+   files named [.put.<pid>.<counter>.tmp] (from [tmp_suffix_for_call]). This cleanup runs at
+   [create] time, AFTER [Dir_lock.acquire] succeeds, so any temp file sitting in [dir_path]
+   at that point cannot belong to any still-live writer -- a live writer's own [create] call
+   would already be holding the lock. This is why we can unlink unconditionally: we have
+   exclusive access and no other writer can be using this directory.
+
+   This solves the unbounded crash-debris accumulation that the per-call unique suffix
+   introduced (Task 16 Important 2): before the fix, a crash left at most one [.put.tmp]
+   file per key, self-bounded by reuse (same deterministic name on next put). After the
+   fix, each crash leaves a file with a name that will never be generated again (pid+counter
+   pair is global), so nothing would ever clean it up without an explicit sweep. *)
+let sweep_stale_temp_files ~fs ~dir_path =
+  try
+    let entries = Eio.Path.read_dir Eio.Path.(fs / dir_path) in
+    List.iter (fun basename ->
+        (* Match stale temp files: the pattern used by [durable_write] is [key_path].put.[pid].[counter].tmp.
+           Distinguish from real key files (exactly 64 lowercase hex, no ".put."), the owner marker
+           (starts with ".riptide-kv-"), and the lock file (".riptide-lock"). *)
+        let contains_substring haystack needle =
+          let nl = String.length needle and hl = String.length haystack in
+          let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+          nl = 0 || go 0
+        in
+        let is_stale_temp_file =
+          (* Must contain ".put." and end with ".tmp" -- these patterns uniquely identify temp files *)
+          contains_substring basename ".put." &&
+          String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp" &&
+          (* Exclude owner marker and lock file (which start with ".") *)
+          (String.length basename = 0 || String.sub basename 0 1 <> "." ||
+           (* But DO include files that start with "." only if they match the .put. pattern
+              (the owner marker and lock don't have .put., so this distinguishes them) *)
+           contains_substring basename ".put.")
+        in
+        if is_stale_temp_file then
+          try Eio.Path.unlink Eio.Path.(fs / dir_path / basename)
+          with Eio.Io _ -> ()) (* Ignore errors: file already gone, or already handled by concurrent create *)
+      entries
+  with Eio.Io _ -> () (* Directory doesn't exist yet or can't be read; that's fine *)
+
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
    top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
    owner-marker check runs strictly after this, since it needs [dir_path] to already exist (an
@@ -541,6 +585,11 @@ let create ~sw ~fs ~owner dir_path =
         | exception Eio.Io _ -> None)
       dir_path
   in
+  (* Task 16: now that we hold the exclusive [flock(2)], sweep any stale temp files left behind
+     by crashed writers. This runs before the owner-marker check, safe to do anywhere after the
+     lock is acquired and before the record is constructed (order relative to owner-marker doesn't
+     matter functionally, but this placement keeps all post-lock setup together). *)
+  sweep_stale_temp_files ~fs ~dir_path;
   (* Task 11 review (finding I1, and re-review finding 1): the lock's lifetime must track the
      SUCCESSFULLY CONSTRUCTED handle's, not the "flock succeeded" attempt's -- and that means
      EVERY step between [Dir_lock.acquire] succeeding and [t] actually being returned has to sit

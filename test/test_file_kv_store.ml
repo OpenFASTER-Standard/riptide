@@ -177,30 +177,29 @@ let test_put_overwrite_leaves_no_leftover_tmp_file () =
         (File_kv_store.get t ~key:"k"))
 
 let test_interrupted_overwrite_leaves_old_value_intact () =
-  (* Review Focus: this is exactly the crash scenario the reviewer described -- a failure
-     partway through a [put]'s write-to-temp phase must leave the key's already-durable
-     value fully intact and readable, never a torn header/data mix. We simulate this by
-     creating a stale temp file (matching the dynamic [.put.[pid].[counter].tmp] pattern)
-     before calling a real [put], then verify the real [put] correctly writes its own distinct
-     temp file and the old value remains readable. *)
+  (* Task 16: stale temp files from crashes are automatically swept at [create] time, so this
+     test verifies that behavior: create a stale .put.*.tmp file before opening a handle, then
+     confirm the handle's creation sweeps it away (and any real key's data stays intact). *)
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
-      Eio.Switch.run @@ fun sw ->
-      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
-      File_kv_store.put t ~key:"k" "original";
-      (* Create a stale temp file with a dynamic-style name to simulate crash debris. *)
+      (Eio.Switch.run @@ fun sw ->
+       let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+       File_kv_store.put t ~key:"k" "original");
+      (* After the first handle closes, create a stale temp file to simulate crash debris. *)
       let stale_tmp_path = Filename.concat dir (key_hash_hex "k" ^ ".put.99999.99999.tmp") in
       let oc = open_out_bin stale_tmp_path in
       output_string oc "garbage-partial-write-left-by-a-simulated-crash";
       close_out oc;
-      Alcotest.(check (option string)) "old value still fully intact and readable" (Some "original")
-        (File_kv_store.get t ~key:"k");
-      (* A later, successful put must still work correctly despite the stale temp-file debris
-         a real crash would also have left behind. Task 16: the new [put] uses its own dynamic
-         suffix and won't collide with the stale temp file. *)
-      File_kv_store.put t ~key:"k" "new";
-      Alcotest.(check (option string)) "subsequent put still succeeds" (Some "new")
-        (File_kv_store.get t ~key:"k"))
+      Alcotest.(check bool) "stale temp file exists before create" true
+        (Sys.file_exists stale_tmp_path);
+      (Eio.Switch.run @@ fun sw ->
+       (* Opening a new handle triggers create-time sweep, which removes the stale file. *)
+       let t2 = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+       Alcotest.(check bool) "stale temp file was swept away during create" false
+         (Sys.file_exists stale_tmp_path);
+       (* Real key's data survives intact. *)
+       Alcotest.(check (option string)) "original value still readable after sweep" (Some "original")
+         (File_kv_store.get t2 ~key:"k")))
 
 (* -- Final-review Finding 1: [put] must make the renamed directory ENTRY durable, not just the
    temp file's content, by fsyncing the containing directory after the rename -- exactly as
@@ -722,9 +721,9 @@ let test_concurrent_same_key_puts_never_produce_a_torn_unreadable_record () =
             File_kv_store.put t ~key:"shared" written_values.(i);
             ignore (Atomic.fetch_and_add completed 1))
       done;
-      (* Wait for all fibers to complete. Spin-yield until all n fibers have incremented
-         the counter. This is a simple polling loop; a production system might use Eio's
-         condition variables or channels, but this is sufficient for a test. *)
+      (* Wait for all fibers to complete. Use a simple spin-yield loop (deliberate choice
+         for test clarity: polling the atomic counter is more transparent than setting up
+         channels or condition variables for this bounded test scenario). *)
       let rec wait_for_completion () =
         if Atomic.get completed < n then begin
           Eio.Fiber.yield ();
