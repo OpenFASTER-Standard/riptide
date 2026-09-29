@@ -1044,11 +1044,21 @@
             "id": 12,
             "title": "[3.4] A superblock-rebuild entry point",
             "description": "A superblock-rebuild entry point",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Add Storage_intf.S.superblock_rebuild_from_wal : t -> unit, callable when superblock_read returns None over a non-empty WAL, reconstructing a fresh superblock from the WAL's own recoverable state.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "b5e1c60b333e9df2b08efefef2f514e800b9004f",
+                "05e4127069d44c6d0307fdee5423dd7841ac1d4f",
+                "6c559905edfaf5cb8e9fa8ca8596f3b5cb7dc4ff",
+                "fef86955d2c5ff98ebe0e2e8e41f2559b7ae5db4",
+                "cb7941acd90be81724577749a04e7688277ceab2"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 13,
