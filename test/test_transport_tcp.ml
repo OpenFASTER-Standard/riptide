@@ -30,6 +30,10 @@
      cross-peer misattribution, even under concurrent multi-connection traffic;
    - [Tcp.create] does not return until every SPECIFIC expected peer id is connected, rather than
      merely that many connections existing (see that test's own comment);
+   - [receive]'s reported sender is decoded from the certificate actually verified during the TLS
+     handshake, never from the handshake preamble's own claim, even when a connection is
+     constructed (by hand, bypassing [connect_to]) so the two genuinely disagree (see
+     [test_receive_follows_the_certificate_not_the_preamble_claim] below);
    - the dial side's own TLS handshake (inside [connect_to]) is bounded by
      [tls_handshake_timeout], the same as the accept side's, rather than able to hang [Tcp.create]
      forever against a peer that accepts the TCP connection and then never speaks TLS back (see
@@ -327,6 +331,64 @@ let test_create_waits_for_the_specific_expected_peers () =
           [ 1; 2 ];
         Eio.Switch.fail sw Stray_mesh_torn_down)
   with Stray_mesh_torn_down -> ()
+
+(* -- Area 4b: [receive]'s reported sender follows the certificate, never the preamble --------
+
+   The property [authenticated_peer_id] (tcp.ml) exists to guarantee -- that {!Tcp.receive}'s
+   reported sender is decoded from the certificate {e actually verified} during the mutual TLS
+   handshake, never from the handshake preamble's own in-band claim -- has no test anywhere in
+   this suite, old or new, that ever makes the two diverge: every mesh built above (including
+   [test_create_waits_for_the_specific_expected_peers]'s strays) hands every connection a
+   certificate whose SAN-encoded id and preamble claim are the same value. A regression that
+   silently reverted [reader_body] to trusting the preamble instead of re-deriving from
+   [Tls_eio.epoch] would pass every one of those tests unchanged.
+
+   This test forces the divergence directly, the same way the stray-connection test above
+   bypasses [Tcp.connect_to] (which always ties the preamble it writes to the same identity as
+   the certificate it dials with, so it structurally cannot produce this case): dial the
+   receiving peer's real listener with a raw socket, complete a real mTLS handshake presenting a
+   certificate that encodes id [claimed_cert_id], then write a handshake preamble claiming a
+   DIFFERENT id [claimed_preamble_id], then a real length-prefixed frame. [receive] on the other
+   end must report the certificate's id -- never the preamble's. *)
+exception Preamble_cert_divergence_test_done
+
+let test_receive_follows_the_certificate_not_the_preamble_claim () =
+  let receiver_id = 2 in
+  let peer_specs = [ (receiver_id, "127.0.0.1", 19381) ] in
+  let claimed_cert_id = 42 and claimed_preamble_id = 7 in
+  let frame payload = be8 (String.length payload) ^ payload in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  try
+    Eio.Switch.run (fun sw ->
+        (* A single-member "mesh": [receiver] has no other peer to dial or wait on, so [create]
+           starts its listener and returns immediately -- the stray connection below is dialed
+           entirely by hand, exactly like the strays in the readiness test above. *)
+        let receiver =
+          Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
+            ~tls:(peer_identity receiver_id)
+        in
+        let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19381) in
+        let flow = Eio.Net.connect ~sw net addr in
+        let tls =
+          Tls_eio.client_of_flow
+            (Tls_identity.client_config
+               (identity_of cluster_ca (Printf.sprintf "peer-%d.riptide.test" claimed_cert_id)))
+            flow
+        in
+        let msg = "divergent-preamble-vs-cert" in
+        Eio.Flow.copy_string (be8 claimed_preamble_id ^ frame msg) tls;
+        let payload, sender = Tcp.receive receiver in
+        Alcotest.(check bool)
+          "test setup: the preamble's claim genuinely differs from the certificate's id" true
+          (claimed_preamble_id <> claimed_cert_id);
+        Alcotest.(check string) "message content arrives unmodified" msg payload;
+        Alcotest.(check int)
+          "receive attributes the message to the certificate's id, not the differing preamble claim"
+          claimed_cert_id sender;
+        Eio.Switch.fail sw Preamble_cert_divergence_test_done)
+  with Preamble_cert_divergence_test_done -> ()
 
 (* -- Area 5: mutual TLS ---------------------------------------------------------------------
 
@@ -689,6 +751,8 @@ let tests =
       test_no_cross_peer_misattribution_under_concurrent_traffic);
     ("create waits for the specific expected peers, not merely that many connections", `Quick,
       test_create_waits_for_the_specific_expected_peers);
+    ("receive attributes a message to the certificate's id, not a differing preamble claim",
+      `Quick, test_receive_follows_the_certificate_not_the_preamble_claim);
     ("mTLS: a mutual handshake between two CA-signed peers succeeds and carries bytes", `Quick,
       test_mutual_handshake_between_two_ca_signed_peers_succeeds);
     ("mTLS: the server rejects a client certificate signed by an unrelated CA", `Quick,
