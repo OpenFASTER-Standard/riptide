@@ -539,13 +539,20 @@ let wal_highest_op_number t = t.highest_op_number
    two disagree.
 
    HOW OFTEN IT IS ACTUALLY CALLED (corrected, review finding M5 -- this comment previously claimed
-   "at most once per restart", which is wrong): a bounded, small number of times per replica
-   LIFECYCLE, never once per append. {!Riptide_vsr.Replica.restart} reads it TWICE -- once in its
-   fail-stop guard and once more in its post-recovery truncate condition -- {!Riptide_vsr.Replica.create}
-   reads it once in its backend-is-not-virgin guard, and {!superblock_rebuild_from_wal} derives its
-   [op_number] from the same scan once per repair. Four call sites, each on a cold path, so the cost
-   of re-walking the ring is still irrelevant next to the property it buys; the point of the
-   correction is only that "once" was a claim someone could build on and it was not true.
+   "at most once per restart", which is wrong; round 4 corrected it a second time -- the "TWICE"
+   replacement was ALSO wrong, in the other direction). {!Riptide_vsr.Replica.restart} reads it UP
+   TO TWICE, not unconditionally twice, because its fail-stop guard's [durable = None && ...]
+   short-circuits: an ORDINARY restart over a readable superblock never evaluates the guard's
+   right-hand side at all, so it reads this accessor exactly ONCE, in the post-recovery truncate
+   condition. The fail-stop path itself (an unreadable superblock over a non-empty WAL) reads it
+   once in the guard and then raises, never reaching the truncate condition -- also exactly ONCE.
+   Only a genuinely EMPTY backend (no superblock and no WAL) reads it TWICE: once in the guard
+   (which returns 0, so the guard does not fire and restart continues), and once more in the
+   truncate condition that follows. {!Riptide_vsr.Replica.create} reads it once in its
+   backend-is-not-virgin guard, and {!superblock_rebuild_from_wal} derives its [op_number] from the
+   same scan once per repair. A bounded, small number of times per replica LIFECYCLE either way,
+   never once per append, so the cost of re-walking the ring is still irrelevant next to the
+   property it buys.
 
    See [recover_highest_durable_op_number]'s own comment for the full safety argument and for what the
    previous, false version of THAT comment claimed. *)

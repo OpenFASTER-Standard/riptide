@@ -91,12 +91,29 @@ module type S = sig
         [NoCommittedOpProvablyAbsent].
 
       The FOUR callers that must use THIS one (review finding M3 corrected the count from three; the
-      fourth was always there, it was simply not listed), all for that reason:
+      fourth was always there, it was simply not listed) -- but the "safety bug rather than an
+      inefficiency" stakes above apply to only THREE of them, not uniformly to all four (round-4
+      correction: an earlier version of this list claimed all four shared the same reason, which
+      overstates what the fourth caller actually needs).
       {!Riptide_vsr.Replica.restart}'s fail-stop guard and {!Riptide_vsr.Replica.create}'s
-      backend-is-not-virgin guard (both of which decide whether a backend is EMPTY -- and a backend
-      holding one header-only slot is not), {!Riptide_vsr.Replica.restart}'s own post-recovery
-      truncate condition (which decides whether the backend might still be holding anything ABOVE the
-      superblock's [op_number]), and {!superblock_rebuild_from_wal}'s own [op_number] derivation. *)
+      backend-is-not-virgin guard are both in the safety-bug category: both decide whether a backend
+      is EMPTY, and a backend holding one header-only slot is not, so under-reporting here is exactly
+      the [NoCommittedOpProvablyAbsent] hazard described above. {!superblock_rebuild_from_wal}'s own
+      [op_number] derivation is the same category for the same reason: an under-reported [op_number]
+      here would durably write a superblock that itself claims fewer ops than the WAL still holds.
+
+      {!Riptide_vsr.Replica.restart}'s own post-recovery truncate condition (which decides whether the
+      backend might still be holding anything ABOVE the superblock's [op_number]) is the fourth
+      caller, and its reason for using this accessor is DIFFERENT, not a safety-bug avoidance --
+      see {!Riptide_vsr.Replica.restart}'s own comment above that condition for the full account.
+      Using the STRICT reading there instead would not itself be unsafe: on every backend that exists
+      in this codebase today, the call this condition guards is already a no-op regardless of which
+      reading decides whether it fires ({!Riptide_storage.File_storage.wal_truncate_after} gates its
+      own body on the strict reading, so a header-only slot above [op_number] is never physically
+      discarded either way -- Task 13 round-3 finding M3). The durable reading is used there anyway
+      for a forward-looking reason: a future backend whose [wal_truncate_after] DID physically discard
+      header-only slots would need this condition to read true for that discard to ever be reached
+      and checked against [truncate_wal]'s own [~committed] guard. *)
   val wal_highest_durable_op_number : t -> int
 
   (** Durably overwrites the single superblock record. *)
@@ -213,9 +230,13 @@ module type S = sig
         THIS replica's [k] is the maximum.
         {b CORRECTION (review finding 2): that is NOT what marks the second trace's stale ops 2 and 3
         committed, and this comment used to claim it was.} [HighestCommitNumber] is an INDEPENDENT
-        maximum over the whole DVC quorum's own [k] values (VSR.tla:257-260) and does not consult the
-        repaired replica's supplied [commit_number] on that path at all -- the SURVIVING peer's own
-        honest [k = 3] is what carries the commit-number forward there. Pinned by the narrowed arm
+        maximum over the whole DVC quorum's own [k] values (VSR.tla:257-260), and the repaired
+        replica's supplied [commit_number] IS one of the inputs to that maximum, through its own
+        DVC's [k] -- it is consulted, not ignored. {b Round 4 correction:} what actually decides the
+        outcome in this scenario is that the supplied value is not what the maximum EVALUATES TO --
+        the SURVIVING peer's own honest [k = 3] is equal-or-higher, so it is the peer's [k], not the
+        repaired replica's, that ends up carrying the commit-number forward there, regardless of what
+        the repaired replica supplies. Pinned by the narrowed arm
         [test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_still_replaces_committed_data]:
         supplying the TRUE [commit_number] ([1]) alongside the SAME over-claimed
         [view_number]/[last_normal_view] pair ([3], [3]) reproduces the replacement outcome UNCHANGED,

@@ -1036,32 +1036,34 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
        refusing to start. Coming up with op_number = 0 over a WAL that still holds entries would \
        make this replica prove absent (VSR.tla's CanNack) every op it durably held, which a nack \
        quorum turns into cluster-wide loss of committed data (VSR.tla:111-150). The durable log is \
-       intact and untouched; recovering this replica needs either the superblock rebuilt or the \
-       backend discarded wholesale, neither of which restart can decide on its own. TO REBUILD \
-       (Task 13): call this backend's own Storage_intf.S.superblock_rebuild_from_wal ~view_number \
-       ~last_normal_view ~commit_number (e.g. \
-       Riptide_storage.File_storage.superblock_rebuild_from_wal), then retry Replica.restart. THOSE \
-       THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED, AND THE ONLY SAFE VALUES ARE THIS \
-       REPLICA'S OWN TRUE PRIOR DURABLE STATE -- the exact triple its own superblock held before \
-       the write that tore it. DO NOT COPY THEM OFF A LIVE PEER'S CURRENT STATE: an earlier version \
-       of this message told you to do exactly that, and that advice is WITHDRAWN as actively wrong. \
-       A value too LOW makes this replica lose view-change log selection to a peer holding a SHORTER \
-       log, silently destroying a committed op cluster-wide -- the exact loss this refusal exists to \
-       prevent, reintroduced by the repair. A value too HIGH -- which is what a surviving peer's \
-       CURRENT last_normal_view gives you whenever this replica had fallen behind that peer on view \
-       transitions, something nobody can rule out once THIS replica's own superblock is gone -- \
-       makes this replica WIN that selection with a stale log and silently REPLACE the cluster's \
-       real, already-acknowledged committed values with its own. THE ONLY SOURCE THAT QUALIFIES is \
-       one SYNCHRONOUSLY COUPLED to this replica's own durable superblock write -- a copy of the \
-       RECORD that became durable with it, not a record of the messages this replica sent. An \
-       external monitor watching this replica's traffic does NOT qualify, and an earlier version of \
-       this message wrongly offered it as an example: every durable write here happens strictly \
-       BEFORE the message that announces it, and a backup adopting a new view (ReceiveSV) announces \
-       nothing at all, so an observed triple can be wrong in EITHER catastrophic direction. As of \
-       Task 13 no such synchronously-coupled source exists in this codebase, so in practice this \
-       repair CANNOT be used safely and the backend must be discarded wholesale instead. See \
-       Storage_intf.S.superblock_rebuild_from_wal's own doc comment for both traces and for the full \
-       disclosed limitation.";
+       intact and untouched. RECOMMENDATION: DISCARD THIS BACKEND WHOLESALE AND RESTORE THIS \
+       REPLICA FRESH FROM THE REST OF THE CLUSTER. As of Task 13, no source available in this \
+       codebase can safely supply the values a superblock rebuild needs (see below), so in \
+       practice that repair CANNOT be used safely -- treating this backend as permanently lost is \
+       the safer path. A LAST-RESORT REBUILD REPAIR EXISTS (Task 13), ONLY FOR AN OPERATOR WITH \
+       GENUINE OUT-OF-BAND EVIDENCE OF THIS REPLICA'S OWN PRIOR DURABLE STATE: call this backend's \
+       own Storage_intf.S.superblock_rebuild_from_wal ~view_number ~last_normal_view \
+       ~commit_number (e.g. Riptide_storage.File_storage.superblock_rebuild_from_wal), then retry \
+       Replica.restart. THOSE THREE VALUES ARE REQUIRED AND MUST NOT BE GUESSED, AND THE ONLY SAFE \
+       VALUES ARE THIS REPLICA'S OWN TRUE PRIOR DURABLE STATE -- the exact triple its own \
+       superblock held before the write that tore it. DO NOT COPY THEM OFF A LIVE PEER'S CURRENT \
+       STATE: an earlier version of this message told you to do exactly that, and that advice is \
+       WITHDRAWN as actively wrong. A value too LOW makes this replica lose view-change log \
+       selection to a peer holding a SHORTER log, silently destroying a committed op cluster-wide \
+       -- the exact loss this refusal exists to prevent, reintroduced by the repair. A value too \
+       HIGH -- which is what a surviving peer's CURRENT last_normal_view gives you whenever this \
+       replica had fallen behind that peer on view transitions, something nobody can rule out once \
+       THIS replica's own superblock is gone -- makes this replica WIN that selection with a stale \
+       log and silently REPLACE the cluster's real, already-acknowledged committed values with its \
+       own. THE ONLY SOURCE THAT QUALIFIES is one SYNCHRONOUSLY COUPLED to this replica's own \
+       durable superblock write -- a copy of the RECORD that became durable with it, not a record \
+       of the messages this replica sent. An external monitor watching this replica's traffic does \
+       NOT qualify, and an earlier version of this message wrongly offered it as an example: every \
+       durable write here happens strictly BEFORE the message that announces it, and a backup \
+       adopting a new view (ReceiveSV) announces nothing at all, so an observed triple can be \
+       wrong in EITHER catastrophic direction. See \
+       Storage_intf.S.superblock_rebuild_from_wal's own doc comment for both traces and for the \
+       full disclosed limitation.";
   let view_number, last_normal_view, op_number, commit_number =
     match durable with
     | Some (v, lnv, n, k) -> (v, lnv, n, k)
