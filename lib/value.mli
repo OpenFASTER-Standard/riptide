@@ -63,7 +63,18 @@ type value =
     rejected outright rather than silently picked by whichever entry
     happened to sort first. This holds even for a [value] built directly
     in memory, never round-tripped through {!canonical_decode} (which
-    enforces the same rule from the wire-bytes side). *)
+    enforces the same rule from the wire-bytes side).
+
+    Also raises [Invalid_argument] if [v] nests [Record]/[Sum]/[Sequence]/[Map]
+    more than 1000 levels deep - a real, enforced limit, not aspirational
+    language: this codebase's own real payloads never come close to it (the
+    deepest, an [Envelope], is a handful of levels), and it exists
+    specifically to keep a [Map] with 2+ entries at every nesting level -
+    still algorithmically quadratic in depth (see [encode_into]'s own doc
+    comment in the implementation) - cheap regardless of how deep a [value]
+    built directly in memory happens to be, not just one that arrived via
+    {!canonical_decode} (which enforces the identical cap from the wire-bytes
+    side, for a different reason - see there). *)
 val canonical_encode : value -> string
 
 (** The structural inverse of {!canonical_encode}: decodes a [value] from
@@ -96,6 +107,35 @@ val canonical_encode : value -> string
     arriving over a network with no integrity guarantee) raises cleanly
     rather than reading out of bounds, looping unboundedly, or crashing with
     an unhandled exception.
+
+    Two further bounds are real, enforced limits (not aspirational language) -
+    both independently necessary, since they guard against two different
+    resources an adversarial input can exhaust:
+
+    - {b Nesting depth}: rejected past 1000 levels of [Record]/[Sum]/[Sequence]/[Map]
+      nesting, the same cap {!canonical_encode} enforces (see its own doc
+      comment) - without it, a chain nested a few hundred thousand levels
+      deep costs an attacker only a few KB of wire bytes but can drive this
+      function's own recursion arbitrarily deep, exhausting the call stack.
+
+    - {b Total decoded node count}: rejected once the number of decoded
+      nodes (every [Scalar]/[Record]/[Sum]/[Sequence]/[Map] counts as one,
+      at any depth) exceeds a budget scaled to the input's own byte length -
+      [max 10_000 (String.length input / 64)], i.e. at most one decoded node
+      per 64 bytes of input, floored at 10,000 nodes so small, legitimate
+      inputs are never affected. Without this, a compact wire encoding
+      (e.g. a flat [Sequence] of cheap [Bool] elements, needing only 2 wire
+      bytes each) can still expand into a live in-memory tree tens of times
+      larger than its own byte size, purely from OCaml's own per-node heap
+      overhead (measured: ~55 bytes of live heap per [Bool] node, a ~27x
+      amplification over its 2-byte wire cost) - a 64 MiB frame shaped this
+      way was measured reaching ~9 GB live memory with no other protection
+      in place (docs/superpowers/specs/2026-09-29-audit-remediation-design.md,
+      Decision 2.3), which the existing "claimed count can't exceed
+      remaining bytes" check alone does not prevent, since that check only
+      rules out claiming *more nodes than the input could physically
+      contain* - it says nothing about the memory cost of the nodes the
+      input genuinely does contain.
 
     Also raises [Invalid_argument] if a [Record]'s fields, or a [Map]'s
     entries, are not encoded in strict canonical order - each field name

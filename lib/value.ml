@@ -167,7 +167,43 @@ let sort_and_reject_duplicate_keys ~what compare_key entries =
   reject_duplicate_keys ~what compare_key sorted;
   sorted
 
-let rec encode_into buf (v : value) =
+(* Task 8 (docs/superpowers/plans/2026-09-29-audit-remediation.md): a hard cap on nesting
+   depth, enforced identically by [encode_into] and [decode_value] (see each function's own
+   ["nesting depth exceeds the limit"] check just inside their entry point) - a [value] tree
+   is never more than [max_nesting_depth] [Record]/[Sum]/[Sequence]/[Map] levels deep,
+   regardless of whether it arrived via [canonical_decode] from untrusted wire bytes or was
+   built directly in memory by this process's own code.
+
+   Two independent reasons this needs to be on BOTH sides, not just decode:
+
+   1. [decode_value] itself: an unbounded-depth input lets an attacker who controls only a
+      few KB of wire bytes (a deeply nested chain needs very few bytes per level - see
+      [build_nested_map_key_wire_bytes] in test_value.ml) drive OCaml's own call stack
+      arbitrarily deep, i.e. a cheap-to-construct stack-exhaustion DoS with no ceiling at
+      all before this cap existed.
+
+   2. [encode_into]'s [Map] case, for a [value] with 2+ Map entries at every nesting level:
+      per that case's own doc comment above (the "Two or more entries..." branch), this
+      remains algorithmically quadratic in depth (Θ(depth × size)) because closing it
+      properly needs a byte-lexicographic structural comparator across all 5 constructors -
+      judged too risky to build here given how consensus-safety-critical getting canonical
+      ordering right is (see this task's own report for the full controller ruling). Capping
+      nesting depth at 1000 is the accepted mitigation for that residual: measured directly
+      (test_value.ml's [test_two_entries_per_level_deep_map_encode_hash_residual_bounded]),
+      a 2-entries-per-level chain at depth 1000 costs ~19ms/~37MB, vs. the same shape at
+      depth 20,000 costing ~7s/~14.5GB - the quadratic blowup is still there in the abstract,
+      but a depth-1000 ceiling keeps its concrete cost negligible. A [value] built directly in
+      memory (never round-tripped through [canonical_decode]) can trigger this exact shape
+      just as easily as a decoded one, which is why [encode_into] enforces the same cap
+      independently rather than relying on every producer of a deep [value] to have gone
+      through [decode_value]'s check first. *)
+let max_nesting_depth = 1000
+
+let depth_exceeded_error ~what =
+  invalid_arg (Printf.sprintf "%s: nesting depth exceeds the limit of %d levels" what max_nesting_depth)
+
+let rec encode_into buf ~depth (v : value) =
+  if depth > max_nesting_depth then depth_exceeded_error ~what:"canonical_encode";
   match v with
   | Scalar (Bool b) ->
     Wbuf.add_char buf tag_scalar_bool;
@@ -199,16 +235,16 @@ let rec encode_into buf (v : value) =
     List.iter
       (fun (k, v) ->
          buf_add_len_prefixed buf k;
-         encode_into buf v)
+         encode_into buf v ~depth:(depth + 1))
       sorted
   | Sum (tag, v) ->
     Wbuf.add_char buf tag_sum;
     buf_add_len_prefixed buf tag;
-    encode_into buf v
+    encode_into buf v ~depth:(depth + 1)
   | Sequence items ->
     Wbuf.add_char buf tag_sequence;
     write_u64_be buf (List.length items);
-    List.iter (encode_into buf) items
+    List.iter (fun item -> encode_into buf item ~depth:(depth + 1)) items
   | Map entries ->
     Wbuf.add_char buf tag_map;
     write_u64_be buf (List.length entries);
@@ -239,9 +275,9 @@ let rec encode_into buf (v : value) =
           doc comment for why that matters). *)
        let len_off = Wbuf.reserve buf 8 in
        let key_start = Wbuf.length buf in
-       encode_into buf k;
+       encode_into buf k ~depth:(depth + 1);
        Wbuf.patch_u64_be buf len_off (Wbuf.length buf - key_start);
-       encode_into buf v
+       encode_into buf v ~depth:(depth + 1)
      | _ :: _ :: _ ->
        (* Two or more entries genuinely need their full encoded key bytes to
           determine sort order, so this path still materializes each key via
@@ -271,15 +307,19 @@ let rec encode_into buf (v : value) =
           general multi-key case.
 
           This remains quadratic in depth for Maps with 2+ entries per
-          nesting level - see
-          docs/superpowers/plans/2026-09-29-audit-remediation.md Task 8,
-          which threads a depth counter through BOTH [decode_value] and
-          [encode_into] (capping nesting at 1000) and is the intended
-          mitigation for this residual. Do not silently narrow Task 8's
-          scope to [decode_value] only. *)
+          nesting level - see docs/superpowers/plans/2026-09-29-audit-remediation.md
+          Task 8 (landed: [max_nesting_depth]/[depth_exceeded_error] above,
+          threaded through BOTH [decode_value] and [encode_into]), which caps
+          nesting at 1000 and is the accepted mitigation for this residual -
+          not a fix for the underlying Θ(depth x size) algorithm, which is
+          still exactly as quadratic as described above, but a ceiling that
+          keeps its concrete cost negligible (~19ms/~37MB at depth 1000, per
+          test_two_entries_per_level_deep_map_encode_hash_residual_bounded in
+          test_value.ml, vs. ~7s/~14.5GB at depth 20,000) rather than
+          catastrophic. *)
        let encoded_entries = List.map (fun (k, v) ->
            let kb = Wbuf.create 64 in
-           encode_into kb k;
+           encode_into kb k ~depth:(depth + 1);
            (Wbuf.contents kb, v))
            entries
        in
@@ -288,12 +328,12 @@ let rec encode_into buf (v : value) =
        List.iter
          (fun (kbytes, v) ->
             buf_add_len_prefixed buf kbytes;
-            encode_into buf v)
+            encode_into buf v ~depth:(depth + 1))
          sorted)
 
 let canonical_encode v =
   let buf = Wbuf.create 256 in
-  encode_into buf v;
+  encode_into buf v ~depth:0;
   Wbuf.contents buf
 
 (* ---- Decoding ----
@@ -390,7 +430,60 @@ let compare_byte_range s ~a_pos ~a_len ~b_pos ~b_len =
   in
   loop 0
 
-let rec decode_value s pos ~bound =
+(* Task 8: a hard budget on the *total number of decoded nodes* (every [decode_value] call -
+   Scalar leaf or Record/Sum/Sequence/Map container alike - counts as exactly one), scaled to
+   the input's own byte length and enforced independently of [max_nesting_depth] above (that
+   cap bounds recursion/stack depth; this one bounds total heap allocation - a wide, shallow
+   tree with millions of siblings costs nothing against the depth cap but everything against
+   this one, and vice versa for a deep, narrow chain).
+
+   Why a per-input-size budget, not just relying on [read_len_prefix]'s existing "claimed
+   count can't exceed remaining bytes" check: that check already makes it impossible to claim
+   more nodes than the input could physically contain (every node needs real, distinct wire
+   bytes - there's no compression or back-reference in this format), so it already bounds
+   worst-case node count to roughly (input length / 2) for the cheapest possible node (a
+   [Bool] scalar: 1 tag byte + 1 value byte). The problem this budget closes is that this
+   existing, unavoidable bound is still far too loose: OCaml's own per-node heap overhead
+   turns a compact wire encoding into a much larger live in-memory tree. Measured directly
+   (a tight loop allocating [Scalar (Bool b)] cons cells with [b] not statically known, so the
+   compiler can't share/constant-fold them - the same shape [decode_value]'s own Bool case
+   builds): ~55 bytes of live OCaml heap per node (a 2-word [Bool] block + 2-word [Scalar]
+   block + 3-word list cons cell = 7 words = 56 bytes on a 64-bit runtime, matching the
+   measurement almost exactly), against only 2 bytes of wire encoding - a ~27x amplification
+   even before accounting for [decode_value]'s own [List.rev] at the end of each
+   Record/Sequence/Map loop transiently doubling that level's own list, or the OCaml major
+   heap's own fragmentation/growth-increment overhead on top of raw live-word counts. This
+   matches the audit's own reproduction: a worst-case 64 MiB (67,108,864-byte) frame - the
+   size of [lib/transport/tcp.ml]'s own [max_message_size], the largest frame this codebase
+   will ever hand to [canonical_decode] - packed with cheap [Bool] [Sequence] elements reaches
+   ~9 GB live memory with no other protection in place (docs/superpowers/specs/2026-09-29-audit-remediation-design.md,
+   Decision 2.3).
+
+   Formula: [max_decoded_nodes input_len = max min_decoded_nodes_floor (input_len /
+   bytes_per_node_budget)], i.e. at most one decoded node allowed per
+   [bytes_per_node_budget] (64) bytes of input, floored at [min_decoded_nodes_floor] (10,000)
+   so a small, legitimate message (this codebase's own real payloads - an [Envelope] wraps at
+   most a handful of levels - are nowhere near this floor) is never rejected just because a
+   byte-scaled budget would otherwise be tiny for it. For the audit's own 64 MiB reproduction
+   size, this budget is 1,048,576 nodes: the cheapest possible attack shape (a flat, all-Bool
+   [Sequence]) hits that ceiling after decoding only ~2 MiB of its claimed 64 MiB (at 2
+   wire-bytes/node), well under 3% of the way through, at an estimated ~55 MB of live heap
+   (1,048,576 nodes x ~55 bytes/node) even before the safety margin the [List.rev]/fragmentation
+   factors above provide - three orders of magnitude below the audit's observed ~9 GB, and
+   rejected almost immediately rather than after doing most of the harmful work. *)
+let min_decoded_nodes_floor = 10_000
+let bytes_per_node_budget = 64
+
+let max_decoded_nodes ~input_len =
+  let scaled = input_len / bytes_per_node_budget in
+  if scaled < min_decoded_nodes_floor then min_decoded_nodes_floor else scaled
+
+let rec decode_value s pos ~bound ~depth ~node_budget ~node_count =
+  if depth > max_nesting_depth then depth_exceeded_error ~what:"canonical_decode";
+  incr node_count;
+  if !node_count > node_budget then
+    invalid_arg
+      (Printf.sprintf "canonical_decode: decoded node count exceeds budget of %d nodes for this input" node_budget);
   if pos >= bound then invalid_arg "canonical_decode: unexpected end of input (expected a value tag byte)";
   let tag = s.[pos] in
   let pos = pos + 1 in
@@ -441,7 +534,7 @@ let rec decode_value s pos ~bound =
              invalid_arg
                (Printf.sprintf "canonical_decode: record fields are not in canonical order (%S after %S)" k pk)
          | None -> ());
-        let v, pos = decode_value s pos ~bound in
+        let v, pos = decode_value s pos ~bound ~depth:(depth + 1) ~node_budget ~node_count in
         loop (i - 1) pos ((k, v) :: acc) ~prev_key:(Some k)
     in
     let fields, pos = loop count pos [] ~prev_key:None in
@@ -449,14 +542,14 @@ let rec decode_value s pos ~bound =
   else if tag = tag_sum then
     let tlen, pos = read_len_prefix s pos ~bound ~what:"sum tag" in
     let t, pos = read_bytes_exact s pos tlen in
-    let v, pos = decode_value s pos ~bound in
+    let v, pos = decode_value s pos ~bound ~depth:(depth + 1) ~node_budget ~node_count in
     (Sum (t, v), pos)
   else if tag = tag_sequence then
     let count, pos = read_len_prefix s pos ~bound ~what:"sequence element count" in
     let rec loop i pos acc =
       if i = 0 then (List.rev acc, pos)
       else
-        let v, pos = decode_value s pos ~bound in
+        let v, pos = decode_value s pos ~bound ~depth:(depth + 1) ~node_budget ~node_count in
         loop (i - 1) pos (v :: acc)
     in
     let items, pos = loop count pos [] in
@@ -524,9 +617,9 @@ let rec decode_value s pos ~bound =
                    offset %d)"
                   entry_index kblob_start)
          | None -> ());
-        let k, kpos = decode_value s kblob_start ~bound:kblob_end in
+        let k, kpos = decode_value s kblob_start ~bound:kblob_end ~depth:(depth + 1) ~node_budget ~node_count in
         if kpos <> kblob_end then invalid_arg "canonical_decode: trailing bytes after map key value";
-        let v, pos = decode_value s kblob_end ~bound in
+        let v, pos = decode_value s kblob_end ~bound ~depth:(depth + 1) ~node_budget ~node_count in
         loop (i - 1) pos ((k, v) :: acc) ~prev_kblob:(Some (kblob_start, kblob_len))
     in
     let entries, pos = loop count pos [] ~prev_kblob:None in
@@ -535,8 +628,11 @@ let rec decode_value s pos ~bound =
 
 let canonical_decode s =
   if String.length s = 0 then invalid_arg "canonical_decode: empty input";
-  let v, pos = decode_value s 0 ~bound:(String.length s) in
-  if pos <> String.length s then invalid_arg "canonical_decode: trailing bytes after decoded value";
+  let input_len = String.length s in
+  let node_budget = max_decoded_nodes ~input_len in
+  let node_count = ref 0 in
+  let v, pos = decode_value s 0 ~bound:input_len ~depth:0 ~node_budget ~node_count in
+  if pos <> input_len then invalid_arg "canonical_decode: trailing bytes after decoded value";
   v
 
 let content_hash v = Digestif.SHA256.(to_raw_string (digest_string (canonical_encode v)))

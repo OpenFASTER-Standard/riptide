@@ -389,24 +389,37 @@ let build_nested_map_key_value ~depth =
    implementation measures ~2.3-2.6x and passes with a wide margin. *)
 let scaling_bound ~t_d ~factor ~floor = (t_d *. factor) +. floor
 
+(* Task 8 update: canonical_encode/canonical_decode now enforce a hard 1000-level
+   nesting-depth cap (lib/value.ml's [max_nesting_depth]), so depth 20,000 - the original
+   audit reproduction size these two tests and the correctness cross-check below used to
+   run at - is no longer even a legal input: both would now raise [Invalid_argument]
+   outright (depth-exceeded) rather than run to completion at all. Depths lowered to
+   200/800 (still a 4x span, so the linear-vs-quadratic discrimination reasoning above is
+   unchanged) so these three tests keep exercising genuine, still-decodable inputs under
+   the new cap. The property under test here - Task 5's O(depth) fix for a single-entry
+   Map-key chain - is a different, already-closed finding from Task 8's own 2+-entries
+   residual (see [test_two_entries_per_level_deep_map_encode_hash_residual_bounded] below)
+   and is unaffected by the depth cap itself; only the specific depth these tests can
+   legally probe changed. *)
 let test_deeply_nested_map_keys_encode_in_linear_time () =
   (* Correctness pin, independent of timing: cross-check against the
      independently hand-built wire bytes for the exact same structure, byte
-     for byte, at the same depth (20,000) the original audit finding used.
-     Timing alone can't catch an off-by-one in the backpatched Map-key
-     length prefix (see [Wbuf.reserve]/[Wbuf.patch_u64_be] in [lib/value.ml])
-     - a mismatch there would silently produce a corrupt frame with a wrong
-     length prefix, only surfacing as a decode failure elsewhere. *)
-  let v20k = build_nested_map_key_value ~depth:20_000 in
+     for byte, at depth 1000 - the maximum nesting depth Task 8's cap now
+     allows (see the update note above). Timing alone can't catch an
+     off-by-one in the backpatched Map-key length prefix (see
+     [Wbuf.reserve]/[Wbuf.patch_u64_be] in [lib/value.ml]) - a mismatch
+     there would silently produce a corrupt frame with a wrong length
+     prefix, only surfacing as a decode failure elsewhere. *)
+  let v_at_cap = build_nested_map_key_value ~depth:1000 in
   Alcotest.(check string) "encodes to the same bytes as the hand-built wire format"
-    (build_nested_map_key_wire_bytes ~depth:20_000) (Value.canonical_encode v20k);
+    (build_nested_map_key_wire_bytes ~depth:1000) (Value.canonical_encode v_at_cap);
   let time_at depth =
     let v = build_nested_map_key_value ~depth in
     let start = Unix.gettimeofday () in
     ignore (Value.canonical_encode v);
     Unix.gettimeofday () -. start
   in
-  let d = 20_000 in
+  let d = 200 in
   let t_d = time_at d in
   let t_4d = time_at (4 * d) in
   let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
@@ -423,7 +436,7 @@ let test_deeply_nested_map_keys_decode_in_linear_time () =
     ignore (Value.canonical_decode wire);
     Unix.gettimeofday () -. start
   in
-  let d = 20_000 in
+  let d = 200 in
   let t_d = time_at d in
   let t_4d = time_at (4 * d) in
   let bound = scaling_bound ~t_d ~factor:8.0 ~floor:0.1 in
@@ -454,21 +467,27 @@ let test_deeply_nested_map_keys_decode_in_linear_time () =
    explicitly out of scope here - consensus-safety-critical canonical
    ordering is a much higher-risk place to introduce a subtle bug than this
    DoS is to leave in place a little longer, and Task 8 (depth-bounded
-   decode/encode, capping nesting at 1000) is the intended mitigation.
+   decode/encode, capping nesting at 1000) is the accepted mitigation.
+
+   Task 8 has now landed (lib/value.ml's [max_nesting_depth]/[depth_exceeded_error],
+   threaded through both [decode_value] and [encode_into]): a value nested past 1000
+   levels is rejected outright by both [canonical_encode] and [canonical_decode], so this
+   residual's blast radius is now genuinely bounded at the concrete, negligible cost this
+   test pins - not merely "expected to be neutralized by a future task" as this comment
+   previously said. The underlying algorithm is still exactly as quadratic in the abstract
+   as described above (Task 8 caps the practical cost, it does not change the Big-O), which
+   is why this test remains in the suite as a regression trip-wire rather than being
+   deleted now that a mitigation exists.
 
    This test is a pinning/regression baseline, not a fix: it measures the
-   *current* cost of this residual at Task 8's own future cap (depth 1000,
+   *current* cost of this residual at Task 8's now-enforced cap (depth 1000,
    NOT the 20,000 used to demonstrate the blowup - that takes ~7s and would
-   make the suite unbearably slow), so Task 8's depth-cap work has a
-   concrete "must not regress past this" number, and so the residual is
-   something the suite actually knows about rather than only something
-   described in a report file. The reviewer measured ~19ms/37MB at depth
-   1000 (matching the doc comment in [lib/value.ml] that Task 8 threads a
-   depth counter through both [decode_value] and [encode_into] and is
-   expected to neutralize this as a practical DoS even though the
-   underlying algorithm stays quadratic in the abstract) - 500ms leaves
-   generous real headroom above that as a genuine trip-wire, not a
-   hair-trigger flaky bound. *)
+   make the suite unbearably slow), so a regression in either Task 8's cap or
+   Task 5's in-place rewrite has a concrete "must not regress past this"
+   number to trip, and so the residual is something the suite actually knows
+   about rather than only something described in a report file. The reviewer
+   measured ~19ms/37MB at depth 1000 - 500ms leaves generous real headroom
+   above that as a genuine trip-wire, not a hair-trigger flaky bound. *)
 let build_two_entry_per_level_deep_map_value ~depth =
   let rec loop i acc =
     if i = 0 then acc
@@ -499,10 +518,92 @@ let test_two_entries_per_level_deep_map_encode_hash_residual_bounded () =
   let elapsed = Unix.gettimeofday () -. start in
   Alcotest.(check bool)
     (Printf.sprintf
-       "2-entries-per-level Map with a 1000-deep chain (Task 8's future depth cap) content_hashes \
-        in well under 2.0s (residual pinning baseline for Task 8 not to regress past; took %.4fs)"
+       "2-entries-per-level Map with a 1000-deep chain (Task 8's enforced depth cap) content_hashes \
+        in well under 2.0s (residual pinning baseline Task 8's cap must not regress past; took %.4fs)"
        elapsed)
     true (elapsed < 2.0)
+
+(* ---- Task 8: bounded decode depth and an output-node budget ----
+
+   docs/superpowers/plans/2026-09-29-audit-remediation.md Task 8. Two independent bounds,
+   tested separately below: a nesting-depth cap (stack-exhaustion DoS) and a decoded-node
+   count budget scaled to the input's own byte length (memory-amplification DoS - see
+   lib/value.ml's own doc comment on [max_decoded_nodes] for the full reasoning and the
+   measurements behind the formula). *)
+
+(* Hand-constructs the wire bytes for a value nested [depth] levels deep via [Sum] - tag_sum
+   ++ len_prefixed(tag) ++ inner value, bottoming out at a plain Scalar Int. A different
+   constructor from [build_nested_map_key_wire_bytes] above (which nests via [Map] keys)
+   specifically so this test exercises the depth cap on a different constructor than the one
+   the Map-key tests already cover - the cap applies identically to
+   [Record]/[Sum]/[Sequence]/[Map] (see [decode_value]'s own depth check, which fires
+   regardless of which of these four tags is being decoded), so any one of them is a valid
+   witness, but using a different one than the existing Map-key tests is slightly stronger
+   coverage than reusing the same shape a second time. Built with a plain O(depth) loop (no
+   need for the O(1)-per-level closed-form trick [build_nested_map_key_wire_bytes] uses) since
+   the depth used here (2000, just past the 1000 cap) is far too small for an O(depth^2)
+   construction to matter. *)
+let build_nested_sum_wire_bytes ~depth =
+  let innermost = raw_int 0L in
+  let sum_tag = "x" in
+  let tag_prefix = len_prefixed sum_tag in
+  let buf = Buffer.create (String.length innermost + ((1 + String.length tag_prefix) * depth)) in
+  for _ = 1 to depth do
+    Buffer.add_char buf '\x06';
+    Buffer.add_string buf tag_prefix
+  done;
+  Buffer.add_string buf innermost;
+  Buffer.contents buf
+
+let test_decode_rejects_excessive_nesting_depth () =
+  let wire = build_nested_sum_wire_bytes ~depth:2000 in
+  Alcotest.check_raises "depth past 1000 is rejected cleanly, not left to the runtime stack"
+    (Invalid_argument "canonical_decode: nesting depth exceeds the limit of 1000 levels")
+    (fun () -> ignore (Value.canonical_decode wire))
+
+(* Mirrors [lib/value.ml]'s own [max_decoded_nodes] formula exactly (that function is
+   internal, not exposed via value.mli, so it can't be called directly from here) -
+   duplicated rather than re-derived so this test's expected-budget computation and the
+   implementation's real one can never silently drift apart without a comment update on
+   both sides. *)
+let bytes_per_node_budget = 64
+let min_decoded_nodes_floor = 10_000
+let expected_node_budget ~input_len = max min_decoded_nodes_floor (input_len / bytes_per_node_budget)
+
+(* Mirrors the audit's own worst-case reproduction directly, at full scale: a 64
+   MiB frame (matching [lib/transport/tcp.ml]'s own [max_message_size], the largest frame
+   this codebase will ever hand to [canonical_decode]) shaped as a single flat [Sequence] of
+   the cheapest possible element ([Scalar (Bool false)], 2 wire bytes each) - measured by
+   the audit reaching ~9GB live memory with no protection in place
+   (docs/superpowers/specs/2026-09-29-audit-remediation-design.md, Decision 2.3). Built at
+   full scale rather than scaled down like the depth tests above because, unlike those, this
+   construction is genuinely cheap (a single [Bytes.make] linear fill, no quadratic anything)
+   and [canonical_decode]'s own node-count budget check fires within the first ~2 MiB of
+   this ~64 MiB input, so the test stays fast despite the large buffer.
+
+   [Bytes.make total_len '\x00'] does double duty: '\x00' is both a harmless zero-fill byte
+   AND [tag_scalar_bool], and a second '\x00' after it is a valid Bool-false payload byte -
+   so simply zero-filling the whole buffer already produces a stream of genuinely valid
+   [Scalar (Bool false)] wire encodings for every element after the 9-byte Sequence header,
+   with no separate per-element write loop needed. *)
+let test_decode_rejects_a_node_count_over_budget () =
+  let mib = 1024 * 1024 in
+  let target_total_len = 64 * mib in
+  let header_len = 1 + 8 (* tag_sequence + u64 element count *) in
+  let element_count = (target_total_len - header_len) / 2 in
+  let total_len = header_len + (element_count * 2) in
+  let buf = Bytes.make total_len '\x00' in
+  Bytes.set buf 0 '\x07';
+  (* tag_sequence *)
+  for i = 0 to 7 do
+    Bytes.set buf (1 + i) (Char.chr ((element_count lsr (8 * (7 - i))) land 0xff))
+  done;
+  let oversized_wire = Bytes.unsafe_to_string buf in
+  let node_budget = expected_node_budget ~input_len:total_len in
+  Alcotest.check_raises "node budget is enforced before allocating all of a 64 MiB frame's declared elements"
+    (Invalid_argument
+       (Printf.sprintf "canonical_decode: decoded node count exceeds budget of %d nodes for this input" node_budget))
+    (fun () -> ignore (Value.canonical_decode oversized_wire))
 
 (* Malformed-input tests: each of these must raise [Invalid_argument]
    promptly - never read out of bounds, loop, or crash with some other
@@ -689,11 +790,13 @@ let tests =
       test_decode_accepts_a_correctly_ordered_multi_entry_map );
     ("encode rejects an in-memory duplicate key record", `Quick, test_encode_rejects_an_in_memory_duplicate_key_record);
     ("encode rejects an in-memory duplicate key map", `Quick, test_encode_rejects_an_in_memory_duplicate_key_map);
-    ("20k-deep nested map keys decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
-    ("20k-deep nested map keys encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
+    ("nested map keys (within Task 8's depth cap) decode in linear time", `Quick, test_deeply_nested_map_keys_decode_in_linear_time);
+    ("nested map keys (within Task 8's depth cap) encode in linear time", `Quick, test_deeply_nested_map_keys_encode_in_linear_time);
     ( "2-entries-per-level 1000-deep map key encode/hash residual bounded",
       `Quick,
       test_two_entries_per_level_deep_map_encode_hash_residual_bounded );
+    ("decode rejects excessive nesting depth", `Quick, test_decode_rejects_excessive_nesting_depth);
+    ("decode rejects a node count over budget", `Quick, test_decode_rejects_a_node_count_over_budget);
     QCheck_alcotest.to_alcotest value_injective_prop;
     QCheck_alcotest.to_alcotest record_permutation_invariance_prop;
     QCheck_alcotest.to_alcotest map_permutation_invariance_prop;
