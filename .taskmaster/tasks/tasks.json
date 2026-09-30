@@ -837,7 +837,7 @@
         "id": "12",
         "title": "Harden Layer 0 against adversarial real-world conditions (deep audit remediation)",
         "description": "Close every finding from the 2026-09-29 five-track adversarial audit of the value codec, VSR consensus/replication, storage, materializer/lattice, and transport/crypto layers -- six Critical, live-reproduced. See docs/superpowers/specs/2026-09-29-audit-remediation-design.md for the full design.",
-        "status": "in-progress",
+        "status": "done",
         "priority": "high",
         "dependencies": [
           "4"
@@ -1387,30 +1387,42 @@
             "id": 32,
             "title": "[7.4] A generic event hook for observability, plus peer_op_number exposure",
             "description": "A generic event hook for observability, plus peer_op_number exposure",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Replica.create/restart gain ?on_event, mirroring the existing ?on_commit_advanced pattern, covering guard rejections, status transitions, and commit_number decreases (not filtered out, unlike the existing hook). Add a real peer_op_number accessor.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "98bfcfa628c956380b0b63172af294138d9a2230",
+                "d58ffc8f891532a56e6bf97364767a385e7fc31d"
+              ]
+            }
           },
           {
             "id": 33,
             "title": "[7.5] Doc corrections: stale retry/backoff claim, missing svc_count accessor",
             "description": "Doc corrections: stale retry/backoff claim, missing svc_count accessor",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Correct 2026-09-24-layer0-followup-hardening-design.md's still-present claim about unshipped disk-full retry/backoff behavior to point forward to Decision 3.3. Add the svc_count accessor replica.mli:538 already references but that doesn't exist.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "98bfcfa628c956380b0b63172af294138d9a2230",
+                "d58ffc8f891532a56e6bf97364767a385e7fc31d"
+              ]
+            }
           }
         ]
       }
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-29T00:00:00.000Z",
+      "lastModified": "2026-09-30T06:51:03.000Z",
       "taskCount": 12,
-      "completedCount": 4,
+      "completedCount": 5,
       "tags": [
         "master"
       ]
