@@ -142,6 +142,84 @@ let listen_backlog = 64
    opening far more connections than this cluster's own membership size would ever hit the cap. *)
 let default_max_connections ~peers = max 16 (4 * List.length peers)
 
+(* Default for [create]'s [?inbox_capacity] -- the bound on how many not-yet-[receive]d
+   [(payload, sender)] pairs the shared inbox (see [t.inbox]) will hold before the reader fiber
+   that produced the next one blocks trying to add it. Without a bound ([Eio.Stream.create max_int],
+   this module's previous behavior) a peer that sends faster than the local caller drains
+   [receive] grows this process's memory without limit -- the audit's own reproduction pushed
+   20,000 x 64KiB payloads (~1.25GB) onto it with nothing ever pushing back.
+
+   Sized against this module's own real consumption model, the same discipline
+   [default_max_connections] above and [File_storage.pool_size] elsewhere in this codebase already
+   use, not guessed. The one real (non-simulated-only-in-spirit) precedent for how a caller drains
+   this interface is [lib/dst/cluster.ml]'s own dispatch loop: one Eio fiber per replica, calling
+   [receive] (there, {!Riptide_sim.Sim_transport.receive}; the same {!Transport_intf.S.receive} this
+   module also implements) and fully handling one message before calling [receive] again --
+   sequential, never concurrent, the same shape [File_storage.pool_size]'s own comment already cites
+   from the same file for the same reason. Under that consumption model, this peer's inbox can
+   legitimately have up to [List.length peers - 1] messages arrive in one genuine burst -- one from
+   each other cluster member, e.g. every backup replying to the same broadcast at once (see
+   [try_forfeit_view_change] in [lib/vsr/replica.ml] for a concrete broadcast shape: "for peer = 1 to
+   replica_count, send") -- before the single dispatch loop gets back around to draining them.
+   [4 *] that gives headroom for a short RUN of such bursts (e.g. a view-change episode's
+   StartViewChange immediately followed by DoViewChange, from every backup) to queue up across a
+   few dispatch iterations without the reader fiber ever blocking on ordinary, non-adversarial
+   traffic. [max 16] puts the same floor under tiny clusters that [default_max_connections] does,
+   for the same reason: a 2- or 3-peer cluster would otherwise get a cap of 4 or 8, comfortably
+   within reach of legitimate burst traffic this cap has no business rejecting.
+
+   This is deliberately a SMALL number, not a large one -- unlike [default_max_connections] (which
+   exists to make an attacker's job harder by raising a ceiling far above legitimate use), this
+   cap's whole job is to make [reader_body] apply real backpressure quickly once the local consumer
+   falls behind, so a fast-sending peer's excess data stays on the wire (and, transitively, in the
+   OS's own bounded socket buffers) instead of being copied into this process's heap indefinitely.
+   Hitting this cap during real operation is a signal the LOCAL consumer isn't keeping up, not that
+   the cap is too small. *)
+let default_inbox_capacity ~peers = max 16 (4 * List.length peers)
+
+(* Default for [create]'s [?read_idle_timeout] -- see [t]'s own [read_idle_timeout] field and
+   [reader_body] for the mechanism. Deliberately NOT [tls_handshake_timeout]/[preamble_read_timeout]
+   (10.0s each): those bound how long a quick, one-time protocol STEP is allowed to take, a
+   completely different question from "is this already-established, steady-state connection still
+   useful". Conflating the two would make an ordinary, healthy multi-minute lull in application
+   traffic indistinguishable from a wedged handshake.
+
+   {b Why minutes, not seconds -- and why a large number of minutes specifically.} This module's
+   only production caller is a VSR replica's message path (see tcp.mli's opening paragraph), and as
+   of this task there is no heartbeat or other synthetic non-silence mechanism anywhere in this
+   codebase's real VSR implementation: [lib/vsr/replica.ml]'s own [check_timeout] doc comment
+   confirms a caller-driven wall-clock timer that would notice "no Prepare/heartbeat seen recently"
+   is still only a hypothetical future extension, not something built, and nothing today calls
+   [check_timeout] outside test harnesses on any real wall-clock schedule at all (confirmed by
+   grepping every non-test caller: there are none). Concretely, that means every message this
+   module ever carries in real operation -- Prepare/PrepareOk/Commit from client writes, or
+   StartViewChange/DoViewChange/StartView from a view change -- is driven by something a CLIENT or
+   an operator did, not by any periodic internal clock. A cluster with no client write traffic for
+   an extended stretch (a quiet night, a batch-oriented workload with long gaps between jobs, a
+   staging/dev cluster left idle) is, today, honestly indistinguishable from this module's own
+   perspective from one that has gone silently wrong -- there is no lower bound this module can
+   observe on how long *legitimate* silence lasts, because nothing yet guarantees an upper bound on
+   it either.
+
+   Given that, and given tcp.mli's own "no reconnection once established" limitation (see its
+   "Explicitly out of scope" section) -- meaning this timeout firing during a legitimate quiet
+   period severs the connection PERMANENTLY, not until traffic resumes -- the honest choice is to
+   bias heavily toward never firing during real operation, accepting in exchange that a genuinely
+   dead/wedged connection (the case this exists to reclaim) sits idle for longer before this module
+   notices. 30 minutes is comfortably beyond any lull this system's current (heartbeat-free) design
+   would produce during ACTUAL use (an operator/client-driven system going 30 full minutes with
+   *zero* activity on one specific pairwise link, while otherwise healthy, would itself be a
+   surprising, worth-investigating fact about that deployment) while still being a small, finite,
+   human-scale number rather than "hours" or "never" -- so a connection that is not merely quiet but
+   genuinely abandoned (the peer crashed without a TCP reset, a network path silently black-holed
+   the connection, or a misbehaving/compromised peer is deliberately holding it open and idle) is
+   reclaimed within a bounded, noticeable window instead of consuming an fd and a fiber for the
+   lifetime of the process. See tcp.mli's "Explicitly out of scope" section for the disclosure this
+   trade-off requires: this default does not, and cannot by itself, fully close "a peer holds a
+   connection open forever" -- only a heartbeat (VSR/cluster layer) or a reconnection mechanism
+   (this transport layer), both explicitly out of scope here, would. *)
+let default_read_idle_timeout = 30.0 *. 60.0
+
 (* Hard upper bound on a single message's size: [Buf_read.of_flow]'s [~max_size] (so a peer that
    claims a frame longer than this gets rejected via [Frame_too_large] below, rather than this
    process trying to allocate an unbounded buffer for it), and [send]'s own cap on outgoing
@@ -158,6 +236,18 @@ let max_message_size = 64 * 1024 * 1024
    so a [Tcp: connection error] log line can say *why* a connection was dropped instead of looking
    identical to an ordinary disconnect. *)
 exception Frame_too_large of int
+
+(* Raised by [reader_body] when no complete frame arrives within [t.read_idle_timeout] of when the
+   wait for it began (the connection's own handshake completing, for the first frame; the previous
+   frame's own arrival, for every one after). Caught immediately next to where it is raised, exactly
+   like [Frame_too_large] above, purely so a [Tcp: connection error] log line can say *why* the
+   connection was dropped (a deliberate idleness bound, distinct from an ordinary disconnect) --
+   never escapes this module. See [default_read_idle_timeout]'s own comment for what this timeout
+   closes, why its value is what it is, and the residual risk it does NOT close (a legitimate quiet
+   period is indistinguishable from a dead connection at this layer, and tcp.mli's own "no
+   reconnection once established" limitation makes this timeout's closure of the former
+   PERMANENT). *)
+exception Read_idle_timeout
 
 (* Raised by [connect_to] when the TLS handshake with a dialed peer fails, so that [create] can
    report it as the distinct, named cause it is rather than folding it into the "gave up dialing"
@@ -199,6 +289,11 @@ type t = {
      authenticator built from the same trust anchor, which is what makes every connection in the
      mesh mutually authenticated in both directions -- see tls_identity.mli. *)
   tls : Tls_identity.t;
+  (* Resolved value of [create]'s [?read_idle_timeout] (see [default_read_idle_timeout] for the
+     default and its justification). Stored on [t], rather than threaded as a separate argument to
+     every call site that needs it, because every connection this [t] ever runs -- dialed or
+     accepted -- uses the same value; see [reader_body]. *)
+  read_idle_timeout : float;
   (* Each element is [(payload, sender)], where [sender] is the id [authenticated_peer_id] (see
      below) decoded from the certificate actually presented on the connection the message arrived
      on -- never the handshake preamble's claim. [reader_body] is the only producer. *)
@@ -411,7 +506,15 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
    - [Frame_too_large]: the peer's declared frame length was negative or over [max_message_size];
    - [Buf_read.Buffer_limit_exceeded]/[Invalid_argument]: defense in depth for the same class of
      malformed-length input as [Frame_too_large], in case some other path into this loop ever
-     produces it directly instead of going through [read_frame]'s own check.
+     produces it directly instead of going through [read_frame]'s own check;
+   - [Read_idle_timeout]: no complete frame arrived within [t.read_idle_timeout] of the previous one
+     (or of this loop starting, for the first). Wraps ONLY the wait for the next frame
+     ([read_frame r]) -- never the [Eio.Stream.add] just below it. That distinction is load-bearing:
+     blocking in [Eio.Stream.add] means this connection is actively delivering data and the LOCAL
+     consumer merely hasn't drained the shared inbox yet (Fix 1's own, intentional backpressure --
+     see [default_inbox_capacity]), which is not idleness and must never be timed out, or it would
+     defeat that backpressure's entire purpose by dropping a connection for the "crime" of the local
+     side being temporarily busy.
 
    This same function is used for both accepted and dialed connections' read sides -- both go
    through [run_connection], so both get identical fault handling and identical connection
@@ -419,12 +522,21 @@ let writer_body t ~is_dialer peer_id flow writer_cell =
    also makes [authenticated_peer_id]'s use of [Tls_eio.epoch flow] correct on both sides
    symmetrically: for an accepted connection [flow]'s [peer_certificate] is the dialer's (client)
    certificate, and for a dialed connection it is the accepted peer's (server) certificate -- mutual
-   TLS means both sides always have one to report once the handshake has completed at all. *)
-let reader_body t flow r =
+   TLS means both sides always have one to report once the handshake has completed at all.
+
+   [~clock] is needed only for the [Read_idle_timeout] wait above -- both call sites
+   ([handle_accepted], [connect_to]) already have a [clock] in scope for their own pre-existing
+   handshake/preamble timeouts, so this is a plain threaded-through argument, not a new
+   dependency. *)
+let reader_body t ~clock flow r =
   try
     let sender = authenticated_peer_id flow in
     while true do
-      let payload = read_frame r in
+      let payload =
+        match Eio.Time.with_timeout clock t.read_idle_timeout (fun () -> Ok (read_frame r)) with
+        | Ok payload -> payload
+        | Error `Timeout -> raise Read_idle_timeout
+      in
       Eio.Stream.add t.inbox (payload, sender)
     done
   with
@@ -442,6 +554,13 @@ let reader_body t flow r =
       len max_message_size
   | Eio.Buf_read.Buffer_limit_exceeded | Invalid_argument _ as exn ->
     Eio.traceln "Tcp: connection error: %s; dropping connection" (Printexc.to_string exn)
+  | Read_idle_timeout ->
+    Eio.traceln
+      "Tcp: connection error: no frame received within %.1fs of the last one (or of the connection \
+       establishing, for the first); treating as idle and dropping connection -- see \
+       default_read_idle_timeout's own comment for why this is permanent (no reconnection) if this \
+       was in fact a legitimate quiet period, not a dead connection"
+      t.read_idle_timeout
 
 (* Runs one connection's whole lifetime, coupling its reader and writer fibers so that neither can
    outlive the other's knowledge that the connection is dead.
@@ -489,11 +608,11 @@ let reader_body t flow r =
    Nothing here relies on a peer being able to distinguish an orderly TLS shutdown from a dropped
    connection: this module treats every way a connection can end identically, and has no
    truncation-sensitive stream semantics for close_notify to protect.) *)
-let run_connection t ~is_dialer ~owns_flow peer_id flow r =
+let run_connection t ~is_dialer ~owns_flow ~clock peer_id flow r =
   let writer_cell = ref None in
   Eio.Fiber.first
     (fun () -> writer_body t ~is_dialer peer_id flow writer_cell)
-    (fun () -> reader_body t flow r);
+    (fun () -> reader_body t ~clock flow r);
   (match !writer_cell, Hashtbl.find_opt t.writers peer_id with
    | Some w, Some w' when w == w' -> Hashtbl.remove t.writers peer_id
    | _ -> ());
@@ -551,7 +670,7 @@ let handle_accepted t ~clock raw_flow =
   | Ok tls_flow -> (
     let r = Eio.Buf_read.of_flow tls_flow ~max_size:max_message_size in
     match Eio.Time.with_timeout clock preamble_read_timeout (fun () -> Ok (read_preamble r)) with
-    | Ok peer_id -> run_connection t ~is_dialer:false ~owns_flow:false peer_id tls_flow r
+    | Ok peer_id -> run_connection t ~is_dialer:false ~owns_flow:false ~clock peer_id tls_flow r
     | Error `Timeout ->
       Eio.traceln
         "Tcp: connection error: accepted connection sent no handshake preamble within %.1fs; \
@@ -701,7 +820,7 @@ let connect_to t ~sw ~net ~clock ~host ~port peer_id =
   | Ok tls_flow ->
     Eio.Fiber.fork ~sw (fun () ->
         let r = Eio.Buf_read.of_flow tls_flow ~max_size:max_message_size in
-        run_connection t ~is_dialer:true ~owns_flow:true peer_id tls_flow r)
+        run_connection t ~is_dialer:true ~owns_flow:true ~clock peer_id tls_flow r)
 
 (* Which peers in [peers] this handle does not yet have an outbound path to. The empty list is
    exactly the "mesh is formed" condition [create] waits for, and the same list names the peers in
@@ -716,7 +835,7 @@ let missing_peers t peers =
     (fun (id, _, _) -> if id <> t.my_id && not (Hashtbl.mem t.writers id) then Some id else None)
     peers
 
-let create ?max_connections ~sw ~net ~clock ~my_id ~peers ~tls () =
+let create ?max_connections ?inbox_capacity ?read_idle_timeout ~sw ~net ~clock ~my_id ~peers ~tls () =
   let max_connections =
     match max_connections with
     | Some n -> n
@@ -730,6 +849,27 @@ let create ?max_connections ~sw ~net ~clock ~my_id ~peers ~tls () =
      this call, instead of a clear error naming the actual bad argument at the actual call site. *)
   if max_connections <= 0 then
     invalid_arg (Printf.sprintf "Tcp.create: ~max_connections must be positive, got %d" max_connections);
+  let inbox_capacity =
+    match inbox_capacity with
+    | Some n -> n
+    | None -> default_inbox_capacity ~peers
+  in
+  (* Same fail-fast discipline as [max_connections] above, for the same reason: [Eio.Stream.create]
+     itself only special-cases exactly [0] (a legitimate, fully-synchronous rendezvous stream, see
+     [Eio.Stream]'s own implementation) and otherwise hits an uncaught [Assert_failure] inside
+     [Eio.Stream.Locking.create] for any [capacity <= 0] that isn't exactly [0] (i.e. any negative
+     value) -- an unhelpful failure mode, far from this call, for a caller error this function can
+     name precisely instead. *)
+  if inbox_capacity <= 0 then
+    invalid_arg (Printf.sprintf "Tcp.create: ~inbox_capacity must be positive, got %d" inbox_capacity);
+  let read_idle_timeout =
+    match read_idle_timeout with
+    | Some d -> d
+    | None -> default_read_idle_timeout
+  in
+  if read_idle_timeout <= 0.0 then
+    invalid_arg
+      (Printf.sprintf "Tcp.create: ~read_idle_timeout must be positive, got %.6f" read_idle_timeout);
   let my_host, my_port =
     match List.find_opt (fun (id, _, _) -> id = my_id) peers with
     | Some (_, host, port) -> (host, port)
@@ -738,7 +878,8 @@ let create ?max_connections ~sw ~net ~clock ~my_id ~peers ~tls () =
   let t =
     { my_id;
       tls;
-      inbox = Eio.Stream.create max_int;
+      read_idle_timeout;
+      inbox = Eio.Stream.create inbox_capacity;
       membership_ids = List.map (fun (id, _, _) -> id) peers;
       writers = Hashtbl.create (List.length peers);
       writer_added = Eio.Condition.create ();

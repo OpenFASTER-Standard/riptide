@@ -59,14 +59,15 @@
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
    19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372, 19391,
-   19410) so a re-run or a future added test in this file can't collide even if an earlier
-   test's sockets are still winding down -- [Tcp.create] itself passes [~reuse_addr:true] to
-   [Eio.Net.listen], but distinct ports sidestep the question entirely rather than relying on
-   that. [Tcp.create] does not expose its internal listening socket, so there is no way to ask it
-   for an OS-assigned ephemeral (port 0) address from outside; fixed, spread-out ports are the
-   only option here. Note [19410] is dialed directly with raw sockets, never through [Tcp.create]
-   or [with_mesh] -- it belongs to a probe process forked from this file, not a peer in this file's
-   own [Eio_main.run]. *)
+   19410, 19401-19402, 19421-19422) so a re-run or a future added test in this file can't collide
+   even if an earlier test's sockets are still winding down -- [Tcp.create] itself passes
+   [~reuse_addr:true] to [Eio.Net.listen], but distinct ports sidestep the question entirely rather
+   than relying on that. [Tcp.create] does not expose its internal listening socket, so there is no
+   way to ask it for an OS-assigned ephemeral (port 0) address from outside; fixed, spread-out ports
+   are the only option here. Note [19410] is dialed directly with raw sockets, never through
+   [Tcp.create] or [with_mesh] -- it belongs to a probe process forked from this file, not a peer in
+   this file's own [Eio_main.run]. [19422] (Task 30's read-idle-timeout test) is likewise a raw
+   listener standing in for peer 2, not a real [Tcp.create] peer. *)
 
 open Riptide_transport
 
@@ -1165,6 +1166,181 @@ let test_emfile_on_accept_does_not_kill_the_listener () =
                 true
                 (contains_substring ~needle:"Too many open files" log))))
 
+(* -- Area 10: a configurable, finite cap on the shared inbox (Task 30, Fix 1) --------------
+
+   Regression test for the audit finding that [Eio.Stream.create max_int] (this module's shared
+   receive-side inbox, fed by every connection's own reader fiber and drained by {!receive}/
+   {!receive_nonblocking}) let a fast-sending peer grow this process's memory without bound if the
+   local caller doesn't keep up -- reproduced by the audit at 20,000 x 64KiB. The fix makes the
+   inbox's capacity finite and caller-configurable ([?inbox_capacity] on [Tcp.create]): once it is
+   full, [reader_body]'s own call to [Eio.Stream.add] blocks the READER fiber itself, rather than
+   accepting an unbounded backlog of not-yet-consumed messages.
+
+   {b How this is observed without measuring real process RSS.} [receive_nonblocking] is a thin
+   wrapper over [Eio.Stream.take_nonblocking], and this suite's own pinned Eio (0.12,
+   [lib/eio/stream.ml]) documents and implements a specific, deterministic hand-off: draining one
+   item from a FULL bounded stream immediately (synchronously, within the very same
+   [take_nonblocking] call, before the blocked writer's own fiber ever gets a scheduler tick) moves
+   the single writer that was blocked trying to add the next item into the queue -- see that
+   module's own [add]/[take] comments ("This is called directly from [wake_one] ... We get here
+   immediately when called by [take], after removing an item, so there is space"). [reader_body]'s
+   loop only ever has ONE [Eio.Stream.add] call in flight at a time (it reads one frame, then tries
+   to add it, in strict sequence) -- so at most one write can ever be sitting blocked waiting for
+   room. Combining the two facts: draining this test's peer's inbox in a tight loop (no sleep or
+   other yield point between iterations, so the reader fiber's OWN continuation never actually gets
+   to run and attempt a THIRD item) surfaces exactly [inbox_capacity] items already queued plus the
+   one single item the blocked reader hands off on the very first drain call -- [inbox_capacity + 1]
+   total -- never more, and, crucially, never anywhere close to the far larger number of messages
+   actually sent, which is exactly the bound this fix exists to prove. *)
+let test_inbox_capacity_is_bounded_not_unbounded () =
+  let peer_specs = [ (1, "127.0.0.1", 19401); (2, "127.0.0.1", 19402) ] in
+  let inbox_capacity = 5 in
+  let total_sent = 200 in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  try
+    Eio.Switch.run (fun sw ->
+        let handles = Hashtbl.create 2 in
+        Eio.Fiber.all
+          (List.map
+             (fun (my_id, _, _) ->
+               fun () ->
+                 let t =
+                   Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id)
+                     ~inbox_capacity ()
+                 in
+                 Hashtbl.replace handles my_id t)
+             peer_specs);
+        let a = Hashtbl.find handles 1 and b = Hashtbl.find handles 2 in
+        (* Peer 2 never calls [receive]/[receive_nonblocking] until the drain below -- exactly the
+           "local caller doesn't keep up" scenario the audit's own finding describes. *)
+        for i = 1 to total_sent do
+          Tcp.send a ~to_:2 (Printf.sprintf "msg-%d" i)
+        done;
+        (* Real wall-clock time for peer 2's reader fiber to actually run: read every frame already
+           sitting in the (tiny, real-loopback) socket buffer and push as many as it can into its
+           now-bounded inbox before blocking trying to push the next one. Generous relative to real
+           loopback IPC of a few hundred tiny messages. *)
+        Eio.Time.sleep clock 0.3;
+        let drained = ref 0 in
+        let rec drain () =
+          match Tcp.receive_nonblocking b with
+          | Some _ ->
+            incr drained;
+            drain ()
+          | None -> ()
+        in
+        drain ();
+        Alcotest.(check int)
+          (Printf.sprintf
+             "peer 2's inbox holds exactly its configured capacity plus the one item its reader was \
+              blocked trying to add (%d), not anywhere near all %d messages peer 1 actually sent"
+             (inbox_capacity + 1) total_sent)
+          (inbox_capacity + 1) !drained;
+        Eio.Switch.fail sw Test_mesh_torn_down)
+  with Test_mesh_torn_down -> ()
+
+(* -- Area 11: a read-idle timeout closes an established connection that goes silent (Task 30,
+   Fix 2) ---------------------------------------------------------------------------------------
+
+   Regression test for the audit finding that an established connection (past both existing
+   handshake-layer bounded waits) could be held open, completely silent, forever -- there was no
+   timeout anywhere in [reader_body]'s post-handshake frame-read loop. The fix wraps ONLY the wait
+   for the next frame in [Eio.Time.with_timeout clock t.read_idle_timeout], the same mechanism
+   [tls_handshake_timeout]/[preamble_read_timeout] already use one layer earlier -- see
+   [default_read_idle_timeout]'s own comment in [tcp.ml] for why its production default (30 minutes)
+   is nowhere near [tls_handshake_timeout]/[preamble_read_timeout]'s ~10s, and for the disclosed,
+   real residual risk (a sufficiently long but genuinely healthy quiet period is indistinguishable
+   from a dead connection at this layer, and tcp.mli's own "no reconnection once established"
+   limitation makes this timeout's closure of the former PERMANENT).
+
+   This test passes a SHORT, test-only [~read_idle_timeout] explicitly -- never the real ~30-minute
+   default, which would make this test take real minutes even on a real clock, and would still be
+   the wrong thing to assert against even on a mock one (this test is about proving the mechanism
+   the parameter wires up, not re-deriving the production default's own justification). Like
+   [test_dial_side_tls_handshake_has_a_bounded_timeout] above, it uses an [Eio_mock.Clock] (the same
+   virtual-time mechanism [lib/sim/network.ml] already uses for [Riptide_sim]) so the timeout fires
+   near-instantly and deterministically regardless of the configured value, instead of either
+   sleeping for real or racing the assertion against wall-clock flakiness.
+
+   A raw TCP listener again stands in for peer 2 (as in that same earlier test), except this one
+   DOES complete a real mutual-TLS handshake -- proving the connection genuinely reaches
+   "established", past both existing bounded waits -- and then goes completely silent forever,
+   never writing a single byte back (correct behavior for peer 2's role here regardless: only the
+   DIALER writes a handshake preamble; the accepting side never sends one back -- see tcp.mli's wire
+   format section). That silence is exactly the "genuinely established, then nothing, ever" shape
+   [read_idle_timeout] exists to bound. *)
+exception Read_idle_timeout_probe_done
+
+let test_established_connection_is_closed_after_read_idle_timeout () =
+  let peer_specs = [ (1, "127.0.0.1", 19421); (2, "127.0.0.1", 19422) ] in
+  let read_idle_timeout = 5.0 (* short, test-only value; see this test's own comment above for why
+                                  the real ~30-minute default is deliberately not used here *) in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let real_clock = Eio.Stdenv.clock env in
+  let mock_clock = Eio_mock.Clock.make () in
+  let clock_for_tcp : float Eio.Time.clock_ty Eio.Std.r =
+    (mock_clock :> float Eio.Time.clock_ty Eio.Std.r)
+  in
+  let t1 = ref None in
+  (try
+     Eio.Switch.run (fun sw ->
+         let listener =
+           Eio.Net.listen ~reuse_addr:true ~backlog:1 ~sw net
+             (`Tcp (Eio.Net.Ipaddr.V4.loopback, 19422))
+         in
+         Eio.Fiber.both
+           (fun () ->
+             (* Stand in for peer 2: accept the TCP connection and complete a real mutual-TLS
+                handshake, so the connection genuinely reaches "established" -- then go completely
+                silent forever. [sw] keeps the fd alive after this fiber moves on. *)
+             let flow, _addr = Eio.Net.accept ~sw listener in
+             let tls_flow =
+               Tls_eio.server_of_flow (Tls_identity.server_config (peer_identity 2)) flow
+             in
+             ignore tls_flow)
+           (fun () ->
+             let t =
+               Tcp.create ~sw ~net ~clock:clock_for_tcp ~my_id:1 ~peers:peer_specs
+                 ~tls:(peer_identity 1) ~read_idle_timeout ()
+             in
+             t1 := Some t);
+         (* Both branches above have completed: peer 1's [Tcp.create] has returned (a dialed
+            connection's outbound path is ready as soon as the handshake completes -- see tcp.mli's
+            own [create] doc -- it does not wait on the reader loop this timeout lives in), and peer
+            2's stand-in has finished its own handshake and gone silent. The read-idle timeout wait
+            registered by peer 1's background reader fiber may not have been scheduled to actually
+            run yet at this exact point, so poll (on the REAL clock) until advancing the mock clock
+            succeeds -- the same robust idiom
+            [test_dial_side_tls_handshake_has_a_bounded_timeout] above uses, for the same reason. *)
+         let rec wait_for_timeout_job () =
+           match Eio_mock.Clock.advance mock_clock with
+           | () -> ()
+           | exception Invalid_argument _ ->
+             Eio.Time.sleep real_clock 0.02;
+             wait_for_timeout_job ()
+         in
+         wait_for_timeout_job ();
+         (* Give the now-unblocked reader fiber a moment on the real clock to actually run its
+            timeout-handling code path (log, end the loop, let [Eio.Fiber.first] cancel the writer,
+            remove the [t.writers] entry) before this test inspects the result. *)
+         Eio.Time.sleep real_clock 0.05;
+         Eio.Switch.fail sw Read_idle_timeout_probe_done)
+   with Read_idle_timeout_probe_done -> ());
+  let t1 = match !t1 with Some t -> t | None -> Alcotest.fail "peer 1's Tcp.create never returned" in
+  (* The connection is now closed from peer 1's own perspective: [run_connection] has removed its
+     [writers] entry for peer 2 once both the (timed-out) reader and the (cancelled) writer
+     confirmed the connection dead, so a subsequent [send] is refused exactly the way tcp.mli's
+     "Send failures" section documents for a connection "established and has since been confirmed
+     dead" -- not held open silently forever. *)
+  Alcotest.check_raises
+    "peer 1's connection to peer 2 is closed after the read-idle timeout elapses with no frame \
+     received, not held open forever"
+    (Invalid_argument "Tcp.send: no connection to peer 2")
+    (fun () -> Tcp.send t1 ~to_:2 "x")
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
@@ -1199,5 +1375,9 @@ let tests =
     ("accept loop caps the number of concurrently accepted connections", `Quick,
       test_accept_loop_caps_concurrent_connections);
     ("EMFILE on accept does not kill the listener", `Quick,
-      test_emfile_on_accept_does_not_kill_the_listener)
+      test_emfile_on_accept_does_not_kill_the_listener);
+    ("the shared inbox has a finite, configurable capacity, not an unbounded one", `Quick,
+      test_inbox_capacity_is_bounded_not_unbounded);
+    ("an established connection that goes silent is closed after its read-idle timeout", `Quick,
+      test_established_connection_is_closed_after_read_idle_timeout)
   ]

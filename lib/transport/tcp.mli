@@ -200,18 +200,44 @@
     {2 Explicitly out of scope}
 
     No reconnection/retry once a connection has been established (only the initial "wait for the
-    rest of the cluster to come up" retry during {!create} exists, bounded -- see {!create}); no
-    binding of a peer's PREAMBLE-claimed id (used for {!send}'s outbound routing table) to the
+    rest of the cluster to come up" retry during {!create} exists, bounded -- see {!create}). {b This
+    is what makes [read_idle_timeout] (see {!create}) a permanent, not a recoverable, closure:} once
+    a connection is dropped for going quiet longer than [read_idle_timeout], nothing anywhere in this
+    module (or, as of this task, anywhere else in this codebase's real VSR implementation -- there is
+    no heartbeat mechanism either; see [default_read_idle_timeout]'s own comment for how this was
+    confirmed) will ever re-establish it. If that silence was a genuinely healthy quiet period (no
+    client write traffic for a while, not a dead or wedged peer), the two peers on that connection are
+    now permanently partitioned from each other for the rest of the process's life, indistinguishable
+    from here on out from any other reason {!send} might report "no connection to peer". This task
+    deliberately biases [read_idle_timeout]'s default heavily toward avoiding that outcome (30
+    minutes, not seconds -- see [default_read_idle_timeout]), but a large timeout only lowers the
+    odds of hitting this, it cannot eliminate them: this transport-layer module cannot, on its own,
+    tell "the peer went quiet because nothing needed saying" apart from "the peer is gone and never
+    coming back" for any finite timeout value. Fully closing that ambiguity needs either a heartbeat
+    at a higher (VSR/cluster) layer or a reconnection mechanism here -- both explicitly out of scope
+    for this task and this module, so [read_idle_timeout] closes the "an attacker (or a wedged peer)
+    can hold a connection open, idle, for the lifetime of the process" finding only at the cost of
+    this disclosed, real, un-eliminated risk in the other direction, not for free.
+
+    No binding of a peer's PREAMBLE-claimed id (used for {!send}'s outbound routing table) to the
     certificate it presented on that connection -- {!receive}'s reported sender {e is} now bound to
     the certificate; the routing table is the narrower, still-open part (see "Authentication"
     above); no certificate revocation, rotation or expiry handling of any kind -- {!create} takes the
     material it is given, and an expired certificate simply starts failing handshakes; no explicit
-    shutdown/close (see the note at the end of this comment); no backpressure or flow control of
-    any kind -- despite an earlier draft of this comment claiming {!Eio.Buf_write} provides some,
-    it does not: both the per-connection write buffer and the receive-side inbox
-    ([Eio.Stream.create max_int]) grow without bound in memory if a peer sends faster than the
-    other side calls {!receive}. A caller that needs real backpressure today gets none from this
-    module beyond whatever the OS TCP stack itself applies to the underlying socket buffers.
+    shutdown/close (see the note at the end of this comment).
+
+    {b Backpressure and flow control:} the receive side now has real, if narrow, backpressure --
+    {!create}'s [inbox_capacity] bounds the shared inbox every connection's reader delivers into
+    (see {!create}), and a reader fiber blocks, rather than growing this process's memory without
+    bound, once it is full; that block is what naturally propagates into TCP-level flow control
+    against whichever peer is sending too fast, an inherent property of a blocking, cooperative
+    reader loop over a real socket rather than a mechanism this module implements on top of it. What
+    remains genuinely out of scope is the OTHER side of the same problem: the per-connection
+    OUTGOING write buffer ({!Eio.Buf_write}, one per connection, fed by {!send}) still grows without
+    bound in memory if a local caller calls {!send} faster than the OS can actually drain it onto the
+    wire -- despite an earlier draft of this comment claiming {!Eio.Buf_write} bounds that too, it
+    does not. A caller that needs real send-side backpressure today gets none from this module beyond
+    whatever the OS TCP stack itself applies to the underlying socket buffers.
 
     Also out of scope, and worth naming here rather than only in the plan this module was built
     from: fault injection against {e real} sockets. This module has never been exercised under
@@ -256,6 +282,8 @@ val max_message_size : int
 
 val create :
   ?max_connections:int ->
+  ?inbox_capacity:int ->
+  ?read_idle_timeout:float ->
   sw:Eio.Switch.t ->
   net:_ Eio.Net.t ->
   clock:_ Eio.Time.clock ->
@@ -265,10 +293,11 @@ val create :
   unit ->
   t
 (** [create ~sw ~net ~clock ~my_id ~peers ~tls ()] brings up this peer's side of the transport
-    mesh. The trailing [unit] is only there so that [?max_connections] can be optional at all --
-    every other argument is a required label, and OCaml needs a final non-labeled argument to know
-    where the optional-argument list ends (the same pattern {!Riptide_vsr.Replica.create}'s own
-    [?on_commit_advanced] uses in this codebase) -- it carries no meaning of its own:
+    mesh. The trailing [unit] is only there so that [?max_connections]/[?inbox_capacity]/
+    [?read_idle_timeout] can be optional at all -- every other argument is a required label, and
+    OCaml needs a final non-labeled argument to know where the optional-argument list ends (the
+    same pattern {!Riptide_vsr.Replica.create}'s own [?on_commit_advanced] uses in this codebase)
+    -- it carries no meaning of its own:
 
     - Starts a listener on [my_id]'s own [(host, port)] entry in [peers].
     - Dials every peer in [peers] with an id greater than [my_id] (retrying with a short sleep,
@@ -304,6 +333,32 @@ val create :
     attempted beyond the cap is never handed to [accept(2)] at all -- it sits in the kernel's own
     listen backlog ([listen_backlog]) until a slot frees, rather than being individually accepted
     and then closed by this module.
+
+    [inbox_capacity] caps how many not-yet-{!receive}d [(payload, sender)] pairs the shared inbox
+    every connection's reader delivers into will hold before the reader fiber that produced the
+    next one blocks trying to add it -- see the implementation's [default_inbox_capacity] for the
+    default ([max 16 (4 * List.length peers)]) and the consumption model it is sized against. This
+    closes an audit finding: without it ([Eio.Stream.create max_int], this module's previous
+    behavior), a peer that sends faster than the local caller drains {!receive} grows this
+    process's memory without limit (reproduced at 20,000 x 64KiB). Once the inbox is full, the
+    blocked reader fiber simply stops pulling more bytes off its own connection's socket -- which
+    is real backpressure against whichever peer is sending too fast, an inherent property of a
+    blocking, cooperative reader loop over a real socket, not a mechanism this module has to
+    implement on top. This is the "no backpressure ... the receive-side inbox grows without bound"
+    half of the "Explicitly out of scope" section above being closed; the OTHER half named there
+    (the per-connection outgoing write buffer) remains open, unaffected by this parameter.
+
+    [read_idle_timeout] bounds how long an ESTABLISHED connection (past both handshake-layer waits
+    above) may go without a complete frame arriving before it is dropped -- see the
+    implementation's [reader_body] for the mechanism and [default_read_idle_timeout] for the
+    default (30 minutes) and, importantly, the reasoning behind picking a number this large: this
+    module's only production caller has no heartbeat or other synthetic non-silence mechanism today
+    (see that comment for how this was confirmed, not assumed), so a long stretch of zero traffic on
+    one specific connection can be entirely legitimate, and {e this parameter's closure of the
+    "Explicitly out of scope" no-reconnection gap above is PERMANENT} if it fires during such a
+    period. Applies only to the wait for the NEXT frame -- never to time already spent blocked on
+    [inbox_capacity]'s own backpressure above, which is the connection actively delivering data, not
+    idleness.
 
     [peers] is the full membership table, including an entry for [my_id] itself. [create] blocks
     until this peer has an outbound path ready to {e each specific} other peer id in [peers] (not
