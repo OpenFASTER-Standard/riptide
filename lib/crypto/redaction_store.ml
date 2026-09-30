@@ -3,7 +3,10 @@
     keystore deletion. See redaction_store.mli for the full design argument (Decision 4), the
     meaning of [event_id] here, and why it is not the envelope's own event_id. *)
 
-type t = { kv : Riptide_storage.File_kv_store.t; kek : Kek.t }
+(* Task 25: [kek] is now mutable so {!rotate_kek} can switch a live [t] over to a new key in
+   place, once (and only once) rotation genuinely completes -- see [rotate_kek]'s own comment
+   below and redaction_store.mli's doc for the full argument. *)
+type t = { kv : Riptide_storage.File_kv_store.t; mutable kek : Kek.t }
 
 let owner_tag = "redaction-keystore"
 
@@ -19,7 +22,13 @@ let create ~kv ~kek =
    authenticate instead of silently decrypting the wrong record. See kek.mli for why wrapping uses
    Kek's own freshly-nonced GCM rather than Dek.encrypt on a Dek.of_raw-reconstructed KEK (whose
    counter resets to zero on every reconstruction, collapsing the nonce entropy to 32 bits). *)
-let wrap_dek t ~event_id (dek : Dek.t) = Kek.wrap t.kek ~aad:event_id (Dek.raw dek)
+(* Task 25: split into a [_with]-suffixed core (against a CALLER-SUPPLIED [kek], not necessarily
+   [t]'s own) plus a thin [t.kek]-using wrapper -- [unwrap_dek_with] below gets the identical
+   split, for the identical reason. {!rotate_kek} needs to wrap the SAME dek bytes under a
+   [new_kek] that is not (yet) [t.kek], and re-keying is exactly "wrap under a different Kek.t",
+   nothing more. *)
+let wrap_dek_with kek ~event_id (dek : Dek.t) = Kek.wrap kek ~aad:event_id (Dek.raw dek)
+let wrap_dek t ~event_id dek = wrap_dek_with t.kek ~event_id dek
 
 (* Task 24: this keystore's own on-disk record format, as of this task -- [event_id] (in the
    clear; see redaction_store.mli's own note on why that is not a new secrecy hole) followed
@@ -41,8 +50,8 @@ let wrap_dek t ~event_id (dek : Dek.t) = Kek.wrap t.kek ~aad:event_id (Dek.raw d
 let encode_record ~event_id wrapped = Printf.sprintf "%d:%s%s" (String.length event_id) event_id wrapped
 
 (* Inverse of [encode_record]. [None] on anything that does not parse as that exact shape --
-   see [enumerate_event_ids] below and [unwrap_dek]'s own comment for how each of this function's
-   two callers treats that outcome, and why differently. *)
+   see [enumerate_event_ids] below and [unwrap_dek_with]'s own comment for how each of this
+   function's callers treats that outcome, and why differently. *)
 let decode_record raw =
   match String.index_opt raw ':' with
   | None -> None
@@ -55,7 +64,13 @@ let decode_record raw =
       let wrapped = String.sub raw (colon_idx + 1 + len) (String.length raw - colon_idx - 1 - len) in
       Some (event_id, wrapped))
 
-let unwrap_dek t ~event_id record =
+(* Task 25: like [wrap_dek]/[wrap_dek_with] above, split into a core that takes its [kek] as an
+   explicit argument (never necessarily [t.kek]) plus a thin wrapper below that always passes
+   [t.kek]. This is the mechanical piece both {!decrypt_with} and {!rotate_kek} are built from: the
+   ability to try a SPECIFIC candidate key against a specific stored record without needing [t]'s
+   own current key to already be the right one -- see redaction_store.mli's [decrypt_with] doc for
+   why that is a real recovery primitive, not incidental refactoring. *)
+let unwrap_dek_with kek ~event_id record =
   match decode_record record with
   | None -> None
   | Some (_embedded_event_id, wrapped) ->
@@ -84,7 +99,7 @@ let unwrap_dek t ~event_id record =
           regression behind a check that has nothing to do with cryptography. So the embedded copy
           is read only by {!enumerate_event_ids} below, which has no security property riding on
           it, never here. *)
-    (match Kek.unwrap t.kek ~aad:event_id wrapped with
+    (match Kek.unwrap kek ~aad:event_id wrapped with
     | None -> None
     (* Dek.of_raw raises Invalid_argument on anything that isn't exactly 32 bytes. GCM
        authentication already makes a wrong-length unwrap result essentially unreachable without
@@ -105,11 +120,15 @@ let encrypt_for_storage t ~event_id (v : Riptide.Value.value) =
   Riptide_storage.File_kv_store.put t.kv ~key:event_id (encode_record ~event_id (wrap_dek t ~event_id dek));
   ciphertext
 
-let decrypt t ~event_id ciphertext =
+(* Task 25: the explicit-KEK-override read path -- {!decrypt} below is just this applied to
+   [t.kek]. See redaction_store.mli's own [decrypt_with] doc for why this exists as a real
+   recovery primitive (trying a SPECIFIC candidate key against a specific entry, independent of
+   whatever [t.kek] currently holds), not as incidental refactoring. *)
+let decrypt_with t ~kek ~event_id ciphertext =
   match Riptide_storage.File_kv_store.get t.kv ~key:event_id with
   | None -> None (* redacted, never stored, or the stored entry failed its own checksum *)
   | Some record -> (
-    match unwrap_dek t ~event_id record with
+    match unwrap_dek_with kek ~event_id record with
     | None -> None
     | Some dek -> (
       match Dek.decrypt dek ciphertext with
@@ -119,6 +138,8 @@ let decrypt t ~event_id ciphertext =
            honest write path can produce; it still must not escape as an exception from a function
            documented to return an option. *)
         try Some (Riptide.Value.canonical_decode plaintext) with Invalid_argument _ -> None)))
+
+let decrypt t ~event_id ciphertext = decrypt_with t ~kek:t.kek ~event_id ciphertext
 
 (* Task 24: recovers the full set of event_ids this keystore currently holds a wrapped DEK for,
    with no external log replay needed -- see this module's own [.mli] doc on [enumerate_event_ids]
@@ -177,6 +198,56 @@ let enumerate_event_ids t =
         match decode_record record with
         | Some (event_id, _wrapped) -> event_id :: acc
         | None -> acc))
+
+(* Task 25: raised by [rotate_kek] below for an entry whose wrapped DEK authenticates under
+   NEITHER the key rotation started with nor the key it is rotating to -- see [rotate_kek]'s own
+   comment, and redaction_store.mli's doc, for why this is deliberately a loud failure rather than
+   a silent skip. *)
+exception Undecryptable_entry of string
+
+(* Task 25: the KEK-compromise remediation path -- see redaction_store.mli's own [rotate_kek] doc
+   for the full design argument (resumability and corrupted-entry judgment calls, both stated and
+   justified there, not just here).
+
+   Enumerates every live [event_id] via [enumerate_event_ids] (no separate enumeration mechanism
+   is built here -- Task 24 already solved that problem). For each one: try to unwrap its current
+   record under [old_kek] (the key [t] held when this call started, captured once up front, before
+   any mutation); if that succeeds, the entry has not yet been rotated in this call, so re-wrap the
+   SAME dek bytes under [new_kek] (same [~aad:event_id] binding [wrap_dek] itself uses) and write
+   the new record back via [File_kv_store.put] -- the exact same atomic per-key write path
+   [encrypt_for_storage] already uses (write-temp-then-rename, Tasks 15/16), so this function adds
+   no new atomicity of its own, it only reuses what already exists. If unwrapping under [old_kek]
+   fails, try [new_kek] before giving up: a successful unwrap there means this entry was already
+   rotated by an earlier, interrupted call to [rotate_kek], and is left untouched rather than
+   rewritten (see the .mli for why this resumability choice was made deliberately, not merely
+   picked). If NEITHER key opens it, raise [Undecryptable_entry] immediately -- real corruption
+   unrelated to rotation, since [enumerate_event_ids] found this exact entry live and readable
+   moments earlier in this very call.
+
+   Only once every [event_id] has been handled without raising does [t]'s own [kek] field actually
+   change -- a partial failure therefore always leaves [t] still pointed at [old_kek], regardless
+   of how many individual entries were already rewritten under [new_kek] before the failure. *)
+let rotate_kek t ~new_kek =
+  let old_kek = t.kek in
+  List.iter
+    (fun event_id ->
+      match Riptide_storage.File_kv_store.get t.kv ~key:event_id with
+      | None ->
+        (* Deleted (a concurrent [redact]) between [enumerate_event_ids]'s fold and this read --
+           the same ordinary, expected race [enumerate_event_ids]'s own comment already accepts
+           for itself. Nothing is left here to rotate. *)
+        ()
+      | Some record -> (
+        match unwrap_dek_with old_kek ~event_id record with
+        | Some dek ->
+          Riptide_storage.File_kv_store.put t.kv ~key:event_id
+            (encode_record ~event_id (wrap_dek_with new_kek ~event_id dek))
+        | None -> (
+          match unwrap_dek_with new_kek ~event_id record with
+          | Some _ -> (* already rotated by an earlier attempt; leave it exactly as-is *) ()
+          | None -> raise (Undecryptable_entry event_id))))
+    (enumerate_event_ids t);
+  t.kek <- new_kek
 
 let redact t ~event_id = Riptide_storage.File_kv_store.delete t.kv ~key:event_id
 

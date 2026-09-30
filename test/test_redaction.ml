@@ -157,8 +157,9 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
          at some later ciphertext/decode step that happens to also yield None. Asserted against
          Kek directly, on the true wrapped-DEK bytes (the embedded event_id prefix stripped off),
          so dropping [~adata] from Kek.wrap/unwrap fails here loudly instead of silently leaving the
-         suite green -- see [unwrap_dek]'s own comment in redaction_store.ml for why Redaction_store
-         itself deliberately never gates on the embedded event_id the way this direct Kek-level
+         suite green -- see [unwrap_dek_with]'s own comment in redaction_store.ml (Task 25: the
+         function this logic now lives in) for why Redaction_store itself deliberately never gates
+         on the embedded event_id the way this direct Kek-level
          assertion is free to, for a plain diagnostic purpose, here in the test alone. *)
       Alcotest.(check bool) "the same blob unwraps under its own AAD" true
         (Kek.unwrap kek ~aad:"e1" wrapped_e1 <> None);
@@ -297,6 +298,170 @@ let test_enumerate_event_ids_does_not_include_a_redacted_event_id () =
       let found = List.sort compare (Redaction_store.enumerate_event_ids store) in
       Alcotest.(check (list string)) "only the non-redacted event_id remains enumerable" [ "stays" ]
         found)
+
+(* -- Task 25: Redaction_store.rotate_kek -- the KEK-compromise remediation path. Before this
+   task, the only way to recover from a compromised KEK was to destroy every record this keystore
+   protects (nothing could re-wrap them under a fresh key); rotate_kek is that recovery path. See
+   redaction_store.mli's own [rotate_kek] doc for the full design argument this task's tests below
+   pin down: per-entry (not cross-entry) atomicity, the chosen resumability behavior (a second call
+   after a partial failure completes the rotation rather than requiring an operator to reconstruct
+   progress by hand), and the corrupted-entry judgment (raise loudly, rather than silently skip). *)
+
+let with_two_kek_store f =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
+          dir
+      in
+      let kek1 = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let kek2 = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let store = Redaction_store.create ~kv ~kek:kek1 in
+      f ~kv ~kek1 ~kek2 ~store)
+
+let value_for id = Riptide.Value.Scalar (Riptide.Value.String ("secret-" ^ id))
+
+(* Reconstructs [Redaction_store.encode_record]'s own private, length-prefixed format by hand --
+   the exact same duplication this file's own [strip_embedded_event_id_prefix] (above) already
+   relies on for [test_wrapped_dek_is_bound_to_its_event_id], for the same reason: reaching the
+   true on-disk record shape for a deeper assertion/simulation than the public interface alone
+   would allow. *)
+let build_record ~event_id wrapped = Printf.sprintf "%d:%s%s" (String.length event_id) event_id wrapped
+
+(* Simulates a real process crash partway through {!Redaction_store.rotate_kek}: performs exactly
+   the same primitives rotate_kek's own per-entry step does (read the record, unwrap under the old
+   kek, re-wrap the SAME dek bytes under the new kek, write the record back) directly against
+   [kv], for one chosen [event_id], without ever calling [rotate_kek] itself.
+
+   This is a deliberate stand-in for a genuine crash, not a contrived shortcut: each entry's own
+   rewrite depends on nothing but its own [event_id] (no shared state or ordering with any other
+   entry), so the on-disk result of doing this for N of M entries is bit-identical to whatever a
+   real crash after exactly N successful iterations of rotate_kek's own loop would leave. Scripting
+   an actual crash mid-loop would instead depend on controlling
+   {!Riptide_storage.File_kv_store.fold}'s own enumeration order to decide which N entries "got
+   there first" -- but that order is explicitly unspecified (see [file_kv_store.ml]'s own [fold]
+   comment and [kv_store_intf.mli]'s), so a test relying on it would be flaky by construction. This
+   file already makes the identical deliberate choice for the same reason in
+   [plant_a_corrupt_leaf_file_at_its_own_sharded_path] above (see that function's own comment). *)
+let simulate_one_rotation_step ~kv ~old_kek ~new_kek event_id =
+  match Riptide_storage.File_kv_store.get kv ~key:event_id with
+  | None -> Alcotest.fail (Printf.sprintf "expected %s to already be stored" event_id)
+  | Some record -> (
+    let wrapped = strip_embedded_event_id_prefix record in
+    match Kek.unwrap old_kek ~aad:event_id wrapped with
+    | None -> Alcotest.fail (Printf.sprintf "expected %s to still be wrapped under old_kek" event_id)
+    | Some dek_raw ->
+      let new_wrapped = Kek.wrap new_kek ~aad:event_id dek_raw in
+      Riptide_storage.File_kv_store.put kv ~key:event_id (build_record ~event_id new_wrapped))
+
+let test_rotate_kek_re_wraps_every_entry_and_old_kek_no_longer_decrypts () =
+  with_two_kek_store (fun ~kv:_ ~kek1 ~kek2 ~store ->
+      let ids = [ "e1"; "e2"; "e3" ] in
+      let cts =
+        List.map (fun id -> (id, Redaction_store.encrypt_for_storage store ~event_id:id (value_for id))) ids
+      in
+      Redaction_store.rotate_kek store ~new_kek:kek2;
+      List.iter
+        (fun (id, ct) ->
+          Alcotest.(check bool) (Printf.sprintf "%s decrypts under the new KEK after rotation" id) true
+            (Redaction_store.decrypt_with store ~kek:kek2 ~event_id:id ct = Some (value_for id));
+          Alcotest.(check bool) (Printf.sprintf "%s no longer decrypts under the old KEK" id) true
+            (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:id ct = None))
+        cts;
+      (* rotate_kek also switches [store]'s own key in place, so ordinary [decrypt] (which always
+         uses [t.kek], never an explicit key) now works with no override at all. *)
+      List.iter
+        (fun (id, ct) ->
+          Alcotest.(check bool) (Printf.sprintf "%s: ordinary decrypt now uses the new key too" id) true
+            (Redaction_store.decrypt store ~event_id:id ct = Some (value_for id)))
+        cts)
+
+let test_rotate_kek_interrupted_partway_leaves_a_readable_mix_not_torn_entries () =
+  with_two_kek_store (fun ~kv ~kek1 ~kek2 ~store ->
+      let ids = [ "e1"; "e2"; "e3" ] in
+      let cts =
+        List.map (fun id -> (id, Redaction_store.encrypt_for_storage store ~event_id:id (value_for id))) ids
+      in
+      (* Simulate a crash after 2 of the 3 entries have rotated; "e3" is deliberately left
+         untouched, still wrapped under kek1. *)
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e1";
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e2";
+      List.iter
+        (fun (id, ct) ->
+          let under_old = Redaction_store.decrypt_with store ~kek:kek1 ~event_id:id ct in
+          let under_new = Redaction_store.decrypt_with store ~kek:kek2 ~event_id:id ct in
+          Alcotest.(check bool)
+            (Printf.sprintf "%s decrypts under exactly one of the two keys, never both and never \
+                              neither -- i.e. it is not torn" id)
+            true
+            ((under_old = Some (value_for id)) <> (under_new = Some (value_for id)));
+          match id with
+          | "e1" | "e2" ->
+            Alcotest.(check bool) (Printf.sprintf "%s has already rotated to the new key" id) true
+              (under_new = Some (value_for id))
+          | _ ->
+            Alcotest.(check bool) (Printf.sprintf "%s has not yet rotated -- still under the old key" id)
+              true
+              (under_old = Some (value_for id)))
+        cts)
+
+let test_rotate_kek_second_call_after_a_partial_failure_is_resumable () =
+  with_two_kek_store (fun ~kv ~kek1 ~kek2 ~store ->
+      let ids = [ "e1"; "e2"; "e3" ] in
+      let cts =
+        List.map (fun id -> (id, Redaction_store.encrypt_for_storage store ~event_id:id (value_for id))) ids
+      in
+      (* Simulate: a first rotate_kek call was interrupted after 2 of 3 entries -- see
+         [simulate_one_rotation_step]'s own comment for why this stands in for a genuine crash.
+         [store]'s own kek is still kek1, exactly as a real interrupted rotate_kek would leave it,
+         since the (simulated) first attempt never reached its own final assignment. *)
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e1";
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e2";
+      (* The resumed, real call: must complete cleanly even though "e1"/"e2" are already under
+         kek2 while [store] itself still believes its key is kek1. *)
+      Redaction_store.rotate_kek store ~new_kek:kek2;
+      List.iter
+        (fun (id, ct) ->
+          Alcotest.(check bool)
+            (Printf.sprintf "%s decrypts via ordinary decrypt once the resumed rotation completes" id)
+            true
+            (Redaction_store.decrypt store ~event_id:id ct = Some (value_for id));
+          Alcotest.(check bool) (Printf.sprintf "%s no longer opens under the old KEK" id) true
+            (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:id ct = None))
+        cts)
+
+let test_rotate_kek_raises_on_an_entry_undecryptable_under_either_key () =
+  with_two_kek_store (fun ~kv ~kek1 ~kek2:new_kek ~store ->
+      let good_ct = Redaction_store.encrypt_for_storage store ~event_id:"good" (value_for "good") in
+      (* A real, durably-stored, correctly length-prefixed record whose wrapped-DEK bytes are
+         simply garbage -- authenticates under neither kek1 nor new_kek. This is the "data
+         corruption unrelated to rotation" scenario redaction_store.mli's [rotate_kek] doc
+         describes, not a rotation bug -- planted directly via File_kv_store.put, the same way a
+         foreign write or a genuinely corrupt entry would arrive, bypassing Redaction_store's own
+         write path entirely (same technique test_enumerate_event_ids_skips_an_undecodable_record_
+         without_raising already uses for a different, decode-level failure). *)
+      Riptide_storage.File_kv_store.put kv ~key:"corrupt"
+        (build_record ~event_id:"corrupt" "not-a-real-wrapped-dek-at-all");
+      Alcotest.check_raises "an entry unreadable under either key stops the rotation, loudly"
+        (Redaction_store.Undecryptable_entry "corrupt")
+        (fun () -> Redaction_store.rotate_kek store ~new_kek);
+      (* The good, pre-existing entry survives the failed rotation -- either it was already
+         rotated to new_kek before the exception fired, or it was never reached; either way it is
+         readable under exactly one of the two keys, never destroyed. *)
+      Alcotest.(check bool)
+        "the good entry is still readable after the failed rotation, under whichever key applies"
+        true
+        (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:"good" good_ct = Some (value_for "good")
+        || Redaction_store.decrypt_with store ~kek:new_kek ~event_id:"good" good_ct
+           = Some (value_for "good"));
+      (* [store]'s own kek never switched -- the exception fired before rotate_kek's own final
+         assignment could run. A fresh encrypt through the same [store] after the failed rotation
+         still uses the OLD key, proving this directly rather than relying on an internal field no
+         public API exposes. *)
+      let after_ct = Redaction_store.encrypt_for_storage store ~event_id:"after" (value_for "after") in
+      Alcotest.(check bool) "store's own kek is unchanged after a failed rotation" true
+        (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:"after" after_ct = Some (value_for "after")))
 
 (* -- Subtask 4.8's [Redaction_store] half: [create] must itself verify [kv] was actually built
    with its own [owner_tag], not just document the convention every real call site already
@@ -736,4 +901,16 @@ let tests =
     ( "Task 24: enumerate_event_ids does not include a redacted event_id",
       `Quick,
       test_enumerate_event_ids_does_not_include_a_redacted_event_id );
+    ( "Task 25: rotate_kek re-wraps every entry and the old KEK no longer decrypts",
+      `Quick,
+      test_rotate_kek_re_wraps_every_entry_and_old_kek_no_longer_decrypts );
+    ( "Task 25: rotate_kek interrupted partway leaves a readable mix, not torn entries",
+      `Quick,
+      test_rotate_kek_interrupted_partway_leaves_a_readable_mix_not_torn_entries );
+    ( "Task 25: a second rotate_kek call after a partial failure is resumable",
+      `Quick,
+      test_rotate_kek_second_call_after_a_partial_failure_is_resumable );
+    ( "Task 25: rotate_kek raises on an entry undecryptable under either key",
+      `Quick,
+      test_rotate_kek_raises_on_an_entry_undecryptable_under_either_key );
   ]

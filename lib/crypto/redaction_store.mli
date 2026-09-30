@@ -29,10 +29,15 @@
     stable for that record's lifetime.
 
     {b Concurrency.} A [t] is as safe to share as the underlying
-    {!Riptide_storage.File_kv_store.t} and no safer; it holds no mutable state of its own. Two
-    concurrent {!encrypt_for_storage} calls for the {e same} [event_id] race in the keystore
-    exactly as two concurrent [put]s would -- one DEK wins, and the ciphertext returned by the
-    loser becomes undecryptable. Callers must not reuse an [event_id] for two different records. *)
+    {!Riptide_storage.File_kv_store.t} and no safer. Two concurrent {!encrypt_for_storage} calls
+    for the {e same} [event_id] race in the keystore exactly as two concurrent [put]s would -- one
+    DEK wins, and the ciphertext returned by the loser becomes undecryptable. Callers must not
+    reuse an [event_id] for two different records.
+
+    {b Task 25 update:} [t] now does hold one piece of mutable state of its own -- its [kek]
+    field, switched in place by {!rotate_kek}. See {!rotate_kek}'s own doc for exactly what that
+    means for a caller racing a rotation against an ordinary {!encrypt_for_storage}/{!decrypt}
+    call. *)
 
 type t
 
@@ -250,11 +255,33 @@ val decrypt : t -> event_id:string -> string -> Riptide.Value.value option
     even inspects it for its own correctness -- it always authenticates under the CALLER-SUPPLIED
     [event_id] (this function's own argument, i.e. the KV lookup key) as GCM AAD, exactly as before
     this task, and simply ignores the embedded copy. This is a considered choice, not an oversight:
-    see [unwrap_dek] in this module's own [.ml] for why even a cheap plaintext cross-check against
+    see [unwrap_dek_with] in this module's own [.ml] (Task 25: the function this logic now lives
+    in, [unwrap_dek] itself having been folded into it once nothing but [decrypt_with] still needed
+    a [t.kek]-defaulting wrapper) for why even a cheap plaintext cross-check against
     the embedded copy was deliberately rejected, not merely not added -- it would make the AAD-swap
     attack test_wrapped_dek_is_bound_to_its_event_id (test_redaction.ml) exercises fail for the
     wrong reason, masking rather than proving the real AAD-based protection. The embedded copy is
     read only by {!enumerate_event_ids} below, which has no security property riding on it. *)
+
+val decrypt_with : t -> kek:Kek.t -> event_id:string -> string -> Riptide.Value.value option
+(** [decrypt_with t ~kek ~event_id ciphertext] is {!decrypt}, except it authenticates and unwraps
+    the stored DEK under the {b caller-supplied} [kek] instead of [t]'s own current key -- [t]
+    itself is consulted only to reach the underlying keystore ([t]'s [kv]), never its own [kek].
+    Indeed {!decrypt} is defined as nothing more than [decrypt_with t ~kek:t.kek ~event_id
+    ciphertext].
+
+    {b Task 25: this is the KEK-compromise recovery primitive, not optional polish.}
+    {!rotate_kek} below can leave a real, on-disk mix after a crash partway through its own
+    work -- some entries wrapped under the key rotation started with, some already under the key
+    it was rotating to (each individual entry's own rewrite is atomic via
+    {!Riptide_storage.File_kv_store.put}'s existing write-temp-then-rename path, but there is no
+    transaction spanning the whole rotation; see {!rotate_kek}'s own doc for the precise
+    atomicity claim). An operator or caller recovering from exactly that state needs a way to try
+    a SPECIFIC candidate key against a specific entry without first needing [t]'s own [kek] field
+    to already hold the right one for that entry -- that is exactly what this function is. It has
+    no security property of its own beyond {!decrypt}'s: it is exactly as safe, and exactly as
+    "None on every failure, never an exception," as {!decrypt}, parameterized over which key gets
+    tried. *)
 
 val enumerate_event_ids : t -> string list
 (** [enumerate_event_ids t] returns every [event_id] this keystore currently holds a wrapped DEK
@@ -277,6 +304,88 @@ val enumerate_event_ids : t -> string list
     -- see this module's own [.ml] ([enumerate_event_ids]'s comment) for why that specific failure
     mode is believed unreachable in practice for a keystore this module fully controls the format
     of, and for the honest disclosure of what silently skipping it actually costs. *)
+
+exception Undecryptable_entry of string
+(** Raised by {!rotate_kek} for the [event_id] of an entry whose wrapped DEK authenticates under
+    neither the key rotation started with nor the key it is rotating to. See {!rotate_kek}'s own
+    doc for why this is a deliberate, loud failure rather than a silent skip. *)
+
+val rotate_kek : t -> new_kek:Kek.t -> unit
+(** [rotate_kek t ~new_kek] is the KEK-compromise remediation path: before this function existed,
+    the only way to recover from a compromised (or merely due-for-rotation) KEK was to destroy
+    every record this keystore protects, since nothing could re-wrap them under a fresh key. This
+    re-wraps every DEK the keystore currently holds -- the DEK bytes themselves never change, only
+    which key wraps them -- under [new_kek], then switches [t] itself over so every subsequent
+    {!encrypt_for_storage}/{!decrypt} call made through this same [t] immediately uses the new key.
+
+    {b Mechanically:} enumerates every live [event_id] via {!enumerate_event_ids} (Task 24 -- no
+    separate enumeration mechanism is built here), and for each one, unwraps its current DEK and
+    re-wraps the identical bytes under [new_kek] with the same [~aad:event_id] binding
+    {!encrypt_for_storage} already uses, writing the new record back via
+    {!Riptide_storage.File_kv_store.put} -- the exact same atomic per-key write path
+    {!encrypt_for_storage} itself uses (write-temp-then-rename, Tasks 15/16; nothing new is built
+    here). Only once every entry has been handled without error does [t]'s own [kek] field
+    actually change.
+
+    {b Atomicity, stated precisely: per-entry, never cross-entry.} Each individual entry's
+    rewrite is atomic -- a crash mid-write of ONE entry can never leave that one entry readable as
+    a torn mix of its old and new wrapped bytes; a subsequent read of it sees either the fully-old
+    or the fully-new record, in full. There is, deliberately, no transaction spanning the whole
+    rotation: a crash between two entries' writes leaves a real, readable keystore where some
+    entries are wrapped under the old key and some under [new_kek], and [t]'s own [kek] field is
+    still the OLD key (the final assignment never ran, since it only runs after every entry above
+    it succeeds). This is disclosed, expected behavior, not a defect -- see the resumability point
+    below for the intended way to recover from exactly this state.
+
+    {b Resumability -- a deliberate design choice, not a default landed on silently.} A second
+    call to [rotate_kek] after a first attempt was interrupted partway is fully supported and {b
+    is} the intended recovery path, rather than requiring an operator to somehow reconstruct which
+    entries already rotated: for each entry, this function first tries to unwrap it under the key
+    [t] held when THIS call started (the "old" key for this call) and, only if that fails, tries
+    [new_kek] before giving up -- a successful unwrap under [new_kek] is treated as "already
+    rotated by an earlier attempt" and the entry is left untouched rather than rewritten a second
+    time. This makes a re-run after a partial failure naturally idempotent: already-rotated
+    entries are skipped, not-yet-rotated entries are completed, and the final [t.kek <- new_kek]
+    assignment runs once every entry -- old, already-new, or newly-rotated in this call -- is
+    accounted for. The alternative (raise immediately on any entry not readable under the OLD key,
+    forcing an operator to manually track rotation progress across a crash) was considered and
+    rejected as strictly worse with no compensating benefit: {!decrypt_with} above already has to
+    exist for other reasons (see its own doc), so trying both candidate keys per entry costs one
+    extra, cheap {!Kek.unwrap} attempt, and turns "an operator must reconstruct partial progress by
+    hand before it's safe to try again" into "just call [rotate_kek] again."
+
+    {b A record that fails to unwrap under EITHER key raises {!Undecryptable_entry}[ event_id],
+    immediately, stopping the rotation right there} -- deliberately {b not} the same
+    "cannot-distinguish, skip silently" tolerance {!enumerate_event_ids} uses for its own two
+    silent-skip cases. Those are read-time ambiguities about records that may never have existed
+    coherently to begin with (a concurrent delete racing the fold; a foreign write this module
+    never produced). This is a different situation: {!enumerate_event_ids} just found this exact
+    [event_id] to be live and readable moments before, in the very same call -- for it to then not
+    open under either key this rotation knows about is a real, otherwise-silent corruption case,
+    surfacing on an operation whose entire job is re-keying every entry it can see. Skipping it
+    silently would leave a permanently stuck entry (undecryptable forever once rotation
+    eventually completes and [t] drops the old key, with no signal anywhere that this ever
+    happened). Raising instead stops the rotation with the offending [event_id] named, leaves that
+    entry and everything {!enumerate_event_ids} had not yet reached still under the OLD key (fully
+    recoverable, since [t.kek] is untouched by a failed call), and leaves every entry already
+    rotated earlier in this same call intact and readable under [new_kek] -- consistent with this
+    codebase's established preference for a loud, investigable failure over a quiet, unrecoverable
+    one (e.g. this module's own {!redact} durability disclosures, or the project's Task 13
+    superblock-rebuild and Task 21 exception-narrowing work).
+
+    {b Concurrency.} [t]'s [kek] field is genuinely mutable as of this task (it was immutable
+    before) -- calling [rotate_kek] concurrently with itself, or with a concurrent
+    {!encrypt_for_storage}/{!decrypt} through the SAME [t] that expects a single, stable key for
+    its whole operation, is not safe: such a caller may observe either key, exactly as any
+    unsynchronized mutable-field read/write race would. This is not a new class of unsafety this
+    module did not already have -- see this module's own header on concurrency: a [t] was already
+    documented as "only as safe to share as the underlying
+    {!Riptide_storage.File_kv_store.t}, and no safer," and every individual
+    {!Riptide_storage.File_kv_store.get}/[put] call [rotate_kek] performs is exactly as safe (or
+    unsafe) under concurrent use as any other caller's own use of that same [kv] would be.
+
+    @raise Undecryptable_entry if some entry's wrapped DEK authenticates under neither the key [t]
+    held when this call started nor [new_kek]. *)
 
 val redact : t -> event_id:string -> unit
 (** [redact t ~event_id] deletes [event_id]'s wrapped DEK from the keystore. This is the whole of
