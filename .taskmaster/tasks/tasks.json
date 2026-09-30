@@ -1273,11 +1273,17 @@
             "id": 25,
             "title": "[5.3] require_encryption becomes a construction-time policy, not a per-call flag",
             "description": "require_encryption becomes a construction-time policy, not a per-call flag",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Batch_commit's constructor gains ?require_encryption (default false), stored on the handle; propose's own ?require_encryption, if supplied, overrides it per-call. Closes the same-call-site-forgets-both-flags finding.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "848c1b7ec1784ba5d84ffbd88f690b4c0364c04b"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 26,
