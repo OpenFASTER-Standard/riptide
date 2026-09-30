@@ -100,6 +100,7 @@ let () =
          ("file_kv_store", Test_file_kv_store.tests);
          ("aligned_buffer_pool", Test_aligned_buffer_pool.tests);
          ("materializer", Test_materializer.tests);
+         ("module_protocol", Test_module_protocol.tests);
          ("storage_shared_file_storage", Test_storage_shared.file_storage_tests);
          ("storage_shared_fault_injecting_storage", Test_storage_shared.fault_injecting_storage_tests);
          ("storage_shared_memory_storage", Test_storage_shared.memory_storage_tests);
