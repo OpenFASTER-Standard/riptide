@@ -475,11 +475,44 @@ val redact : t -> event_id:string -> unit
     replica by VSR. Losing that single directory therefore makes every record it covers
     unrecoverable cluster-wide -- strictly weaker durability than the log itself has. This cuts
     both ways for redaction: it is what makes a redaction cheap and complete (one deletion, one
-    place), and it is also a real single point of failure that an encrypted deployment must
-    address out of band, by backing up or replicating the keystore directory with the same care
-    the KEK file gets. See {!Riptide_batch_commit.Batch_commit.propose}'s own doc comment for how
-    this plays out across a view change. Replicating the keystore -- including what redaction
-    would then have to mean -- is out of scope here and tracked as its own future task. *)
+    place), and it is also a real single point of failure. See
+    {!Riptide_batch_commit.Batch_commit.propose}'s own doc comment for how this plays out across a
+    view change. Replicating the keystore -- including what redaction would then have to mean --
+    is out of scope here and tracked as its own future task.
+
+    {b A previous version of this doc recommended addressing that single point of failure "out of
+    band, by backing up or replicating the keystore directory with the same care the KEK file
+    gets." That recommendation is retracted (audit finding, 2026-09-29): it silently defeats this
+    function's own core guarantee.} [redact] deletes the live keystore's only pointer to
+    [event_id]'s wrapped DEK; it has {b no effect whatsoever} on any copy of that pointer made
+    before the redaction ran -- a filesystem backup, a snapshot, a replica of the keystore
+    directory itself, anything. An operator who backs up the keystore and later redacts a record
+    that was already captured in that backup has not protected the record from loss; they have
+    permanently defeated its redaction instead, since the backup plus the KEK recovers it exactly
+    as well as the live keystore did before {!redact} ran (pinned by a running test,
+    [test_a_pre_redaction_keystore_backup_defeats_redaction] in [test/test_redaction.ml]).
+
+    {b The real architecture, stated precisely rather than gestured at:} durability of a wrapped
+    DEK does {b not} come from this system's own replication the way the ciphertext's does. VSR
+    replicates the payload byte-identically to every replica because the wrapped DEK never enters
+    that payload at all -- {!encrypt_for_storage} writes it with a plain
+    {!Riptide_storage.File_kv_store.put} straight into [t]'s own local [kv], a step VSR has no
+    part in and never sees. Only the replica a given {!encrypt_for_storage} call actually runs on
+    ever holds that DEK; a later view change that moves the primary elsewhere leaves that DEK
+    behind on the old primary while new writes' DEKs accumulate on the new one, so the DEKs
+    protecting one log can end up scattered across whichever machine happened to be primary when
+    each record was encrypted (see {!Riptide_batch_commit.Batch_commit.propose}'s own doc comment
+    for the precise mechanism). [redact] itself only ever touches [t]'s own local keystore, so
+    redacting cluster-wide requires applying it to every replica's keystore individually.
+
+    {b There is consequently no backup or retention policy for keystore-derived data that is both
+    safe and a complete accidental-loss mitigation at the same time, and this doc does not claim
+    to have found one.} Any such policy must do one of two things: actively prune already-redacted
+    entries from itself on the same schedule redaction happens (so a copy can never outlive the
+    redaction it should have respected), or simply not retain data past the shortest tolerable
+    redaction-latency window (so nothing is ever old enough to matter). A policy that does neither
+    -- including the one this doc used to recommend -- is not a durability improvement; it is a
+    standing way to make every future redaction of anything already captured a no-op. *)
 
 val payload_of_ciphertext : string -> Riptide.Value.value
 (** [payload_of_ciphertext ct] is the canonical way this codebase carries ciphertext inside a

@@ -562,6 +562,54 @@ let test_decrypt_of_tampered_ciphertext_is_none () =
       Alcotest.(check bool) "GCM authentication rejects a flipped tag byte" true
         (Redaction_store.decrypt store ~event_id:"e1" (Bytes.to_string tampered) = None))
 
+(* ---- Task 26: pinning the real (disclosed, unfixed) durability guarantee ---- *)
+
+(* This is NOT a bug-fix test: it pins the honest, disclosed limitation redaction_store.mli and
+   batch_commit.mli both now document in place of the retracted "back up the keystore directory"
+   recommendation -- a filesystem-level copy of the keystore directory taken before a redaction
+   still holds the wrapped DEK, so that copy plus the KEK recovers the "redacted" record just as
+   well as the live keystore did before redaction ran. Per CLAUDE.md's "no spec without running
+   code" rule, the doc's own claim has to be backed by exactly this kind of running proof -- this
+   test is expected to PASS as written, today, with no code change; it would only ever fail if some
+   other change in this codebase accidentally broke the backup+KEK recovery path it pins. *)
+let test_a_pre_redaction_keystore_backup_defeats_redaction () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      Eio.Switch.run @@ fun sw ->
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
+          dir
+      in
+      let store = Redaction_store.create ~kv ~kek in
+      let v = Riptide.Value.Scalar (Riptide.Value.String "sensitive") in
+      let ct = Redaction_store.encrypt_for_storage store ~event_id:"evt-1" v in
+      (* Simulate exactly the advice this task retracts: an operator takes a plain filesystem
+         backup of the keystore directory while "evt-1"'s wrapped DEK is still live in it. *)
+      let backup_dir = Filename.temp_file "riptide_redaction_test_backup" "" in
+      Unix.unlink backup_dir;
+      let status =
+        Sys.command (Printf.sprintf "cp -r %s %s" (Filename.quote dir) (Filename.quote backup_dir))
+      in
+      Alcotest.(check int) "backup copy succeeded" 0 status;
+      Fun.protect
+        ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote backup_dir))))
+        (fun () ->
+          Redaction_store.redact store ~event_id:"evt-1";
+          Alcotest.(check bool) "live store: genuinely gone" true
+            (Redaction_store.decrypt store ~event_id:"evt-1" ct = None);
+          Eio.Switch.run (fun sw' ->
+              let backup_kv =
+                Riptide_storage.File_kv_store.create ~sw:sw' ~fs:(Eio.Stdenv.fs env)
+                  ~owner:Redaction_store.owner_tag backup_dir
+              in
+              let backup_store = Redaction_store.create ~kv:backup_kv ~kek in
+              Alcotest.(check bool)
+                "a pre-redaction backup + the KEK still recovers it -- the real, disclosed \
+                 guarantee"
+                true
+                (Redaction_store.decrypt backup_store ~event_id:"evt-1" ct <> None))))
+
 (* ---- Kek.load: the real, file-based KEK sourcing (Decision 5) ---- *)
 
 let write_key_file ~dir ~name ~perm contents =
@@ -920,6 +968,9 @@ let tests =
       `Quick,
       test_create_rejects_a_kv_tagged_for_a_different_owner );
     ("decrypt of tampered ciphertext is None", `Quick, test_decrypt_of_tampered_ciphertext_is_none);
+    ( "Task 26: a pre-redaction keystore backup defeats redaction (disclosed, not fixed)",
+      `Quick,
+      test_a_pre_redaction_keystore_backup_defeats_redaction );
     ("Kek.load reads a well-formed file", `Quick, test_kek_load_reads_a_well_formed_file);
     ("Kek.load on a missing file raises", `Quick, test_kek_load_missing_file_raises);
     ("Kek.load on a wrong-length file raises", `Quick, test_kek_load_wrong_length_raises);
