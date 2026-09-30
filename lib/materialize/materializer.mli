@@ -75,6 +75,14 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       not promise atomicity of a [get] + [put] pair issued by two different [KV.t] handles (or two
       different [Materializer.t]s over the same handle).
 
+      {b New resource cost introduced by this fix, distinct from the accumulator-value-size WARNING
+      below (this one is about the lock table's own memory, not about anything stored in [KV]):}
+      [t] retains one small [Eio.Mutex.t] per distinct [merge_key] ever written through it, for the
+      rest of [t]'s lifetime -- this table is never pruned, so a caller that writes an unbounded
+      number of distinct [merge_key]s through one long-lived [t] accumulates an unbounded number of
+      mutexes alongside it. Building an eviction/GC mechanism for this table is out of scope for
+      this fix.
+
       WARNING, and it is reached by ordinary use rather than misuse: an accumulator is the join of
       every value ever written to its [merge_key], so for a grow-only lattice it grows without
       bound -- while a real [KV] backend's single value is bounded

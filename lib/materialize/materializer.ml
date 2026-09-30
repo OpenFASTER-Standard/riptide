@@ -25,22 +25,30 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
   (* Task 20: look up [merge_key]'s mutex, creating it on first use. Two fibers racing to be the
      first writer of a never-before-seen [merge_key] can never each create and insert their OWN
      mutex (which would defeat the whole fix -- they'd hold different locks and still race the
-     way [write] used to): this codebase's Eio usage is single-domain, cooperative scheduling
-     throughout (see {!Riptide_storage.Aligned_buffer_pool}'s own doc comment for the same
-     argument made elsewhere), and a fiber only ever yields to another fiber at an actual
-     blocking operation. [Hashtbl.find_opt] and [Hashtbl.add] below do no I/O and contain no such
-     operation, so whichever fiber reaches this function first runs the whole
+     way [write] used to). This is verified directly against Eio's own single-domain, cooperative
+     scheduling semantics (per [Eio.Fiber]'s own documentation: within a domain, only one fiber
+     runs at a time, and a fiber is only suspended in favor of another when it performs an
+     operation that can block): [Hashtbl.find_opt] and [Hashtbl.add] below do no I/O and contain
+     no such operation, so whichever fiber reaches this function first runs the whole
      find-then-maybe-create-then-add sequence to completion before any other fiber gets a chance
      to run -- there is no window in which a second fiber could observe [None] for a key the
      first fiber has already decided to create a mutex for but not yet inserted. (This reasoning
      is specific to a single OS domain; it would not hold if a future caller ran multiple Eio
-     domains against one shared [t], which nothing in this codebase does today.) *)
+     domains against one shared [t], which nothing in this codebase does today.)
+
+     [Hashtbl.replace], not [Hashtbl.add], for the insert: correctness here depends entirely on
+     the invariant above (two fibers never both reach the [None] branch for the same key) holding
+     perfectly. [replace] makes an accidental future violation of that invariant idempotent --
+     the second insert just overwrites the first with an equivalent, freshly-created mutex --
+     instead of [add]'s behavior of leaving both bindings present with the old one shadowed,
+     which would silently waste a mutex but otherwise still work by luck today, and be a much
+     more confusing bug to chase if it ever didn't. *)
   let mutex_for t ~merge_key =
     match Hashtbl.find_opt t.locks merge_key with
     | Some mutex -> mutex
     | None ->
       let mutex = Eio.Mutex.create () in
-      Hashtbl.add t.locks merge_key mutex;
+      Hashtbl.replace t.locks merge_key mutex;
       mutex
 
   let write t ~merge_key value =
