@@ -251,7 +251,7 @@ let plant_a_corrupt_leaf_file_at_its_own_sharded_path dir key =
   output_string oc "not a valid header+data record -- too short, wrong checksum, garbage bytes";
   close_out oc
 
-let test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising () =
+let test_enumerate_event_ids_skips_a_hash_whose_record_fails_durable_read_without_raising () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
       Eio.Switch.run @@ fun sw ->
@@ -265,19 +265,24 @@ let test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_wi
         (Redaction_store.encrypt_for_storage store ~event_id:"valid-event"
            (Riptide.Value.Scalar (Riptide.Value.String "sensitive")));
       (* A real, [fold]-visitable leaf (a syntactically valid 64-lowercase-hex filename, in its own
-         correct shard subdirectory) whose CONTENT fails [File_kv_store]'s own checksum -- so
-         [get_by_hash] returns [None] for this hash even though [fold] visited it. *)
+         correct shard subdirectory) whose CONTENT is not a valid [File_kv_store] record -- so
+         [get_by_hash] returns [None] for this hash even though [fold] visited it. (Re-review
+         finding: this planted content is short enough to be rejected already at [durable_read]'s
+         header-read stage, before any checksum comparison is reached -- "fails its own checksum"
+         overstated the specific mechanism. Either way it is the same documented
+         "cannot distinguish never-written from corrupted" contract [get]/[get_by_hash] already
+         state, and exercises the same [get_by_hash]-returns-[None] branch this test targets.) *)
       plant_a_corrupt_leaf_file_at_its_own_sharded_path dir "corrupt-key";
       (* Sanity: confirm the premise -- [get_by_hash] genuinely returns [None] for this hash, not
          [Some] something [decode_record] merely happens to reject; otherwise this test would
          exercise the same decode-failure branch the previous test already covers, not this one. *)
-      Alcotest.(check (option string)) "the planted leaf's own hash reads back as None (checksum \
-                                        failure), not Some"
+      Alcotest.(check (option string)) "the planted leaf's own hash reads back as None (rejected by \
+                                        durable_read), not Some"
         None
         (Riptide_storage.File_kv_store.get_by_hash kv ~hash:(key_hash_hex "corrupt-key"));
       let found = Redaction_store.enumerate_event_ids store in
       Alcotest.(check (list string))
-        "the checksum-failing hash is silently skipped -- only the real event_id is recovered, and \
+        "the unreadable hash is silently skipped -- only the real event_id is recovered, and \
          nothing raised"
         [ "valid-event" ] found)
 
@@ -727,7 +732,7 @@ let tests =
     ( "Task 24 review (Important): enumerate_event_ids skips a hash whose record fails its own \
        checksum without raising",
       `Quick,
-      test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising );
+      test_enumerate_event_ids_skips_a_hash_whose_record_fails_durable_read_without_raising );
     ( "Task 24: enumerate_event_ids does not include a redacted event_id",
       `Quick,
       test_enumerate_event_ids_does_not_include_a_redacted_event_id );

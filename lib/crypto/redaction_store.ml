@@ -135,17 +135,18 @@ let decrypt t ~event_id ciphertext =
    running tests (test_redaction.ml), not prose alone -- review finding, first round: neither
    branch had a test at all.}
    - [get_by_hash] returning [None] (the record was deleted -- e.g. a concurrent {!redact} -- or
-     failed its own checksum, between [fold]'s directory listing and this read) is an ORDINARY,
-     expected race on a live store, exactly the same "cannot distinguish never-written from
-     corrupted" ambiguity {!Riptide_storage.Kv_store_intf.S.get} already documents. Skipped
-     silently, the same way a caller retrying a lookup after a redaction would see nothing there
-     either. The checksum-failure half of this is exercised deterministically (no genuine race
-     needed to reproduce the same [None] outcome) by
-     test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising,
-     which plants a syntactically-real, checksum-failing leaf file directly at its own computed
-     sharded path -- that test's own comment explains why this is not independently distinguishable
-     from the deleted-mid-fold race in a realistic single-threaded test (both collapse into the
-     same [get_by_hash] [None]).
+     is rejected by [durable_read] as unreadable/corrupt, between [fold]'s directory listing and
+     this read) is an ORDINARY, expected race on a live store, exactly the same "cannot
+     distinguish never-written from corrupted" ambiguity {!Riptide_storage.Kv_store_intf.S.get}
+     already documents. Skipped silently, the same way a caller retrying a lookup after a
+     redaction would see nothing there either. The unreadable-record half of this is exercised
+     deterministically (no genuine race needed to reproduce the same [None] outcome) by
+     test_enumerate_event_ids_skips_a_hash_whose_record_fails_durable_read_without_raising,
+     which plants a syntactically-real leaf file (rejected by [durable_read], not necessarily at
+     the checksum step specifically -- a too-short planted record is already rejected earlier, at
+     the header-read stage) directly at its own computed sharded path -- that test's own comment
+     explains why this is not independently distinguishable from the deleted-mid-fold race in a
+     realistic single-threaded test (both collapse into the same [get_by_hash] [None]).
    - [decode_record] failing on bytes that DID read back successfully is a different matter: every
      record in this keystore's own directory is written exclusively by this module's own
      {!encrypt_for_storage}, always via [encode_record], so a successfully-checksummed record that
