@@ -266,6 +266,38 @@ end
    `dune test`. *)
 let fuel_budget_seconds = 2.0
 
+(* Blocked (via [Unix.sigprocmask]) for the duration of [supervise_child]'s own [cleanup]
+   sequence (kill/waitpid/close/close) -- see [cleanup]'s own comment for why. Every genuinely
+   *asynchronous*, externally-deliverable POSIX signal OCaml exposes a named constant for.
+   Deliberately excludes: [Sys.sigkill]/[Sys.sigstop] (POSIX-unblockable -- [sigprocmask] just
+   silently ignores them if included, so omitting them changes nothing, but they're omitted for
+   clarity); and the *synchronous* fault signals ([Sys.sigsegv]/[sigbus]/[sigill]/[sigfpe]/
+   [sigtrap]/[sigsys]) -- blocking one of those and then actually triggering it is undefined
+   behavior at the OS level, and none of them can plausibly originate from [cleanup]'s own few,
+   simple syscalls anyway (a real libwasmtime-side fault happens in the forked CHILD, an
+   entirely separate process/address space unaffected by the PARENT's own signal mask here). *)
+let signals_to_mask_during_cleanup =
+  [
+    Sys.sigalrm;
+    Sys.sigvtalrm;
+    Sys.sigprof;
+    Sys.sigint;
+    Sys.sigterm;
+    Sys.sighup;
+    Sys.sigquit;
+    Sys.sigusr1;
+    Sys.sigusr2;
+    Sys.sigpipe;
+    Sys.sigchld;
+    Sys.sigtstp;
+    Sys.sigttin;
+    Sys.sigttou;
+    Sys.sigpoll;
+    Sys.sigurg;
+    Sys.sigxcpu;
+    Sys.sigxfsz;
+  ]
+
 (* The real linear-memory page limit the brief's own Step 3 text calls for ("a linear-memory
    page limit set at instantiation"). One WASM page is 64 KiB; 1024 pages is 64 MiB -- generous
    enough for any module this task's own fixtures or Task 6's first real module plausibly needs
@@ -478,22 +510,41 @@ let instantiate ~tier ~module_bytes ~host =
    reaps the child and closes both [req_r]/[resp_w] exactly once, via [cleanup], so {!invoke}'s
    own documented "never raises" contract genuinely holds no matter how the call ends.
 
-   This took two real fix rounds to actually close, not one -- worth naming both, since the
-   second is exactly the kind of gap "the happy-path tests all pass" hides. Round 1 fixed 2 of 5
-   *outcome* branches (an unrecognized pipe tag, or the child's write end closing before a
-   complete message arrived) that skipped [cleanup] entirely. Round 2 fixed a DIFFERENT, deeper
-   gap the first round's own [step] structure still had: only the [read_msg] call itself was
-   guarded against exceptions -- the *surrounding* [Unix.select] call and the 'L'/'R'/'P'
-   host-callback invocations were not, despite being just as capable of raising. Reproduced live
-   by the code review, not theoretically: this test suite's own real, permanently-armed SIGALRM
-   watchdog (`test_riptide.ml`'s per-test timeout) firing while genuinely blocked inside
-   [Unix.select] raised an exception at that exact call site that escaped `invoke` uncaught,
-   and the forked child (a runaway guest) was left orphaned to PID 1, still running at 100% CPU,
-   confirmed live via `ps aux`. Both rounds' regressions are pinned by
-   `For_testing.simulate_child_death_mid_message` (round 1: a child that closes its pipe without
-   completing a message) and `For_testing.simulate_an_exception_mid_step` (round 2: an exception
-   raised from inside the very code path [step] runs on every iteration, standing in for both
-   the watchdog scenario and a genuinely misbehaving host closure). *)
+   This took three real fix rounds to actually close, not one -- worth naming all three, since
+   each subsequent one is exactly the kind of gap "the happy-path tests all pass, and so does
+   the last regression test" hides. Round 1 fixed 2 of 5 *outcome* branches (an unrecognized
+   pipe tag, or the child's write end closing before a complete message arrived) that skipped
+   [cleanup] entirely. Round 2 fixed a deeper gap the first round's own [step] structure still
+   had: only the [read_msg] call itself was guarded against exceptions -- the *surrounding*
+   [Unix.select] call and the 'L'/'R'/'P' host-callback invocations were not, despite being just
+   as capable of raising. Reproduced live by the code review, not theoretically: this test
+   suite's own real, permanently-armed SIGALRM watchdog (`test_riptide.ml`'s per-test timeout)
+   firing while genuinely blocked inside [Unix.select] raised an exception at that exact call
+   site that escaped `invoke` uncaught, and the forked child (a runaway guest) was left orphaned
+   to PID 1, still running at 100% CPU, confirmed live via `ps aux`.
+
+   Round 3 fixed [cleanup] itself: wrapping the OUTER [step] in a try/with (round 2's fix) makes
+   [step] as a whole exception-safe, but [cleanup]'s own body -- [kill]; [waitpid]; [close];
+   [close] -- was not internally atomic against a SECOND asynchronous signal landing mid-sequence
+   (e.g. between [kill] and [waitpid]). Since [cleaned_up] was set to [true] BEFORE that
+   sequence ran, an interrupting exception at that point escaped uncaught (not a [Unix.Unix_error],
+   so unaffected by round 2's [EINTR] handling) AND left [cleaned_up] already [true], so nothing
+   ever retried the skipped [waitpid]/[close]/[close] -- a permanent zombie + 2 leaked fds, not
+   just an escaped exception. Reproduced live by the code review (not theoretically): temporarily
+   widened the kill-to-waitpid window with a sleep, fired SIGALRM repeatedly, watched the child
+   become `<defunct>` via `ps --ppid`, confirmed the fds still open via `/proc/<pid>/fd`, then
+   reverted the instrumentation. Fixed by masking every asynchronous signal
+   ([signals_to_mask_during_cleanup]) around [cleanup]'s own sequence via [Unix.sigprocmask] --
+   not by re-narrowing the guard again -- so a second signal is deferred, not lost, and by moving
+   [cleaned_up := true] to run only once the whole sequence has actually completed, so even a
+   genuinely unexpected (non-signal) failure mid-sequence leaves a clean, fully-idempotent state
+   to retry from rather than a permanently-stuck "done" flag.
+
+   All three rounds' regressions are pinned by `For_testing.simulate_child_death_mid_message`
+   (round 1), `simulate_an_exception_mid_step` (round 2), and
+   `simulate_repeated_signals_during_cleanup` (round 3: a real, repeatedly-firing OS signal
+   throughout an entire contained call, the same live-signal rigor the review's own
+   reproduction used, without needing a permanent debug hook in production code). *)
 let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, string) result =
   let host_of_sink () =
     match !sink with
@@ -502,76 +553,126 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
   in
   let cleaned_up = ref false in
   let cleanup () =
-    if not !cleaned_up then (
-      cleaned_up := true;
-      (* Harmless if the child already exited on its own (success/'E'/timeout already sent it a
-         SIGKILL): killing an already-dead pid just raises ESRCH, tolerated below. Sending it
-         unconditionally here, on every path, is exactly what makes this a single, uniform
-         cleanup instead of the per-path duplication the original code had (and got wrong). *)
-      (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
-      (try ignore (Unix.waitpid [] child_pid) with Unix.Unix_error _ -> ());
-      (try Unix.close req_r with Unix.Unix_error _ -> ());
-      (try Unix.close resp_w with Unix.Unix_error _ -> ()))
+    if not !cleaned_up then
+      (* The whole thing is wrapped in one more try/with, deliberately even OUTSIDE the masked
+         section below: masking prevents a SECOND signal from interrupting the kill/waitpid/
+         close/close sequence ITSELF, but a signal already pending when [Unix.sigprocmask]
+         restores the mask in [~finally] can still be delivered (and its handler raise) right as
+         -- or immediately after -- that restore call returns, i.e. at [cleanup]'s own exit point,
+         past the protected section but still inside [cleanup]'s own call frame. Without this
+         outer guard that exception would propagate to WHATEVER called [cleanup] -- including
+         call sites that aren't themselves inside [step]'s own try (there are none left after
+         folding the deadline check in below, but relying on that structurally rather than
+         guaranteeing it locally is exactly the kind of narrowing that made rounds 1 and 2 each
+         need a further round). Guaranteeing [cleanup] itself never raises (bar the two
+         exceptions below) makes the guarantee true by construction, not by every caller
+         happening to already be inside a try. *)
+      try
+        (* Mask every asynchronous signal for the duration of the actual work below, so a SECOND
+           signal-driven exception (another watchdog tick, or anything else with an OCaml-level
+           raising handler) can't land mid-sequence and leave it half-done -- see this
+           function's own doc comment (round 3) for the live reproduction this closes.
+           [SIG_BLOCK] returns the mask that was in effect before, which is restored via
+           [SIG_SETMASK] in [~finally] regardless of how the protected body ends, so this never
+           leaves the process with a signal mask the CALLER didn't already choose. *)
+        let previous_mask = Unix.sigprocmask Unix.SIG_BLOCK signals_to_mask_during_cleanup in
+        Fun.protect
+          ~finally:(fun () -> ignore (Unix.sigprocmask Unix.SIG_SETMASK previous_mask))
+          (fun () ->
+            (* Harmless if the child already exited on its own (success/'E'/timeout already sent
+               it a SIGKILL): killing an already-dead pid just raises ESRCH, tolerated below.
+               Sending it unconditionally here, on every path, is exactly what makes this a
+               single, uniform cleanup instead of the per-path duplication the original code had
+               (and got wrong). *)
+            (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
+            (try ignore (Unix.waitpid [] child_pid) with Unix.Unix_error _ -> ());
+            (try Unix.close req_r with Unix.Unix_error _ -> ());
+            (try Unix.close resp_w with Unix.Unix_error _ -> ());
+            (* Set only once the full sequence above has actually run to completion -- not
+               before -- so a genuinely unexpected failure partway through (masking closes off
+               the signal-driven case specifically, but this is cheap, unconditional defense in
+               depth against anything else) leaves a retry starting fresh rather than a
+               permanently-stuck "done" flag skipping whatever hadn't run yet. Every step above
+               is itself idempotent (re-killing/re-waiting/re-closing an already-handled
+               resource just hits its own tolerated error), so a full retry from scratch is
+               always safe. *)
+            cleaned_up := true)
+      with
+      | (Out_of_memory | Stack_overflow) as exn -> raise exn
+      | _ -> ()
   in
   let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
-  (* One step of work: the [Unix.select] call, the [read_msg] that follows it, and dispatching
-     whichever tag came back ('L'/'R'/'P' invoke the REAL host closures, which are entirely
-     caller-supplied code this loader has no control over). Wrapped as ONE unit in a SINGLE
-     exception guard below -- not per-call, not "just the read_msg" -- because ANY of it can
-     raise, not just the read. Found live, via the test suite's own real, permanently-armed
-     SIGALRM watchdog (`test_riptide.ml`'s per-test timeout, re-armed before every test
-     including this loader's own) firing while genuinely blocked inside [Unix.select]: the
-     watchdog's handler raises an OCaml exception at that exact blocking call's own call site
-     (this is how [Sys.Signal_handle] delivery across a blocking syscall works), and a first
-     version of this function only guarded the [read_msg] call specifically -- [select] itself,
-     and the 'L'/'R'/'P' branches' calls into [host_of_sink ()]'s closures, sat completely
-     outside any guard. Reproduced live: the exception escaped `invoke` uncaught (breaking its
-     own "never raises" contract) AND the forked child was never reaped, orphaned to PID 1,
-     confirmed still running at 100% CPU via `ps aux` afterward. A host closure is exactly as
-     capable of raising as anything else here -- it's entirely caller-supplied code (Task 6's
-     own reactor will supply real ones) -- so it needs exactly the same blanket protection, not
-     a narrower one just because it isn't `Unix.select`/`read_msg`. *)
-  let step ~remaining : [ `Continue | `Done of (bytes, string) result ] =
+  (* One step of work: the fuel-deadline check, the [Unix.select] call, the [read_msg] that
+     follows it, and dispatching whichever tag came back ('L'/'R'/'P' invoke the REAL host
+     closures, which are entirely caller-supplied code this loader has no control over). Wrapped
+     as ONE unit in a SINGLE exception guard below -- not per-call, not "just the read_msg", and
+     not "everything except the deadline check" -- because ANY of it can raise, not just the
+     read, and folding the deadline check in here too (rather than leaving it in [loop], guarded
+     separately) means literally every [cleanup] call site in this function sits under the same
+     guard, with no separate, easy-to-miss path left ungoverned. See this function's own doc
+     comment above for the three real, live-reproduced gaps this closed, one per fix round. *)
+  let step () : [ `Continue | `Done of (bytes, string) result ] =
     try
-      match Unix.select [ req_r ] [] [] remaining with
-      | [], _, _ -> `Continue (* spurious wakeup with time still left -- recompute and retry *)
-      | _ -> (
-        let tag, payload = Pipe_protocol.read_msg req_r in
-        match tag with
-        | 'L' ->
-          (host_of_sink ()).log (Bytes.to_string payload);
-          `Continue
-        | 'R' ->
-          let merge_key = Bytes.to_string payload in
-          (match (host_of_sink ()).read_materialized ~merge_key with
-          | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
-          | Some value ->
-            Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
-            Pipe_protocol.write_frame resp_w value);
-          `Continue
-        | 'P' ->
-          let status =
-            match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
-          in
-          Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
-          `Continue
-        | 'D' ->
-          cleanup ();
-          `Done (Ok payload)
-        | 'E' ->
-          cleanup ();
-          `Done (Error (Bytes.to_string payload))
-        | other ->
-          cleanup ();
-          `Done
-            (Error
-               (Printf.sprintf "Loader.invoke: internal containment-pipe protocol error (unrecognized tag %C)" other)))
+      let remaining = deadline -. Unix.gettimeofday () in
+      if remaining <= 0. then (
+        cleanup ();
+        `Done
+          (Error
+             (Printf.sprintf
+                "Loader.invoke: fuel exhausted (wall-clock budget of %.1fs exceeded; the \
+                 classic wasm_c_api this loader runs on has no fuel-metering API, see \
+                 loader.ml's top comment -- the guest was SIGKILLed, not merely abandoned)"
+                fuel_budget_seconds)))
+      else
+        match Unix.select [ req_r ] [] [] remaining with
+        | [], _, _ -> `Continue (* spurious wakeup with time still left -- recompute and retry *)
+        | _ -> (
+          let tag, payload = Pipe_protocol.read_msg req_r in
+          match tag with
+          | 'L' ->
+            (host_of_sink ()).log (Bytes.to_string payload);
+            `Continue
+          | 'R' ->
+            let merge_key = Bytes.to_string payload in
+            (match (host_of_sink ()).read_materialized ~merge_key with
+            | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
+            | Some value ->
+              Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
+              Pipe_protocol.write_frame resp_w value);
+            `Continue
+          | 'P' ->
+            let status =
+              match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
+            in
+            Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
+            `Continue
+          | 'D' ->
+            cleanup ();
+            `Done (Ok payload)
+          | 'E' ->
+            cleanup ();
+            `Done (Error (Bytes.to_string payload))
+          | other ->
+            cleanup ();
+            `Done
+              (Error
+                 (Printf.sprintf "Loader.invoke: internal containment-pipe protocol error (unrecognized tag %C)" other)))
     with
     | Unix.Unix_error (Unix.EINTR, _, _) ->
       (* A genuinely spurious interruption of the blocking syscall itself (as opposed to an
          OCaml-level signal handler raising something of its own, handled by the catch-all
          below) -- retry, not a failure. *)
       `Continue
+    | (Out_of_memory | Stack_overflow) as exn ->
+      (* These two are conventionally never silently caught-and-converted in OCaml -- they can
+         indicate the process is already in a degraded state, and swallowing them here would
+         hide that from the caller. [cleanup] is still attempted first (its own operations are
+         cheap syscalls with minimal allocation, and leaving a zombie/leaked fds behind on the
+         way out is its own real cost even when the process is about to report a more serious
+         problem), but the exception itself is deliberately let through rather than converted to
+         an ordinary [Error]. *)
+      cleanup ();
+      raise exn
     | exn ->
       cleanup ();
       `Done
@@ -582,21 +683,7 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
                of the host"
               (Printexc.to_string exn)))
   in
-  let rec loop () =
-    let remaining = deadline -. Unix.gettimeofday () in
-    if remaining <= 0. then (
-      cleanup ();
-      Error
-        (Printf.sprintf
-           "Loader.invoke: fuel exhausted (wall-clock budget of %.1fs exceeded; the classic \
-            wasm_c_api this loader runs on has no fuel-metering API, see loader.ml's top \
-            comment -- the guest was SIGKILLed, not merely abandoned)"
-           fuel_budget_seconds))
-    else
-      match step ~remaining with
-      | `Continue -> loop ()
-      | `Done result -> result
-  in
+  let rec loop () = match step () with `Continue -> loop () | `Done result -> result in
   loop ()
 
 (* Real containment for the (possibly-infinite) guest call: forks a genuine OS process to make
@@ -653,14 +740,19 @@ let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
     supervise_child ~child_pid ~req_r ~resp_w ~sink:t.sink ()
 
 (* Exposed only so this task's own regression tests can prove {!invoke}'s "never raises, no
-   zombie/fd leak" contract holds on the two paths this loader cannot organically trigger through
-   the public guest-execution API alone: [simulate_child_death_mid_message] (round 1's fix) --
-   a child that dies via an uncaught OS signal (or any other means that closes its pipe before a
-   complete message is written) rather than through its own [try...with]; and
-   [simulate_an_exception_mid_step] (round 2's fix) -- an exception raised from inside [step]
-   itself, whether from a host callback or from [Unix.select]'s own call site (what the code
-   review's real SIGALRM-watchdog reproduction looked like). Not part of the guest-execution API
-   -- Task 4/6 should never call either. *)
+   zombie/fd leak" contract holds on the paths this loader cannot organically trigger through the
+   public guest-execution API alone: [simulate_child_death_mid_message] (round 1's fix) -- a
+   child that dies via an uncaught OS signal (or any other means that closes its pipe before a
+   complete message is written) rather than through its own [try...with]; [simulate_an_exception_
+   mid_step] (round 2's fix) -- an exception raised from inside [step] itself, whether from a
+   host callback or from [Unix.select]'s own call site (what the code review's first live
+   SIGALRM-watchdog reproduction looked like); and [simulate_repeated_signals_during_cleanup]
+   (round 3's fix) -- a real, rapidly and repeatedly firing OS signal throughout an entire
+   contained call, proving [cleanup] itself is safe against a SECOND signal landing mid-sequence
+   (what the review's second live reproduction, widening the kill-to-waitpid window with a
+   temporary sleep, looked like -- reproduced here without needing that same kind of permanent
+   debug hook in production code). Not part of the guest-execution API -- Task 4/6 should never
+   call any of these. *)
 module For_testing = struct
   let simulate_child_death_mid_message () =
     let req_r, req_w = Unix.pipe ~cloexec:false () in
@@ -721,6 +813,68 @@ module For_testing = struct
       in
       let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
       result, child_pid, req_r, resp_w
+
+  exception Injected_signal_for_testing
+
+  let simulate_repeated_signals_during_cleanup () =
+    let req_r, req_w = Unix.pipe ~cloexec:false () in
+    let resp_r, resp_w = Unix.pipe ~cloexec:false () in
+    match Unix.fork () with
+    | 0 ->
+      (* Sleeps briefly before closing its pipe without ever sending a complete message --
+         giving the parent real wall-clock time inside both [Unix.select] and (once the pipe
+         closes) [cleanup] itself for the rapidly, repeatedly firing signal armed below to
+         actually land during both, not just have a theoretical chance to. *)
+      Unix.close req_r;
+      Unix.close resp_w;
+      Unix.sleepf 0.02;
+      Unix.close resp_r;
+      Unix.close req_w;
+      Unix._exit 0
+    | child_pid ->
+      Unix.close req_w;
+      Unix.close resp_r;
+      let sink =
+        ref
+          (Direct
+             { read_materialized = (fun ~merge_key:_ -> None); propose_write = (fun _ -> Ok ()); log = ignore })
+      in
+      (* SIGALRM specifically, since it's a real, externally-armed signal this same test binary
+         already relies on elsewhere (`test_riptide.ml`'s own suite-wide watchdog) -- reusing it
+         here is what makes this a faithful, live reproduction of the review's own finding rather
+         than a synthetic stand-in. Both the previous handler and the previous itimer are saved
+         and restored exactly, regardless of how the protected call ends, specifically so this
+         doesn't clobber that suite-wide watchdog's own armed state for whatever test runs next. *)
+      let previous_handler =
+        Sys.signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise Injected_signal_for_testing))
+      in
+      (* 5ms, not something far more aggressive like 1ms: a first version of this test used a
+         1ms interval and reliably SEGFAULTed, but only when run as part of the FULL suite (never
+         in isolation, and never in a minimal standalone repro built to match this exact
+         mask/fork/signal shape) -- strong circumstantial evidence it was hammering the OCaml
+         runtime's own signal delivery hard enough to land inside a GC-triggered finalizer for
+         some *unrelated*, already-created wasmtime object left over from an earlier test still
+         awaiting collection (this test binary never touches wasmtime before `module_loader`'s
+         own first test), rather than exposing anything about THIS loader's own [cleanup] logic
+         specifically. That's a real, if narrower, fragility of OCaml signal handlers combined
+         with ctypes-foreign's own dynamic-closure/finalizer machinery (this task already found
+         two unrelated, genuine bugs in exactly that combination -- see this file's top comment
+         point 0) -- worth knowing about, but out of THIS finding's own scope to chase further.
+         5ms still fires several times within the child's 20ms sleep window (comfortably enough
+         to reliably land inside both [Unix.select] and [cleanup] itself across repeated runs --
+         verified live, 5/5 clean full-suite runs at this interval, vs. reliable reproduction of
+         the SEGFAULT within the first 1-2 runs at 1ms) without reproducing that separate
+         crash. *)
+      let previous_itimer =
+        Unix.setitimer Unix.ITIMER_REAL { Unix.it_interval = 0.005; it_value = 0.005 }
+      in
+      Fun.protect
+        ~finally:(fun () ->
+          ignore (Unix.setitimer Unix.ITIMER_REAL previous_itimer);
+          Sys.set_signal Sys.sigalrm previous_handler)
+        (fun () ->
+          let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
+          result, child_pid, req_r, resp_w)
 end
 
 let invoke t ~entrypoint ~arg =

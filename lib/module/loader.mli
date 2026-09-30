@@ -94,14 +94,31 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     closed, on every exit path — including a child that dies via an uncaught OS signal (a real,
     demonstrated possibility on this exact codebase: [loader.ml]'s top comment point 0 already
     found `libwasmtime`'s own Rust internals capable of process-aborting panics) rather than
-    through its own clean reporting, AND including an exception raised from the parent's own
-    supervision step itself — whether from [Unix.select] (confirmed live by a real, permanently-
-    armed test-suite watchdog firing mid-[select]) or from a host callback (this task's own
+    through its own clean reporting; an exception raised from the parent's own supervision step
+    itself — whether from [Unix.select] or from a host callback (this task's own
     ["log"]/["read_materialized"]/["propose_write"], entirely caller-supplied code this loader
-    does not control). This took two real fix rounds to actually hold for every path, not one —
-    the first left the second gap (an unguarded [select]/host-callback) standing; see
-    [loader.ml]'s [supervise_child] and [step] for the full history. No exit path leaks a zombie
-    process or a file descriptor. *)
+    does not control); AND a SECOND asynchronous signal landing mid-cleanup itself (masked via
+    [Unix.sigprocmask] around the actual kill/waitpid/close/close sequence, with [cleanup]
+    guaranteed by construction to never propagate anything out of it besides [Out_of_memory]/
+    [Stack_overflow], which are deliberately let through rather than silently converted, per
+    OCaml convention). This took three real fix rounds to actually hold for every path, not
+    one or two — each prior round's own regression test passed while a further gap the review
+    kept finding stood; see [loader.ml]'s [supervise_child], [step], and [cleanup] for the full
+    history, all three confirmed via a live, real-signal reproduction (a real, permanently-armed
+    SIGALRM in this same test suite, not a synthetic stand-in) at each round. No exit path leaks
+    a zombie process or a file descriptor.
+
+    **Known, disclosed, deliberately-not-engineered-around interaction**: this test suite's own
+    external per-test watchdog (`test_riptide.ml`'s [Suite_timeout], a SIGALRM-driven safety net
+    entirely separate from and unrelated to this loader's own [fuel_budget_seconds]) firing while
+    execution is inside [invoke] gets caught by the same catch-all that handles every other
+    asynchronous signal here, and silently converted to an ordinary [Error] result instead of
+    surfacing as the loud "this test hung" failure it's meant to be. This is a real interaction
+    worth knowing about if a future test on this loader ever times out unexpectedly quietly
+    instead of loudly, but it is specific to this one test suite's own harness design, not
+    something [loader.ml] should special-case — it has no business knowing about a test-only
+    exception type, and doing so would mean reaching outside its own module boundary to
+    accommodate one specific caller's testing infrastructure. *)
 
 module For_testing : sig
   val simulate_child_death_mid_message :
@@ -128,4 +145,17 @@ module For_testing : sig
       own code review reproduced live, goes through too). Not part of the guest-execution API —
       Task 4/6 must never call this. Same return shape and same two independent checks
       ([Unix.kill pid 0] / [Unix.close]) as {!simulate_child_death_mid_message} above. *)
+
+  val simulate_repeated_signals_during_cleanup :
+    unit -> (bytes, string) result * int * Unix.file_descr * Unix.file_descr
+  (** Exists only for this task's own regression test proving the same guarantee holds against a
+      SECOND asynchronous signal landing mid-[cleanup] itself (not just mid-[step], which
+      {!simulate_an_exception_mid_step} already covers) — arms a real, rapidly and repeatedly
+      firing [SIGALRM] (the same signal this test binary's own suite-wide watchdog uses, reused
+      here deliberately rather than a synthetic one, for a faithful live reproduction) around an
+      entire contained call, then restores the exact previous handler/itimer state regardless of
+      outcome so it doesn't disturb that watchdog for whatever test runs next. Not part of the
+      guest-execution API — Task 4/6 must never call this. Same return shape and same two
+      independent checks ([Unix.kill pid 0] / [Unix.close]) as {!simulate_child_death_mid_message}
+      above. *)
 end

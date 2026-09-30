@@ -219,6 +219,13 @@ let test_run_contained_reaps_and_closes_fds_even_when_a_host_callback_raises_mid
          "a host callback (or the surrounding Unix.select call, per the code review's own live \
           SIGALRM-watchdog reproduction) raising mid-step"
 
+let test_cleanup_reaps_and_closes_fds_even_under_repeated_signals_mid_cleanup () =
+  Loader.For_testing.simulate_repeated_signals_during_cleanup ()
+  |> assert_contained_failure_with_no_leaks
+       ~scenario:
+         "a real, rapidly repeated SIGALRM firing throughout an entire contained call, including \
+          during cleanup's own kill/waitpid/close/close sequence"
+
 let test_microvm_tier_raises_a_clear_not_implemented_error () =
   Alcotest.check_raises "microvm tier is designed, not built"
     (Failure "Loader.instantiate: Microvm tier is not yet implemented (Task 8's own job)") (fun () ->
@@ -267,6 +274,9 @@ let tests =
        mid-step",
       `Quick,
       test_run_contained_reaps_and_closes_fds_even_when_a_host_callback_raises_mid_step );
+    ( "cleanup reaps the child and closes both pipe fds even under repeated signals mid-cleanup",
+      `Quick,
+      test_cleanup_reaps_and_closes_fds_even_under_repeated_signals_mid_cleanup );
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );
