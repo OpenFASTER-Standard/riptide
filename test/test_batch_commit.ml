@@ -605,6 +605,60 @@ let test_allow_all_is_the_explicit_no_policy_choice () =
   Alcotest.(check int) "committed: the real write plus its synthetic authorization-decision write" 2
     (List.length (Batch_commit.committed_envelopes t))
 
+(* Review finding (task-master Task 5, subtask 5, review round 1): the checkpoint must be
+   evaluated ONLY for a call that could actually cause NEW data to enter the log -- see
+   batch_commit.mli's own "Authorization" section for the full three-idiom account this test
+   pins one leg of. A propose call repeating an ALREADY-COMMITTED batch's own original writes,
+   now supplying ~materialize, is idiom (2) of that account: it must succeed and materialize even
+   if ~authorize would deny those exact writes if evaluated right now, exactly like idiom (1) (an
+   empty-[writes] drain) and idiom (3) ({!Batch_commit.materialize_up_to}, which has no
+   [~authorize] in scope at all) already do -- because nothing new is being proposed for
+   [~authorize] to have a say over; the batch is already, irrevocably committed. *)
+let test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_authorize () =
+  let t = create_solo () in
+  let allow_now = ref true in
+  let authorize (_ : Batch_commit.write) =
+    if !allow_now then Batch_commit.Allow else Batch_commit.Deny "policy now denies this"
+  in
+  let h = Batch_commit.create ~replica:t ~authorize () in
+  let actor = "actor-1" in
+  let writes =
+    [
+      w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") ~merge_key:(Some "mk")
+        (record_value "1");
+    ]
+  in
+  (* First call: allowed, commits normally, with NO ~materialize sink -- simulating a caller that
+     committed the batch (or crashed) before ever supplying a materializer. *)
+  Batch_commit.propose h ~idempotency_key:"k1" writes;
+  Alcotest.(check int) "the batch committed: the real write plus its synthetic \
+                        authorization-decision write"
+    2 (List.length (Batch_commit.committed_envelopes t));
+  (* Now the policy flips to deny EVERYTHING -- including these exact, already-committed writes,
+     if this checkpoint were (incorrectly) still consulting ~authorize for this call. *)
+  allow_now := false;
+  let materialized = ref [] in
+  let sink : Batch_commit.materialize_sink =
+    { write = (fun ~merge_key payload -> materialized := (merge_key, payload) :: !materialized) }
+  in
+  let denials_before = Batch_commit.authorization_denials () in
+  (* THE RETRY under test: same idempotency_key, same original writes, now with ~materialize. *)
+  Batch_commit.propose h ~idempotency_key:"k1" ~materialize:sink writes;
+  Alcotest.(check int) "no new denial was recorded -- the checkpoint was never consulted for a \
+                        call proposing nothing new"
+    denials_before (Batch_commit.authorization_denials ());
+  Alcotest.(check int) "still exactly the original 2 envelopes -- nothing new was (or could be) \
+                        proposed"
+    2 (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int) "the materialize step fired anyway, despite ~authorize now denying these \
+                        writes if it were ever asked"
+    1 (List.length !materialized);
+  match !materialized with
+  | [ (merge_key, payload) ] ->
+    Alcotest.(check string) "the merge_key materialized is the real write's own" "mk" merge_key;
+    Alcotest.(check bool) "...with its own original payload" true (payload = record_value "1")
+  | _ -> Alcotest.fail "expected exactly one materialized write"
+
 let tests =
   [
     ("empty batch commits as zero envelopes", `Quick, test_empty_batch_commits_as_zero_envelopes);
@@ -642,4 +696,6 @@ let tests =
       test_propose_appends_a_synthetic_authorization_decision_write);
     ("allow_all is the explicit, visible no-policy-yet choice", `Quick,
       test_allow_all_is_the_explicit_no_policy_choice);
+    ("catch-up materialization of an already-committed key is exempt from ~authorize", `Quick,
+      test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_authorize);
   ]

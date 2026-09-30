@@ -410,40 +410,74 @@ val propose :
     deployment's own choice, not silent plaintext.
 
     {b Authorization} (task-master Task 5, subtask 5 -- the universal, mandatory checkpoint every
-    write through this module passes through): before any other guard below that can actually
-    cause a commit -- i.e. before the idempotency-key/commit-membership check that follows --
-    [Batch_commit.t]'s own [~authorize] (supplied once, at {!create} time) is evaluated against
-    EVERY write in [writes], unconditionally, on EVERY call, whether or not [idempotency_key] is
-    already committed or merely appended. If any write's [authorize w] returns [Deny reason], this
-    function increments {!authorization_denials} and returns -- doing nothing else at all: no
-    write is proposed, and the materialize step below does not run either, even if [?materialize]
-    was supplied. A batch is one atomic, indivisible unit, so a single denied write refuses the
-    WHOLE batch, not just itself -- there is no partial-batch commit path anywhere in this module,
-    and authorization does not create one. (A caller relying on the empty-[writes] materialize-only
-    idiom described below is unaffected by this in practice: [List.exists] over an empty list is
-    vacuously [false], so an empty batch is never denied by construction, whatever [~authorize]
-    is.)
+    write through this module passes through): {b evaluated ONLY for a call that could actually
+    cause NEW data to enter the replicated log} -- i.e. only inside the SAME "[idempotency_key] is
+    not already anywhere in this replica's log" guard the idempotency-key/commit-membership
+    paragraph below describes, not before it and not unconditionally on every call (review
+    finding, this task's own review round 1; an earlier version of this checkpoint evaluated
+    [~authorize] unconditionally, ahead of that guard, which is the design this paragraph
+    supersedes). When that guard is reached, [Batch_commit.t]'s own [~authorize] (supplied once,
+    at {!create} time) is evaluated against EVERY write in [writes]. If any write's [authorize w]
+    returns [Deny reason], this function increments {!authorization_denials} and proposes nothing
+    for this call -- the materialize step below still runs, exactly as it does for a batch that
+    was simply never proposed at all, and finds nothing committed under [idempotency_key] either
+    way, so this is not a special case needing its own check. A batch is one atomic, indivisible
+    unit, so a single denied write refuses the WHOLE batch, not just itself -- there is no
+    partial-batch commit path anywhere in this module, and authorization does not create one.
 
-    If every write is [Allow], this function proceeds as described below, with ONE addition: when
-    [writes] and [Batch_commit.replica t]'s log together mean a real proposal happens (i.e. inside
-    the same "not already in the log" guard the paragraph below describes), one additional,
-    synthetic {!write} recording the decision is appended to the writes actually encoded and
-    passed to {!Riptide_vsr.Replica.propose} -- [actor = "riptide.module.authz"],
-    [causation]/[correlation] copied from [writes]'s own first element (making it a real,
-    causally-linked member of the same batch, not a freestanding fact), [merge_key = None], and a
-    [payload] recording [idempotency_key] and the fact the batch was allowed. This write commits,
-    chains, and decodes exactly like any other write in the batch -- {!committed_envelopes} yields
-    one extra envelope per successfully-proposed batch as a result, which every caller comparing
-    envelope counts against a proposed-write count must account for. It carries no [merge_key], so
-    it is invisible to materialization, and it is never encrypted even when [?encryption] is
-    supplied -- it is a fact ABOUT the batch's authorization, not user payload data, so it is
-    deliberately excluded from the encrypted-payload/redaction story the rest of this comment
-    describes.
+    {b Why a call against an ALREADY-committed [idempotency_key] is correctly exempt from this
+    checkpoint entirely}, stated precisely because Task 6 (the reactor wiring a real policy) must
+    not assume otherwise: this checkpoint's whole purpose is to gate NEW data entering the
+    replicated log. A materialize-only call against data that is already durably committed
+    introduces nothing new -- the cluster already, irrevocably agreed on it before this call was
+    ever made -- so re-consulting [~authorize] over it protects nothing; it would only make a
+    caller's own LOCAL materialized view inconsistently stale, depending on which of three
+    operationally-identical idioms it happened to reach for catch-up materialization of an
+    already-committed key:
+    - [propose t ~idempotency_key ~materialize:sink []] (the documented empty-[writes] drain
+      idiom below) -- never reaches this checkpoint at all, since [writes = []] fails the
+      "not already in the log" guard's own [writes <> []] half regardless of log state.
+    - [propose t ~idempotency_key ~materialize:sink writes], where [writes] repeats the
+      already-committed batch's own original content (the only kind of retry this fire-and-forget
+      layer's own contract permits a client to issue at all) -- fails the SAME guard's
+      "not (already_in_log ...)" half, so this checkpoint is never reached either, for exactly
+      the same reason the propose-side optimization just below it is skipped: the key is already
+      in the log.
+    - {!materialize_up_to} -- takes a bare {!Riptide_vsr.Replica.t}, with no {!t} (and therefore
+      no [~authorize]) in scope at all to consult.
+
+    Before this fix, only the SECOND of these three idioms was gated by [~authorize] -- purely
+    because it happens to also carry a non-empty [writes] argument, not because it does anything
+    the other two don't. A caller's ability to catch its own materializer up on data the cluster
+    already committed depended on which of three equally-valid idioms it happened to call, which
+    is the inconsistency this restructuring closes: all three are now uniformly exempt, and
+    [~authorize] is consulted exactly once per batch, at the one moment ([writes <> []] and the
+    key is genuinely new to this replica's log) where a [Deny] can still prevent something from
+    happening. This is also the more literal reading of "every write ... passes through the
+    checkpoint": a materialize-only call against already-committed data is not proposing a
+    "write" in the log-entry sense at all, so excluding it from the checkpoint is consistency
+    with that reading, not a weakening of it.
+
+    If every write is [Allow] (or the guard above is not reached at all, i.e. nothing new is being
+    proposed), this function proceeds as described below, with ONE addition on the [Allow] path:
+    when [writes] and [Batch_commit.replica t]'s log together mean a real proposal happens (i.e.
+    inside the same "not already in the log" guard just described), one additional, synthetic
+    {!write} recording the decision is appended to the writes actually encoded and passed to
+    {!Riptide_vsr.Replica.propose} -- [actor = "riptide.module.authz"], [causation]/[correlation]
+    copied from [writes]'s own first element (making it a real, causally-linked member of the
+    same batch, not a freestanding fact), [merge_key = None], and a [payload] recording
+    [idempotency_key] and the fact the batch was allowed. This write commits, chains, and decodes
+    exactly like any other write in the batch -- {!committed_envelopes} yields one extra envelope
+    per successfully-proposed batch as a result, which every caller comparing envelope counts
+    against a proposed-write count must account for. It carries no [merge_key], so it is invisible
+    to materialization, and it is never encrypted even when [?encryption] is supplied -- it is a
+    fact ABOUT the batch's authorization, not user payload data, so it is deliberately excluded
+    from the encrypted-payload/redaction story the rest of this comment describes.
 
     A denied batch's key is consequently NEVER added to the log at all (unlike an empty batch,
-    which is refused earlier, before authorization is even consulted, by the guard below) -- a
-    later call under the same [idempotency_key] with a permissive [~authorize] (or against a
-    different handle) is a genuine first attempt, not a blocked retry.
+    which is refused earlier, before this guard is ever reached, by the guard below) -- a later
+    call under the same [idempotency_key] with a permissive [~authorize] (or against a different
+    handle) is a genuine first attempt, not a blocked retry.
 
     Checks first whether [idempotency_key] already appears among the batches in
     [Batch_commit.replica t]'s own log -- the WHOLE log as {!Riptide_vsr.Replica.entries} reports
