@@ -1356,11 +1356,16 @@
             "id": 30,
             "title": "[7.2] A stranded replica keeps retrying its view-change broadcast",
             "description": "A stranded replica keeps retrying its view-change broadcast",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "try_forfeit_view_change/check_timeout re-broadcast StartViewChange on each timeout while below quorum, bounded by the existing svc_limit. Fix svc_count not incrementing on the below-quorum path in the same change.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "4e83b29eefd3a4280fc75dcfd399a633f844b399"
+              ]
+            }
           },
           {
             "id": 31,
