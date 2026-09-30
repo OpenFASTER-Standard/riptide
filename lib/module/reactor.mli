@@ -66,7 +66,33 @@ val subscribe :
     {!Loader.host_functions}'s own [log] field is filled in internally by this reactor and cannot
     be customized per subscription -- nothing about a call here needs to, since a module's log
     output is this reactor's own operational concern (see {!For_testing.log_call_count} for how
-    this task's own tests observe it fired at all), not a per-subscription policy choice. *)
+    this task's own tests observe it fired at all), not a per-subscription policy choice. Every
+    line this reactor itself emits -- both a dispatched module's own relayed [log] calls and this
+    reactor's own dispatch-failure/dispatch-raised messages (see {!wrap_materialize_sink}) -- is
+    tagged with the [merge_key] and [module_.local_path] responsible for it, so multiple modules
+    subscribed to the same or different keys (the fan-out shape this reactor exists for) remain
+    attributable in the log stream, not merged into one undifferentiated "[reactor] ..." line.
+
+    {b Known, disclosed residual gap: [~propose] is fire-and-forget from this reactor's own
+    perspective.} {!wrap_materialize_sink} calls [propose] and relays only the [Ok]/[Error] shape
+    it returns back to the guest as a status byte -- it does not await, retry, or otherwise confirm
+    that whatever the closure did on the other end (e.g. a real
+    {!Riptide_batch_commit.Batch_commit.propose} call, itself already documented as fire-and-forget
+    -- see {!Riptide_batch_commit.Batch_commit.propose}'s own doc comment) actually, durably
+    committed. A caller wiring [~propose] against a real {!Riptide_batch_commit.Batch_commit.t}
+    handle has no built-in signal from either module for whether one specific proposed write
+    landed; inferring it indirectly (e.g. via
+    {!Riptide_batch_commit.Batch_commit.authorization_denials}'s own before/after delta around one
+    call, the technique this task's own test suite uses) is sound ONLY because
+    {!wrap_materialize_sink}'s own dispatch to every subscriber of a given [merge_key] is genuinely
+    SEQUENTIAL, never concurrent -- see {!wrap_materialize_sink}'s own doc comment, which states
+    this as an actual, load-bearing contract of this module, not an incidental implementation
+    detail. A caller building a per-call delta like this must not assume it would stay sound if a
+    future version of this function ever dispatched subscribers concurrently. A deployment that
+    genuinely needs to know whether a specific proposed write committed needs its own out-of-band
+    signal (e.g. reading back through {!Riptide_batch_commit.Batch_commit.committed_envelopes}, or
+    a future, real acknowledgment mechanism -- {!Riptide_batch_commit.Batch_commit.propose}'s own
+    doc comment marks that "Task 9's own job") -- this reactor provides none itself. *)
 
 val wrap_materialize_sink :
   t ->
@@ -74,18 +100,25 @@ val wrap_materialize_sink :
   Riptide_batch_commit.Batch_commit.materialize_sink
 (** Returns a sink whose [write ~merge_key v] first calls [inner.write ~merge_key v] --
     materialization is never skipped, delayed, or reordered by anything this function adds -- and
-    then, for every module {!subscribe}d to [merge_key] (in subscription order; independently of
-    each other, per this file's top comment), calls {!Loader.instantiate} fresh followed by
-    {!Loader.invoke} [~entrypoint:"handle" ~arg:(Riptide.Value.canonical_encode v)] -- reusing
-    this codebase's own existing, canonical [Value.value <-> bytes] wire convention (the same one
-    {!Riptide_batch_commit.Batch_commit} itself encodes/decodes batches with) rather than
-    inventing a second one just for this call.
+    then, for every module {!subscribe}d to [merge_key], in subscription order, ONE AT A TIME --
+    {b sequentially, never concurrently; this is a real, load-bearing contract of this function,
+    not merely today's implementation detail, see [subscribe]'s own "Known, disclosed residual
+    gap" paragraph for exactly what a caller's own code correctly depends on this for} -- calls
+    {!Loader.instantiate} fresh followed by {!Loader.invoke} [~entrypoint:"handle"
+    ~arg:(Riptide.Value.canonical_encode v)] -- reusing this codebase's own existing, canonical
+    [Value.value <-> bytes] wire convention (the same one {!Riptide_batch_commit.Batch_commit}
+    itself encodes/decodes batches with) rather than inventing a second one just for this call.
+    Each dispatch is otherwise fully independent of every other (per this file's top comment):
+    sequential ordering is a scheduling fact, not a data or control dependency between modules.
 
     A module's own dispatch failing -- {!Loader.instantiate} raising (a bad tier, an over-large
     declared memory, an unsupported import), or {!Loader.invoke} returning [Error] (a protocol
     violation, a trap, a fuel timeout) -- is caught here, logged, and does not raise out of this
     [write]: it is treated exactly like a module that chose to do nothing this dispatch, not like
-    a failure of {!wrap_materialize_sink} itself. A change on a [merge_key] with no subscribers is
+    a failure of {!wrap_materialize_sink} itself. [Out_of_memory]/[Stack_overflow] are the one
+    exception: both are re-raised rather than caught, matching [loader.ml]'s own [cleanup]
+    precedent in this exact codebase -- they signal the process itself is in trouble, not a normal
+    per-module failure to log and continue past. A change on a [merge_key] with no subscribers is
     a total no-op beyond the inner [write] call -- no {!Loader.instantiate} is ever attempted. *)
 
 module For_testing : sig
