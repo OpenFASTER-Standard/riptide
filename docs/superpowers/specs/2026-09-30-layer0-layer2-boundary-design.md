@@ -188,8 +188,16 @@ this is a security-critical verification surface, not a project-owned convention
 **Chosen: shell out to the real, official `cosign` binary** as a subprocess, checking its exit code
 and output — never hand-rolled cryptographic or attestation-verification logic in OCaml. "Don't roll
 your own crypto" applies here in a way it doesn't for Decision 3's ABI, which is inherently
-project-specific and safe to own directly. Modules are distributed as OCI artifacts addressed by
-content digest, never a mutable tag. A module's isolation tier (Decision 5's `Sfi | Microvm`) is
+project-specific and safe to own directly. **Distribution, corrected (final fix wave re-review, same
+class as I3):** this paragraph asserted "modules are distributed as OCI artifacts addressed by content
+digest, never a mutable tag." No OCI or registry code exists anywhere in `lib/module` — `Admission.verify`
+takes a **local filesystem path** plus a **caller-supplied expected digest**, and verifies the file's
+own SHA-256 against it before invoking `cosign`. The part of that claim which is real, and is what the
+property was actually for, is the content-addressing: nothing is ever identified to this gate by a
+mutable name, and a byte that changes makes verification fail. How an artifact *arrives* at that local
+path is deliberately outside this boundary — whoever fetches it (an OCI pull, a build step, an
+operator `scp`) is a separate concern with its own design, listed as a named deferral below rather than
+implied by this decision. A module's isolation tier (Decision 5's `Sfi | Microvm`) is
 recorded as part of admission — the gate is the one place that durably decides which tier a given
 module's artifact runs under, so Decision 5's loader has a single source of truth to read rather
 than a second, independent configuration surface.
@@ -289,11 +297,17 @@ document:
 - **Isolation (Decision 5):** a module that deliberately loops forever or overruns its own memory
   is contained — doesn't crash the host, doesn't touch another module's or the core's memory,
   triggers fuel exhaustion or a trap as designed.
-- **Admission gate (Decision 6):** a real signed, provenance-valid artifact passes; a tampered or
-  unsigned one is rejected — via real `cosign` subprocess invocations. **Open question, named
-  rather than silently decided:** whether CI runs against a live Sigstore/Fulcio/Rekor instance or
-  a documented local stand-in; resolve this in the implementation plan once cosign's own testing
-  conventions are checked, not assumed here.
+- **Admission gate (Decision 6):** a real **signed** artifact passes; a tampered or unsigned one is
+  rejected — via real `cosign` subprocess invocations against a real, freshly generated keypair.
+  (Corrected in this plan's final fix wave, re-review of finding I3: this bullet said
+  "signed, **provenance-valid** artifact," repeating in the Testing-strategy section the same
+  overclaim Decision 6's own text was corrected for. No test asserts anything about provenance,
+  because no code verifies any — see Decision 6 above for what shipped and the named deferral.)
+  **Open question, named rather than silently decided:** whether CI runs against a live
+  Sigstore/Fulcio/Rekor instance or a documented local stand-in; resolve this in the implementation
+  plan once cosign's own testing conventions are checked, not assumed here. (As built, the suite
+  uses neither: `--tlog-upload=false`/`--insecure-ignore-tlog=true` with a local keypair, so no
+  network dependency — and `cosign` is a hard prerequisite for the suite as a whole, see the README.)
 - **Authorization checkpoint (Decision 7):** an exhaustive call-site audit (grep-based, in the
   style `scripts/check-citations` already established this session for a different invariant)
   plus fuzzing, proving no write can bypass the checkpoint under any code path — exactly the
@@ -340,6 +354,11 @@ disclosed in the relevant `.mli`, so a caller meets it at the point of use, not 
 - **Surfacing module traps through a structured event channel** (Error handling, review finding M4) —
   needs a Layer 0 interface decision (extend `replica_event`, or give the reactor its own event
   channel) under this project's own Layer 0 governance rule; traps are stderr-logged today.
+- **Artifact distribution (OCI registry fetch)** (Decision 6, re-review of finding I3) — admission
+  verifies a local path against a caller-supplied digest; nothing fetches, pulls, or resolves an
+  artifact from a registry, and nothing in `lib/module` knows what OCI is. Whoever puts the bytes at
+  that path is a separate design (and must carry the digest with them, since that is what makes the
+  gate meaningful).
 - **Per-dispatch amortization of module compilation** (Decision 5, review finding M3 / Task 6's own
   boundary-friction item 2) — every dispatch currently recompiles the module from its WAT/wasm source
   and forks a fresh process; a compiled-artifact cache or instance pool is a real performance
