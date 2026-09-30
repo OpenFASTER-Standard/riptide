@@ -679,7 +679,15 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
                    dispatch loop / [body] -- both of which run strictly after
                    [replica_cells.(index)] has already been filled in (see the two
                    [on_replica_created] call sites in [with_cluster]). No op can exist to append
-                   before the replica that would append it exists. *)
+                   before the replica that would append it exists.
+
+                   Deliberately [failwith] rather than the softer [| None -> true (* unreachable *)]
+                   precedent used for an analogous "tie the knot" cell in
+                   [test/test_lattice_materialize_crypto_scenarios.ml]: that file's cell is consulted
+                   from a much smaller, hand-rolled harness where a silent default is easy to audit
+                   by inspection, while this one backs a shared, general-purpose harness where a
+                   silently-permitted eviction on a violated invariant would be far harder to notice.
+                   Failing loudly here is a deliberate choice, not an oversight. *)
                 failwith
                   "Cluster.run_on_file_storage: ?may_evict consulted before this replica's \
                    forward-reference cell was ever filled in -- should be unreachable, see this \

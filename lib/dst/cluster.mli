@@ -454,6 +454,10 @@ val run_on_file_storage :
     path, so {!Riptide_vsr.Replica.append_refusals}'s [eviction_blocked] was structurally pinned at
     [0] no matter what a caller did.
 
+    {b Its proactive counterpart is {!Riptide_storage.File_storage.ring_margin}} -- this predicate
+    only decides what happens once eviction is actually attempted; [ring_margin] is the early-warning
+    signal a caller can poll beforehand to see a wedge coming before any write is ever refused.
+
     {b This is not the FULL predicate task-master Task 6 eventually wants} -- see
     {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}'s own doc comment, "the
     second half of task-master Task 6's own [?may_evict] predicate": the first half (a
