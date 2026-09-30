@@ -1323,11 +1323,18 @@
             "id": 28,
             "title": "[6.3] A bounded inbox and a read-idle timeout on established connections",
             "description": "A bounded inbox and a read-idle timeout on established connections",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Eio.Stream.create max_int becomes a finite, configurable capacity (real backpressure via a full inbox blocking the sender). Add a read-idle timeout on established connections, reusing the shape of the existing handshake/preamble timeouts.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "4f5df16f56b07b268434218a586f31d02216787e",
+                "96374675f54ca70bf1af9d29671c1705b4d55e73"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 29,
