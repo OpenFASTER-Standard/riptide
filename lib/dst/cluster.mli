@@ -405,6 +405,7 @@ val run_on_file_storage :
   ?ring_capacity:int ->
   ?net_fault_config:Riptide_sim.Network.fault_config ->
   ?storage_fault_config:Riptide_storage.Fault_injecting_storage.fault_config ->
+  ?enable_eviction_gate:bool ->
   (replicas:Riptide_vsr.Replica.t array ->
    settle:(unit -> unit) ->
    restart:(?lose_superblock:bool -> ?repair_superblock:superblock_repair -> int -> bool) ->
@@ -441,4 +442,39 @@ val run_on_file_storage :
     permanently omits the evicted ops, no replica can either supply them or prove them absent, so
     the first view change after that point never completes -- the cluster forfeits, bumps its view,
     and repeats forever, never returning to [Normal]. A ring big enough to hold the whole run's log
-    is the only configuration in which this harness tests the protocol rather than that limit. *)
+    is the only configuration in which this harness tests the protocol rather than that limit.
+
+    {b Task 31 (audit-remediation): every replica's underlying {!Riptide_storage.File_storage} is now
+    built with a real [?may_evict] predicate} --
+    {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}, negated (an eviction is
+    permitted exactly when the op-number about to be evicted does NOT carry a
+    [merge_key] -- i.e. materialization was never asked to care about it). This is the fix for the
+    literal audit finding: before this task, nothing anywhere in this codebase ever supplied
+    {!Riptide_storage.File_storage.create} a [?may_evict] predicate through any real (non-test-only)
+    path, so {!Riptide_vsr.Replica.append_refusals}'s [eviction_blocked] was structurally pinned at
+    [0] no matter what a caller did.
+
+    {b This is not the FULL predicate task-master Task 6 eventually wants} -- see
+    {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}'s own doc comment, "the
+    second half of task-master Task 6's own [?may_evict] predicate": the first half (a
+    materialization watermark, "already consumed, so it's fine to evict even with a merge_key") is
+    state a FUTURE task owns, not this one, and is deliberately not implemented here. In its
+    absence, this wiring is maximally conservative: an op-number carrying a [merge_key] can never be
+    evicted while it is still visible to {!Riptide_vsr.Replica.entries} (i.e. until an eventual
+    restart's contiguous-prefix rebuild stops seeing it at all -- see that function's own "AFTER A
+    RESTART OVER A WRAPPED RING" clause). A scenario that commits [merge_key]-carrying batches past
+    [ring_capacity] should expect backpressure ([eviction_blocked] climbing, no further commits
+    past the ring boundary until something relieves it), not silent eviction -- unlike a scenario
+    using plain, non-batch-shaped values (every existing test as of this task), for which
+    {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key} always answers [false]
+    (nothing here decodes as a batch at all) and eviction proceeds exactly as it always did.
+
+    [?enable_eviction_gate] (default [true]) is the one override for a scenario that needs this
+    protection turned OFF -- narrow by design, not a general escape hatch. Its only known use is
+    [test_dst_scenarios.ml]'s own
+    [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry], which pins a
+    DIFFERENT, already-disclosed limitation (see
+    {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}'s own "AFTER A RESTART
+    OVER A WRAPPED RING" doc) that specifically requires the ring to wrap via ordinary, UNPROTECTED
+    eviction of merge_key-carrying entries -- exactly what this task's new default now prevents,
+    with no materialization watermark yet in place to ever let the gate relent on its own. *)

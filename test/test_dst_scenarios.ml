@@ -1666,8 +1666,18 @@ let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry (
   let lww n : Riptide_lattice.Last_write_wins.t =
     { value = v (value_of n); timestamp = Int64.of_int n }
   in
+  (* Task 31 (audit-remediation): [~enable_eviction_gate:false]. [run_on_file_storage] now wires a
+     real [?may_evict] by default (see cluster.mli's own doc on that parameter), and this scenario's
+     every write DOES carry [restart_merge_key] -- exactly what that gate protects, and with no
+     materialization watermark yet implemented (Task 6, not this task), it would never let ops
+     1 and 2 be evicted at all, so the ring could never reach the WRAPPED state this test exists to
+     study. This test targets a DIFFERENT, already-disclosed limitation (restart recovery losing
+     visibility of a still-unmaterialized entry once the ring has wrapped -- see
+     [Batch_commit.write_at_op_number_has_merge_key]'s own "AFTER A RESTART OVER A WRAPPED RING"
+     doc), which is orthogonal to whether eviction itself is gated; disabling the gate here
+     reproduces this call site's exact pre-Task-31 behavior so that limitation stays reachable. *)
   Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3
-    ~ring_capacity:wrapped_ring_capacity
+    ~ring_capacity:wrapped_ring_capacity ~enable_eviction_gate:false
     (fun ~replicas ~settle ~restart ->
       let r = replicas.(0) in
       (* op 1: committed AND materialized. The only op this consumer ever gets to. *)
@@ -1778,6 +1788,63 @@ let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry (
         (fingerprint snapshot_before)
         (fingerprint (durable_snapshot mat_dir)))
 
+(* ---------------------------------------------------------------------------------------------
+   Task 31 (audit-remediation): [eviction_blocked] is no longer structurally pinned at 0.
+
+   Before this task, nothing in this codebase's real (non-test-only) code ever supplied
+   [File_storage.create] a [?may_evict] predicate -- [Riptide_dst.Cluster.run_on_file_storage]'s own
+   call site (the one every DST scenario in this file goes through) simply never passed the
+   argument, so [Riptide_vsr.Replica.append_refusals]'s own [eviction_blocked] bucket had no way to
+   ever become nonzero anywhere this suite could reach, no matter how a scenario was written. This
+   test is the real, end-to-end proof that the gap is closed: it drives a [run_on_file_storage]
+   cluster (the SAME production-shaped call site every other scenario in this file uses, not a
+   hand-rolled one), commits [merge_key]-carrying batches (via [Riptide_batch_commit.Batch_commit],
+   the intended real caller of this mechanism -- see [cluster.mli]'s own doc on
+   [run_on_file_storage]'s [?may_evict] wiring) past a deliberately tiny [ring_capacity], and checks
+   [append_refusals] directly. *)
+let test_eviction_blocked_actually_increments_when_may_evict_is_wired () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      let tiny_ring_capacity = 2 in
+      Riptide_dst.Cluster.run_on_file_storage ~env ~dir ~seed:1 ~replica_count:3
+        ~ring_capacity:tiny_ring_capacity
+        (fun ~replicas ~settle ~restart:_ ->
+          let r = replicas.(0) in
+          let eviction_blocked replica =
+            List.assoc "eviction_blocked" (Replica.append_refusals replica)
+          in
+          Alcotest.(check int) "precondition: eviction_blocked starts at 0" 0
+            (eviction_blocked r);
+          (* Every write below carries a merge_key, so
+             [Batch_commit.write_at_op_number_has_merge_key] answers [true] for every op-number it
+             commits -- meaning NONE of them is ever evictable under this task's wiring (there is no
+             materialization watermark yet; see cluster.mli's own doc on this half-a-predicate
+             limitation). Committing more of them than [tiny_ring_capacity] holds therefore drives
+             real backpressure rather than silent eviction: op [tiny_ring_capacity + 1] cannot be
+             durably appended anywhere without evicting op 1, which the predicate refuses. *)
+          for n = 1 to tiny_ring_capacity + 3 do
+            Riptide_batch_commit.Batch_commit.propose
+              (Riptide_batch_commit.Batch_commit.create ~replica:r ())
+              ~idempotency_key:(Printf.sprintf "k%d" n)
+              [
+                {
+                  Riptide_batch_commit.Batch_commit.actor = "actor-1";
+                  causation = Value.content_hash (v (Printf.sprintf "k%d-c" n));
+                  correlation = Value.content_hash (v (Printf.sprintf "k%d-r" n));
+                  payload = v (Printf.sprintf "v%d" n);
+                  merge_key = Some "mk";
+                };
+              ];
+            settle ()
+          done;
+          Alcotest.(check bool)
+            "eviction_blocked > 0 on the primary -- not structurally pinned at 0 any more" true
+            (eviction_blocked r > 0);
+          Alcotest.(check int)
+            "backpressure, not silent progress: the log never advanced past what the ring can \
+             actually hold"
+            tiny_ring_capacity (Replica.commit_number r)))
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -1823,4 +1890,7 @@ let tests =
     ( "Task 13 fix round: the superblock repair brings a refusing replica back, with the crashed \
        replicas' own real prior view/commit values", `Quick,
       test_the_superblock_repair_brings_a_refusing_replica_back );
+    ( "Task 31 (audit-remediation): eviction_blocked actually increments once ?may_evict is really \
+       wired through run_on_file_storage's real File_storage.create call site", `Quick,
+      test_eviction_blocked_actually_increments_when_may_evict_is_wired );
   ]

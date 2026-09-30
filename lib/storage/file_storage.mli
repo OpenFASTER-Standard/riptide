@@ -138,3 +138,132 @@ val create :
     The predicate is in-memory state on the returned [t] and is deliberately not persisted: it is a
     policy, supplied afresh on each [create], evaluated against whatever [wal_highest_op_number]
     recovery found already on disk. *)
+
+val ring_capacity : t -> int
+(** [ring_capacity t] is the fixed slot count [t] was constructed with -- the same value passed to
+    {!create}'s own required [~ring_capacity] argument, read back rather than tracked separately
+    by a caller that already holds a [t]. Exists chiefly for the resize-before-wedge runbook
+    below, which needs an OLD store's own capacity to compute where its still-live entries
+    begin. *)
+
+val ring_margin : t -> int
+(** [ring_margin t] is how many more entries [t]'s ring can accept before the NEXT append would
+    have to evict something.
+
+    {b Task 31 (audit-remediation): the proactive, before-the-fact counterpart to
+    {!Riptide_vsr.Replica.append_refusals}'s [eviction_blocked]}, which only reports a refusal
+    AFTER {!create}'s own [?may_evict] has already declined one. A caller watching [ring_margin]
+    fall toward [0] can act -- resize via the runbook below, or otherwise relieve whatever
+    [?may_evict] policy it supplied -- before a single eviction is ever attempted, rather than
+    discovering the problem only once [eviction_blocked] has already started climbing.
+
+    [ring_capacity t] minus the number of entries currently live: before the ring has ever wrapped
+    ([wal_highest_op_number t <= ring_capacity t]), every appended entry is still live, so that
+    count is exactly [wal_highest_op_number t]; once it has wrapped, exactly [ring_capacity t]
+    entries are live at any one time (each new append evicts exactly one older one), so the live
+    count saturates at [ring_capacity t] and [ring_margin] saturates at [0]. It does not go
+    negative, and it does not distinguish "just wrapped" from "wrapped long ago" -- both report
+    [0], which is the correct reading for an early-warning signal: the next append will evict
+    something either way, and how long that has already been true is not this function's
+    question. *)
+
+val wal_seed_starting_op_number : t -> op_number:int -> unit
+(** [wal_seed_starting_op_number t ~op_number] declares that [t]'s WAL begins at [op_number]
+    rather than [1] -- the one primitive the resize-before-wedge runbook below needs, and the only
+    reason this function exists; no other caller in this codebase should ever reach for it.
+
+    {b Why it is needed at all.} {!wal_append}'s own sequencing guard requires
+    [op_number = wal_highest_op_number t + 1] on every call, unconditionally -- correct for the
+    ordinary case (a backend's WAL always starts at op 1), but exactly what makes it otherwise
+    impossible to seed a FRESH backend with only the still-live SUFFIX of another ring's WAL: that
+    suffix's first real op-number is whatever the old ring's own eviction left as its oldest
+    survivor, almost always well above 1, and there is no data left anywhere to replay the ops
+    below that point (the old ring already evicted them). This function is the escape hatch: it
+    moves [t]'s own bookkeeping forward without writing anything, so the very next {!wal_append}
+    can legally be [op_number] instead of [1].
+
+    @raise Invalid_argument if [wal_highest_op_number t <> 0] -- this seeds a VIRGIN backend's
+      starting point; it never fast-forwards one that already holds real appended state (whether
+      from this same process or recovered from disk on {!create}), which would silently discard
+      the difference between "genuinely never written" and "written, then this call pretended it
+      wasn't".
+    @raise Invalid_argument if [op_number < 1].
+
+    {b What reads back for every op-number below [op_number], forever.} [None] -- {!wal_read}'s
+    own out-of-range/never-written case, reached the same way it already is (nothing is written to
+    disk for them, so a header scan finds nothing there either, on this handle or after a later
+    reopen). That is the honest representation: those op-numbers' real data is gone (evicted by
+    whatever ring this store's data was copied from), and this function deliberately provides no
+    way to fabricate a readable substitute for them.
+
+    {b Purely in-memory, and cheap for exactly that reason.} No header or data slot is touched, so
+    a REOPEN of [t]'s directory never needs to know this call happened: {!create}'s own recovery
+    scan finds [op_number] and above's real headers on disk and recovers the same
+    [wal_highest_op_number] this call only ever approximated in memory for the one live handle
+    that made it. *)
+
+(** {2 The resize-before-wedge runbook (Task 31, audit-remediation)}
+
+    How to move a replica's WAL from a smaller ring to a larger one BEFORE the smaller one wedges
+    (either from ordinary eviction destroying data a caller still needs, or from {!create}'s own
+    [?may_evict] permanently refusing further appends) -- using only the primitives above, with no
+    dedicated "resize" entry point of its own. Watch {!ring_margin} approach [0] (or
+    {!Riptide_vsr.Replica.append_refusals}'s [eviction_blocked] start climbing) as the trigger to
+    run this, rather than a fixed schedule.
+
+    {[
+      let old_t = (* the existing, near-full (or already-wrapped) store *) in
+      let new_t = File_storage.create ~sw ~fs ~ring_capacity:bigger_capacity new_dir in
+      let old_highest = File_storage.wal_highest_op_number old_t in
+      (* THE SUBTLETY: where to start copying FROM. Naively starting at op 1 works only while
+         [old_t]'s ring has never wrapped; once it has, ops below this point were already
+         evicted, and [wal_read] returns [None] for them -- indistinguishable, from the read call
+         alone, from "the log simply doesn't reach that far yet". Treating an early [None] as
+         "done, nothing more to copy" either copies nothing at all (if op 1 already happens to be
+         evicted) or stops after copying only a prefix of the truly-live range -- both silent
+         under-copies. The correct starting point is the OLDEST entry [old_t] can still prove
+         live: *)
+      let start = max 1 (old_highest - File_storage.ring_capacity old_t + 1) in
+      (* Real op-numbers, not a renumbering from 1: this store's WAL is (or backs) a live
+         replica's actual consensus log, and [wal_highest_op_number]/[wal_append]'s own
+         sequencing guard are both stated in terms of the SAME op-numbers the replica itself
+         tracks -- a copy that renumbered starting at 1 would leave [new_t] reporting a
+         [wal_highest_op_number] wildly disagreeing with what the replica believes its own log
+         holds. *)
+      if start > 1 then File_storage.wal_seed_starting_op_number new_t ~op_number:start;
+      for op_number = start to old_highest do
+        match File_storage.wal_read old_t ~op_number with
+        | None ->
+          (* Only reachable if [old_t] misreported its own [wal_highest_op_number], or [start]
+             above was computed wrong -- both a bug in this procedure, never a normal outcome; a
+             real runbook should treat this as a hard failure; it means "not live" and "once
+             wrapped and never written" are actually cases that dropped this entry silently. *)
+          invalid_arg
+            (Printf.sprintf "resize: op_number %d expected live, read back None" op_number)
+        | Some data -> File_storage.wal_append new_t ~op_number data
+      done
+    ]}
+
+    {b [new_t]'s [ring_capacity] must be at least the number of entries actually being copied}
+    ([min old_highest (File_storage.ring_capacity old_t)]) -- the whole point of resizing is that
+    none of them get re-evicted by the copy itself. Passing a "larger" capacity that still is not
+    large enough silently defeats the runbook rather than erroring: an eviction during the copy
+    looks exactly like any other eviction to this module.
+
+    {b Do this copy against a [new_t] created WITHOUT [?may_evict].} [?may_evict]'s own gate (see
+    {!create}) decides whether to evict purely from OP-NUMBER ARITHMETIC ([op_number >
+    ring_capacity]), not from whether [new_t] itself ever really held a prior occupant at that
+    slot -- correct for an ordinary store (which always starts at op 1, so the arithmetic and real
+    occupancy always agree), but not for one seeded mid-sequence by this runbook: for every
+    [op_number] up to [start + File_storage.ring_capacity new_t - 1], the arithmetic points at an
+    op-number below [start] that [new_t] never actually wrote, and a supplied predicate would be
+    asked to bless evicting an entry that, from [new_t]'s own point of view, was never there to
+    lose in the first place. If ongoing [?may_evict] protection is wanted for [new_t] going
+    forward, attach it on a FRESH {!create} of the same directory once the copy above has
+    completed -- that reopen's own recovery scan re-derives [wal_highest_op_number] from the real
+    headers the copy just wrote, so it needs none of [wal_seed_starting_op_number]'s bookkeeping,
+    and the arithmetic-vs-occupancy mismatch above no longer applies to appends made from that
+    point on (though it can recur for another [File_storage.ring_capacity new_t] appends past
+    THAT point too, for the identical underlying reason -- this is a property of resizing a ring
+    at all, not specific to any one implementation choice here, and is disclosed rather than
+    solved). *)

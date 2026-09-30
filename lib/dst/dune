@@ -1,3 +1,8 @@
 (library
  (name riptide_dst)
- (libraries riptide riptide_vsr riptide_sim riptide_storage eio eio.mock))
+ ; riptide_batch_commit (Task 31, audit-remediation): [run_on_file_storage]'s own [File_storage.create]
+ ; call wires [?may_evict] to [Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key] --
+ ; see cluster.ml's own comment at that call site. Confirmed acyclic before this dependency was added:
+ ; riptide_batch_commit depends only on riptide/riptide_vsr/riptide_materialize, none of which depend
+ ; on riptide_dst.
+ (libraries riptide riptide_vsr riptide_sim riptide_storage riptide_batch_commit eio eio.mock))

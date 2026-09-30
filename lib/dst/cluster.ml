@@ -215,7 +215,7 @@ let for_test_settle_loop ~drain_round ~inflight ~yield ~wait_io ~deadline_budget
    --------------------------------------------------------------------------------------------- *)
 
 let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
-    ~make_storage ~wait_io ~delivery_rounds ?max_wait_duration ?clock body =
+    ~make_storage ~wait_io ~delivery_rounds ?max_wait_duration ?clock ?on_replica_created body =
   let net_seed, storage_seeds = split_seed seed ~replica_count in
   let net = Riptide_sim.Network.create ~faults:net_fault_config ~seed:net_seed () in
   for id = 1 to replica_count do
@@ -288,6 +288,13 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
            view to 1 so [Primary(1) = 1] and [replicas.(0)] is the primary a caller can [propose]
            against directly, matching [with_cluster_and_storage]'s own pin for the same reason. *)
         Riptide_vsr.Replica.for_test_set_view_number r 1;
+        (* Task 31 (audit-remediation): the forward-reference cell's fill-in half -- see
+           [run_on_file_storage]'s own comment at its [?may_evict] closure for the full mechanism.
+           [make_storage] (called above, building [fault_storages]) runs strictly BEFORE this
+           [Riptide_vsr.Replica.create] returns, so any [?may_evict] predicate closed over a cell
+           this call fills in can never observe it still empty -- see that same comment for why the
+           [None] branch it must still handle is provably unreachable rather than merely unlikely. *)
+        Option.iter (fun f -> f ~index:i r) on_replica_created;
         r)
   in
   let settle () =
@@ -501,6 +508,12 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
     | r ->
       replicas.(i) <- r;
       alive.(i) <- true;
+      (* Task 31: re-fill the same cell on every restart, not just the initial creation --
+         [storages.(i)]/[fault_storages.(i)] (and therefore any [?may_evict] closure captured at
+         [File_storage.create] time) survive a "crash" unchanged; only [Riptide_vsr.Replica.t]
+         itself is rebuilt. Without this, a predicate closed over the cell would keep consulting the
+         pre-crash replica object forever after the first restart. *)
+      Option.iter (fun f -> f ~index:i r) on_replica_created;
       true
     | exception Invalid_argument _ ->
       alive.(i) <- false;
@@ -602,6 +615,7 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
     ?(ring_capacity = default_ring_capacity)
     ?(net_fault_config = Riptide_sim.Network.default_fault_config)
     ?(storage_fault_config = Riptide_storage.Fault_injecting_storage.default_fault_config)
+    ?(enable_eviction_gate = true)
     (body :
       replicas:Riptide_vsr.Replica.t array ->
       settle:(unit -> unit) ->
@@ -612,14 +626,70 @@ let run_on_file_storage ~env ~dir ~seed ~replica_count ?(svc_limit = default_svc
     storage_fault_config;
   let fs = Eio.Stdenv.fs env in
   let clock = Eio.Stdenv.clock env in
+  (* Task 31 (audit-remediation): the actual finding this closes is that [eviction_blocked] was
+     structurally pinned at 0 -- nothing anywhere ever supplied [File_storage.create] a real
+     [?may_evict] predicate, so it could never have anything to refuse. The intended predicate,
+     {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}, needs a real
+     [Riptide_vsr.Replica.t] to read ([Replica.entries]) -- but [make_storage] below (which builds
+     the [?may_evict] closure passed to [File_storage.create]) runs BEFORE [with_cluster]'s own
+     [Riptide_vsr.Replica.create]/[restart] for that same index, so the closure cannot capture the
+     replica it will protect directly at the point it is built.
+
+     [replica_cells] is the forward-reference: one [Riptide_vsr.Replica.t option ref] per replica
+     index, created here (before [make_storage] ever runs), closed over by [?may_evict]'s own
+     closure below, and filled in by [with_cluster] itself (via [~on_replica_created]) immediately
+     after each [Replica.create]/[restart] call returns for that same index -- see those two call
+     sites' own comments in [with_cluster] for the fill-in half of this mechanism. *)
+  let replica_cells : Riptide_vsr.Replica.t option ref array =
+    Array.init replica_count (fun _ -> ref None)
+  in
   Eio.Switch.run @@ fun storage_sw ->
   with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_fault_config
     ~make_storage:(fun ~index ~replication_quorum ~prng ->
       let path = Filename.concat dir (string_of_int (index + 1)) in
+      (* [?enable_eviction_gate] (default [true], the correct production behavior): the ONE
+         override this harness exposes for a scenario that needs Task 31's own protection turned
+         OFF, and it exists for a genuinely narrow reason, not as a general escape hatch --
+         [test_dst_scenarios.ml]'s own
+         [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry] pins a
+         DIFFERENT, already-disclosed limitation (restart recovery cannot recover a
+         still-unmaterialized entry once the ring has wrapped -- see
+         {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}'s own "AFTER A
+         RESTART OVER A WRAPPED RING" doc) that is orthogonal to whether eviction itself is gated,
+         and its own scenario needs the ring to actually wrap via ordinary, UNPROTECTED eviction of
+         merge_key-carrying entries to reach that state at all -- exactly what this task's default
+         now prevents (there is no materialization watermark yet, so with the gate on, a
+         merge_key-carrying entry can never be evicted while still visible to
+         [Replica.entries], which never happens for that test's scenario without a restart in
+         between). Passing [~enable_eviction_gate:false] there reproduces this call site's exact
+         pre-Task-31 behavior, isolating that test to the limitation it actually targets. *)
+      let may_evict =
+        if not enable_eviction_gate then None
+        else
+          Some
+            (fun ~op_number ->
+              match !(replica_cells.(index)) with
+              | Some r ->
+                not (Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key r ~op_number)
+              | None ->
+                (* Provably unreachable, not merely unlikely: [?may_evict] is consulted only from
+                   inside [File_storage.wal_append] (see file_storage.mli's own "When it is
+                   consulted" clause), and the only appends this harness ever drives are the ones a
+                   live [Replica.t] for this SAME index issues from inside [with_cluster]'s
+                   dispatch loop / [body] -- both of which run strictly after
+                   [replica_cells.(index)] has already been filled in (see the two
+                   [on_replica_created] call sites in [with_cluster]). No op can exist to append
+                   before the replica that would append it exists. *)
+                failwith
+                  "Cluster.run_on_file_storage: ?may_evict consulted before this replica's \
+                   forward-reference cell was ever filled in -- should be unreachable, see this \
+                   call site's own comment")
+      in
       Riptide_storage.Fault_injecting_storage.create ~prng ~fault_config:storage_fault_config
         ~replication_quorum
         ~underlying:(module Riptide_storage.File_storage)
-        (Riptide_storage.File_storage.create ~sw:storage_sw ~fs ~ring_capacity path))
+        (Riptide_storage.File_storage.create ~sw:storage_sw ~fs ~ring_capacity ?may_evict path))
+    ~on_replica_created:(fun ~index r -> replica_cells.(index) := Some r)
       (* A real, tiny sleep on the REAL clock, not [Eio.Fiber.yield]: a fiber parked on an io_uring
          completion is not runnable, so yielding to it achieves nothing -- eio_linux only reaps
          completions when its run queue empties, which a yield-only loop never lets happen. This is

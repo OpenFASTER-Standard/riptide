@@ -846,6 +846,83 @@ let test_may_evict_applies_after_a_reopen_against_the_recovered_op_number () =
         (Invalid_argument "wal_append: eviction blocked for op_number 1")
         (fun () -> File_storage.wal_append t2 ~op_number:3 "c"))
 
+(* ============================================================================================
+   TASK 31 (audit-remediation): ring_margin, a proactive early-warning signal for the
+   resize-before-wedge runbook documented in file_storage.mli. Per Controller Ruling 1 for this
+   task, [ring_margin] is a [File_storage]-specific function (like [ring_capacity]/[?may_evict]
+   above it), not part of the generic [Storage_intf.S] -- so it is exercised here directly against
+   a concrete [File_storage.t], never through the abstract interface. *)
+let test_ring_margin_reports_real_remaining_capacity () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:16 dir in
+      for op = 1 to 10 do
+        File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
+      done;
+      Alcotest.(check int) "6 slots of margin remain (16 - 10)" 6 (File_storage.ring_margin t))
+
+let test_ring_margin_is_zero_once_the_ring_has_wrapped () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:4 dir in
+      for op = 1 to 6 do
+        File_storage.wal_append t ~op_number:op (Printf.sprintf "entry-%d" op)
+      done;
+      Alcotest.(check int) "margin saturates at 0 once wrapped, never negative" 0
+        (File_storage.ring_margin t))
+
+(* ============================================================================================
+   TASK 31: the resize-before-wedge runbook, documented in file_storage.mli. The real subtlety
+   under test: once the OLD ring has genuinely WRAPPED, the correct starting op-number to copy
+   FROM is the oldest still-live one, not op 1 -- naively starting at op 1 would hit an early
+   [None] from [wal_read] (op 1 is already evicted) and either under-copy or mis-diagnose "done"
+   too early. [ring_capacity:2] with 5 appends wraps the ring twice over (ops 1..3 evicted, ops 4
+   and 5 still live), so this genuinely exercises wraparound, not mere near-fullness. *)
+let test_a_ring_can_be_resized_before_it_wedges_by_copying_live_entries () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun old_dir ->
+      with_tmp_dir (fun new_dir ->
+          Eio.Switch.run @@ fun sw ->
+          let old_t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:2 old_dir in
+          for op = 1 to 5 do
+            File_storage.wal_append old_t ~op_number:op (Printf.sprintf "entry-%d" op)
+          done;
+          (* Precondition: the ring really did wrap, and ops 1..3 are genuinely gone. *)
+          Alcotest.(check bool) "precondition: op 1 was evicted" true
+            (File_storage.wal_read old_t ~op_number:1 = None);
+          Alcotest.(check bool) "precondition: op 3 was evicted" true
+            (File_storage.wal_read old_t ~op_number:3 = None);
+          Alcotest.(check bool) "precondition: op 4 is still live" true
+            (File_storage.wal_read old_t ~op_number:4 <> None);
+          let new_t = File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8 new_dir in
+          let old_highest = File_storage.wal_highest_op_number old_t in
+          let start = max 1 (old_highest - File_storage.ring_capacity old_t + 1) in
+          Alcotest.(check int) "the correct starting point is the oldest still-live op, not 1" 4
+            start;
+          if start > 1 then File_storage.wal_seed_starting_op_number new_t ~op_number:start;
+          for op_number = start to old_highest do
+            match File_storage.wal_read old_t ~op_number with
+            | None ->
+              Alcotest.fail
+                (Printf.sprintf "op_number %d expected live in the old store, read back None"
+                   op_number)
+            | Some data -> File_storage.wal_append new_t ~op_number data
+          done;
+          (* The new, larger store holds every entry the old one had -- both still-live ones,
+             exactly, no more and no less -- and nothing else. *)
+          Alcotest.(check (option string)) "op 4 copied correctly" (Some "entry-4")
+            (File_storage.wal_read new_t ~op_number:4);
+          Alcotest.(check (option string)) "op 5 copied correctly" (Some "entry-5")
+            (File_storage.wal_read new_t ~op_number:5);
+          Alcotest.(check (option string)) "op 1, already gone from the old store, stays gone" None
+            (File_storage.wal_read new_t ~op_number:1);
+          Alcotest.(check (option string)) "op 3, already gone from the old store, stays gone" None
+            (File_storage.wal_read new_t ~op_number:3);
+          Alcotest.(check int) "new store's highest op number matches the old one" old_highest
+            (File_storage.wal_highest_op_number new_t)))
+
 (* Task 11: the PHYSICAL guard -- a real [flock(2)] on the target directory, held for the whole
    lifetime of the handle [create] returns, closing a real, live-reproduced Critical finding (two
    genuinely separate OS processes both constructing a store over the same directory at once could
@@ -1410,4 +1487,13 @@ let tests =
     ( "Task 19 Bug 2: downgrade marks direct_capable false before attempting the reopen",
       `Quick,
       test_downgrade_marks_direct_incapable_before_attempting_the_reopen );
+    ( "Task 31: ring_margin reports real remaining capacity",
+      `Quick,
+      test_ring_margin_reports_real_remaining_capacity );
+    ( "Task 31: ring_margin saturates at 0 once the ring has wrapped",
+      `Quick,
+      test_ring_margin_is_zero_once_the_ring_has_wrapped );
+    ( "Task 31: a ring can be resized before it wedges by copying live entries, past wraparound",
+      `Quick,
+      test_a_ring_can_be_resized_before_it_wedges_by_copying_live_entries );
   ]

@@ -558,6 +558,35 @@ let wal_read t ~op_number =
 
 let wal_highest_op_number t = t.highest_op_number
 
+(* Task 31 (audit-remediation): a plain accessor for the value every caller already supplied to
+   [create] -- see file_storage.mli's own doc for why this exists (chiefly so the
+   resize-before-wedge runbook can compute an OLD store's starting op-number from [t] alone). *)
+let ring_capacity t = t.ring_capacity
+
+(* Task 31 (audit-remediation): the proactive counterpart to [Riptide_vsr.Replica.append_refusals]'s
+   [eviction_blocked] -- see file_storage.mli's own doc for the full "early warning" framing. The
+   live-entry count needs no scan: before the ring has ever wrapped ([highest_op_number <=
+   ring_capacity]) every appended entry is still live, so the count is exactly [highest_op_number];
+   once wrapped, exactly [ring_capacity] entries are ever live at once (each append evicts exactly
+   one). [min] folds both cases into one expression without a branch. *)
+let ring_margin t = t.ring_capacity - min t.highest_op_number t.ring_capacity
+
+(* Task 31 (audit-remediation): the one primitive the resize-before-wedge runbook (file_storage.mli)
+   needs and the only reason this function exists -- see that doc for the full "why" (in short:
+   [wal_append]'s own sequencing guard requires starting at op 1 for a virgin backend, which makes
+   it otherwise impossible to seed a fresh ring with only the still-live SUFFIX of another ring's
+   WAL, since the ops below that suffix were already evicted from the source and cannot be
+   replayed). Purely in-memory: no header or data is written, so a later reopen's own recovery scan
+   is unaffected by whether this was ever called -- it only ever trusts what is really on disk. *)
+let wal_seed_starting_op_number t ~op_number =
+  if t.highest_op_number <> 0 then
+    invalid_arg
+      "wal_seed_starting_op_number: t already has entries (wal_highest_op_number > 0) -- this \
+       seeds a virgin backend's starting point, it never fast-forwards one that already holds \
+       real appended state";
+  if op_number < 1 then invalid_arg "wal_seed_starting_op_number: op_number must be >= 1";
+  t.highest_op_number <- op_number - 1
+
 (* {!Storage_intf.S.wal_highest_durable_op_number} (Task 13 re-review finding 2): the header-only
    scan, exported. A fresh scan rather than a cached field on purpose -- [t.highest_op_number] is the
    STRICT value maintained across appends/truncates, and the whole point here is the case where the
