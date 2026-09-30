@@ -493,11 +493,12 @@ val redact : t -> event_id:string -> unit
     [test_a_pre_redaction_keystore_backup_defeats_redaction] in [test/test_redaction.ml]).
 
     {b The real architecture, stated precisely rather than gestured at:} durability of a wrapped
-    DEK does {b not} come from this system's own replication the way the ciphertext's does. VSR
-    replicates the payload byte-identically to every replica because the wrapped DEK never enters
-    that payload at all -- {!encrypt_for_storage} writes it with a plain
-    {!Riptide_storage.File_kv_store.put} straight into [t]'s own local [kv], a step VSR has no
-    part in and never sees. Only the replica a given {!encrypt_for_storage} call actually runs on
+    DEK does {b not} come from this system's own replication the way the ciphertext's does.
+    {!encrypt_for_storage} writes the wrapped DEK with a plain
+    {!Riptide_storage.File_kv_store.put} straight into [t]'s own local [kv] -- a step VSR has no
+    part in and never sees -- so the wrapped DEK never enters the replicated payload at all, unlike
+    the ciphertext, which VSR does replicate byte-identically to every replica. Only the replica a
+    given {!encrypt_for_storage} call actually runs on
     ever holds that DEK; a later view change that moves the primary elsewhere leaves that DEK
     behind on the old primary while new writes' DEKs accumulate on the new one, so the DEKs
     protecting one log can end up scattered across whichever machine happened to be primary when
