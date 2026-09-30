@@ -36,6 +36,19 @@
     directly from the spec: no [PrepareOk] re-send on [StartView], and only a higher-view
     [StartViewChange] (never a higher-view [DoViewChange]) makes a replica adopt a higher view.
 
+    {b Doc-comment convention for symbols this signature does not export} (final whole-branch
+    review of the audit-remediation branch, finding M1): use an odoc code span [like_this], never a
+    cross-reference [{!like_this}]. Several of this module's most-discussed functions --
+    [adopt_durable_log], [durable_append], [truncate_wal], [prefix_ok], [slot_state] -- are private
+    to [replica.ml] and are absent from this signature, so [{!...}] on them can NEVER resolve, no
+    matter how this project's dune/odoc packaging changes. That is a different, permanent thing from
+    the known, already-ruled-out-of-scope cross-library case ([{!Riptide_batch_commit}] just above,
+    and every other [{!Riptide_X.Y}] in this repo), which fails only because no library here has a
+    [public_name] yet. Tasks 3, 12 and 33 each introduced [{!...}] references of the former kind
+    while documenting their own new guards; they are now code spans. Stdlib exceptions
+    ([Invalid_argument], [Out_of_memory], [Sys_error]) take the same treatment, and already did
+    everywhere else in this file.
+
     {b View number}: {!handle_message} enforces VSR.tla's own [m.view = View(r)] guard by
     dropping any [Prepare]/[Prepare_ok] (the two normal-case types that carry a [view] field)
     whose [view] isn't exactly {!view_number}'s current value. The view-change message types name
@@ -232,7 +245,7 @@ val create :
     blocks the protocol; {!check_timeout} can never trigger it, since none of the four commit sites
     is reachable from it — it reaches [SendDVC] only, never [SendSV]) {b exactly once per genuine increase} in {!commit_number},
     with [~old_commit] the value immediately before the change and [~new_commit] the value
-    immediately after. It is given plain [int]s and nothing else: {!Replica} is Layer 0 and stays
+    immediately after. It is given plain [int]s and nothing else: [Replica] is Layer 0 and stays
     domain-agnostic about what a consumer does with commit progress (the ring-eviction watermark is
     the first consumer). Omitting it is the zero-cost default and leaves behaviour bit-for-bit
     identical to before this parameter existed.
@@ -812,7 +825,7 @@ exception Sender_mismatch of string
 (** Raised by {!handle_message} — see its own doc comment for exactly when and why — on a mismatch
     between a decoded message's own claimed sender and the transport-authenticated [~sender] it
     actually arrived from. {b Audit-remediation Task 3, Finding 1 of the fix round}: this used to
-    be a bare [Invalid_argument], overloading the same exception {!durable_append}'s own escape
+    be a bare [Invalid_argument], overloading the same exception [durable_append]'s own escape
     hatch uses for a completely different condition (an unclassified backend refusal that must
     NEVER be laundered into "the protocol declined an op" — see [replica.ml]'s comment at that
     raise site). A caller whose dispatch loop absorbs [Invalid_argument] to stay total against a
@@ -821,18 +834,18 @@ exception Sender_mismatch of string
     exactly the sender-mismatch case and let everything else propagate unchanged. *)
 
 exception Committed_prefix_mismatch of string
-(** Raised by {!adopt_durable_log} — reached from {!handle_message}'s [Start_view] dispatch and
+(** Raised by [adopt_durable_log] — reached from {!handle_message}'s [Start_view] dispatch and
     from the internal, [Do_view_change]-driven [SendSV] action (see {!handle_message}'s own doc
     comment) — when an incoming log's content at some op-number [o] in [1, commit_number] disagrees
     with what THIS replica already durably holds and regards as committed at that same [o]. {b
-    Audit-remediation Task 33}: {!adopt_durable_log}'s own prefix-matching walk used to just STOP at
+    Audit-remediation Task 33}: [adopt_durable_log]'s own prefix-matching walk used to just STOP at
     the first content mismatch and let the caller's truncate-then-reappend silently overwrite
     everything from there on, including already-committed op-numbers — a same-length, differently
-    forged log passes every existing LENGTH-based guard ({!truncate_wal}'s own
+    forged log passes every existing LENGTH-based guard ([truncate_wal]'s own
     [resulting_length < committed] check, the Review-Focus fix) without ever having its CONTENT
     compared against what is already committed. This closes that gap: the whole adoption is refused,
     not just truncated to the point of disagreement, so nothing already committed is put at risk by
-    a partial rewrite either. See [replica.ml]'s own comment at {!adopt_durable_log} for the exact
+    a partial rewrite either. See [replica.ml]'s own comment at [adopt_durable_log] for the exact
     check, including why it deliberately reads [commit_number] as it stands at that function's own
     entry rather than either caller's own [~committed] argument.
 
@@ -882,7 +895,7 @@ val handle_message : t -> sender:int -> string -> unit
     {b {!Sender_mismatch} is not this function's only disclosed exception} (audit-remediation
     Task 33): the [Start_view] dispatch described below can also raise {!Committed_prefix_mismatch}
     — see that exception's own doc comment for exactly when, and [replica.ml]'s own comment at
-    {!adopt_durable_log} (the shared function both [Start_view]'s dispatch and the internal
+    [adopt_durable_log] (the shared function both [Start_view]'s dispatch and the internal
     [Do_view_change]-driven [SendSV] action funnel through) for the full mechanism. A caller that
     already catches {!Sender_mismatch} to stay total against adversarial input must catch this one
     too, by name, the same way — see the two exceptions' own doc comments for why they are
@@ -1169,13 +1182,13 @@ val append_refusals : t -> (string * int) list
       opposite of what it means — that the entry can never be durable here — and would make this
       counter useless for the lag signal described above.
     - [storage_fault] (Task 12, audit-remediation Decision 3.3) — a REAL, narrowly-classified
-      resource condition out of the backend: {!Out_of_memory} itself, or an
+      resource condition out of the backend: [Out_of_memory] itself, or an
       {!Eio.Io}/bare {!Unix.Unix_error} wrapping exactly one of four errnos — [ENOSPC] (disk full),
       [EDQUOT] (quota exceeded — OCaml's [Unix.error] has no symbolic constructor for this, so it is
       matched as [EUNKNOWNERR 122], its value on every Linux this runs on), [EIO] (hardware I/O
       error), or [ENOMEM] (allocation failure at the syscall level). Before this bucket existed,
       none of these were [Invalid_argument] at all, so they matched nothing below and propagated
-      straight out of {!durable_append} as an unhandled exception instead of being refused like
+      straight out of [durable_append] as an unhandled exception instead of being refused like
       every other kind of append failure — closing Storage-Important-1 (a disk filling up under a
       live {!Riptide_storage.File_storage} could kill the whole replica process).
 
