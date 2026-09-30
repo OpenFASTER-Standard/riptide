@@ -89,5 +89,6 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
         let encoded = t.encode merged in
         match KV.put t.kv ~key:merge_key encoded with
         | () -> ()
-        | exception Invalid_argument msg -> raise (Value_too_large msg))
+        | exception Invalid_argument msg ->
+          raise (Value_too_large (Printf.sprintf "merge_key %S -- %s" merge_key msg)))
 end

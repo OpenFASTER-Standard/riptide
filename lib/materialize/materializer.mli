@@ -1,8 +1,10 @@
 exception Value_too_large of string
 (** Raised by {!Make.write} when the merged accumulator's encoded size exceeds the underlying
     [KV]'s own value-size bound (see {!Make.write}'s own doc comment for the full account of when
-    and why this happens, and what it means for the accumulator). Carries the same message
-    [KV.put]'s own [Invalid_argument] raised, unchanged.
+    and why this happens, and what it means for the accumulator). The message is formatted as
+    ["merge_key %S -- <KV message>"], where ["<KV message>"] is the original message from
+    [KV.put]'s own [Invalid_argument]. This makes the failing [merge_key] visible alongside the
+    original size-mismatch details.
 
     Declared here, at this module's own top level, rather than nested inside {!Make}'s functor
     body: {!Make} is a generative functor, so a type or exception declared inside its body would

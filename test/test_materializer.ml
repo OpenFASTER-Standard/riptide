@@ -244,6 +244,34 @@ let test_writes_to_different_merge_keys_are_not_serialized () =
     "\"b\"'s write is unaffected by \"a\"'s lock" [ "from-b" ]
     (G_set.elements (GMB.read m ~merge_key:"b"))
 
+(* Helper to overflow the value size limit (4096 bytes) *)
+let overflow_a_key ~merge_key =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" dir in
+      let m = GM.create ~kv ~owner:"materializer" ~decode:g_set_decode ~encode:g_set_encode in
+      (* Create a list of strings large enough that encoding will exceed 4096 bytes *)
+      let large_strings = List.init 500 (fun i -> Printf.sprintf "very-long-string-to-exceed-max-value-size-%d" i) in
+      GM.write m ~merge_key (G_set.of_list large_strings))
+
+let test_overflow_error_names_the_merge_key () =
+  let test_key = "the-test-key-identifying-overflow" in
+  let string_contains haystack needle =
+    try ignore (Str.search_forward (Str.regexp_string needle) haystack 0); true
+    with Not_found -> false
+  in
+  (* Verify the error message actually contains the merge_key by catching and checking *)
+  try
+    overflow_a_key ~merge_key:test_key;
+    Alcotest.fail "expected Value_too_large exception"
+  with
+  | Riptide_materialize.Materializer.Value_too_large msg ->
+    if string_contains msg test_key then
+      () (* Pass: merge_key is in the message *)
+    else
+      Alcotest.fail (Printf.sprintf "error message does not contain merge_key %S: %s" test_key msg)
+
 let tests =
   [ ("convergence regardless of fold order", `Quick, test_convergence_regardless_of_fold_order);
     ( "create rejects a kv tagged for a different owner",
@@ -257,4 +285,7 @@ let tests =
       test_concurrent_writers_to_one_merge_key_lose_no_updates );
     ( "writes to different merge_keys are not serialized against each other",
       `Quick,
-      test_writes_to_different_merge_keys_are_not_serialized ) ]
+      test_writes_to_different_merge_keys_are_not_serialized );
+    ( "overflow error names the merge_key",
+      `Quick,
+      test_overflow_error_names_the_merge_key ) ]
