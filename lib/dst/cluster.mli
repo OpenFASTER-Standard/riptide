@@ -30,9 +30,22 @@ type superblock_repair = {
     NOT faithful and must not be copied into new scenarios.} A live peer's CURRENT
     [view_number]/[last_normal_view] describe THAT replica's progress, which may be strictly ahead
     of the crashed one's; supplying the peer's higher [last_normal_view] makes the repaired replica
-    WIN view-change log selection with a STALE log and silently replace the cluster's real committed
-    values with its own (traced and pinned in [test/test_vsr_replica_recovery.ml]'s
-    [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data]). A scenario models
+    WIN view-change log selection with a STALE log, putting the cluster's real committed values at
+    risk (traced and pinned in [test/test_vsr_replica_recovery.ml]'s
+    [test_a_rebuild_copying_a_live_peers_current_values_is_now_refused_not_replaced]).
+
+    {b Narrowed, not closed, by audit-remediation Task 33} (final whole-branch review, finding I1 --
+    this paragraph was written by Task 13 and said "silently replace the cluster's real committed
+    values with its own", and it named that same test under its PRE-Task-33 name,
+    [..._replaces_committed_data]; Task 33 both renamed the test and changed what it asserts, and
+    swept the accompanying disclosure into [Riptide_storage.Storage_intf] and
+    [Riptide_vsr.Replica] but not into this file): {!Riptide_vsr.Replica.Committed_prefix_mismatch}
+    now makes an honest survivor REFUSE such a log outright rather than adopt it, so the corruption
+    stays confined to the mis-repaired replica instead of replacing committed data cluster-wide.
+    That is a real narrowing, not a fix -- a replica with no readable local copy at the disputed
+    op-numbers still adopts the wrong log silently (see that exception's own doc comment for the
+    residual Absent/Corrupt gap) -- so everything this paragraph requires of a scenario still
+    stands unchanged. A scenario models
     the operator honestly only by supplying the crashed replica's OWN prior state — which a scenario,
     unlike a real operator, can simply read off that replica before crashing it. {b That is a
     privilege only a scenario has}: round 3's finding 1 established that a real operator has no
