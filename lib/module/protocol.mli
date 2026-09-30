@@ -29,8 +29,10 @@ val create :
     - [initial] is not in [states]
     - any transition's [from_state] or [to_state] is not in [states]
     - two transitions share the same [(from_state, on_call)] pair
-      (nondeterministic protocol; the FSM must have exactly one next state
-      for any given (state, call) pair, never zero or multiple). *)
+      (rejects nondeterminism; the protocol must not define multiple next states
+      for the same state and call). Having zero transitions for a given
+      [(state, call)] pair is normal and expected — that's what {!step} returns
+      [Error] for. *)
 
 (** An in-progress run through the protocol, tracking the current state. *)
 type checker
