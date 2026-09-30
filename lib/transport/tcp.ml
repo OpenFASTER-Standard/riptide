@@ -189,15 +189,21 @@ let default_inbox_capacity ~peers = max 16 (4 * List.length peers)
    of this task there is no heartbeat or other synthetic non-silence mechanism anywhere in this
    codebase's real VSR implementation: [lib/vsr/replica.ml]'s own [check_timeout] doc comment
    confirms a caller-driven wall-clock timer that would notice "no Prepare/heartbeat seen recently"
-   is still only a hypothetical future extension, not something built, and nothing today calls
-   [check_timeout] outside test harnesses on any real wall-clock schedule at all (confirmed by
-   grepping every non-test caller: there are none). Concretely, that means every message this
-   module ever carries in real operation -- Prepare/PrepareOk/Commit from client writes, or
-   StartViewChange/DoViewChange/StartView from a view change -- is driven by something a CLIENT or
-   an operator did, not by any periodic internal clock. A cluster with no client write traffic for
-   an extended stretch (a quiet night, a batch-oriented workload with long gaps between jobs, a
-   staging/dev cluster left idle) is, today, honestly indistinguishable from this module's own
-   perspective from one that has gone silently wrong -- there is no lower bound this module can
+   is still only a hypothetical future extension, not something built. Every actual call site of
+   [check_timeout] is either under [test/*.ml] or under [explore/*.ml]'s own DST/simulation
+   exploration harnesses (e.g. [explore/explore_dst.ml], [explore/trace_dst.ml]) -- confirmed by
+   grepping every call site directly, not assumed -- and none of those drive it on a real wall
+   clock either: the [explore/*.ml] harnesses fire it as a round-driven "timeout storm" inside a
+   seeded, simulated run ([Riptide_sim.Prng]-keyed rounds, not [Unix.gettimeofday]/[Eio.Time]), the
+   same DST style [test/test_dst_scenarios.ml] already uses. So while [check_timeout] is not
+   LITERALLY uncalled outside tests, nothing that calls it is a real, wall-clock/production driver
+   -- the underlying fact this default's justification actually depends on. Concretely, that means
+   every message this module ever carries in real operation -- Prepare/PrepareOk/Commit from client
+   writes, or StartViewChange/DoViewChange/StartView from a view change -- is driven by something a
+   CLIENT or an operator did, not by any periodic internal clock. A cluster with no client write
+   traffic for an extended stretch (a quiet night, a batch-oriented workload with long gaps between
+   jobs, a staging/dev cluster left idle) is, today, honestly indistinguishable from this module's
+   own perspective from one that has gone silently wrong -- there is no lower bound this module can
    observe on how long *legitimate* silence lasts, because nothing yet guarantees an upper bound on
    it either.
 

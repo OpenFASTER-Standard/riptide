@@ -59,15 +59,22 @@
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
    19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372, 19391,
-   19410, 19401-19402, 19421-19422) so a re-run or a future added test in this file can't collide
+   19410, 19431-19432, 19441-19442) so a re-run or a future added test in this file can't collide
    even if an earlier test's sockets are still winding down -- [Tcp.create] itself passes
    [~reuse_addr:true] to [Eio.Net.listen], but distinct ports sidestep the question entirely rather
    than relying on that. [Tcp.create] does not expose its internal listening socket, so there is no
    way to ask it for an OS-assigned ephemeral (port 0) address from outside; fixed, spread-out ports
    are the only option here. Note [19410] is dialed directly with raw sockets, never through
    [Tcp.create] or [with_mesh] -- it belongs to a probe process forked from this file, not a peer in
-   this file's own [Eio_main.run]. [19422] (Task 30's read-idle-timeout test) is likewise a raw
-   listener standing in for peer 2, not a real [Tcp.create] peer. *)
+   this file's own [Eio_main.run]. [19442] (Task 30's read-idle-timeout test) is likewise a raw
+   listener standing in for peer 2, not a real [Tcp.create] peer.
+
+   This file also shares one OS process (the [test_riptide] binary) with [test_transport_shared.ml],
+   which independently claims its own, disjoint port range (19401-19403, as of this writing -- see
+   that file's own top-of-function comment on [test_tcp_echo_between_peers]) for its own real
+   [Tcp.create]-backed peers. Neither file's ports may ever overlap the other's: check that file's
+   own claimed range before adding a new port here, the same discipline it already applies in the
+   other direction. *)
 
 open Riptide_transport
 
@@ -1193,7 +1200,7 @@ let test_emfile_on_accept_does_not_kill_the_listener () =
    total -- never more, and, crucially, never anywhere close to the far larger number of messages
    actually sent, which is exactly the bound this fix exists to prove. *)
 let test_inbox_capacity_is_bounded_not_unbounded () =
-  let peer_specs = [ (1, "127.0.0.1", 19401); (2, "127.0.0.1", 19402) ] in
+  let peer_specs = [ (1, "127.0.0.1", 19431); (2, "127.0.0.1", 19432) ] in
   let inbox_capacity = 5 in
   let total_sent = 200 in
   Eio_main.run @@ fun env ->
@@ -1274,7 +1281,7 @@ let test_inbox_capacity_is_bounded_not_unbounded () =
 exception Read_idle_timeout_probe_done
 
 let test_established_connection_is_closed_after_read_idle_timeout () =
-  let peer_specs = [ (1, "127.0.0.1", 19421); (2, "127.0.0.1", 19422) ] in
+  let peer_specs = [ (1, "127.0.0.1", 19441); (2, "127.0.0.1", 19442) ] in
   let read_idle_timeout = 5.0 (* short, test-only value; see this test's own comment above for why
                                   the real ~30-minute default is deliberately not used here *) in
   Eio_main.run @@ fun env ->
@@ -1289,7 +1296,7 @@ let test_established_connection_is_closed_after_read_idle_timeout () =
      Eio.Switch.run (fun sw ->
          let listener =
            Eio.Net.listen ~reuse_addr:true ~backlog:1 ~sw net
-             (`Tcp (Eio.Net.Ipaddr.V4.loopback, 19422))
+             (`Tcp (Eio.Net.Ipaddr.V4.loopback, 19442))
          in
          Eio.Fiber.both
            (fun () ->

@@ -132,8 +132,13 @@ let test_sim_receive_reports_the_authenticated_sender () =
    mirrors test_transport_tcp.ml's own [with_mesh] pattern: force the switch to finish via
    [Eio.Switch.fail] once the shared test body returns, rather than let [Eio.Switch.run] block
    forever waiting for the never-ending listener/reader/writer fibers [Tcp.create] forks onto it.
-   Distinct ports (19401-19403) from every range test_transport_tcp.ml already uses, so the two
-   files' tests can never collide even if run back-to-back.
+   Distinct ports (19401-19403) from every range test_transport_tcp.ml already uses (as of this
+   writing: 19301-19303, 19311-19312, 19321-19323, 19331-19333, 19341-19342, 19351-19353,
+   19361-19362, 19371-19372, 19391, 19410, 19431-19432, 19441-19442 -- see that file's own
+   top-of-file port-choice comment), so the two files' tests can never collide even if run
+   back-to-back. Both files compile into the same [test_riptide] binary, so this is a real,
+   checked-by-hand invariant, not a hypothetical one: check that file's own claimed ranges before
+   adding a new port here, the same discipline it already applies in the other direction.
 
    [Tcp] is unconditionally mutually-authenticated, so this glue also has to mint a real X.509
    identity per peer (one shared CA, one leaf each -- see test_transport_tcp.ml's own material for
