@@ -169,7 +169,7 @@ let test_tcp_echo_between_peers () =
                  fun () ->
                    let t =
                      Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs
-                       ~tls:(shared_tcp_identity my_id)
+                       ~tls:(shared_tcp_identity my_id) ()
                    in
                    Hashtbl.replace handles my_id t)
                peer_specs);
@@ -200,7 +200,7 @@ let test_tcp_receive_reports_the_authenticated_sender () =
                  fun () ->
                    let t =
                      Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs
-                       ~tls:(shared_tcp_identity my_id)
+                       ~tls:(shared_tcp_identity my_id) ()
                    in
                    Hashtbl.replace handles my_id t)
                peer_specs);

@@ -149,15 +149,16 @@
     unrecoverable, at which point the failure is raised on [sw] rather than retried silently
     forever -- this module has no other channel to report it on.
 
-    Because there is no cap on the number of concurrent accepted connections, any party able to
-    reach this listener's port can drive it into fd exhaustion (and therefore the unrecoverable
-    case above) simply by opening connections and stalling. Mutual TLS does not fix this: an
-    attacker with no certificate at all still gets a socket, a fiber and an fd for as long as the
-    handshake wait allows. What bounds it is that both waits are bounded (~10s for the handshake,
-    ~10s for the preamble), so each such connection is a transient cost rather than a permanent
-    one. Connection-count limiting and per-source rate limiting remain out of scope -- noted here
-    because this is the specific mechanism by which reachability of the port stays a liveness
-    concern even though it is no longer an authenticity one.
+    {!create}'s [max_connections] bounds the number of concurrently accepted connections this
+    listener will ever be handling at once (mid-handshake or fully connected), which closes the
+    fd-exhaustion route this paragraph used to describe as open: without it, any party able to
+    reach this listener's port could drive it into fd exhaustion (and therefore the unrecoverable
+    case above) simply by opening connections and stalling -- mutual TLS alone does not fix this,
+    since an attacker with no certificate at all still gets a socket, a fiber and an fd for as long
+    as the handshake wait allows. Both handshake-layer waits (~10s for the TLS handshake, ~10s for
+    the preamble) remain in place regardless, so even a connection admitted under the cap is only
+    ever a transient cost, never a permanent one. Per-source rate limiting (as opposed to a single
+    process-wide count) remains out of scope.
 
     A connection whose TLS handshake is {e refused} -- no certificate, or one from an authority
     this cluster does not trust -- is logged and dropped, and deliberately does {e not} count
@@ -239,14 +240,20 @@ val max_message_size : int
       something the other rejects. *)
 
 val create :
+  ?max_connections:int ->
   sw:Eio.Switch.t ->
   net:_ Eio.Net.t ->
   clock:_ Eio.Time.clock ->
   my_id:int ->
   peers:(int * string * int) list ->
   tls:Tls_identity.t ->
+  unit ->
   t
-(** [create ~sw ~net ~clock ~my_id ~peers ~tls] brings up this peer's side of the transport mesh:
+(** [create ~sw ~net ~clock ~my_id ~peers ~tls ()] brings up this peer's side of the transport
+    mesh. The trailing [unit] is only there so that [?max_connections] can be optional at all --
+    every other argument is a required label, and OCaml needs a final non-labeled argument to know
+    where the optional-argument list ends (the same pattern {!Riptide_vsr.Replica.create}'s own
+    [?on_commit_advanced] uses in this codebase) -- it carries no meaning of its own:
 
     - Starts a listener on [my_id]'s own [(host, port)] entry in [peers].
     - Dials every peer in [peers] with an id greater than [my_id] (retrying with a short sleep,
@@ -271,6 +278,17 @@ val create :
     separate optional ones on purpose: the three values are only meaningful together (see
     {!Tls_identity.create}, which validates their mutual consistency once, up front), and there is
     no supported configuration of this transport that omits them.
+
+    [max_connections] caps how many connections this peer's listener will ever have
+    simultaneously accepted (mid-handshake or fully connected) -- see the implementation's
+    [run_accept_loop] for the mechanism, and its [default_max_connections] for the default
+    ([max 16 (4 * List.length peers)]) and the concurrency model that default is sized against.
+    This closes an audit finding: without it, any party able to reach this listener's port could
+    exhaust this process's file descriptors, and therefore kill the listener, simply by opening
+    connections and never completing them (reproduced at 315 concurrent connections). A connection
+    attempted beyond the cap is never handed to [accept(2)] at all -- it sits in the kernel's own
+    listen backlog ([listen_backlog]) until a slot frees, rather than being individually accepted
+    and then closed by this module.
 
     [peers] is the full membership table, including an entry for [my_id] itself. [create] blocks
     until this peer has an outbound path ready to {e each specific} other peer id in [peers] (not

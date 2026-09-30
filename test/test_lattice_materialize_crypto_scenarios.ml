@@ -1686,12 +1686,12 @@ let test_no_plaintext_on_a_real_mtls_wire () =
              t1 :=
                Some
                  (Riptide_transport.Tcp.create ~sw ~net ~clock ~my_id:1 ~peers:peers_for_1
-                    ~tls:(peer_identity 1)))
+                    ~tls:(peer_identity 1) ()))
            (fun () ->
              t2 :=
                Some
                  (Riptide_transport.Tcp.create ~sw ~net ~clock ~my_id:2 ~peers:peers_for_2
-                    ~tls:(peer_identity 2)));
+                    ~tls:(peer_identity 2) ()));
          let t1 = Option.get !t1 and t2 = Option.get !t2 in
          let message = Printf.sprintf "{\"payload\":\"%s\"}" wire_marker in
          Riptide_transport.Tcp.send t1 ~to_:2 message;

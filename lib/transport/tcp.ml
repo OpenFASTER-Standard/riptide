@@ -66,6 +66,29 @@ let accept_max_consecutive_errors = 64
    simpler than trying to size it from [peers]. *)
 let listen_backlog = 64
 
+(* Default for [create]'s [?max_connections] -- the cap on how many accepted connections this
+   listener will ever be handling (mid-handshake or fully connected) at once, closing the audit
+   finding that an unbounded accept loop lets any party reachable on this port exhaust this
+   process's file descriptors simply by opening connections and stalling (reproduced at 315
+   concurrent connections) -- see [run_accept_loop] below for the mechanism.
+
+   Sized against this module's own real concurrency model, not guessed, the same discipline
+   [File_storage.pool_size] uses for its own pool: this module's connection topology (see tcp.mli)
+   means a peer with [n] entries in [peers] (including itself) accepts at most [n - 1] legitimate
+   long-lived connections in steady state -- one per lower-id peer. [List.length peers] is
+   therefore already a generous upper bound on steady-state load; [4 *] that gives headroom for
+   the one case steady-state count does not cover -- reconnect churn, where an old connection can
+   still be occupying a slot (not yet noticed dead by this side) at the exact moment its peer's
+   replacement connection arrives, so more than one "slot" can transiently be in flight per peer
+   id without anything being wrong. [max 16] puts a floor under tiny clusters (a 2- or 3-peer
+   cluster would otherwise get a cap of 4 or 8, which stress/reconnect-heavy tests in this
+   codebase's own suite could plausibly bump into for reasons that have nothing to do with the
+   fd-exhaustion attack this cap exists to stop). Both numbers land far below any realistic fd
+   ulimit (a bare-bones default is commonly 1024), so normal operation -- even a reconnect storm
+   across the whole membership at once -- should never observe a refusal; only a genuine attacker
+   opening far more connections than this cluster's own membership size would ever hit the cap. *)
+let default_max_connections ~peers = max 16 (4 * List.length peers)
+
 (* Hard upper bound on a single message's size: [Buf_read.of_flow]'s [~max_size] (so a peer that
    claims a frame longer than this gets rejected via [Frame_too_large] below, rather than this
    process trying to allocate an unbounded buffer for it), and [send]'s own cap on outgoing
@@ -484,20 +507,59 @@ let handle_accepted t ~clock raw_flow =
 
 (* The listener's whole lifetime: accept connections until cancelled, surviving transient
    accept-time errors -- see [accept_max_consecutive_errors] above for the full reasoning behind
-   this loop's error policy, including why it eventually gives up rather than retrying forever. *)
-let run_accept_loop t ~sw ~clock listener =
+   this loop's error policy, including why it eventually gives up rather than retrying forever.
+
+   [connections] is an [Eio.Semaphore.t] sized to [max_connections] (see [create] and
+   [default_max_connections]'s own comments for the cap this closes and how its default is
+   chosen). This is the same idiom {!Eio.Net.run_server}'s own [run_server_loop] uses internally
+   for exactly this problem (see [lib_eio/net.ml] in the installed Eio 0.12: it does
+   [Semaphore.acquire connections] immediately before its own [accept_fork] call, and releases via
+   [Fun.protect ~finally] wrapped around the connection handler) -- reused here rather than
+   switching this whole loop over to [run_server] itself, because [run_server]'s own internal
+   [Switch.run]/error handling does not compose with this loop's bespoke consecutive-error
+   backoff-then-give-up policy above; only the semaphore-around-[accept_fork] piece is adopted.
+
+   [Eio.Semaphore.acquire] happens BEFORE [accept_fork], not around it: this is what makes a
+   connection beyond the cap never reach [accept(2)] at all (see tcp.mli's [max_connections] doc)
+   rather than being accepted and then immediately closed -- it is left sitting, already
+   TCP-established, in the kernel's own [listen_backlog] until a permit frees up. The release
+   happens inside the connection handler itself, via [Fun.protect ~finally], so a permit is held
+   for a connection's entire [handle_accepted] lifetime -- handshake, preamble, and (if it gets
+   that far) the full [run_connection] run -- not merely for the moment of [accept(2)] succeeding.
+
+   The one thing this reuse does NOT get for free from [Eio.Net.run_server]: that function's
+   [accept_fork] call is the only thing that can fail before the fork happens, and on such a
+   failure the semaphore permit already acquired is simply never released (harmless there, because
+   [run_server]'s own failure path lets the exception escape and end the whole server, so a leaked
+   permit is moot). This loop's OWN error policy instead swallows a transient accept(2) failure and
+   retries -- so unlike [run_server], a leaked permit here would be observable: enough transient
+   accept errors would silently ratchet this listener's admission cap down forever. Both exception
+   branches below therefore release the permit explicitly before retrying (or before re-raising)
+   -- correct because [accept_fork]'s own contract is that [~on_error] covers only the per-
+   connection handler fiber (see [accept_max_consecutive_errors]'s comment above), so every
+   exception caught here is necessarily one where [accept(2)] itself failed before any fiber was
+   forked to inherit the permit via the [Fun.protect] above. *)
+let run_accept_loop t ~sw ~clock ~max_connections listener =
+  let connections = Eio.Semaphore.make max_connections in
   let consecutive_errors = ref 0 in
   while true do
+    Eio.Semaphore.acquire connections;
     match
       Eio.Net.accept_fork ~sw listener
         ~on_error:(fun exn -> Eio.traceln "Tcp: connection error: %s" (Printexc.to_string exn))
-        (fun flow _addr -> handle_accepted t ~clock flow)
+        (fun flow _addr ->
+          Fun.protect
+            ~finally:(fun () -> Eio.Semaphore.release connections)
+            (fun () -> handle_accepted t ~clock flow))
     with
     | () -> consecutive_errors := 0
     (* [Eio.Cancel.Cancelled] is deliberately NOT caught: it is this fiber's own switch tearing
        down, not a listener fault, and must propagate for that teardown to complete. *)
-    | exception (Eio.Cancel.Cancelled _ as exn) -> raise exn
+    | exception (Eio.Cancel.Cancelled _ as exn) ->
+      Eio.Semaphore.release connections;
+      raise exn
     | exception ((Eio.Io _ | End_of_file) as exn) ->
+      Eio.Semaphore.release connections;
       incr consecutive_errors;
       if !consecutive_errors >= accept_max_consecutive_errors then begin
         Eio.traceln
@@ -585,7 +647,12 @@ let missing_peers t peers =
     (fun (id, _, _) -> if id <> t.my_id && not (Hashtbl.mem t.writers id) then Some id else None)
     peers
 
-let create ~sw ~net ~clock ~my_id ~peers ~tls =
+let create ?max_connections ~sw ~net ~clock ~my_id ~peers ~tls () =
+  let max_connections =
+    match max_connections with
+    | Some n -> n
+    | None -> default_max_connections ~peers
+  in
   let my_host, my_port =
     match List.find_opt (fun (id, _, _) -> id = my_id) peers with
     | Some (_, host, port) -> (host, port)
@@ -604,7 +671,7 @@ let create ~sw ~net ~clock ~my_id ~peers ~tls =
     Eio.Net.listen ~reuse_addr:true ~backlog:listen_backlog ~sw net
       (addr_of_host_port my_host my_port)
   in
-  Eio.Fiber.fork ~sw (fun () -> run_accept_loop t ~sw ~clock listener);
+  Eio.Fiber.fork ~sw (fun () -> run_accept_loop t ~sw ~clock ~max_connections listener);
   (* Known gap (documented, not fixed here): from this point on, if this function raises, the
      listener and any connections already established stay attached to [sw] with no handle for
      this function to reach them and tear them down -- see tcp.mli's "No shutdown path" section,

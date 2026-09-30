@@ -51,8 +51,8 @@
    [Eio_mock.Clock] instead of the real one, so it does not have this problem and is covered.
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
-   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372) so a
-   re-run or a future added test in this file can't collide even if an earlier
+   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372, 19391) so
+   a re-run or a future added test in this file can't collide even if an earlier
    test's sockets are still winding down -- [Tcp.create] itself passes [~reuse_addr:true] to
    [Eio.Net.listen], but distinct ports sidestep the question entirely rather than relying on
    that. [Tcp.create] does not expose its internal listening socket, so there is no way to ask it
@@ -121,7 +121,7 @@ let with_mesh peer_specs body =
              (fun (my_id, _, _) ->
                fun () ->
                  let t =
-                   Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id)
+                   Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id) ()
                  in
                  Hashtbl.replace handles my_id t)
              peer_specs);
@@ -313,7 +313,7 @@ let test_create_waits_for_the_specific_expected_peers () =
                     in peer 3's connection table when a count-based check would have fired. *)
                  if my_id <> 3 then Eio.Time.sleep clock 0.5;
                  let t =
-                   Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id)
+                   Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id) ()
                  in
                  Hashtbl.replace handles my_id t;
                  if my_id = 3 then List.iter (fun to_ -> Tcp.send t ~to_ msg) [ 1; 2 ])
@@ -367,7 +367,7 @@ let test_receive_follows_the_certificate_not_the_preamble_claim () =
            entirely by hand, exactly like the strays in the readiness test above. *)
         let receiver =
           Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
-            ~tls:(peer_identity receiver_id)
+            ~tls:(peer_identity receiver_id) ()
         in
         let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19381) in
         let flow = Eio.Net.connect ~sw net addr in
@@ -437,7 +437,7 @@ let test_second_connection_claiming_already_connected_id_is_refused () =
           (fun () ->
             (* Create the receiver, which will wait for peer 1's connection *)
             receiver := Some (Tcp.create ~sw ~net ~clock ~my_id:receiver_id ~peers:peer_specs
-              ~tls:(peer_identity receiver_id)))
+              ~tls:(peer_identity receiver_id) ()))
           (fun () ->
             (* Meanwhile, manually create the connections from peer 1 *)
             let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, 19382) in
@@ -688,7 +688,7 @@ let test_dialer_rejects_a_server_certificate_from_an_unrelated_ca () =
                   (fun (my_id, _, _) () ->
                     ignore
                       (Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs
-                         ~tls:(identity_for my_id)))
+                         ~tls:(identity_for my_id) ()))
                   peer_specs)))
    with Failure msg -> failure := Some msg);
   let msg =
@@ -764,7 +764,7 @@ let test_first_bytes_on_the_wire_are_a_tls_handshake () =
                 switch down is how this test ends rather than sitting out peer 1's dial budget. *)
              Eio.Switch.fail sw Wire_probe_done)
            (fun () ->
-             ignore (Tcp.create ~sw ~net ~clock ~my_id:1 ~peers:peer_specs ~tls:(peer_identity 1))))
+             ignore (Tcp.create ~sw ~net ~clock ~my_id:1 ~peers:peer_specs ~tls:(peer_identity 1) ())))
    with Wire_probe_done -> ());
   let observed = !first_bytes in
   Alcotest.(check int) "the probe actually captured the dialer's first bytes" 8
@@ -843,7 +843,7 @@ let test_dial_side_tls_handshake_has_a_bounded_timeout () =
            (fun () ->
              (match
                 Tcp.create ~sw ~net ~clock:clock_for_tcp ~my_id:1 ~peers:peer_specs
-                  ~tls:(peer_identity 1)
+                  ~tls:(peer_identity 1) ()
               with
              | (_ : Tcp.t) ->
                Alcotest.fail
@@ -879,6 +879,100 @@ let test_send_refuses_an_id_outside_the_configured_membership () =
         (Invalid_argument "Tcp.send: no connection to peer 99")
         (fun () -> Tcp.send t ~to_:99 "x"))
 
+(* -- Area 7: a configurable cap on concurrent accepted connections -------------------------
+
+   Regression test for Task 28's audit finding: [run_accept_loop] used to fork a new fiber for
+   every accepted connection unconditionally, with no bound -- an attacker (or a misbehaving
+   client) opening many TCP connections and never completing anything can exhaust this process's
+   file descriptors and kill the listener (reproduced at 315 concurrent connections; see this
+   module's own "Listener error handling" doc section before this fix). The fix wraps
+   [run_accept_loop]'s existing [accept_fork] call in an [Eio.Semaphore.t] sized to
+   [?max_connections] -- see [tcp.ml]'s own comment on [run_accept_loop] for why this, rather
+   than "accept then immediately close", is the chosen mechanism.
+
+   {b What this test actually observes.} With the semaphore wrapped around [accept_fork] itself
+   (not around [handle_accepted]), a connection beyond the cap is never even handed to
+   [Eio.Net.accept]'s underlying [accept(2)] call -- it simply sits, already TCP-established, in
+   the kernel's own listen backlog (a real, observable TCP property: the kernel completes the
+   3-way handshake and queues the connection the instant the backlog has room, entirely
+   independently of whether the application has called [accept(2)] yet). That means a client
+   cannot tell "still queued in the kernel" apart from "not yet connected" merely by observing
+   that [connect] returned -- but it CAN tell the two apart by whether the server ever responds to
+   real TLS bytes it sends: the server's [handle_accepted] doesn't start [Tls_eio.server_of_flow]
+   (and therefore never produces a ServerHello) until [Eio.Net.accept_fork] actually dequeues the
+   connection, which only happens once a semaphore slot is free. So "this client's real mTLS
+   handshake completed" is a faithful, wire-level proxy for "this connection is currently past
+   [accept(2)] and being handled by this listener" -- exactly the property [max_connections] is
+   supposed to bound.
+
+   Each client that completes its handshake holds the connection open (without ever sending this
+   module's own post-handshake preamble) for [hold_time], long enough to force real overlap among
+   concurrently-active clients to be observable, then explicitly closes it -- which the server
+   observes as an early EOF on its own bounded preamble read (see [handle_accepted]), causing that
+   connection's [handle_accepted] call to return and its semaphore permit to be released for the
+   next waiting client. A client that is still waiting for a permit doesn't hang forever either
+   way: bounded by its own [Eio.Time.with_timeout] below, generous relative to
+   [hold_time] * [num_clients] / [max_connections] (the real worst-case queue-drain time). *)
+exception Concurrency_cap_test_done
+
+let test_accept_loop_caps_concurrent_connections () =
+  let my_id = 1 in
+  let port = 19391 in
+  let max_connections = 2 in
+  let num_clients = 6 in
+  let hold_time = 0.3 in
+  let peer_specs = [ (my_id, "127.0.0.1", port) ] in
+  let max_active_observed = ref 0 in
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+  (try
+     Eio.Switch.run (fun sw ->
+         let (_ : Tcp.t) =
+           Tcp.create ~sw ~net ~clock ~my_id ~peers:peer_specs ~tls:(peer_identity my_id)
+             ~max_connections ()
+         in
+         let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+         (* Only ever touched from Eio fibers running cooperatively on this one domain -- no
+            genuine data race, so a plain [ref] (not an [Eio.Mutex]-guarded value or an [Atomic])
+            is enough, the same reasoning [file_storage.ml]'s single-fiber-per-replica model
+            relies on elsewhere in this codebase. *)
+         let active = ref 0 in
+         let client_body i () =
+           let flow = Eio.Net.connect ~sw net addr in
+           match
+             Eio.Time.with_timeout clock 10.0 (fun () ->
+                 Ok
+                   (Tls_eio.client_of_flow
+                      (Tls_identity.client_config
+                         (identity_of cluster_ca (Printf.sprintf "client-%d.riptide.test" i)))
+                      flow))
+           with
+           | exception (Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ | End_of_file | Eio.Io _) -> ()
+           | Error `Timeout ->
+             Alcotest.failf
+               "client %d: the server never dequeued this connection within the test's own \
+                generous timeout -- either the cap never releases queued connections, or it is \
+                stuck at 0 permits"
+               i
+           | Ok tls ->
+             incr active;
+             if !active > !max_active_observed then max_active_observed := !active;
+             Eio.Time.sleep clock hold_time;
+             decr active;
+             (try Eio.Flow.close tls with End_of_file | Eio.Io _ -> ())
+         in
+         Eio.Fiber.all (List.init num_clients (fun i () -> client_body i ()));
+         Eio.Switch.fail sw Concurrency_cap_test_done)
+   with Concurrency_cap_test_done -> ());
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "at most %d connections were ever simultaneously past accept(2) and being handled by this \
+        listener (observed a peak of %d, out of %d clients)"
+       max_connections !max_active_observed num_clients)
+    true
+    (!max_active_observed <= max_connections)
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
@@ -909,5 +1003,7 @@ let tests =
     ("mTLS: the dial-side TLS handshake has a bounded timeout, not an unbounded hang", `Quick,
       test_dial_side_tls_handshake_has_a_bounded_timeout);
     ("send refuses an id outside the configured membership", `Quick,
-      test_send_refuses_an_id_outside_the_configured_membership)
+      test_send_refuses_an_id_outside_the_configured_membership);
+    ("accept loop caps the number of concurrently accepted connections", `Quick,
+      test_accept_loop_caps_concurrent_connections)
   ]
