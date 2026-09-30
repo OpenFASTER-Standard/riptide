@@ -1236,11 +1236,18 @@
             "id": 23,
             "title": "[5.1] Retract the keystore-backup recommendation; state the real guarantee precisely",
             "description": "Retract the keystore-backup recommendation; state the real guarantee precisely",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Remove redaction_store.mli's recommendation to back up the keystore directory; state plainly that redaction has no effect on any pre-redaction copy. Add test_a_pre_redaction_keystore_backup_defeats_redaction pinning the real, disclosed behavior.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "3d1bfcec2041af830fee39092075e7c57679f04c",
+                "8af8accc773aa76ccd25320244e6b7cadf60738e"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 24,
