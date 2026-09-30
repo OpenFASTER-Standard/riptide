@@ -307,9 +307,22 @@ let test_two_concurrent_invocations_of_the_same_module_do_not_share_protocol_sta
       log = (fun _ -> ());
     }
   in
+  (* Two transitions, not one: "ready" additionally permits "handle" (looping back to "ready"),
+     so this test is actually discriminating -- not just a protocol that unconditionally rejects
+     "handle" from any state regardless of isolation. If m1's own "init" call wrongly advanced a
+     checker SHARED with m2 to "ready", m2's own "handle" call would then be wrongly PERMITTED
+     (a real regression this exact shape caught live in code review, by temporarily memoizing/
+     sharing the checker ref across same-protocol-value instantiate calls and confirming the
+     single-transition version of this test still reported [OK] despite the sharing). With a
+     correctly-isolated m2 (still at its own fresh "init"), "handle" has no transition from
+     "init" and is still correctly rejected. *)
   let protocol =
     Protocol.create ~states:[ "init"; "ready" ] ~initial:"init"
-      ~transitions:[ { from_state = "init"; on_call = "init"; to_state = "ready" } ]
+      ~transitions:
+        [
+          { from_state = "init"; on_call = "init"; to_state = "ready" };
+          { from_state = "ready"; on_call = "handle"; to_state = "ready" };
+        ]
   in
   let module_bytes = read_file "fixtures/echo.wat" in
   let m1 = Loader.instantiate ~tier:Loader.Sfi ~module_bytes ~host ~protocol in
