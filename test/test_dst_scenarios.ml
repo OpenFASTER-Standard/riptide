@@ -67,7 +67,7 @@
      HOW THE EXCEPTION IS PHRASED, and why it was rephrased (Task 11 review follow-up). It used to
      read [is_primary && status = Normal && last_normal_view = view_number]. That last conjunct is
      VACUOUS -- [status = Normal => last_normal_view = view_number] is an invariant of the protocol
-     itself (replica.ml:389-391 records a TLC run of exactly that invariant over a copy of VSR.tla
+     itself (replica.ml:688-690 records a TLC run of exactly that invariant over a copy of VSR.tla
      with ZERO violations across 264,376 distinct reachable states), so the condition reduced to
      "any primary in Normal", i.e. that primary's ORDINARY STEADY STATE rather than the narrow
      post-view-change window it claimed to describe. It is now a TRANSITION test instead -- the
@@ -502,7 +502,7 @@ let test_confined_commit_regression () =
    The previous version of this exception was [is_primary && status = Normal && last_normal_view =
    view_number]. That last conjunct is VACUOUS: [status = Normal => last_normal_view =
    view_number] is an invariant of the protocol itself -- every action that (re-)enters Normal
-   sets both in the same step, and replica.ml:389-391 records a TLC run of that exact invariant
+   sets both in the same step, and replica.ml:688-690 records a TLC run of that exact invariant
    over a copy of VSR.tla finding ZERO violations across 264,376 distinct reachable states. So the
    old condition reduced to "any primary in Normal", i.e. that primary's ordinary steady state,
    and would have excused a commit regression at ANY moment of a primary's life rather than the

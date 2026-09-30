@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Checks this repo's in-source `<file>:<line>` citations against the real files they name.
+
+Usage: scripts/check-citations            (checks lib/, test/, explore/, spec/)
+       scripts/check-citations PATH...    (checks only the given files/directories)
+       scripts/check-citations --drifted   also list citations whose target line's CONTENT
+                                           has changed since the citation itself was written
+                                           (a review aid, not a pass/fail rule -- see below)
+
+WHY THIS EXISTS. This codebase deliberately cites exact line numbers in doc comments
+(`replica.ml:1427`, `VSR.tla:248-255`, ...), which is what makes its comments checkable rather
+than decorative -- but a line number is only correct relative to a file's current shape. The
+final whole-branch review of the `audit-remediation` branch found 20 citations that had been
+CORRECT when written and were silently invalidated by a later, unrelated task inserting lines
+into the file they pointed at (`lib/vsr/replica.ml` alone grew by ~830 lines across that
+branch's 34 tasks). Not one of the 34 per-task reviews could have caught it: in every case the
+citing file and the shifted file were touched by different tasks.
+
+HARD RULE (exit 1):
+  A citation naming a file that resolves to a real repo path must not point past that file's
+  end. Zero false positives: `foo.ml:4000` in a 900-line file is unambiguously wrong.
+
+WARNING (reported, does not fail):
+  A single-line citation pointing at a BLANK line. Always a real error, but this repo currently
+  has a known, separately-scoped population of them -- see the baseline note below -- so it is
+  reported rather than gating.
+
+KNOWN BASELINE, disclosed rather than silently tolerated: 13 warnings are expected as of the
+final whole-branch review of `audit-remediation`, and every one of them is a `VSR.tla:<n>`
+citation. `spec/tla/VSR.tla` gained lines inside its own `VARIABLES` block (multi-line comments
+on `rep_view_number`/`rep_last_normal_view`/`rep_recv_dvc`) at some point BEFORE that branch
+existed, shifting a large family of spec citations by a NON-constant offset: `rep_status` is
+cited as `VSR.tla:29` and really lives at `:57`; `rep_last_normal_view` is cited as `:31` and
+lives at `:60`; `rep_recv_dvc` is cited as `:34` and lives at `:64` (+28, +29, +30). There are
+429 `VSR.tla:<n>` citations in this repo and the blank-line rule happens to catch only the 13
+that landed on whitespace. `VSR.tla` is byte-identical between `main` and the `audit-remediation`
+branch tip, so none of this was caused by that branch and none of it affects any of its 33 audit
+findings; re-deriving all 429 is its own piece of work, with its own real risk of introducing
+fresh wrong numbers, and is deliberately NOT bundled into a review fix wave. Treat a NEW warning
+here (anything beyond those 13) as a real regression to fix.
+
+DISCLOSED LIMITATION of the hard rule, stated rather than papered over: it cannot catch a
+citation that drifted to a line which merely says something ELSE -- which is exactly the shape
+all 20 of the branch findings above had. There is no mechanical test for "this line still says
+what the citing sentence claims"; that needs a reader. `--drifted` is the best available
+approximation: for each citation it compares the target line's content NOW against its content
+at the commit that last touched the citing line (via `git blame`), and reports the ones that
+differ. That is a heuristic with real false positives (a citation written before its target file
+had settled, and every citation into a file that changed for unrelated reasons while still saying
+the same thing), so it is deliberately NOT part of the pass/fail rule -- run it when a branch has
+rewritten a heavily-cited file, and read the output.
+
+Exit codes: 0 clean, 1 hard violations found, 2 usage/environment error.
+"""
+import collections
+import functools
+import os
+import re
+import subprocess
+import sys
+
+CITATION = re.compile(r"([A-Za-z0-9_./-]+\.(?:ml|mli|tla|c))[:](\d+)(?:-(\d+))?")
+SCANNED_SUFFIXES = (".ml", ".mli", ".md", ".tla")
+DEFAULT_ROOTS = ("lib", "test", "explore", "spec")
+
+# See this module's docstring: the disclosed, pre-existing VSR.tla population.
+KNOWN_BLANK_LINE_WARNINGS = 13
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def tracked_files():
+    r = git("ls-files")
+    if r.returncode != 0:
+        sys.exit("error: not a git repository (or git unavailable)")
+    return r.stdout.split()
+
+
+@functools.lru_cache(maxsize=None)
+def lines_at(rev, path):
+    r = git("show", f"{rev}:{path}")
+    return tuple(r.stdout.split("\n")) if r.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=None)
+def blame(path):
+    """line number -> commit sha that last touched it."""
+    r = git("blame", "--porcelain", "HEAD", "--", path)
+    out = {}
+    for line in r.stdout.split("\n"):
+        m = re.match(r"^([0-9a-f]{40}) \d+ (\d+)", line)
+        if m:
+            out[int(m.group(2))] = m.group(1)
+    return out
+
+
+def main(argv):
+    show_drifted = "--drifted" in argv
+    roots = [a for a in argv if not a.startswith("--")] or list(DEFAULT_ROOTS)
+
+    all_files = tracked_files()
+    by_basename = collections.defaultdict(list)
+    for f in all_files:
+        by_basename[os.path.basename(f)].append(f)
+
+    def resolve(ref):
+        """A citation names a repo-relative path or a bare basename; resolve or give up."""
+        candidates = by_basename.get(os.path.basename(ref), [])
+        for c in candidates:
+            if c == ref or c.endswith("/" + ref):
+                return c
+        return candidates[0] if len(candidates) == 1 else None
+
+    scanned = [
+        f
+        for f in all_files
+        if f.endswith(SCANNED_SUFFIXES) and any(f == r or f.startswith(r + "/") for r in roots)
+    ]
+
+    violations, warnings, drifted, checked = [], [], [], 0
+    for f in scanned:
+        try:
+            src = open(f, encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for m in CITATION.finditer(src):
+            ref, lo = m.group(1), int(m.group(2))
+            hi = int(m.group(3)) if m.group(3) else lo
+            target = resolve(ref)
+            if target is None:
+                continue  # not a path in this repo (an external file, a version string, ...)
+            now = open(target, encoding="utf-8").read().split("\n")
+            citing_line = src[: m.start()].count("\n") + 1
+            checked += 1
+            if hi > len(now):
+                violations.append(
+                    f"{f}:{citing_line}: cites {m.group(0)}, but {target} has only "
+                    f"{len(now)} lines"
+                )
+                continue
+            if lo == hi and not now[lo - 1].strip():
+                warnings.append(f"{f}:{citing_line}: cites {m.group(0)}, which is a blank line")
+            if show_drifted:
+                rev = blame(f).get(citing_line)
+                then = lines_at(rev, target) if rev else None
+                if then and len(then) >= hi:
+                    a = "\n".join(now[lo - 1 : hi]).strip()
+                    b = "\n".join(then[lo - 1 : hi]).strip()
+                    if a != b:
+                        drifted.append(f"{f}:{citing_line}: cites {m.group(0)} ({target})")
+
+    if show_drifted:
+        print(f"-- possibly drifted since written (heuristic, false positives expected): {len(drifted)}")
+        for d in drifted:
+            print(f"  {d}")
+
+    if warnings:
+        print(f"-- warnings ({len(warnings)}; {KNOWN_BLANK_LINE_WARNINGS} expected, all VSR.tla -- see this script's own docstring):")
+        for w in warnings:
+            print(f"  {w}")
+        if len(warnings) > KNOWN_BLANK_LINE_WARNINGS:
+            print(
+                f"-- NOTE: {len(warnings) - KNOWN_BLANK_LINE_WARNINGS} more than the disclosed "
+                "baseline; treat the extras as a real regression."
+            )
+
+    for v in violations:
+        print(v, file=sys.stderr)
+    if violations:
+        print(f"\n{len(violations)} citation violation(s) out of {checked} checked", file=sys.stderr)
+        return 1
+    print(f"ok: {checked} in-repo line citations checked across {len(scanned)} files")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

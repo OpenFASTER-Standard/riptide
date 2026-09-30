@@ -130,7 +130,7 @@ exception Replica_stopped
    task-4-review.md's F2 finding says this harness structurally lacked: a way to make survivors'
    logs genuinely DIVERGE before a view change, rather than every survivor holding an identical log
    by construction (the old version's [settle] always drained to full quiescence first, so
-   [WinningDVC]/[winning_dvc] (replica.ml:539-551) never had anything real to arbitrate between).
+   [WinningDVC]/[winning_dvc] (replica.ml:1581-1593) never had anything real to arbitrate between).
    [isolate i]/[reconnect i] are a TEST-ONLY network PARTITION, orthogonal to [stop]: unlike [stop],
    replica [i] keeps running completely normally while isolated (it can still send -- nothing here
    stops that direction, and nothing in this file's own scenarios ever needs it stopped) -- it
@@ -444,8 +444,8 @@ let test_single_view_change_survives_primary_failure () =
    (never-reset) aux_svc_count.
 
    WHICH OF THE TWO RESET SITES THIS TEST ACTUALLY EXERCISES (corrected per task-4-review.md's own
-   F1, which mutation-proved this precisely: deleting the SendSV-path reset at replica.ml:665 left
-   BOTH of this file's tests passing, while deleting the ReceiveSV-path reset at replica.ml:807 made
+   F1, which mutation-proved this precisely: deleting the SendSV-path reset at replica.ml:1897 left
+   BOTH of this file's tests passing, while deleting the ReceiveSV-path reset at replica.ml:2289 made
    THIS test fail at the exact assertion below): only ReceiveSV's. The one replica whose episode-1
    reset came via SendSV is episode 1's own new primary (it is the one that actually RUNS SendSV,
    becoming primary) -- and that is exactly the replica this test kills at the top of episode 2
@@ -736,9 +736,9 @@ let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
    crash, so every survivor's log was identical going into every view change above). This test
    builds ONE survivor (X) with a MUCH longer log but a STALE last_normal_view, and asserts the
    real cluster's adopted log after a view change is NOT X's, proving winning_dvc's own documented
-   algorithm (replica.ml:533-551, lexicographic max by (last_normal_view, n), last_normal_view
+   algorithm (replica.ml:1581-1593, lexicographic max by (last_normal_view, n), last_normal_view
    FIRST) genuinely composes over real message flow -- not the one with the highest n (a real
-   historical VRR safety bug, the exact class the comment at replica.ml:533-535 warns about) and
+   historical VRR safety bug, the exact class the comment at replica.ml:1586-1589 warns about) and
    not the lexicographic MINIMUM either.
 
    7 replicas (Replica.create requires an ODD count, 2f + 1 = ReplicaCount -- VSR.tla's own

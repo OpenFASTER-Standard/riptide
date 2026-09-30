@@ -799,7 +799,7 @@ let readable_entries t =
    that reading would do, it cannot move this function's result.
 
    DO NOT read that as "a drop-in extension point the receiver already supports". It is not. The
-   receiving side REJECTS in-range nack evidence: [nacks_wellformed] (:1405) drops any DVC
+   receiving side REJECTS in-range nack evidence: [nacks_wellformed] (:2128) drops any DVC
    carrying a nack at or below the sender's own [n] WHOLESALE -- the entire message is discarded
    as malformed, not partially honoured, not specially handled (pinned by
    [test_out_of_range_nack_is_a_total_no_op] in test_vsr_replica_recovery.ml and by a
@@ -1067,7 +1067,7 @@ let adopt_durable_log t (values : Value.value list) ~committed =
 
    The previous behaviour was to fall back to [(0, 0, 0, 0)] and then truncate the WAL down to
    match [op_number = 0]. That is not a conservative default; it is the single most dangerous
-   state this protocol has. [sender_proves_absent] (:1091) treats EVERY op above a sender's own
+   state this protocol has. [sender_proves_absent] (:1726) treats EVERY op above a sender's own
    [n] as PROVABLY ABSENT -- that disjunct is sound only because [StorageWellFormed]
    (VSR.tla:742-745) guarantees a durably-written slot can never read back absent. A replica that
    comes back claiming [n = 0] over a WAL that still holds its entries breaks precisely that
@@ -1709,7 +1709,7 @@ let fill_value (dvcs : dvc list) ~winner ~op_number =
    space can carry it in. Today it is also the ONLY disjunct that ever fires.
 
    The [List.mem] disjunct is, as of today, STRUCTURALLY REDUNDANT rather than a second source of
-   evidence -- it refines nothing. [nacks_wellformed] (:1405, reached via [handle_do_view_change])
+   evidence -- it refines nothing. [nacks_wellformed] (:2128, reached via [handle_do_view_change])
    drops any DVC carrying a nack at or below the sender's own [n] wholesale, so every nack that
    survives validation already satisfies [op_number > d.dvc_n], which is precisely the first
    disjunct. An accepted nack therefore cannot contradict [n], cannot refine it, and cannot add
@@ -1719,7 +1719,7 @@ let fill_value (dvcs : dvc list) ~winner ~op_number =
 
    That redundancy is load-bearing in two places: it makes [sender_proves_absent] monotone in
    [op_number] (what makes [completion_point]'s downward-scan bound exact, not a heuristic cap),
-   and it is what lets [provable_nacks] (:496) be provably empty on the sender side with no
+   and it is what lets [provable_nacks] (:816) be provably empty on the sender side with no
    receiver losing any evidence. Reporting genuine in-range holes means relaxing
    [nacks_wellformed] in the same change that widens [provable_nacks] -- see that function's own
    comment for why the sender-only version would wedge the protocol. *)

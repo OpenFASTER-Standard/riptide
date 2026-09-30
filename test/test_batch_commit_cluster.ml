@@ -237,7 +237,8 @@ let test_batch_commits_fully_despite_primary_crash_before_next_propose () =
                as part of the batch under test without this test noticing. Check the actual payload
                content and order, matching this file's own established
                `Value.Record [ ("name", Value.Scalar (Value.String name)) ]` unwrapping convention
-               (test/test_batch_commit.ml:66-73/:164-167). *)
+               (test/test_batch_commit.ml:8's own [record_value] constructor, unwrapped the same way at
+               test/test_batch_commit.ml:229 and :260). *)
             let payload_name (e : Envelope.envelope) =
               match e.payload with
               | Value.Record [ ("name", Value.Scalar (Value.String name)) ] -> name

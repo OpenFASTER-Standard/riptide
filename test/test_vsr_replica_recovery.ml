@@ -332,8 +332,8 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
      backup in view 0 and these are ordinary in-view Prepares. The second one's [k = 1] is what
      commits op 1 ([ReceivePrepareMsg]'s own [IF m.k > @ THEN m.k ELSE @] update, VSR.tla:255 --
      NOT :118, which is unrelated storage-model prose; that wrong citation was copied verbatim from
-     replica.ml:930's own comment in fix round 1 instead of being checked against VSR.tla, and
-     replica.ml's copy is wrong too), so the pre-crash replica really does reach
+     replica.mli:930's own comment in fix round 1 instead of being checked against VSR.tla, and
+     replica.mli's copy is wrong too), so the pre-crash replica really does reach
      [commit_number = 1] rather than merely appending. *)
   Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
   Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 3 }));
@@ -362,9 +362,9 @@ let test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advan
      why the unconditional [m.k > @] raise is safe, NOT as a conjunct of [ReceivePrepareMsg], whose
      real guards are VSR.tla:248-251. (Both halves of this citation were wrong in fix round 1:
      ":106-109" is the corrupt/absent slot definitions, and "precondition" overstated what :239 is.)
-     Our own [handle_prepare] does enforce a bound the model leaves implicit -- replica.ml:958's
+     Our own [handle_prepare] does enforce a bound the model leaves implicit -- replica.ml:1427's
      [k > t.commit_number && k < op_number t] -- but note it rejects only the [k] FIELD's effect at
-     [k >= n]; the Prepare itself is still appended and still acked (see replica.ml:953-955). Here
+     [k >= n]; the Prepare itself is still appended and still acked (see replica.ml:1423-1425). Here
      [k = 2] is inside that bound, so this commits op 2 and moves commit_number 1 -> 2. *)
   Replica.handle_message t' ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 3; v = v "c"; k = 2; source = 3 }));
   Alcotest.(check int) "the next real advance landed" 2 (Replica.commit_number t');
@@ -550,7 +550,7 @@ let test_restart_discards_wal_entries_the_superblock_never_saw () =
    commit_number) = (0, 0, 0, 0)] whenever the superblock did not read back, and then truncate the
    WAL down to match [op_number = 0] -- even with the WAL itself fully intact on disk. The replica
    came back reporting [n = 0] in its DoViewChange, and [sender_proves_absent] treats every op above
-   a sender's own [n] as PROVABLY ABSENT (replica.ml:1091), so that replica proceeded to prove
+   a sender's own [n] as PROVABLY ABSENT (replica.ml:1726), so that replica proceeded to prove
    absent every op it had ever durably held. Two such replicas (or one plus one honest nack) are a
    nack quorum, which truncates a committed, client-acknowledged value cluster-wide.
 
@@ -1716,10 +1716,10 @@ let test_cluster_recovers_a_committed_entry_from_one_replicas_corrupted_storage 
    tie -- see the correction below on why test 1 is not actually dependent on that either.
 
    Both survivors report the same [(last_normal_view, n) = (1, 2)], so [WinningDVC]'s maximum is a
-   TIE. This is NOT resolved by hashtable fold order: [valid_dvcs] (replica.ml:942-944) sorts its
+   TIE. This is NOT resolved by hashtable fold order: [valid_dvcs] (replica.ml:1577-1579) sorts its
    result by sender id specifically so the fold in [winning_dvc] is reproducible, and that fold
    keeps the incumbent on a strict-inequality tie, so an exact [(last_normal_view, n)] tie resolves
-   deterministically to the LOWEST sender id (replica.ml:956-957). In test 1 the two survivors are
+   deterministically to the LOWEST sender id (replica.ml:1591-1592). In test 1 the two survivors are
    replicas 2 and 3 (replica 2's DVC to itself is in its own [recv_dvc] too), so replica 2 -- the
    corrupted one -- deterministically wins every run, and test 1 always exercises the cross-replica
    fill, not merely when the build/hashtable happens to order things that way.

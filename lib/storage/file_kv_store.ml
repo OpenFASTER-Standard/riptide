@@ -25,7 +25,7 @@
    [file_storage.ml]'s own top comment ("The installed Eio 0.12's [Eio.Path] has no
    [kind]/[stat]-on-a-path existence check...") already documents exactly this and its fix:
    attempt the operation and catch the resulting [Eio.Io] instead of checking first. [create]
-   below follows [file_storage.ml:277] exactly (try [mkdir], ignore [Eio.Io]); [durable_read]
+   below follows [file_storage.ml:448] exactly (try [mkdir], ignore [Eio.Io]); [durable_read]
    below applies the same "try, don't check" discipline to a per-key file that may not exist
    (never put, or deleted) by opening it and treating [Eio.Io] (ENOENT) as [None].
 
@@ -724,7 +724,7 @@ let sweep_stale_temp_files ~fs ~dir_path =
         try Eio.Path.unlink Eio.Path.(fs / path_str)
         with Eio.Io _ -> () (* Ignore errors: file already gone, or already handled by concurrent create *))
 
-(* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
+(* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:448] -- see this file's
    top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
    owner-marker check runs strictly after this, since it needs [dir_path] to already exist (an
    [Eio.Path.save] into a nonexistent directory would itself raise [Eio.Io], indistinguishable
