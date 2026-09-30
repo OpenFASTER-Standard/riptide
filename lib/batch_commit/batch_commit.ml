@@ -187,11 +187,18 @@ let replica (t : t) = t.replica
    failure is a downstream KV-value-size limit on the MATERIALIZATION side, nothing to do with
    consensus durability, and [Batch_commit] sits ABOVE [Replica] and consumes it -- coupling the
    lower module to a fact about the layer built on top of it would be exactly backwards. It is a
-   single, process-lifetime counter rather than one per [Replica.t] because [Batch_commit] itself
-   holds no per-replica state of its own to attach one to: every other function in this module is a
-   pure projection of a [Replica.t] argument, and there is no [Batch_commit.t]. Like
-   [append_refusals], it never resets: the useful reading is a delta between two samples taken
-   around a call of interest, not an absolute value read in isolation. *)
+   single, process-lifetime counter rather than one per [Replica.t] or per [t]. When this was
+   written (Task 21) the reason given was that there was no [Batch_commit.t] at all to attach one
+   to -- that reason EXPIRED: Task 27 introduced [t] (see [create] below) six tasks later, and this
+   comment kept asserting its absence (final whole-branch review, finding I3). The decision stands
+   on its own footing regardless: [t] carries deployment POLICY ([require_encryption]) and is
+   consulted by [propose] alone, while [materialize_up_to]'s replay walk -- the other loop that
+   drives [materialize_write_catching] and therefore this counter -- still takes a bare
+   [Riptide_vsr.Replica.t] and has no [t] in scope to read or write a per-handle counter through.
+   Attaching the counter to [t] would make the two loops' failures unaggregatable, which is the one
+   thing {!materialize_write_failures}' own contract promises they are not. Like [append_refusals],
+   it never resets: the useful reading is a delta between two samples taken around a call of
+   interest, not an absolute value read in isolation. *)
 let materialize_write_failures_count = ref 0
 
 let materialize_write_failures () = !materialize_write_failures_count

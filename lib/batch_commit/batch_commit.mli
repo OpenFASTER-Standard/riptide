@@ -31,7 +31,7 @@ type write = {
     mechanism and its scope. [None] (the only
     option before this field existed) leaves a write exactly as vulnerable to
     {!Riptide_storage.File_storage}'s bounded ring WAL evicting it as before -- a disclosed,
-    intentional scope boundary, not a bug. On the wire ({!write_of_value}, not exposed by this
+    intentional scope boundary, not a bug. On the wire ([write_of_value], not exposed by this
     [.mli] but documented here since it governs what a REMOTE replica sees), a missing
     [merge_key] field decodes as [None] -- backward-compatible with every batch committed before
     this field existed -- while a field present but not shaped like this module's own encoding
@@ -201,11 +201,17 @@ val materialize_write_failures : unit -> int
     Shaped like {!Riptide_vsr.Replica.append_refusals} on purpose -- {b a monotonic,
     process-lifetime count that never resets}, so the useful reading is a delta between two samples
     taken around a call of interest, not an absolute value read in isolation. Unlike
-    [append_refusals], this is a single counter rather than one per [(string * int)] reason and not
-    scoped to any one {!Riptide_vsr.Replica.t}: [Batch_commit] holds no per-replica state of its own
-    (every other function here is a pure projection of a [Riptide_vsr.Replica.t] argument), and a
-    materializer write failure is a fact about the materialization layer, not about any specific
-    replica's consensus/durability state -- deliberately NOT added to
+    [append_refusals], this is a single counter rather than one per [(string * int)] reason, and it
+    is scoped to neither a {!Riptide_vsr.Replica.t} nor a {!t}: a materializer write failure is a
+    fact about the materialization layer, not about any specific replica's consensus/durability
+    state, and the two loops that can raise it -- {!propose} (which takes a {!t}) and
+    {!materialize_up_to} (which takes a bare {!Riptide_vsr.Replica.t}, and has no {!t} in scope at
+    all) -- must aggregate into ONE count, as the first paragraph above promises, which a
+    per-handle counter could not do. ({b Final whole-branch review, finding I3}: this paragraph used
+    to justify the choice by asserting "[Batch_commit] holds no per-replica state of its own (every
+    other function here is a pure projection of a [Riptide_vsr.Replica.t] argument)" -- true when
+    Task 21 wrote it, falsified by Task 27's introduction of {!t}/{!create}/{!replica} six tasks
+    later, and corrected here to the reason that actually still holds.) Deliberately NOT added to
     {!Riptide_vsr.Replica.append_refusals} itself, which would couple that lower, more foundational
     module to a failure mode entirely of this higher one's own making.
 
@@ -223,12 +229,12 @@ val materialize_up_to :
     1-based op-number/commit-count bound, INCLUSIVE, matching
     {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared against each batch's
     0-based {!Riptide_vsr.Replica.entries} list position [i] as [i < bound], the same
-    correspondence {!committed_batch_values} already establishes: list position [i] is commit
+    correspondence [committed_batch_values] already establishes: list position [i] is commit
     position/op-number [i + 1]) -- materializing every write of every well-formed batch in that
     range that carries [merge_key = Some k], via [materialize.write ~merge_key:k payload], in
     commit order, first-wins per [idempotency_key] (the same dedup rule
     {!committed_envelopes_keyed} uses: a later batch sharing a key already seen earlier in the
-    walk contributes nothing, matching what {!committed_writes_for} would return for that key). A
+    walk contributes nothing, matching what [committed_writes_for] would return for that key). A
     batch that fails to decode (see {!committed_envelopes}'s own decode-failure handling)
     contributes nothing and is skipped, like everywhere else in this module.
 
