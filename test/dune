@@ -8,7 +8,7 @@
  (deps ../spec/golden/vectors.txt ../lib/storage/file_kv_store.ml ../lib/storage/file_storage.ml
    file_storage_o_direct_probe.exe tcp_emfile_probe.exe fixtures/echo.wat fixtures/runaway.wat
    fixtures/read_materialized.wat fixtures/propose_write.wat fixtures/oversized_memory.wat
-   fixtures/unbounded_memory.wat fixtures/memory_import.wat))
+   fixtures/unbounded_memory.wat fixtures/memory_import.wat fixtures/protocol_violator.wat))
 
 ; Task 19 (Bug 1): a standalone helper process [test_file_storage.ml]'s own
 ; [test_an_unrelated_write_error_does_not_permanently_strip_o_direct] forks+execs under a

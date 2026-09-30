@@ -136,6 +136,18 @@ type t = {
   export_positions : (string, int) Hashtbl.t;
   memory : W.Memory.t option;
   sink : sink ref;
+  (* Task 4: this [t]'s own, private session-type checker (Riptide_module.Protocol) -- created
+     once, at [instantiate] time, via [Protocol.start]. Never shared across [t] values: since
+     [instantiate] already creates a fresh [t] per call (Decision 5, this file's top comment),
+     each [t] -- and therefore each [protocol_checker] -- belongs to exactly one caller by
+     construction, which is what makes two concurrent [instantiate] calls' checkers independent
+     with no extra locking needed (see [test_two_concurrent_invocations_of_the_same_module_do_not_
+     share_protocol_state] in test_module_loader.ml). A [ref], not a plain field, because
+     [Protocol.step] is functional (returns a new [checker] rather than mutating one in place) and
+     [invoke] needs to persist the advanced state across separate calls on the same [t] --
+     the same "mutate via a ref cell on an otherwise-immutable record" pattern [sink] above
+     already uses for the same reason. *)
+  protocol_checker : Protocol.checker ref;
 }
 
 (* ── Minimal WebAssembly binary-format section parsing ──────────────────────────────────────
@@ -495,7 +507,7 @@ let check_memory_limit wasm =
             exceeds this loader's cap (%d pages / %d bytes)"
            declared_max (declared_max * 65536) memory_pages_cap (memory_pages_cap * 65536))
 
-let instantiate ~tier ~module_bytes ~host =
+let instantiate ~tier ~module_bytes ~host ~protocol =
   match tier with
   | Microvm ->
     failwith "Loader.instantiate: Microvm tier is not yet implemented (Task 8's own job)"
@@ -518,7 +530,8 @@ let instantiate ~tier ~module_bytes ~host =
     let export_positions = Wasm_binary.export_positions wasm in
     let memory = find_memory export_positions exports in
     memory_ref := memory;
-    { instance; exports; export_positions; memory; sink }
+    let protocol_checker = ref (Protocol.start protocol) in
+    { instance; exports; export_positions; memory; sink; protocol_checker }
 
 (* The parent-side half of containment: services host-function relay requests from the child on
    [req_r]/[resp_w], and returns the child's own final result once it reports done -- via [tag]
@@ -1013,27 +1026,41 @@ module For_testing = struct
           result, child_pid, req_r, resp_w)
 end
 
+(* Task 4: checked FIRST, before any export lookup/memory access/dispatch below -- a call the
+   declared protocol doesn't permit from the checker's current state is rejected outright, with
+   the guest never entered at all (not even far enough to discover it has no such export), per
+   this codebase's own "guard failure => total no-op" convention (see [loader.mli]). On success,
+   [t.protocol_checker] is advanced immediately, before the guest call actually runs -- the
+   protocol governs which calls the guest is permitted to be DISPATCHED with, the same way a
+   session type governs which message a peer is permitted to SEND; it isn't rolled back if the
+   dispatched call then itself fails (traps, times out, etc.), the same way sending a legal
+   message doesn't un-send itself just because its recipient then errors out handling it. *)
 let invoke t ~entrypoint ~arg =
-  match Hashtbl.find_opt t.export_positions entrypoint with
-  | None -> Error (Printf.sprintf "Loader.invoke: no export named %S" entrypoint)
-  | Some idx -> (
-    match List.nth_opt t.exports idx with
-    | None -> Error (Printf.sprintf "Loader.invoke: export %S has no matching extern" entrypoint)
-    | Some extern -> (
-      match t.memory with
-      | None ->
-        Error "Loader.invoke: guest module has no exported \"memory\", cannot marshal arg/result"
-      | Some memory -> (
-        match W.Extern.as_func extern with
-        | exception _ ->
-          Error (Printf.sprintf "Loader.invoke: export %S is not a function" entrypoint)
-        | func -> (
-          match
-            (try
-               write_guest_bytes memory ~ptr:arg_scratch_offset arg;
-               Ok ()
-             with exn -> Error (Printexc.to_string exn))
-          with
-          | Error msg -> Error msg
-          | Ok () ->
-            run_contained t func ~memory ~arg_ptr:arg_scratch_offset ~arg_len:(Bytes.length arg)))))
+  match Protocol.step !(t.protocol_checker) ~call:entrypoint with
+  | Error msg -> Error msg
+  | Ok next_checker -> (
+    t.protocol_checker := next_checker;
+    match Hashtbl.find_opt t.export_positions entrypoint with
+    | None -> Error (Printf.sprintf "Loader.invoke: no export named %S" entrypoint)
+    | Some idx -> (
+      match List.nth_opt t.exports idx with
+      | None -> Error (Printf.sprintf "Loader.invoke: export %S has no matching extern" entrypoint)
+      | Some extern -> (
+        match t.memory with
+        | None ->
+          Error "Loader.invoke: guest module has no exported \"memory\", cannot marshal arg/result"
+        | Some memory -> (
+          match W.Extern.as_func extern with
+          | exception _ ->
+            Error (Printf.sprintf "Loader.invoke: export %S is not a function" entrypoint)
+          | func -> (
+            match
+              (try
+                 write_guest_bytes memory ~ptr:arg_scratch_offset arg;
+                 Ok ()
+               with exn -> Error (Printexc.to_string exn))
+            with
+            | Error msg -> Error msg
+            | Ok () ->
+              run_contained t func ~memory ~arg_ptr:arg_scratch_offset ~arg_len:(Bytes.length arg)))))
+    )

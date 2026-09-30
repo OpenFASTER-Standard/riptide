@@ -6,8 +6,14 @@
     the top of [loader.ml], not the WebAssembly Component Model (no OCaml runtime supports it
     yet).
 
-    Consumed by Task 4 (protocol enforcement wraps {!invoke}) and Task 6 (the reactor calls
-    {!instantiate}/{!invoke} per dispatch). *)
+    Every {!t} also owns its own, private {!Riptide_module.Protocol.checker} (Task 4), created
+    once at {!instantiate} time and advanced by {!invoke} on every call — {!invoke} rejects a
+    call that violates the declared {!Riptide_module.Protocol.t} outright, before the guest is
+    ever dispatched into. Since {!instantiate} already creates a fresh {!t} (and therefore a
+    fresh checker) per call, two concurrent invocations of the same underlying module never share
+    protocol state, with no extra locking needed.
+
+    Consumed by Task 6 (the reactor calls {!instantiate}/{!invoke} per dispatch). *)
 
 type isolation_tier = Sfi | Microvm
 (** Which sandboxing mechanism a module runs under (Decision 5). [Sfi] (Software Fault
@@ -34,10 +40,23 @@ type t
 (** A single, live, already-instantiated guest module. Not reusable across separate logical
     invocations of a module — call {!instantiate} again for each one (Decision 5). *)
 
-val instantiate : tier:isolation_tier -> module_bytes:string -> host:host_functions -> t
+val instantiate :
+  tier:isolation_tier -> module_bytes:string -> host:host_functions -> protocol:Protocol.t -> t
 (** [module_bytes] is WAT text or a raw WASM binary (both accepted transparently — see
     [loader.ml]'s top comment for why); [host] backs whichever of {!host_functions}'s fields the
     guest module actually imports.
+
+    [protocol] (Task 4) is the session-type FSM (see {!Riptide_module.Protocol}) every later
+    {!invoke} call on the returned {!t} is checked against, by entrypoint name — [instantiate]
+    itself merely calls {!Riptide_module.Protocol.start} once, on this argument, to seed the
+    returned [t]'s own private checker; it does not otherwise validate or use [protocol] at
+    instantiate time (a module with no exports the protocol will ever legally permit still
+    instantiates successfully — that's an {!invoke}-time concern, not a setup failure). This is
+    required, not optional, even for tiers/paths where no {!invoke} call will ever actually
+    happen (e.g. [tier = Microvm] below, or the memory-limit/import-rejection failures that abort
+    before any guest call could occur) — every {!t} unconditionally owns a checker from the
+    moment it exists, so there is never a window where {!invoke} could be called against a [t]
+    that has none.
 
     [tier = Microvm] @raise Failure "Loader.instantiate: Microvm tier is not yet implemented
     (Task 8's own job)" — a real, tested error, not silent acceptance of an unbuilt capability.
@@ -69,8 +88,28 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     the guest's own result names (this task's ptr+len marshaling convention, documented in
     [loader.ml]).
 
-    Returns [Error msg] — never raises — for: no such export, the named export isn't a function,
-    the guest traps (including a genuine WASM trap, e.g. an out-of-bounds memory access), or the
+    Task 4: BEFORE any of that — before the export lookup, before touching guest memory, before
+    the guest is dispatched into at all — [entrypoint] is checked against [t]'s own protocol
+    checker (seeded from {!instantiate}'s [~protocol] argument) via
+    {!Riptide_module.Protocol.step}. If the declared protocol has no transition for [entrypoint]
+    from the checker's current state, [invoke] returns that [Error] immediately and the guest
+    never runs — not even far enough to discover it has no such export — matching this
+    codebase's own "guard failure ⇒ total no-op" convention (see {!Riptide_module.Protocol.step}'s
+    own doc comment for the exact error shape). On success, [t]'s checker is advanced immediately,
+    before the now-permitted call actually executes; the protocol governs which calls a guest is
+    permitted to be dispatched with; it does not roll back if the dispatched call then itself
+    fails for an unrelated reason (a trap, a fuel timeout, etc.) — the same way a session-typed
+    peer sending a legal message doesn't un-send it just because the recipient then errors out
+    handling it. Each {!t} owns its own checker, seeded once at {!instantiate} time and never
+    shared with any other {!t} — two concurrent invocations of the very same underlying module
+    (two separate {!instantiate} calls) therefore track their own, fully independent protocol
+    state, with no locking needed (see
+    [test_two_concurrent_invocations_of_the_same_module_do_not_share_protocol_state] in
+    test_module_loader.ml).
+
+    Returns [Error msg] — never raises — for: a protocol violation (above), no such export, the
+    named export isn't a function, the guest traps (including a genuine WASM trap, e.g. an
+    out-of-bounds memory access), or the
     wall-clock containment deadline is exceeded (the closest real equivalent this loader has to
     "fuel exhausted", given no fuel API is available on the classic [wasm_c_api] surface this
     loader runs on — see [loader.ml]'s top comment). The call itself runs in a forked child

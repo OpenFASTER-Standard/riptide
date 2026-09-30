@@ -7,6 +7,17 @@ let read_file path =
   close_in ic;
   s
 
+(* Shared by every test below that doesn't itself care about protocol enforcement (Task 3's own
+   instantiation/invocation/containment/rejection tests, none of which are testing the protocol
+   machinery added in Task 4) -- a minimal, permissive one-state self-loop that allows exactly
+   the one call every one of those tests' own guests is actually invoked with ("handle"), so
+   Loader.instantiate's now-mandatory ~protocol argument never gets in their way. Tests that
+   specifically exercise protocol enforcement (below) build their own, deliberately narrower
+   protocol instead. *)
+let permissive_protocol () =
+  Protocol.create ~states:[ "init" ] ~initial:"init"
+    ~transitions:[ { Protocol.from_state = "init"; on_call = "handle"; to_state = "init" } ]
+
 let test_invoke_calls_the_guests_handle_and_observes_its_log_call () =
   let logged = ref [] in
   let host =
@@ -18,6 +29,7 @@ let test_invoke_calls_the_guests_handle_and_observes_its_log_call () =
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/echo.wat") ~host
+      ~protocol:(permissive_protocol ())
   in
   (match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
   | Ok _ -> ()
@@ -34,6 +46,7 @@ let test_a_runaway_module_is_contained_not_crashing_the_host () =
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/runaway.wat") ~host
+      ~protocol:(permissive_protocol ())
   in
   match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
   | Ok _ -> Alcotest.fail "expected containment, not success"
@@ -53,7 +66,7 @@ let test_read_materialized_relays_a_known_value_back_to_the_guest () =
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/read_materialized.wat")
-      ~host
+      ~host ~protocol:(permissive_protocol ())
   in
   (* arg byte 0 = '\000' selects the "known" key in this fixture's own convention. *)
   match Loader.invoke m ~entrypoint:"handle" ~arg:(Bytes.make 1 '\000') with
@@ -78,7 +91,7 @@ let test_read_materialized_relays_none_for_a_missing_key () =
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/read_materialized.wat")
-      ~host
+      ~host ~protocol:(permissive_protocol ())
   in
   (* any nonzero arg byte 0 selects the "missing" key in this fixture's own convention. *)
   match Loader.invoke m ~entrypoint:"handle" ~arg:(Bytes.make 1 '\001') with
@@ -103,7 +116,7 @@ let test_propose_write_relays_the_guests_bytes_to_the_host_and_returns_success (
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/propose_write.wat")
-      ~host
+      ~host ~protocol:(permissive_protocol ())
   in
   match Loader.invoke m ~entrypoint:"handle" ~arg:(Bytes.of_string "allow-me") with
   | Error e -> Alcotest.fail e
@@ -128,7 +141,7 @@ let test_propose_write_relays_the_hosts_denial_back_to_the_guest () =
   in
   let m =
     Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/propose_write.wat")
-      ~host
+      ~host ~protocol:(permissive_protocol ())
   in
   match Loader.invoke m ~entrypoint:"handle" ~arg:(Bytes.of_string "reject-me") with
   | Error e -> Alcotest.fail e
@@ -153,7 +166,8 @@ let test_instantiate_rejects_a_module_declaring_a_memory_maximum_over_the_cap ()
         bytes) exceeds this loader's cap (1024 pages / 67108864 bytes)") (fun () ->
       ignore
         (Loader.instantiate ~tier:Loader.Sfi
-           ~module_bytes:(read_file "fixtures/oversized_memory.wat") ~host:(no_op_host ())))
+           ~module_bytes:(read_file "fixtures/oversized_memory.wat") ~host:(no_op_host ())
+           ~protocol:(permissive_protocol ())))
 
 let test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all () =
   Alcotest.check_raises
@@ -163,7 +177,8 @@ let test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all () =
         growth) -- a declared maximum of at most 1024 pages (67108864 bytes) is required") (fun () ->
       ignore
         (Loader.instantiate ~tier:Loader.Sfi
-           ~module_bytes:(read_file "fixtures/unbounded_memory.wat") ~host:(no_op_host ())))
+           ~module_bytes:(read_file "fixtures/unbounded_memory.wat") ~host:(no_op_host ())
+           ~protocol:(permissive_protocol ())))
 
 let test_instantiate_rejects_a_module_that_imports_memory_instead_of_declaring_it_locally () =
   Alcotest.check_raises
@@ -175,7 +190,7 @@ let test_instantiate_rejects_a_module_that_imports_memory_instead_of_declaring_i
         imports from \"host\" are supported") (fun () ->
       ignore
         (Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/memory_import.wat")
-           ~host:(no_op_host ())))
+           ~host:(no_op_host ()) ~protocol:(permissive_protocol ())))
 
 (* Shared by both "no zombie/fd leak" regression tests below: asserts the containment call
    returned a real [Error] (never raised), that the forked child was genuinely reaped (not left
@@ -259,7 +274,51 @@ let test_microvm_tier_raises_a_clear_not_implemented_error () =
                Loader.read_materialized = (fun ~merge_key:_ -> None);
                propose_write = (fun _ -> Ok ());
                log = ignore;
-             }))
+             }
+           ~protocol:(permissive_protocol ())))
+
+let test_a_call_violating_the_declared_protocol_is_rejected_not_forwarded_to_the_guest () =
+  let called = ref false in
+  let host =
+    {
+      Loader.read_materialized = (fun ~merge_key:_ -> None);
+      propose_write = (fun _ -> called := true; Ok ());
+      log = (fun _ -> ());
+    }
+  in
+  let protocol =
+    Protocol.create ~states:[ "init"; "ready" ] ~initial:"init"
+      ~transitions:[ { from_state = "init"; on_call = "init"; to_state = "ready" } ]
+  in
+  let m =
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/protocol_violator.wat")
+      ~host ~protocol
+  in
+  match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
+  | Ok _ -> Alcotest.fail "expected rejection"
+  | Error _ ->
+    Alcotest.(check bool) "the guest's own propose_write was never reached" false !called
+
+let test_two_concurrent_invocations_of_the_same_module_do_not_share_protocol_state () =
+  let host =
+    {
+      Loader.read_materialized = (fun ~merge_key:_ -> None);
+      propose_write = (fun _ -> Ok ());
+      log = (fun _ -> ());
+    }
+  in
+  let protocol =
+    Protocol.create ~states:[ "init"; "ready" ] ~initial:"init"
+      ~transitions:[ { from_state = "init"; on_call = "init"; to_state = "ready" } ]
+  in
+  let module_bytes = read_file "fixtures/echo.wat" in
+  let m1 = Loader.instantiate ~tier:Loader.Sfi ~module_bytes ~host ~protocol in
+  let m2 = Loader.instantiate ~tier:Loader.Sfi ~module_bytes ~host ~protocol in
+  (* m1 progresses its own protocol; m2, freshly instantiated, must still start at "init" *)
+  ignore (Loader.invoke m1 ~entrypoint:"init" ~arg:Bytes.empty);
+  match Loader.invoke m2 ~entrypoint:"handle" ~arg:Bytes.empty with
+  | Ok _ -> Alcotest.fail "m2 should still be at its own fresh initial state"
+  | Error _ -> ()
 
 let tests =
   [
@@ -307,4 +366,11 @@ let tests =
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );
+    ( "Loader.invoke rejects a call violating the declared protocol, never forwarding it to the \
+       guest",
+      `Quick,
+      test_a_call_violating_the_declared_protocol_is_rejected_not_forwarded_to_the_guest );
+    ( "two concurrent invocations of the same module do not share protocol state",
+      `Quick,
+      test_two_concurrent_invocations_of_the_same_module_do_not_share_protocol_state );
   ]
