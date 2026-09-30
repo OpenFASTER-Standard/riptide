@@ -873,6 +873,50 @@ let test_ring_margin_is_zero_once_the_ring_has_wrapped () =
       Alcotest.(check int) "margin saturates at 0 once wrapped, never negative" 0
         (File_storage.ring_margin t))
 
+(* FINAL WHOLE-BRANCH REVIEW, finding M2 (Task 31, across its own two additions): [ring_margin] and
+   [wal_seed_starting_op_number] were added by the SAME task, and file_storage.mli's [ring_margin]
+   doc justified its value as "[ring_capacity t] minus the number of entries currently live" -- a
+   derivation that is FALSE the moment [wal_seed_starting_op_number] (the resize runbook's own
+   primitive, ~20 lines further down the same .mli) has moved this handle's
+   [wal_highest_op_number] forward without any entry existing. This test pins both halves of the
+   real behaviour so the corrected doc can never be re-derived back into the false one:
+
+   1. [ring_margin] reads [0] on a ring holding ZERO live entries (the occupancy derivation would
+      have said [ring_capacity] = 8). Live RED evidence for the doc defect: asserting the doc's
+      own predicted 8 here fails with "expected 8, got 0".
+   2. That [0] is nevertheless the CORRECT reading for what [ring_margin] actually promises ("how
+      many more entries before the NEXT append would have to evict"), because eviction itself is
+      decided by OP-NUMBER ARITHMETIC ([op_number > ring_capacity]), not by real slot occupancy --
+      the very arithmetic-vs-occupancy distinction file_storage.mli's runbook already discloses at
+      length for [?may_evict], and now discloses for [ring_margin] too. The gate fires here naming
+      op_number 12, an op this ring never held. *)
+let test_ring_margin_after_seeding_is_arithmetic_not_real_occupancy () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t =
+        File_storage.create ~sw ~fs:(Eio.Stdenv.fs env) ~ring_capacity:8
+          ~may_evict:(fun ~op_number:_ -> false)
+          dir
+      in
+      File_storage.wal_seed_starting_op_number t ~op_number:20;
+      (* Nothing has ever been appended: every op-number is unreadable, so zero entries are live. *)
+      Alcotest.(check (option string)) "precondition: no entry is live at the seeded start" None
+        (File_storage.wal_read t ~op_number:20);
+      Alcotest.(check (option string)) "precondition: no entry is live below the seeded start" None
+        (File_storage.wal_read t ~op_number:12);
+      Alcotest.(check int) "precondition: wal_highest_op_number is the seeded value, not a count" 19
+        (File_storage.wal_highest_op_number t);
+      Alcotest.(check int)
+        "ring_margin is 0 on a ring with ZERO live entries -- the occupancy derivation would say 8"
+        0 (File_storage.ring_margin t);
+      (* ...and 0 is still the right EARLY-WARNING reading: the next append really does consult
+         [?may_evict], for an op-number this ring never held. *)
+      Alcotest.check_raises
+        "the next append is gated by op-number arithmetic, not by real occupancy"
+        (Invalid_argument "wal_append: eviction blocked for op_number 12") (fun () ->
+          File_storage.wal_append t ~op_number:20 "x"))
+
 (* ============================================================================================
    TASK 31: the resize-before-wedge runbook, documented in file_storage.mli. The real subtlety
    under test: once the OLD ring has genuinely WRAPPED, the correct starting op-number to copy
@@ -1493,6 +1537,10 @@ let tests =
     ( "Task 31: ring_margin saturates at 0 once the ring has wrapped",
       `Quick,
       test_ring_margin_is_zero_once_the_ring_has_wrapped );
+    ( "final whole-branch review (M2): after wal_seed_starting_op_number, ring_margin is \
+       op-number arithmetic, not real occupancy",
+      `Quick,
+      test_ring_margin_after_seeding_is_arithmetic_not_real_occupancy );
     ( "Task 31: a ring can be resized before it wedges by copying live entries, past wraparound",
       `Quick,
       test_a_ring_can_be_resized_before_it_wedges_by_copying_live_entries );

@@ -568,7 +568,16 @@ let ring_capacity t = t.ring_capacity
    live-entry count needs no scan: before the ring has ever wrapped ([highest_op_number <=
    ring_capacity]) every appended entry is still live, so the count is exactly [highest_op_number];
    once wrapped, exactly [ring_capacity] entries are ever live at once (each append evicts exactly
-   one). [min] folds both cases into one expression without a branch. *)
+   one). [min] folds both cases into one expression without a branch.
+
+   FINAL WHOLE-BRANCH REVIEW, finding M2: that live-entry reading holds only while the WAL starts at
+   op 1. After [wal_seed_starting_op_number] below (this same task's other addition), it does not --
+   [highest_op_number] is then an absolute op-number with nothing live behind it. The expression is
+   deliberately left unchanged: it is [evicted_op_number]'s own arithmetic gate
+   ([op_number > ring_capacity]) read one append ahead, and THAT is the property callers need, so
+   matching the gate is correct and "counting live entries" was only ever an incidental
+   coincidence for unseeded stores. See file_storage.mli's own corrected doc for the full
+   disclosure, and [test_ring_margin_after_seeding_is_arithmetic_not_real_occupancy] for the pin. *)
 let ring_margin t = t.ring_capacity - min t.highest_op_number t.ring_capacity
 
 (* Task 31 (audit-remediation): the one primitive the resize-before-wedge runbook (file_storage.mli)

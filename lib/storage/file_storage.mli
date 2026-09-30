@@ -157,15 +157,33 @@ val ring_margin : t -> int
     [?may_evict] policy it supplied -- before a single eviction is ever attempted, rather than
     discovering the problem only once [eviction_blocked] has already started climbing.
 
-    [ring_capacity t] minus the number of entries currently live: before the ring has ever wrapped
-    ([wal_highest_op_number t <= ring_capacity t]), every appended entry is still live, so that
-    count is exactly [wal_highest_op_number t]; once it has wrapped, exactly [ring_capacity t]
-    entries are live at any one time (each new append evicts exactly one older one), so the live
-    count saturates at [ring_capacity t] and [ring_margin] saturates at [0]. It does not go
-    negative, and it does not distinguish "just wrapped" from "wrapped long ago" -- both report
-    [0], which is the correct reading for an early-warning signal: the next append will evict
-    something either way, and how long that has already been true is not this function's
-    question. *)
+    Computed as [ring_capacity t - min (wal_highest_op_number t) (ring_capacity t)]. For a store
+    whose WAL starts at op 1 -- every store except one seeded by {!wal_seed_starting_op_number}
+    below -- that is exactly [ring_capacity t] minus the number of entries currently live: before
+    the ring has ever wrapped ([wal_highest_op_number t <= ring_capacity t]), every appended entry
+    is still live, so that count is exactly [wal_highest_op_number t]; once it has wrapped, exactly
+    [ring_capacity t] entries are live at any one time (each new append evicts exactly one older
+    one), so the live count saturates at [ring_capacity t] and [ring_margin] saturates at [0]. It
+    does not go negative, and it does not distinguish "just wrapped" from "wrapped long ago" --
+    both report [0], which is the correct reading for an early-warning signal: the next append will
+    evict something either way, and how long that has already been true is not this function's
+    question.
+
+    {b It is OP-NUMBER ARITHMETIC, not real slot occupancy -- which only matters for a store seeded
+    by {!wal_seed_starting_op_number}} (final whole-branch review, finding M2). That function moves
+    [wal_highest_op_number] forward without any entry existing, so the "minus entries currently
+    live" reading above stops holding: a ring seeded at op 20 with [ring_capacity = 8] reports
+    [ring_margin = 0] while holding {e zero} live entries, where an occupancy-based count would
+    report [8]. The value [0] is still exactly right for what this function actually promises,
+    because {!create}'s own [?may_evict] gate is decided by the SAME arithmetic
+    ([op_number > ring_capacity t]) rather than by whether a prior occupant really existed -- the
+    next append genuinely is gated, naming an op-number this ring never held. This is the identical
+    arithmetic-vs-occupancy property the resize-before-wedge runbook below already discloses for
+    [?may_evict]; it is restated here because [ring_margin] is the signal that runbook tells a
+    caller to WATCH, and an operator who read the occupancy framing literally would see [0] on a
+    freshly-resized, nearly-empty ring and wrongly conclude the resize had not helped. Pinned by
+    [test_file_storage.ml]'s [test_ring_margin_after_seeding_is_arithmetic_not_real_occupancy],
+    which asserts both halves (the [0], and the gate firing for an op-number never held). *)
 
 val wal_seed_starting_op_number : t -> op_number:int -> unit
 (** [wal_seed_starting_op_number t ~op_number] declares that [t]'s WAL begins at [op_number]
