@@ -14,6 +14,15 @@ let read_file path =
    Loader.instantiate's now-mandatory ~protocol argument never gets in their way. Tests that
    specifically exercise protocol enforcement (below) build their own, deliberately narrower
    protocol instead. *)
+(* Substring test, for asserting on a real error message's content rather than merely its
+   non-emptiness -- [Str] is already a dependency of this test executable (test/dune), and
+   test_module_reactor.ml uses this exact helper for the same purpose. *)
+let string_contains ~needle haystack =
+  try
+    ignore (Str.search_forward (Str.regexp_string needle) haystack 0);
+    true
+  with Not_found -> false
+
 let permissive_protocol () =
   Protocol.create ~states:[ "init" ] ~initial:"init"
     ~transitions:[ { Protocol.from_state = "init"; on_call = "handle"; to_state = "init" } ]
@@ -53,40 +62,100 @@ let test_a_runaway_module_is_contained_not_crashing_the_host () =
   | Error e -> Alcotest.(check bool) "fuel exhaustion is reported, not a host crash" true (String.length e > 0)
 
 (* Final-fix-wave finding I2: the containment deadline must charge GUEST execution time only, never
-   time the PARENT spends inside a host closure the guest called out to. Those closures are
-   entirely caller-supplied code (Task 6's reactor wires a real [Batch_commit.propose] into
-   [propose_write], which can cascade into materialization and further nested module dispatches
-   before it returns), and the guest is blocked on the relay response for every microsecond of it --
-   executing nothing of its own. Charging that against its budget made a perfectly well-behaved
-   guest get SIGKILLed and reported "fuel exhausted" AFTER its own write had already been proposed
-   and committed by the very closure whose slowness caused the report.
+   time the PARENT spends servicing a host call the guest is BLOCKED on. [read_materialized] and
+   [propose_write] both have that shape -- the guest issues its call and cannot continue until the
+   parent writes a response frame back -- and both are entirely caller-supplied code: Task 6's
+   reactor wires a real [Batch_commit.propose] into [propose_write], which cascades through the
+   authorization checkpoint, a VSR commit, materialization and every further nested module dispatch
+   before returning. Charging all of that to the guest made a perfectly well-behaved guest get
+   SIGKILLed and reported "fuel exhausted" AFTER its own write had already been proposed and
+   committed by the very closure whose duration caused the report.
 
-   [echo.wat] is exactly the right guest for this: one [host.log] call, then an immediate return.
-   With the log closure alone sleeping longer than the whole budget, a guest doing essentially zero
-   work of its own either completes ([Ok], the correct outcome) or gets reported as a runaway
-   ([Error], the bug) purely as a function of how host-closure time is accounted -- nothing else
-   about the call differs. *)
+   [propose_write.wat] is the right guest for this, and specifically a better one than the [echo.wat]
+   /[host.log] version this test used in fix-wave round 1: [log] is fire-and-forget (no response
+   frame, guest never blocks), so it must NOT be credited at all -- see
+   [test_a_spinning_guest_that_calls_a_slow_log_closure_is_still_contained_on_schedule] below for the
+   containment escape that mis-credit caused, found by re-review. This test therefore exercises the
+   arm the credit is genuinely correct for, and the one I2's real motivating scenario (the reactor's
+   propose_write cascade) actually travels through. The guest does essentially no work of its own, so
+   it either completes ([Ok], correct) or is reported as a runaway ([Error], the bug) purely as a
+   function of how blocked-on-host time is accounted. *)
 let test_time_spent_in_a_host_closure_is_not_charged_against_the_guests_fuel_budget () =
   let host =
     {
       Loader.read_materialized = (fun ~merge_key:_ -> None);
-      propose_write = (fun _ -> Ok ());
       (* Deliberately longer than the ENTIRE budget, so pre-fix there is no remaining time left at
          all the moment this returns -- not a marginal, timing-sensitive overrun. *)
-      log = (fun _ -> Unix.sleepf (Loader.fuel_budget_seconds +. 0.3));
+      propose_write =
+        (fun _ ->
+          Unix.sleepf (Loader.fuel_budget_seconds +. 0.3);
+          Ok ());
+      log = (fun _ -> ());
     }
   in
   let m =
-    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/echo.wat") ~host
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/propose_write.wat") ~host
       ~protocol:(permissive_protocol ())
   in
-  match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
-  | Ok _ -> ()
+  match Loader.invoke m ~entrypoint:"handle" ~arg:(Bytes.of_string "allow-me") with
+  | Ok result ->
+    (* Not just "Ok": the guest's own post-call work (storing the status byte it got back, then
+       returning it) genuinely ran to completion after the slow closure returned, which is what
+       proves the call was serviced rather than the guest merely being reported as successful. *)
+    Alcotest.(check string)
+      "the guest resumed after the slow host call and returned the success status byte it was handed"
+      "\000" (Bytes.to_string result)
   | Error e ->
     Alcotest.failf
-      "a guest that did nothing but call one (slow) host closure was reported as a containment \
-       failure -- host-closure time is being charged against the guest's own fuel budget: %s"
+      "a guest that did nothing but make one (slow) blocking host call was reported as a \
+       containment failure -- time it spent BLOCKED on the host is being charged against its own \
+       fuel budget: %s"
       e
+
+(* Re-review of fix-wave round 1 (Important): the mirror property, and the reason the credit above
+   must be narrow. [host.log] is fire-and-forget -- [make_host_extern]'s "log" case writes the frame
+   and returns, with no response frame for the guest to wait on -- so a guest keeps executing at full
+   speed while the parent is still inside the log closure. Round 1 credited that parent-side time
+   back to the deadline for all three arms alike, which handed a guest free execution time it was
+   actually using: one slow log call bought this fixture's infinite loop an extra whole fuel budget,
+   and a guest interleaving log calls with compute could extend its own deadline without limit. That
+   is a containment escape in the one mechanism whose entire job is bounding untrusted guest
+   execution -- strictly worse than the (real) bug I2 fixed.
+
+   The oracle here has to be elapsed wall-clock time, not the result value: both the correct and the
+   broken behavior end in [Error] (the guest never terminates either way), and only WHEN differs.
+   With the log closure sleeping [fuel_budget_seconds +. 0.2], correct containment kills the guest as
+   soon as that closure returns (~budget + 0.2s, since by then the deadline has already passed),
+   while the broken credit pushes the deadline a full budget further out (~2 * budget + 0.2s). The
+   threshold below sits between those with ~1s of slack on each side, sized off the budget rather
+   than hardcoded. *)
+let test_a_spinning_guest_that_calls_a_slow_log_closure_is_still_contained_on_schedule () =
+  let host =
+    {
+      Loader.read_materialized = (fun ~merge_key:_ -> None);
+      propose_write = (fun _ -> Ok ());
+      log = (fun _ -> Unix.sleepf (Loader.fuel_budget_seconds +. 0.2));
+    }
+  in
+  let m =
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/log_then_spin.wat") ~host
+      ~protocol:(permissive_protocol ())
+  in
+  let started = Unix.gettimeofday () in
+  let result = Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty in
+  let elapsed = Unix.gettimeofday () -. started in
+  (match result with
+  | Ok _ -> Alcotest.fail "a guest spinning forever returned Ok -- it was not contained at all"
+  | Error e ->
+    Alcotest.(check bool) "the spinning guest was contained via the wall-clock budget" true
+      (string_contains ~needle:"fuel exhausted" e));
+  let ceiling = Loader.fuel_budget_seconds *. 1.6 in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "containment happened on schedule (%.2fs elapsed, ceiling %.2fs): a fire-and-forget log call \
+        must not buy a spinning guest extra deadline"
+       elapsed ceiling)
+    true (elapsed < ceiling)
 
 let test_read_materialized_relays_a_known_value_back_to_the_guest () =
   let seen_keys = ref [] in
@@ -193,15 +262,6 @@ let no_op_host () =
     propose_write = (fun _ -> Ok ());
     log = (fun _ -> ());
   }
-
-(* Substring test, for asserting on a real error message's content rather than merely its
-   non-emptiness -- [Str] is already a dependency of this test executable (test/dune), and
-   test_module_reactor.ml uses this exact helper for the same purpose. *)
-let string_contains ~needle haystack =
-  try
-    ignore (Str.search_forward (Str.regexp_string needle) haystack 0);
-    true
-  with Not_found -> false
 
 (* ── Final fix wave, finding I7: Decision 5's own two named isolation properties, neither of which
    had a real test ───────────────────────────────────────────────────────────────────────────────
@@ -389,6 +449,77 @@ let test_cleanup_reaps_and_closes_fds_even_when_a_signal_lands_in_its_pre_mask_w
           without the retry loop leaves the whole kill/waitpid/close/close sequence un-run \
           behind a normal-looking result, with no exception raised anywhere to notice it by"
 
+(* Fix-wave round 2, re-review finding on M1: [invoke] has to create two pipes and fork before the
+   guest can run, and nothing guarded that window -- a real fd exhaustion made
+   [Unix.Unix_error(EMFILE, "pipe", "")] escape uncaught (falsifying the raise contract the same doc
+   comment states) and, when it was the SECOND pipe that failed, leaked the first pipe's two
+   descriptors permanently (falsifying "no exit path leaks a file descriptor", on exactly the path
+   where descriptors are already scarce).
+
+   Driven through [module_loader_emfile_probe.exe] under a real, shell-level [ulimit -n], for the same
+   reason [test_transport_tcp.ml] and [test_file_storage.ml] already drive their own EMFILE/EFBIG
+   reproductions that way: the property only exists with a genuinely FULL descriptor table, and
+   lowering this suite's own budget would break every other test sharing the process. The probe's own
+   top comment documents how it arranges exactly two free descriptors so that the first pipe succeeds
+   and the second fails -- the leak-prone case specifically, not merely "some pipe failed". *)
+let emfile_probe_path = "./module_loader_emfile_probe.exe"
+
+let run_emfile_probe ~ulimit_n =
+  let output_path = Filename.temp_file "module_loader_emfile_probe" ".log" in
+  let out_fd = Unix.openfile output_path [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+  let pid =
+    match Unix.fork () with
+    | 0 ->
+      (try
+         Unix.dup2 out_fd Unix.stdout;
+         Unix.dup2 out_fd Unix.stderr;
+         Unix.close out_fd;
+         Unix.execv "/bin/sh"
+           [|
+             "/bin/sh";
+             "-c";
+             Printf.sprintf "ulimit -n %d && exec %s fixtures/echo.wat" ulimit_n
+               (Filename.quote emfile_probe_path);
+           |]
+       with _ -> Unix._exit 127)
+    | child -> child
+  in
+  Unix.close out_fd;
+  let status = snd (Unix.waitpid [] pid) in
+  let output = read_file output_path in
+  Sys.remove output_path;
+  (status, output)
+
+let test_invoke_reports_an_error_and_leaks_no_fd_when_the_containment_pipes_cannot_be_created () =
+  (* 64 is comfortable enough for the probe's own startup (dynamic linker, the fixture read, whatever
+     wasmtime's own compilation touches) while leaving a table small enough to fill with a handful of
+     [Unix.dup] calls. *)
+  let status, output = run_emfile_probe ~ulimit_n:64 in
+  (* Reported first, so a setup failure inside the probe is legible rather than showing up only as an
+     exit code. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "the probe got past its own setup (output: %s)" (String.trim output))
+    false
+    (string_contains ~needle:"PROBE-SETUP-FAILED" output);
+  Alcotest.(check bool)
+    "invoke returned an Error naming the pipe-creation failure, rather than raising Unix_error"
+    true
+    (string_contains ~needle:"could not create the containment pipes" output);
+  Alcotest.(check bool) "invoke did not raise" false (string_contains ~needle:"PROBE-RESULT raised" output);
+  (* The probe compares its own [/proc/self/fd] count either side of the failed [invoke] and reports
+     the two numbers plus its verdict; both appear in [output] above, which every label here
+     includes, so a failure shows the real before/after counts without this test re-parsing them. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "no descriptor was leaked by the failed setup; probe output: %s"
+       (String.trim output))
+    true
+    (string_contains ~needle:"no_leak=true" output);
+  Alcotest.(check bool)
+    (Printf.sprintf "the probe exited 0 (all its own checks passed); full output: %s"
+       (String.trim output))
+    true
+    (status = Unix.WEXITED 0)
+
 let test_microvm_tier_raises_a_clear_not_implemented_error () =
   Alcotest.check_raises "microvm tier is designed, not built"
     (Failure "Loader.instantiate: Microvm tier is not yet implemented (Task 8's own job)") (fun () ->
@@ -466,9 +597,13 @@ let tests =
     ( "Loader.invoke contains a runaway module instead of crashing the host",
       `Quick,
       test_a_runaway_module_is_contained_not_crashing_the_host );
-    ( "Loader.invoke does not charge host-closure time against the guest's own fuel budget",
+    ( "Loader.invoke does not charge blocked-on-host time against the guest's own fuel budget",
       `Quick,
       test_time_spent_in_a_host_closure_is_not_charged_against_the_guests_fuel_budget );
+    ( "Loader.invoke still contains a spinning guest on schedule despite a slow fire-and-forget log \
+       closure",
+      `Quick,
+      test_a_spinning_guest_that_calls_a_slow_log_closure_is_still_contained_on_schedule );
     ( "Loader.invoke relays a known read_materialized value back to the guest",
       `Quick,
       test_read_materialized_relays_a_known_value_back_to_the_guest );
@@ -511,6 +646,9 @@ let tests =
        window",
       `Quick,
       test_cleanup_reaps_and_closes_fds_even_when_a_signal_lands_in_its_pre_mask_window );
+    ( "Loader.invoke returns an Error and leaks no fd when the containment pipes cannot be created",
+      `Quick,
+      test_invoke_reports_an_error_and_leaks_no_fd_when_the_containment_pipes_cannot_be_created );
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );

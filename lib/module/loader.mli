@@ -50,14 +50,25 @@ val fuel_budget_seconds : float
     value), and this loader's own regression test for "host-closure time is not guest time"
     (below) has to know the budget it is deliberately exceeding.
 
-    {b What this budget does and does not measure.} It bounds GUEST execution time only. Time the
-    PARENT spends inside a host closure the guest called out to ([read_materialized]/
-    [propose_write]/[log], all entirely caller-supplied code — which may itself be arbitrarily
-    slow, and in this plan's own reactor genuinely IS: a relayed [propose_write] can drive a whole
-    nested {!Riptide_batch_commit.Batch_commit.propose}, materialization, and further module
-    dispatches before returning) is explicitly NOT charged against it: the guest is blocked
-    waiting for that response the entire time and is executing nothing of its own. See
-    {!invoke}'s own doc comment for the real bug this closed. *)
+    {b What this budget does and does not measure.} It bounds GUEST execution time only, and the
+    precise rule is {b time the guest provably could not have been executing in} — not the looser
+    "time spent inside a host closure", which is a different thing and, taken as the rule, breaks
+    containment (see below). Concretely: time the PARENT spends servicing a
+    ["read_materialized"]/["propose_write"] call is NOT charged against the budget, because those
+    are request/response — the guest is blocked on the reply for every microsecond of it. Such a
+    closure is entirely caller-supplied code which may be arbitrarily slow, and in this plan's own
+    reactor genuinely is: a relayed ["propose_write"] can drive a whole nested
+    {!Riptide_batch_commit.Batch_commit.propose}, materialization, and further module dispatches
+    before returning.
+
+    ["log"] is deliberately excluded from that credit, and the difference matters: it is
+    fire-and-forget (the guest writes its frame and returns immediately — no response frame exists
+    for it to wait on), so guest and host then run concurrently. Crediting a slow ["log"] closure
+    would hand a guest free execution time it is genuinely using — measured live: one slow ["log"]
+    call bought a spinning guest an extra whole budget, and a guest alternating ["log"] with compute
+    could extend its own deadline without limit. See {!invoke}'s own doc comment for both the real
+    bug this budget accounting closed and the containment escape that the first, too-broad version
+    of it opened. *)
 
 val instantiate :
   tier:isolation_tier -> module_bytes:string -> host:host_functions -> protocol:Protocol.t -> t
@@ -150,18 +161,41 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     results). Each [invoke] call costs a real `fork`, non-trivial relative to an in-process call
     — a real, measurable cost Task 6's reactor should account for, not assume away.
 
-    {b The containment deadline charges GUEST time only} ({!fuel_budget_seconds}). Time this
-    parent process spends inside a host closure the guest called out to — and, transitively,
-    inside anything that closure itself drives — is credited back to the deadline rather than
-    counted against it, because the guest is blocked on the relay response for every microsecond
-    of it and is executing nothing of its own. This is not a fairness nicety: charging it produced
-    a real misbehavior (found by this plan's own final whole-branch review, finding I2), because
-    this plan's reactor wires a genuine {!Riptide_batch_commit.Batch_commit.propose} into
-    ["propose_write"] — authorization checkpoint, VSR commit, materialization, and every further
-    module dispatch that materialization retriggers, all inside one relayed host call. A
-    well-behaved guest was therefore SIGKILLed and reported "fuel exhausted" AFTER the write it
-    proposed had already been committed by the very closure whose duration triggered the report,
-    handing its caller a containment failure for a call that in fact succeeded.
+    {b The containment deadline charges GUEST time only} ({!fuel_budget_seconds}), where "guest
+    time" means precisely {b time the guest could have been executing in}. Time this parent process
+    spends servicing a ["read_materialized"]/["propose_write"] call — and, transitively, anything
+    that closure itself drives — is credited back to the deadline rather than counted against it,
+    because those two are request/response: the guest is blocked on the reply for every microsecond
+    of it and is executing nothing of its own. This is not a fairness nicety: charging it produced a
+    real misbehavior (this plan's final whole-branch review, finding I2), because the reactor wires a
+    genuine {!Riptide_batch_commit.Batch_commit.propose} into ["propose_write"] — authorization
+    checkpoint, VSR commit, materialization, and every further module dispatch that materialization
+    retriggers, all inside one relayed host call. A well-behaved guest was therefore SIGKILLed and
+    reported "fuel exhausted" AFTER the write it proposed had already been committed by the very
+    closure whose duration triggered the report, handing its caller a containment failure for a call
+    that in fact succeeded.
+
+    {b ["log"] is deliberately NOT credited, and that asymmetry is load-bearing.} Unlike the other
+    two, ["log"] is fire-and-forget: the guest writes its frame and returns immediately, with no
+    response frame to wait on, so guest and host run concurrently from that instant. The first
+    version of the fix above credited all three arms alike, which was a genuine containment escape
+    rather than a narrower version of the bug it fixed — live-measured, a spinning guest making one
+    ["log"] call to a slow closure survived a full extra budget, and a guest alternating ["log"]
+    calls with real compute never got contained at all (measured: [invoke] still running when a 15s
+    external watchdog fired, against a 2s budget). Pinned by
+    [test_a_spinning_guest_that_calls_a_slow_log_closure_is_still_contained_on_schedule] in
+    test_module_loader.ml, whose oracle is elapsed wall-clock time (both behaviors return [Error];
+    only {i when} differs).
+
+    {b Known, disclosed consequence of that asymmetry}: a guest that FINISHES while a slow ["log"]
+    closure is still running can still be reported as fuel-exhausted, because by the time this
+    parent returns to its deadline check the budget has already passed even though the guest's own
+    result may already be waiting in the pipe. This is pre-existing behavior (it predates finding
+    I2's fix rather than being introduced by it), it requires a ["log"] closure slow enough to
+    outlast the whole budget — caller-controlled, and microseconds in this plan's own reactor — and
+    the only alternatives are the containment escape above or honouring a post-deadline terminal
+    message, which is a real behavior change to propose on its own merits rather than to slip into a
+    fix wave.
 
     {b Known, disclosed residual gap: a host closure's own duration is not bounded by anything
     here.} A caller-supplied ["log"]/["read_materialized"]/["propose_write"] that blocks forever
@@ -197,13 +231,34 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     real, permanently-armed SIGALRM in this same test suite, not a synthetic stand-in) at each
     round, and the fourth's own residual (the sub-instruction instant at [cleanup]'s own entry,
     before any guard of its own can exist) disclosed in full there rather than glossed. No exit
-    path leaks a zombie process or a file descriptor.
+    path leaks a zombie process or a file descriptor — including, since the re-review of this plan's
+    own fix wave, the SETUP window before a child exists at all: a failure of either [Unix.pipe] or
+    of [Unix.fork] itself closes whatever was already obtained before reporting (that window used to
+    leak the first pipe's two descriptors whenever the second pipe failed, which is precisely when
+    descriptors are scarcest — see the raise contract below for the live reproduction of both halves).
 
-    {b The exact raise contract} (corrected in this plan's final fix wave, review finding M1 — the
-    blanket "never raises" this paragraph used to open with was false in one documented, deliberate,
-    already-tested case, which is worse than making no claim): [invoke] raises exactly two
-    exceptions, [Out_of_memory] and [Stack_overflow], and converts every other failure it can
-    observe into an [Error]. Both are re-raised on purpose rather than swallowed — they say the
+    {b The exact raise contract} (finding M1, corrected TWICE — the original blanket "never raises"
+    was false for the two exceptions below, and the first correction was still false for
+    resource-exhaustion failures in the setup window, which a re-review reproduced live as an escaping
+    [Unix.Unix_error(EMFILE, "pipe", "")]; both are now closed in code rather than narrated around):
+    [invoke] raises exactly two exceptions, [Out_of_memory] and [Stack_overflow], and converts every
+    other failure it can observe into an [Error] — including the ones that happen BEFORE the guest
+    exists at all. Creating the two containment pipes and forking can genuinely fail (EMFILE/ENFILE
+    under a full descriptor table, EAGAIN on a process limit); those are reported as
+    ["Loader.invoke: could not create the containment pipes ..."] / ["... could not fork the
+    containment child ..."], with every descriptor already obtained closed again first — see
+    [test_invoke_reports_an_error_and_leaks_no_fd_when_the_containment_pipes_cannot_be_created] in
+    test_module_loader.ml, which drives a real, genuinely-full fd table in a disposable child process
+    under a shell-level [ulimit -n] (the same technique this suite already uses for EMFILE-on-accept
+    and EFBIG) and checks both halves: that [invoke] returns [Error] rather than raising, and that the
+    process's own [/proc/self/fd] count is identical either side of the failure. Against the
+    unguarded code that same probe reports [PROBE-RESULT raised: Unix.Unix_error(Unix.EMFILE,
+    "pipe", "")] and [PROBE-FDS before=7 after=9] — the escape and the two-descriptor leak, both real.
+
+    What remains outside any guard, stated precisely rather than claimed away: the two [Unix.close]
+    calls with which the parent drops the child's own pipe ends immediately after a successful fork.
+    Those close descriptors this same function created moments earlier, so [EBADF] — [close]'s only
+    documented failure for them — is unreachable by construction. Both are re-raised on purpose rather than swallowed — they say the
     PROCESS is in trouble, not that this one guest call failed, and OCaml convention is not to turn
     either into an ordinary result. [loader.ml]'s own [step] re-raises them (having run [cleanup]
     first, so no zombie or descriptor leaks on the way out), [cleanup] itself re-raises rather than

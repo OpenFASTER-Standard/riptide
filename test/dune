@@ -6,10 +6,12 @@
    alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix digestif
    mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt tls tls-eio)
  (deps ../spec/golden/vectors.txt ../lib/storage/file_kv_store.ml ../lib/storage/file_storage.ml
-   file_storage_o_direct_probe.exe tcp_emfile_probe.exe fixtures/echo.wat fixtures/runaway.wat
+   file_storage_o_direct_probe.exe tcp_emfile_probe.exe module_loader_emfile_probe.exe
+   fixtures/echo.wat fixtures/runaway.wat
    fixtures/read_materialized.wat fixtures/propose_write.wat fixtures/oversized_memory.wat
    fixtures/unbounded_memory.wat fixtures/memory_import.wat fixtures/protocol_violator.wat
-   fixtures/counter.wat fixtures/out_of_bounds.wat fixtures/memory_sentinel.wat))
+   fixtures/counter.wat fixtures/out_of_bounds.wat fixtures/memory_sentinel.wat
+   fixtures/log_then_spin.wat))
 
 ; Task 19 (Bug 1): a standalone helper process [test_file_storage.ml]'s own
 ; [test_an_unrelated_write_error_does_not_permanently_strip_o_direct] forks+execs under a
@@ -18,6 +20,16 @@
 (executable
  (name file_storage_o_direct_probe)
  (libraries riptide_storage eio eio.unix eio_linux eio_main uring optint unix))
+
+; Fix-wave round 2 (re-review finding on M1): a standalone helper process
+; [test_module_loader.ml]'s own
+; [test_invoke_reports_an_error_and_leaks_no_fd_when_the_containment_pipes_cannot_be_created]
+; forks+execs under a [ulimit -n]-lowering shell -- see that probe's own top comment for why a real,
+; genuinely-full fd table has to belong to a disposable child process rather than to this suite's
+; own long-lived one. Same technique as the two probes below/above it.
+(executable
+ (name module_loader_emfile_probe)
+ (libraries riptide_module unix))
 
 ; Task 29: a standalone helper process [test_transport_tcp.ml]'s own
 ; [test_emfile_on_accept_does_not_kill_the_listener] forks+execs under a [ulimit -n]-lowering

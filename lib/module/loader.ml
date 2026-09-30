@@ -724,15 +724,16 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
          set [cleaned_up], and this returns immediately without a second syscall. *)
       cleanup ())
   in
-  (* MUTABLE, deliberately: it is extended by exactly the time the PARENT spends inside a host
-     closure, so only genuine GUEST execution time is ever charged against the budget -- see
-     [charge_to_host] below. *)
+  (* MUTABLE, deliberately: it is extended by exactly the time the PARENT spends servicing a host
+     call the GUEST IS BLOCKED ON, so only time the guest could actually have been executing in is
+     ever charged against the budget -- see [charge_to_host] below for which arms qualify, and
+     which one deliberately does not. *)
   let deadline = ref (Unix.gettimeofday () +. fuel_budget_seconds) in
-  (* Final-fix-wave finding I2. The budget ([fuel_budget_seconds]) stands in for guest FUEL, i.e.
-     work the guest itself does; but this parent's own supervision loop spends real wall-clock time
-     running things that are not the guest at all. The 'L'/'R'/'P' arms below call entirely
-     caller-supplied host closures ([host_functions]'s own three fields), and in this plan's own
-     reactor (Task 6) a relayed [propose_write] genuinely drives a whole nested
+  (* Final-fix-wave finding I2, narrowed by its own re-review. The budget
+     ([fuel_budget_seconds]) stands in for guest FUEL, i.e. work the guest itself does; but this
+     parent's own supervision loop spends real wall-clock time running things that are not the guest
+     at all. The ['R']/['P'] arms below call entirely caller-supplied host closures, and in this
+     plan's own reactor (Task 6) a relayed [propose_write] genuinely drives a whole nested
      [Batch_commit.propose] -- authorization checkpoint, VSR commit, materialization, and every
      module dispatch that materialization itself retriggers -- before it returns. Throughout ALL of
      that the guest is blocked on the relay response, having executed nothing of its own since its
@@ -742,13 +743,22 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
      SIGKILLed and reported "fuel exhausted" -- AFTER the write it proposed had already been
      authorized and committed by the very closure whose duration triggered the report. The caller
      then sees a containment failure for a call that in fact succeeded.
-     So: stop the clock for the duration of every host-side call, by pushing the deadline out by
-     exactly the elapsed host time. [Fun.protect] rather than a plain sequence, so the credit is
-     applied even when the closure raises (in which case [step]'s own guard converts it to a
-     containment failure and cleans up -- the deadline no longer matters, but leaving it
-     inconsistent on one path and not another would be a trap for the next reader). The finally
-     itself cannot raise (one [gettimeofday], one [ref] assignment), so no [Finally_raised] shape
-     is reachable here.
+
+     THE DISTINCTION THAT MAKES THIS SAFE, and the one the first cut of this fix got wrong (caught
+     by re-review, live-measured): the credit is sound ONLY for a REQUEST/RESPONSE arm, where the
+     guest genuinely cannot proceed until this parent answers. That is ['R'] and ['P']. It is NOT
+     sound for ['L'], which is fire-and-forget -- the guest's [log] import writes its frame and
+     returns immediately, so guest and host then run CONCURRENTLY, and crediting the parent's time
+     hands the guest free execution time it is actually using (one slow [log] call bought a spinning
+     guest an extra whole fuel budget; a guest alternating [log] with compute could extend its own
+     deadline indefinitely). "Time spent inside a host closure" was the wrong rule; "time the guest
+     provably could not execute in" is the right one, and they differ precisely on ['L'].
+
+     [Fun.protect] rather than a plain sequence, so the credit is applied even when the closure
+     raises (in which case [step]'s own guard converts it to a containment failure and cleans up --
+     the deadline no longer matters, but leaving it inconsistent on one path and not another would be
+     a trap for the next reader). The finally itself cannot raise (one [gettimeofday], one [ref]
+     assignment), so no [Finally_raised] shape is reachable here.
      What this deliberately does NOT do is bound host-closure time: a host closure that blocks
      forever blocks this loop forever, exactly as it did before this fix. That is the caller's own
      code, on the caller's own (parent) process -- not the untrusted guest this loader is built to
@@ -790,13 +800,34 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
         | _ -> (
           let tag, payload = Pipe_protocol.read_msg req_r in
           match tag with
-          (* All three host-call arms run under [charge_to_host] (finding I2): the guest is blocked
-             on its relayed call from the instant it issued it until this parent has finished both
-             the closure AND the response write that unblocks it, so the whole arm -- not just the
-             closure call inside it -- is host time, not guest time. *)
+          (* NOT under [charge_to_host], deliberately -- see its own comment above, and the
+             re-review finding that this distinction closes. ['L'] is the one fire-and-forget arm:
+             the guest's [log] import writes its frame and returns immediately (nothing reads a
+             response), so the guest goes straight back to executing at full speed while this
+             parent is still inside the caller-supplied [log] closure. Guest and host run
+             CONCURRENTLY here, unlike ['R']/['P'] below where the guest is blocked. Crediting this
+             time back would therefore hand a guest free execution time it is genuinely using: one
+             slow [log] call bought a spinning guest an extra whole fuel budget, and a guest
+             interleaving [log] calls with compute could push its own deadline out without limit --
+             a containment escape in the exact mechanism whose only job is bounding untrusted guest
+             execution. Live-measured before and after; pinned by
+             [test_a_spinning_guest_that_calls_a_slow_log_closure_is_still_contained_on_schedule].
+
+             Consequence, disclosed rather than traded away (see [loader.mli]'s {!invoke}): a guest
+             that FINISHES while a slow [log] closure is still running can still be reported as
+             fuel-exhausted, because by the time this parent gets back to the deadline check the
+             budget has already passed even though a 'D' message may be waiting. That is the
+             pre-existing behavior (it predates finding I2's fix), it needs a slow [log] closure --
+             caller-controlled, microseconds in this plan's own reactor -- and the alternative is
+             the escape above, which is strictly worse. *)
           | 'L' ->
-            charge_to_host (fun () -> (host_of_sink ()).log (Bytes.to_string payload));
+            (host_of_sink ()).log (Bytes.to_string payload);
             `Continue
+          (* ['R'] and ['P'] -- and ONLY these two, never ['L'] above -- run under
+             [charge_to_host]: both are REQUEST/RESPONSE, so the guest is blocked from the instant
+             it issued the call until this parent has finished the closure AND written the response
+             frame that unblocks it. The whole arm, not just the closure call inside it, is
+             therefore host time the guest could not possibly be using. *)
           | 'R' ->
             charge_to_host (fun () ->
                 let merge_key = Bytes.to_string payload in
@@ -875,11 +906,63 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
    touched) and `test_propose_write_relays_the_hosts_denial_back_to_the_guest` (a status byte the
    guest itself wrote via `i32.store8` came back as the pre-call zero, not the guest's own
    write) -- both real regression tests now, not just a design note. *)
-let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
+(* Never-raising, tolerated-error close -- the same idempotent-close idiom [cleanup] above already
+   relies on, factored out so the setup path below can reuse it verbatim rather than re-deriving it. *)
+let close_quietly fd = try Unix.close fd with Unix.Unix_error _ -> ()
+
+(* Both containment pipes, or nothing: if the SECOND [Unix.pipe] fails (EMFILE/ENFILE under a real
+   fd-table exhaustion -- not exotic, it is the same resource class Task 3's own [cleanup] exists to
+   protect), the first pair's two descriptors are closed before the failure propagates. Without this
+   they leaked, permanently, on exactly the path where descriptors are already scarce (re-review
+   finding, which also reproduced [Unix.Unix_error(EMFILE, "pipe", "")] escaping {!invoke} uncaught --
+   see [run_contained]'s own handling below for the second half of that fix). *)
+let create_containment_pipes () =
   let req_r, req_w = Unix.pipe ~cloexec:false () in
-  let resp_r, resp_w = Unix.pipe ~cloexec:false () in
-  match Unix.fork () with
-  | 0 ->
+  match Unix.pipe ~cloexec:false () with
+  | resp_r, resp_w -> (req_r, req_w, resp_r, resp_w)
+  | exception exn ->
+    close_quietly req_r;
+    close_quietly req_w;
+    raise exn
+
+let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
+  (* Setup failures ([Unix.pipe], [Unix.fork]) are part of {!invoke}'s ordinary [Error] contract,
+     not exceptions it lets through -- and every descriptor already obtained is released on the way
+     out. Before this, nothing guarded the window between {!invoke}'s entry and the fork: a real
+     EMFILE escaped as an uncaught [Unix.Unix_error], falsifying both the "returns Error, raises only
+     [Out_of_memory]/[Stack_overflow]" contract and the "no exit path leaks a file descriptor" claim
+     in the same doc comment. [Out_of_memory]/[Stack_overflow] stay exempt here exactly as they are
+     everywhere else in this file: they propagate, rather than being reported as a containment
+     failure. *)
+  match
+    try Ok (create_containment_pipes ()) with
+    | (Out_of_memory | Stack_overflow) as exn -> raise exn
+    | exn -> Error exn
+  with
+  | Error exn ->
+    Error
+      (Printf.sprintf
+         "Loader.invoke: could not create the containment pipes (%s) -- the guest was never \
+          started, and no descriptor was left open"
+         (Printexc.to_string exn))
+  | Ok (req_r, req_w, resp_r, resp_w) -> (
+  match
+    try Ok (Unix.fork ()) with
+    | (Out_of_memory | Stack_overflow) as exn -> raise exn
+    | exn -> Error exn
+  with
+  | Error exn ->
+    (* All four descriptors, since the fork that would have consumed its own ends never happened. *)
+    close_quietly req_r;
+    close_quietly req_w;
+    close_quietly resp_r;
+    close_quietly resp_w;
+    Error
+      (Printf.sprintf
+         "Loader.invoke: could not fork the containment child (%s) -- the guest was never started, \
+          and both containment pipes were closed again"
+         (Printexc.to_string exn))
+  | Ok 0 ->
     (* Child: never returns to the caller of [run_contained] -- always exits here. *)
     Unix.close req_r;
     Unix.close resp_w;
@@ -903,10 +986,10 @@ let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
        for wasmtime state this process only holds a copy-on-write view of is unnecessary risk
        for zero benefit (the parent independently owns and finalizes its own view). *)
     Unix._exit 0
-  | child_pid ->
+  | Ok child_pid ->
     Unix.close req_w;
     Unix.close resp_r;
-    supervise_child ~child_pid ~req_r ~resp_w ~sink:t.sink ()
+    supervise_child ~child_pid ~req_r ~resp_w ~sink:t.sink ())
 
 (* Exposed only so this task's own regression tests can prove {!invoke}'s "never raises, no
    zombie/fd leak" contract holds on the paths this loader cannot organically trigger through the
