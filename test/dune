@@ -3,7 +3,7 @@
  (libraries riptide riptide_batch_commit riptide_crypto riptide_dst riptide_lattice
    riptide_lattice_conformance riptide_materialize riptide_module riptide_pki riptide_sim riptide_storage
    riptide_transport riptide_vsr golden_fixtures
-   alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix
+   alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix digestif
    mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt tls tls-eio)
  (deps ../spec/golden/vectors.txt ../lib/storage/file_kv_store.ml ../lib/storage/file_storage.ml
    file_storage_o_direct_probe.exe tcp_emfile_probe.exe fixtures/echo.wat fixtures/runaway.wat

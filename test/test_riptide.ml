@@ -102,6 +102,7 @@ let () =
          ("materializer", Test_materializer.tests);
          ("module_protocol", Test_module_protocol.tests);
          ("module_loader", Test_module_loader.tests);
+         ("module_admission", Test_module_admission.tests);
          ("storage_shared_file_storage", Test_storage_shared.file_storage_tests);
          ("storage_shared_fault_injecting_storage", Test_storage_shared.fault_injecting_storage_tests);
          ("storage_shared_memory_storage", Test_storage_shared.memory_storage_tests);

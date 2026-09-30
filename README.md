@@ -135,3 +135,72 @@ was possible against this box's CPU for the first time. Verified live: the patch
 (`patch -p1`) to a byte-identical fresh checkout of the pristine source and the result builds; see
 `.superpowers/sdd/2026-09-30-layer0-layer2-boundary/task-3-report.md` for the full diagnostic
 trail (every standalone repro, in order, with exact error text) behind each of the three changes.
+
+## cosign (admission-gate signing) toolchain setup
+
+`lib/module/admission.ml` (Task 5, subtask 4) shells out to a real, locally-installed
+[`cosign`](https://github.com/sigstore/cosign) binary to verify a WASM artifact's signature
+before it is ever admitted — never a placeholder/stubbed check. `cosign` is not baked into this
+box's image and must be installed once, durably, the same way this project's own OCaml toolchain
+already is (see this repo's own `CLAUDE.md`): everything outside `/work` is on the container's
+ephemeral overlay and can vanish between sessions with no restart notice.
+
+Install the Linux amd64 release binary directly from GitHub releases into
+`/work/toolchain/bin` (the same durable directory the OCaml toolchain's own `opam` binary
+already lives in):
+
+```bash
+mkdir -p /work/toolchain/bin
+curl -fsSL -o /work/toolchain/bin/cosign \
+  https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64
+chmod +x /work/toolchain/bin/cosign
+```
+
+(`v3.1.3` was the latest release at install time — check
+`https://github.com/sigstore/cosign/releases/latest` for a newer one before installing.)
+
+**Two real, live-confirmed `cosign` v3.1.3 flag-surface changes worth knowing before writing
+code or tests against it** — this task's own originating brief was written against an older
+release, and its pseudocode (`cosign sign-blob --output-signature <path>.sig`,
+`cosign verify-blob --signature <path>.sig`) no longer runs at all against v3.1.3: both flags
+were fully removed in favor of a single `--bundle <file>` JSON bundle (signature plus, for the
+keyless path, certificate/transparency-log material). `admission.ml`'s own top comment has the
+full diagnostic trail; the short version:
+
+1. **By default, `sign-blob`/`verify-blob` reach out to the real, public Sigstore Rekor
+   transparency log over the network** — confirmed live (a `tlogEntries` block with a genuine
+   `rekor.sigstore.dev` log index/checkpoint appeared in a bundle produced with no extra flags).
+   For local-keypair signing with no live network dependency (this project's own test suite,
+   and this task's own disclosed open-question resolution), pass **both**
+   `--tlog-upload=false --use-signing-config=false` to `sign-blob` (confirmed live:
+   `--tlog-upload=false` alone is rejected — "not supported with --signing-config or
+   --use-signing-config" — it must be paired with `--use-signing-config=false`), and both
+   `--insecure-ignore-tlog=true --insecure-ignore-sct=true` to `verify-blob` (cosign's own
+   naming — this only skips the *additional* Rekor-inclusion/SCT check, never the actual
+   cryptographic signature verification itself, which this project's admission gate never
+   skips).
+2. **`generate-key-pair`/`sign-blob` prompt interactively for a private-key password** unless
+   `COSIGN_PASSWORD` is set in the environment (confirmed live: omitting it under a
+   non-interactive runner hangs on "Enter password for private key:", then fails with an ioctl
+   error). Only matters for signing (test fixtures / a real deployment's own signing pipeline) —
+   `Admission.verify` itself only ever reads a *public* key, which `cosign` never
+   password-prompts for.
+
+Verify the install actually works, end to end, before relying on it — a real
+`generate-key-pair` → `sign-blob` → `verify-blob` → tamper → `verify-blob`-fails round trip in a
+scratch directory:
+
+```bash
+export PATH=/work/toolchain/bin:$PATH COSIGN_PASSWORD=""
+cosign version
+dir=$(mktemp -d) && cd "$dir"
+echo -n "fake wasm bytes" > module.wasm
+cosign generate-key-pair
+cosign sign-blob --key cosign.key --bundle module.wasm.bundle \
+  --tlog-upload=false --use-signing-config=false --yes module.wasm
+cosign verify-blob --key cosign.pub --bundle module.wasm.bundle \
+  --insecure-ignore-tlog=true --insecure-ignore-sct=true module.wasm   # Verified OK
+printf TAMPERED >> module.wasm
+cosign verify-blob --key cosign.pub --bundle module.wasm.bundle \
+  --insecure-ignore-tlog=true --insecure-ignore-sct=true module.wasm   # Error, nonzero exit
+```
