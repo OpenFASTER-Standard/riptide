@@ -1151,11 +1151,18 @@
             "id": 18,
             "title": "[3.10] Minor bundle: O_DIRECT misdetection, use-after-close, startup cost doc",
             "description": "Minor bundle: O_DIRECT misdetection, use-after-close, startup cost doc",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Narrow the blanket Eio.Io catch to real O_DIRECT-unsupported errno shapes; set direct_capable <- false before attempting reopen in downgrade_to_dsync_only; document recover_highest_op_number's O(ring_capacity) startup cost next to the sizing guidance.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "e559cd9f9f4899eb63675a14182d73c5e9726fdc",
+                "61f60650ec42345f1ebf149700a2ca8a8f6f19da"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 19,
