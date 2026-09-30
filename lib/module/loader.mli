@@ -94,14 +94,20 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     closed, on every exit path — including a child that dies via an uncaught OS signal (a real,
     demonstrated possibility on this exact codebase: [loader.ml]'s top comment point 0 already
     found `libwasmtime`'s own Rust internals capable of process-aborting panics) rather than
-    through its own clean reporting. No exit path leaks a zombie process or a file descriptor;
-    see [loader.ml]'s [supervise_child]. *)
+    through its own clean reporting, AND including an exception raised from the parent's own
+    supervision step itself — whether from [Unix.select] (confirmed live by a real, permanently-
+    armed test-suite watchdog firing mid-[select]) or from a host callback (this task's own
+    ["log"]/["read_materialized"]/["propose_write"], entirely caller-supplied code this loader
+    does not control). This took two real fix rounds to actually hold for every path, not one —
+    the first left the second gap (an unguarded [select]/host-callback) standing; see
+    [loader.ml]'s [supervise_child] and [step] for the full history. No exit path leaks a zombie
+    process or a file descriptor. *)
 
 module For_testing : sig
   val simulate_child_death_mid_message :
     unit -> (bytes, string) result * int * Unix.file_descr * Unix.file_descr
   (** Exists only for this task's own regression test proving the "no zombie/fd leak, ever"
-      guarantee documented on {!invoke} above holds even on the one path nothing in the public
+      guarantee documented on {!invoke} above holds even on one path nothing in the public
       ["host"]-import/guest-execution API alone can organically trigger: a contained call's
       forked child dying (here, simulated by a bare child that just closes its pipe) before it
       ever completes a message, the same shape an uncaught OS signal produces. Not part of the
@@ -111,4 +117,15 @@ module For_testing : sig
       ([Unix.kill pid 0] failing with [ESRCH], not merely succeeding on an unreaped zombie) and
       real fd closure ([Unix.close] on either failing with [EBADF], not silently succeeding on
       a still-open descriptor). *)
+
+  val simulate_an_exception_mid_step :
+    unit -> (bytes, string) result * int * Unix.file_descr * Unix.file_descr
+  (** Exists only for this task's own regression test proving the same guarantee holds on the
+      OTHER path nothing in the public API can organically trigger: an exception raised from
+      inside the parent's own supervision step (here, a caller-supplied ["log"] host closure
+      that deliberately raises — the same code path an exception surfacing from [Unix.select]
+      itself, e.g. a real, permanently-armed test-suite watchdog firing mid-call as this task's
+      own code review reproduced live, goes through too). Not part of the guest-execution API —
+      Task 4/6 must never call this. Same return shape and same two independent checks
+      ([Unix.kill pid 0] / [Unix.close]) as {!simulate_child_death_mid_message} above. *)
 end

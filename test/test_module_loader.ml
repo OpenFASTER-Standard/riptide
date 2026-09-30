@@ -165,19 +165,36 @@ let test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all () =
         (Loader.instantiate ~tier:Loader.Sfi
            ~module_bytes:(read_file "fixtures/unbounded_memory.wat") ~host:(no_op_host ())))
 
-let test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message () =
-  let result, child_pid, req_r, resp_w = Loader.For_testing.simulate_child_death_mid_message () in
+let test_instantiate_rejects_a_module_that_imports_memory_instead_of_declaring_it_locally () =
+  Alcotest.check_raises
+    "a memory import (not caught by the local-declaration-only memory-limit check above) is \
+     still rejected at load time, with a clear Failure -- not wasmtime's own opaque \
+     arity-mismatch Trap"
+    (Failure
+       "Loader.instantiate: guest module imports a memory (\"host\".\"memory\") -- only function \
+        imports from \"host\" are supported") (fun () ->
+      ignore
+        (Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/memory_import.wat")
+           ~host:(no_op_host ())))
+
+(* Shared by both "no zombie/fd leak" regression tests below: asserts the containment call
+   returned a real [Error] (never raised), that the forked child was genuinely reaped (not left
+   as a zombie -- [Unix.kill pid 0] must fail with [ESRCH]; it would still SUCCEED on an unreaped
+   zombie, which is still visible to the process table), and that both parent-side pipe fds were
+   genuinely closed (a redundant [Unix.close] must fail with [EBADF], not silently succeed on a
+   still-open descriptor). *)
+let assert_contained_failure_with_no_leaks ~scenario (result, child_pid, req_r, resp_w) =
   (match result with
   | Ok _ ->
     Alcotest.fail
-      "expected a containment-failure Error (invoke's own contract: never raises), not Ok, for a \
-       child that never completed its message"
+      (Printf.sprintf
+         "expected a containment-failure Error (invoke's own contract: never raises), not Ok, \
+          for %s"
+         scenario)
   | Error e ->
     Alcotest.(check bool) "a real, non-empty error is returned instead of an uncaught exception"
       true
       (String.length e > 0));
-  (* A genuinely reaped process is fully gone: kill(pid, 0) fails with ESRCH. An unreaped
-     zombie is still visible to the process table and kill(pid, 0) on it still SUCCEEDS. *)
   (match Unix.kill child_pid 0 with
   | () -> Alcotest.fail "the forked child was left as a zombie -- not reaped"
   | exception Unix.Unix_error (Unix.ESRCH, _, _) -> ()
@@ -190,6 +207,17 @@ let test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message
   in
   confirm_closed "req_r" req_r;
   confirm_closed "resp_w" resp_w
+
+let test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message () =
+  Loader.For_testing.simulate_child_death_mid_message ()
+  |> assert_contained_failure_with_no_leaks ~scenario:"a child that never completed its message"
+
+let test_run_contained_reaps_and_closes_fds_even_when_a_host_callback_raises_mid_step () =
+  Loader.For_testing.simulate_an_exception_mid_step ()
+  |> assert_contained_failure_with_no_leaks
+       ~scenario:
+         "a host callback (or the surrounding Unix.select call, per the code review's own live \
+          SIGALRM-watchdog reproduction) raising mid-step"
 
 let test_microvm_tier_raises_a_clear_not_implemented_error () =
   Alcotest.check_raises "microvm tier is designed, not built"
@@ -229,9 +257,16 @@ let tests =
     ( "Loader.instantiate rejects a module declaring no memory maximum at all",
       `Quick,
       test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all );
+    ( "Loader.instantiate rejects a module that imports memory instead of declaring it locally",
+      `Quick,
+      test_instantiate_rejects_a_module_that_imports_memory_instead_of_declaring_it_locally );
     ( "run_contained reaps the child and closes both pipe fds even when it dies mid-message",
       `Quick,
       test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message );
+    ( "run_contained reaps the child and closes both pipe fds even when a host callback raises \
+       mid-step",
+      `Quick,
+      test_run_contained_reaps_and_closes_fds_even_when_a_host_callback_raises_mid_step );
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );

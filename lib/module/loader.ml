@@ -157,12 +157,6 @@ module Wasm_binary = struct
     let len, pos = read_uleb32 s pos in
     String.sub s pos len, pos + len
 
-  (* `limits ::= 0x00 min:u32 | 0x01 min:u32 max:u32` -- shared by table/memory descriptors. *)
-  let skip_limits s pos =
-    let flag, pos = read_u8 s pos in
-    let _min, pos = read_uleb32 s pos in
-    if flag land 1 = 1 then snd (read_uleb32 s pos) else pos
-
   let iter_sections s ~f =
     let len = String.length s in
     let rec loop pos =
@@ -217,11 +211,28 @@ module Wasm_binary = struct
 
   (* (module_name, field_name) for every *function* import, in the module's own import-section
      order -- the same order `new_instance`'s positional `~imports` must supply externs in.
-     Raises on a table/memory/global import (not supported by this task's host ABI; those kinds
-     are still correctly skipped over structurally so later entries parse right, they're just
-     never turned into an extern for the caller). *)
+
+     Raises a clear [Failure] on a table/memory/global import -- not supported by this task's
+     host ABI, which only ever supplies function imports (see [instantiate]/[build_imports]).
+     This used to only be true in this doc comment, not the code below it: a table/memory/global
+     import was silently *skipped* (correctly parsed past, structurally, so later entries still
+     decoded right) but never actually rejected, so a module importing one of those instead of a
+     function fell through all the way to [new_instance] with a too-short positional imports
+     list, and only failed there, opaquely, via wasmtime's own arity-mismatch [Trap] -- not the
+     clear, documented [Failure] every other {!instantiate}-time rejection in this file raises.
+     Found by code review as a narrow, real mismatch against [loader.mli]'s "instantiate-time
+     failures are [Failure]" contract while re-verifying the memory-limit fix (a module
+     *importing* memory rather than declaring it locally is exactly one way to hit this, since
+     [declared_memory_max_pages] above only inspects locally-declared memories). Fixed here by
+     actually raising, matching what this comment already (wrongly) claimed. *)
   let func_imports wasm : (string * string) list =
     let acc = ref [] in
+    let kind_name = function
+      | 1 -> "table"
+      | 2 -> "memory"
+      | 3 -> "global"
+      | k -> Printf.sprintf "kind %d" k
+    in
     iter_sections wasm ~f:(fun id s pos ->
         if id = 2 (* import section *) then (
           let count, pos = read_uleb32 s pos in
@@ -231,23 +242,19 @@ module Wasm_binary = struct
               let module_name, pos = read_name s pos in
               let field_name, pos = read_name s pos in
               let kind, pos = read_u8 s pos in
-              let pos =
-                match kind with
-                | 0 (* func *) -> snd (read_uleb32 s pos (* typeidx *))
-                | 1 (* table *) ->
-                  let _elemtype, pos = read_u8 s pos in
-                  skip_limits s pos
-                | 2 (* memory *) -> skip_limits s pos
-                | 3 (* global *) ->
-                  let _valtype, pos = read_u8 s pos in
-                  let _mut, pos = read_u8 s pos in
-                  pos
-                | k ->
-                  failwith
-                    (Printf.sprintf "Loader.instantiate: guest module imports unsupported kind %d" k)
-              in
-              if kind = 0 then acc := (module_name, field_name) :: !acc;
-              loop (i + 1) pos
+              match kind with
+              | 0 (* func *) ->
+                let pos = snd (read_uleb32 s pos (* typeidx *)) in
+                acc := (module_name, field_name) :: !acc;
+                loop (i + 1) pos
+              | 1 | 2 | 3 ->
+                failwith
+                  (Printf.sprintf
+                     "Loader.instantiate: guest module imports a %s (%S.%S) -- only function \
+                      imports from \"host\" are supported"
+                     (kind_name kind) module_name field_name)
+              | k ->
+                failwith (Printf.sprintf "Loader.instantiate: guest module imports unsupported kind %d" k)
           in
           loop 0 pos));
     List.rev !acc
@@ -462,19 +469,31 @@ let instantiate ~tier ~module_bytes ~host =
 (* The parent-side half of containment: services host-function relay requests from the child on
    [req_r]/[resp_w], and returns the child's own final result once it reports done -- via [tag]
    'D' (success, [payload] is the guest's own result bytes) or 'E' (the child's own [try...with]
-   caught something and reported it as a clean failure). Every exit from this function's own loop
-   -- success, fuel-timeout, or anything else, INCLUDING a child that dies without ever completing
-   a message (an uncaught OS signal -- SIGSEGV/SIGABRT/SIGBUS from a Rust-side libwasmtime panic
-   during real guest execution is a real, not hypothetical, way this can happen on this exact
-   codebase, see this file's own top comment point 0 -- or protocol corruption) -- reaps the
-   child and closes both [req_r]/[resp_w] exactly once, via [cleanup], so {!invoke}'s own
-   documented "never raises" contract genuinely holds no matter how the child ends. A prior
-   version of this logic only reached that cleanup on 3 of 5 possible exit paths, silently
-   leaking a zombie process and two file descriptors -- and letting the uncaught-EOF exception
-   propagate straight out of [invoke] -- on the other 2 (an unrecognized pipe tag, or the child's
-   write end closing before a complete message arrived); see
-   `For_testing.simulate_child_death_mid_message`'s own regression test for a real, live proof
-   this no longer happens. *)
+   caught something and reported it as a clean failure). Every exit from this function -- success,
+   fuel-timeout, a child that dies without ever completing a message (an uncaught OS signal --
+   SIGSEGV/SIGABRT/SIGBUS from a Rust-side libwasmtime panic during real guest execution is a
+   real, not hypothetical, way this can happen on this exact codebase, see this file's own top
+   comment point 0), protocol corruption, OR an exception from [Unix.select] itself or from a
+   host callback ('L'/'R'/'P' invoke entirely caller-supplied code this loader doesn't control) --
+   reaps the child and closes both [req_r]/[resp_w] exactly once, via [cleanup], so {!invoke}'s
+   own documented "never raises" contract genuinely holds no matter how the call ends.
+
+   This took two real fix rounds to actually close, not one -- worth naming both, since the
+   second is exactly the kind of gap "the happy-path tests all pass" hides. Round 1 fixed 2 of 5
+   *outcome* branches (an unrecognized pipe tag, or the child's write end closing before a
+   complete message arrived) that skipped [cleanup] entirely. Round 2 fixed a DIFFERENT, deeper
+   gap the first round's own [step] structure still had: only the [read_msg] call itself was
+   guarded against exceptions -- the *surrounding* [Unix.select] call and the 'L'/'R'/'P'
+   host-callback invocations were not, despite being just as capable of raising. Reproduced live
+   by the code review, not theoretically: this test suite's own real, permanently-armed SIGALRM
+   watchdog (`test_riptide.ml`'s per-test timeout) firing while genuinely blocked inside
+   [Unix.select] raised an exception at that exact call site that escaped `invoke` uncaught,
+   and the forked child (a runaway guest) was left orphaned to PID 1, still running at 100% CPU,
+   confirmed live via `ps aux`. Both rounds' regressions are pinned by
+   `For_testing.simulate_child_death_mid_message` (round 1: a child that closes its pipe without
+   completing a message) and `For_testing.simulate_an_exception_mid_step` (round 2: an exception
+   raised from inside the very code path [step] runs on every iteration, standing in for both
+   the watchdog scenario and a genuinely misbehaving host closure). *)
 let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, string) result =
   let host_of_sink () =
     match !sink with
@@ -495,6 +514,74 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
       (try Unix.close resp_w with Unix.Unix_error _ -> ()))
   in
   let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
+  (* One step of work: the [Unix.select] call, the [read_msg] that follows it, and dispatching
+     whichever tag came back ('L'/'R'/'P' invoke the REAL host closures, which are entirely
+     caller-supplied code this loader has no control over). Wrapped as ONE unit in a SINGLE
+     exception guard below -- not per-call, not "just the read_msg" -- because ANY of it can
+     raise, not just the read. Found live, via the test suite's own real, permanently-armed
+     SIGALRM watchdog (`test_riptide.ml`'s per-test timeout, re-armed before every test
+     including this loader's own) firing while genuinely blocked inside [Unix.select]: the
+     watchdog's handler raises an OCaml exception at that exact blocking call's own call site
+     (this is how [Sys.Signal_handle] delivery across a blocking syscall works), and a first
+     version of this function only guarded the [read_msg] call specifically -- [select] itself,
+     and the 'L'/'R'/'P' branches' calls into [host_of_sink ()]'s closures, sat completely
+     outside any guard. Reproduced live: the exception escaped `invoke` uncaught (breaking its
+     own "never raises" contract) AND the forked child was never reaped, orphaned to PID 1,
+     confirmed still running at 100% CPU via `ps aux` afterward. A host closure is exactly as
+     capable of raising as anything else here -- it's entirely caller-supplied code (Task 6's
+     own reactor will supply real ones) -- so it needs exactly the same blanket protection, not
+     a narrower one just because it isn't `Unix.select`/`read_msg`. *)
+  let step ~remaining : [ `Continue | `Done of (bytes, string) result ] =
+    try
+      match Unix.select [ req_r ] [] [] remaining with
+      | [], _, _ -> `Continue (* spurious wakeup with time still left -- recompute and retry *)
+      | _ -> (
+        let tag, payload = Pipe_protocol.read_msg req_r in
+        match tag with
+        | 'L' ->
+          (host_of_sink ()).log (Bytes.to_string payload);
+          `Continue
+        | 'R' ->
+          let merge_key = Bytes.to_string payload in
+          (match (host_of_sink ()).read_materialized ~merge_key with
+          | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
+          | Some value ->
+            Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
+            Pipe_protocol.write_frame resp_w value);
+          `Continue
+        | 'P' ->
+          let status =
+            match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
+          in
+          Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
+          `Continue
+        | 'D' ->
+          cleanup ();
+          `Done (Ok payload)
+        | 'E' ->
+          cleanup ();
+          `Done (Error (Bytes.to_string payload))
+        | other ->
+          cleanup ();
+          `Done
+            (Error
+               (Printf.sprintf "Loader.invoke: internal containment-pipe protocol error (unrecognized tag %C)" other)))
+    with
+    | Unix.Unix_error (Unix.EINTR, _, _) ->
+      (* A genuinely spurious interruption of the blocking syscall itself (as opposed to an
+         OCaml-level signal handler raising something of its own, handled by the catch-all
+         below) -- retry, not a failure. *)
+      `Continue
+    | exn ->
+      cleanup ();
+      `Done
+        (Error
+           (Printf.sprintf
+              "Loader.invoke: the contained guest's process ended, or a host callback raised, \
+               before completing its call (%s) -- treated as a containment failure, not a crash \
+               of the host"
+              (Printexc.to_string exn)))
+  in
   let rec loop () =
     let remaining = deadline -. Unix.gettimeofday () in
     if remaining <= 0. then (
@@ -506,45 +593,9 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
             comment -- the guest was SIGKILLed, not merely abandoned)"
            fuel_budget_seconds))
     else
-      match Unix.select [ req_r ] [] [] remaining with
-      | [], _, _ -> loop () (* spurious wakeup with time still left -- recompute and retry *)
-      | _ -> (
-        match Pipe_protocol.read_msg req_r with
-        | exception exn ->
-          cleanup ();
-          Error
-            (Printf.sprintf
-               "Loader.invoke: the contained guest's process ended before completing its call \
-                (%s) -- treated as a containment failure, not a crash of the host"
-               (Printexc.to_string exn))
-        | tag, payload -> (
-          match tag with
-          | 'L' ->
-            (host_of_sink ()).log (Bytes.to_string payload);
-            loop ()
-          | 'R' ->
-            let merge_key = Bytes.to_string payload in
-            (match (host_of_sink ()).read_materialized ~merge_key with
-            | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
-            | Some value ->
-              Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
-              Pipe_protocol.write_frame resp_w value);
-            loop ()
-          | 'P' ->
-            let status =
-              match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
-            in
-            Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
-            loop ()
-          | 'D' ->
-            cleanup ();
-            Ok payload
-          | 'E' ->
-            cleanup ();
-            Error (Bytes.to_string payload)
-          | other ->
-            cleanup ();
-            Error (Printf.sprintf "Loader.invoke: internal containment-pipe protocol error (unrecognized tag %C)" other)))
+      match step ~remaining with
+      | `Continue -> loop ()
+      | `Done result -> result
   in
   loop ()
 
@@ -601,12 +652,15 @@ let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
     Unix.close resp_r;
     supervise_child ~child_pid ~req_r ~resp_w ~sink:t.sink ()
 
-(* Exposed only so this task's own regression test can prove {!invoke}'s "never raises, no
-   zombie/fd leak" contract holds even on the one path this loader cannot organically trigger
-   through the public guest-execution API alone: a child that dies via an uncaught OS signal (or
-   any other means that closes its pipe before a complete message is written) rather than
-   through its own [try...with]. Not part of the guest-execution API -- Task 4/6 should never
-   call this. *)
+(* Exposed only so this task's own regression tests can prove {!invoke}'s "never raises, no
+   zombie/fd leak" contract holds on the two paths this loader cannot organically trigger through
+   the public guest-execution API alone: [simulate_child_death_mid_message] (round 1's fix) --
+   a child that dies via an uncaught OS signal (or any other means that closes its pipe before a
+   complete message is written) rather than through its own [try...with]; and
+   [simulate_an_exception_mid_step] (round 2's fix) -- an exception raised from inside [step]
+   itself, whether from a host callback or from [Unix.select]'s own call site (what the code
+   review's real SIGALRM-watchdog reproduction looked like). Not part of the guest-execution API
+   -- Task 4/6 should never call either. *)
 module For_testing = struct
   let simulate_child_death_mid_message () =
     let req_r, req_w = Unix.pipe ~cloexec:false () in
@@ -628,6 +682,42 @@ module For_testing = struct
         ref
           (Direct
              { read_materialized = (fun ~merge_key:_ -> None); propose_write = (fun _ -> Ok ()); log = ignore })
+      in
+      let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
+      result, child_pid, req_r, resp_w
+
+  let simulate_an_exception_mid_step () =
+    let req_r, req_w = Unix.pipe ~cloexec:false () in
+    let resp_r, resp_w = Unix.pipe ~cloexec:false () in
+    match Unix.fork () with
+    | 0 ->
+      (* Sends one real, well-formed 'L' (log) message, exactly what a genuine guest calling
+         "log" produces -- the parent's own [step] dispatches it to the (caller-supplied) host
+         closure below, which is where this test's own simulated failure actually happens; this
+         child's only job is to trigger that dispatch. *)
+      Unix.close req_r;
+      Unix.close resp_w;
+      Pipe_protocol.write_msg req_w ~tag:'L' (Bytes.of_string "boom");
+      Unix.close resp_r;
+      Unix.close req_w;
+      Unix._exit 0
+    | child_pid ->
+      Unix.close req_w;
+      Unix.close resp_r;
+      let sink =
+        ref
+          (Direct
+             {
+               read_materialized = (fun ~merge_key:_ -> None);
+               propose_write = (fun _ -> Ok ());
+               (* Stands in for BOTH real failure modes this round's fix closes: a host closure
+                  that itself raises (entirely caller-supplied code, e.g. Task 6's own reactor),
+                  and an exception surfacing at the [Unix.select] call site itself (what the code
+                  review's own SIGALRM-watchdog reproduction actually looked like) -- both are
+                  handled by the exact same, now-unconditional exception guard around [step], so
+                  exercising either one proves the fix for both. *)
+               log = (fun _ -> failwith "simulated host-callback failure, mid-step");
+             })
       in
       let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
       result, child_pid, req_r, resp_w
