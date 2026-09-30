@@ -239,18 +239,19 @@ let test_a_real_module_reacts_commits_and_can_retrigger_itself () =
           };
         ];
 
-      (* ── Assertion 1: the module's own handle genuinely ran, more than once -- observable via
-         its host.log call. One initial dispatch (from the write just above) plus at least one
-         retrigger (from that dispatch's own propose_write reaching back into the real replica and
-         re-materializing) is the whole point of this test: a single log call would only prove
-         dispatch happened once, not that the write-triggers-materialize-triggers-dispatch loop
-         genuinely closed. *)
+      (* ── Assertion 1: the module's own handle genuinely ran, exactly the deterministic number of
+         times this chain always produces -- observable via its host.log call. One initial dispatch
+         (from the write just above) plus exactly `max_retriggers` bounded retriggers (from each
+         dispatch's own propose_write reaching back into the real replica and re-materializing) is
+         the whole point of this test: the write-triggers-materialize-triggers-dispatch loop closing
+         a fixed, known number of times, not merely "more than once". *)
       let log_calls_after_dispatch = Reactor.For_testing.log_call_count () in
-      Alcotest.(check bool)
-        "the module's handle ran at least twice -- once for the initial write, once more for its \
-         own retriggered output (observed via its internally-wired host.log call)"
-        true
-        (log_calls_after_dispatch - log_calls_before >= 2);
+      Alcotest.(check int)
+        "the module's handle ran exactly 4 times -- once for the initial write, plus once for each \
+         of the 3 bounded retriggers on its own output (observed via its internally-wired host.log \
+         call)"
+        4
+        (log_calls_after_dispatch - log_calls_before);
 
       (* ── Assertion 2: its propose_write genuinely reached the real replica -- committed_envelopes
          shows real, actor-attributed envelopes for every guest-initiated write, each carrying the
