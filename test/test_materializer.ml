@@ -267,10 +267,16 @@ let test_overflow_error_names_the_merge_key () =
     Alcotest.fail "expected Value_too_large exception"
   with
   | Riptide_materialize.Materializer.Value_too_large msg ->
-    if string_contains msg test_key then
-      () (* Pass: merge_key is in the message *)
-    else
-      Alcotest.fail (Printf.sprintf "error message does not contain merge_key %S: %s" test_key msg)
+    if not (string_contains msg test_key) then
+      Alcotest.fail (Printf.sprintf "error message does not contain merge_key %S: %s" test_key msg);
+    (* Task 22 review, Minor finding: this test must prove its OWN full requirement (merge_key
+       AND the original KV-layer content survive together), not lean on a different task's test
+       (test_lattice_materialize_crypto_scenarios.ml) for half the guarantee -- a future change
+       that replaced [msg] entirely (e.g. dropping the "-- %s" suffix) would otherwise pass here
+       undetected. *)
+    if not (string_contains msg "exceeds this store's max value size") then
+      Alcotest.fail
+        (Printf.sprintf "error message dropped the original KV-layer size-cap content: %s" msg)
 
 let tests =
   [ ("convergence regardless of fold order", `Quick, test_convergence_regardless_of_fold_order);
