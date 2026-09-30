@@ -58,7 +58,60 @@ let tls_handshake_timeout = 10.0
    once the budget is spent the last exception is re-raised, surfacing on [sw] the way an
    unrecoverable listener failure should. 64 * 0.1s means roughly 6s of uninterrupted failure
    before that happens -- far longer than any transient condition here plausibly lasts, far
-   shorter than "never". *)
+   shorter than "never".
+
+   {b Task 29 audit finding: that "far longer than any transient condition here plausibly lasts"
+   assumption is FALSE for [EMFILE] specifically.} [EMFILE] (this process's own fd-table
+   exhaustion) is one of the failure shapes named above, and reproduced live: under sustained fd
+   pressure -- a real attacker opening far more connections than this cluster's membership implies
+   (see [default_max_connections]'s own comment), or just heavy legitimate load -- [EMFILE] can
+   keep firing on every single [accept(2)] call for much longer than 6.4s, because nothing about
+   this process's OWN behavior changes while the external pressure continues. Counting it toward
+   [accept_max_consecutive_errors] therefore does the wrong thing twice over: it kills the listener
+   in response to exactly the condition it should be surviving, and it does so at the worst
+   possible moment -- an ongoing fd-exhaustion incident, where "now nothing is listening at all" is
+   strictly worse than "still degraded but still listening". [run_accept_loop] below therefore
+   excludes [EMFILE] from this counter entirely: it is logged and retried after
+   [accept_error_backoff], the same pause as any other error, but never increments
+   [consecutive_errors] and can never trip the fatal re-raise on its own.
+
+   {b The trade-off this creates, stated plainly rather than left implicit:} under SUSTAINED
+   [EMFILE], this loop now retries FOREVER. There is no bound, and no other error channel for this
+   module to report through (see above) -- so a listener wedged in permanent [EMFILE] looks, from
+   outside this process, like a live but silently non-functional listener for as long as the
+   condition lasts, with nothing here ever escalating it. This is a deliberate call, not an
+   oversight: [EMFILE] is a PER-PROCESS limit, and the dominant realistic cause of relief -- this
+   same process's other connections completing their handshake, timing out
+   ([preamble_read_timeout]/[tls_handshake_timeout] above), or otherwise closing and freeing an fd
+   -- happens from WITHIN this same process, continuously, as an ordinary side effect of it
+   staying alive. Giving up and killing the listener does not make that relief arrive any sooner;
+   it only guarantees zero listening capacity in the meantime instead of degraded listening
+   capacity. "Retry forever, in case it gets better on its own" is therefore the sounder default
+   for this one errno -- but it is a real, live risk surface (an attacker who can sustain far more
+   fd pressure than this process could ever recover from, indefinitely, gets a permanently-degraded
+   listener with no alarm ever raised here), and any future operator-facing health/liveness signal
+   for this transport should treat "stuck retrying [EMFILE] for an extended period" as a condition
+   worth surfacing on its own -- this module still has no such channel, so today that is a real,
+   open gap, not a solved problem.
+
+   {b [ENFILE] is deliberately NOT given the same treatment, and stays in the general, fatal-
+   counted bucket below.} [ENFILE] is SYSTEM-WIDE fd-table exhaustion -- the whole machine, not
+   just this process, is out of descriptors. The "it recovers on its own because this process's
+   other connections keep closing" reasoning above does not transfer: this process's own fd
+   turnover does nothing to relieve a limit it was never the sole consumer of, and the actual
+   consumer holding the system past its limit could be a different process entirely, with no
+   relationship to this one and no guarantee it ever releases anything. Retrying [ENFILE] forever
+   on the same "it'll get better" bet as [EMFILE] would be applying a per-process remedy to a
+   system-wide problem -- optimistic in a way this process has no evidence for. So [ENFILE] keeps
+   counting toward [accept_max_consecutive_errors] and can still trip the fatal re-raise, the same
+   as before this task: for a condition this process cannot itself resolve, surfacing a hard
+   failure (so an operator or orchestrator notices and can act on the actual system-wide resource
+   problem) is the more honest behavior than silently retrying against odds this process has no
+   way to improve. [ENFILE] is not given a distinct log line for this -- [Printexc.to_string]'s own
+   rendering of the underlying [Unix_error] already names it plainly (confirmed live via
+   [Unix.error_message]: "Too many open files in system" for [ENFILE], vs. plain "Too many open
+   files" for [EMFILE]), so the existing "Tcp: accept error (%d consecutive)..." line already lets
+   an operator tell the two apart without new code. *)
 let accept_error_backoff = 0.1
 let accept_max_consecutive_errors = 64
 
@@ -558,6 +611,22 @@ let run_accept_loop t ~sw ~clock ~max_connections listener =
     | exception (Eio.Cancel.Cancelled _ as exn) ->
       Eio.Semaphore.release connections;
       raise exn
+    (* Task 29: EMFILE, and ONLY EMFILE (not ENFILE -- see [accept_max_consecutive_errors]'s own
+       comment above for why the two are deliberately NOT treated alike), is excluded from
+       [consecutive_errors] entirely: neither incremented nor reset, so a run of other errors
+       interleaved with an EMFILE blip keeps accumulating across it rather than either counting
+       EMFILE itself toward the fatal budget or having it silently launder an unrelated ongoing
+       failure back to zero. This branch retries forever on this errno alone, by design -- the
+       disclosed trade-off is documented above, not implicit here. Must come before the general
+       [Eio.Io _ | End_of_file] branch below: that pattern would otherwise match EMFILE first. *)
+    | exception (Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EMFILE, _, _)), _) as exn) ->
+      Eio.Semaphore.release connections;
+      Eio.traceln
+        "Tcp: accept failed with EMFILE (this process's own fd table is full); retrying in %.1fs \
+         without counting toward the fatal accept-error budget -- see accept_max_consecutive_errors's \
+         own comment for the disclosed unbounded-retry trade-off this implies: %s"
+        accept_error_backoff (Printexc.to_string exn);
+      Eio.Time.sleep clock accept_error_backoff
     | exception ((Eio.Io _ | End_of_file) as exn) ->
       Eio.Semaphore.release connections;
       incr consecutive_errors;

@@ -149,6 +149,21 @@
     unrecoverable, at which point the failure is raised on [sw] rather than retried silently
     forever -- this module has no other channel to report it on.
 
+    {b [EMFILE] is the one exception to "several seconds", by design.} Even with the
+    [max_connections] cap below in place, [EMFILE] (this process's own fd table full) remains
+    reachable in practice -- the cap only bounds fds held by connections THIS listener has
+    accepted, not fds this process holds for any other reason (outbound connections to other
+    cluster members, open storage files, etc.), and a caller can configure [max_connections] above
+    what the process's real OS fd ulimit can actually support. When [EMFILE] specifically is what
+    [accept(2)] fails with, this listener retries indefinitely rather than ever treating it as the
+    unrecoverable case above -- see [tcp.ml]'s [accept_max_consecutive_errors] comment for why
+    (this process's own fd churn, not giving up, is what plausibly relieves a per-process limit
+    like this one) and for the disclosed cost of that choice (a listener stuck in sustained
+    [EMFILE] retries forever with no alarm this module can raise on its own).
+    [ENFILE] (system-wide, not per-process, fd exhaustion) is deliberately NOT given this
+    treatment and remains part of the ordinary several-seconds-then-unrecoverable path above --
+    see the same comment for why the two are not interchangeable.
+
     {!create}'s [max_connections] bounds the number of concurrently accepted connections this
     listener will ever be handling at once (mid-handshake or fully connected), which closes the
     fd-exhaustion route this paragraph used to describe as open: without it, any party able to

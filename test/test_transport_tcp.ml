@@ -40,24 +40,33 @@
      [test_dial_side_tls_handshake_has_a_bounded_timeout] below for how this is timed without
      actually waiting out the real ~10s).
 
-   One further failure path is not covered here, for reasons of mechanism rather than oversight,
-   and was instead verified with a throwaway harness: the listener surviving a transient
-   [accept(2)] error needs the process's file-descriptor budget deliberately exhausted, which
-   would break the test runner itself long before it reached an assertion. The {e accept} side's
-   own bounded waits (the TLS handshake and the handshake-preamble read, both ~10s) are similarly
-   not exercised here on a real clock, for the reason above -- ~10s eats most of this suite's own
-   15s-per-test watchdog budget. The {e dial} side's equivalent new timeout, added in this file
-   alongside the fix, sidesteps that by racing the real handshake against a virtual
-   [Eio_mock.Clock] instead of the real one, so it does not have this problem and is covered.
+   One further failure path was long believed uncoverable here, for reasons of mechanism rather
+   than oversight, and was instead verified with a throwaway harness: the listener surviving a
+   transient [accept(2)] error needs the process's file-descriptor budget deliberately exhausted,
+   which would break the test runner itself long before it reached an assertion -- true of {e
+   this} process (the one running the whole [test_riptide] binary), but not of a second, disposable
+   OS process forked and exec'd specifically to be sacrificed this way. [Test 29] revisits that:
+   [test_emfile_on_accept_does_not_kill_the_listener] below forks+execs [tcp_emfile_probe.exe]
+   under a real, shell-level [ulimit -n] (the same technique, and the same reasoning, as
+   [test_file_storage.ml]'s own [ulimit -f]-based real EFBIG reproduction for Task 19), so the real
+   OS-level fd exhaustion happens entirely inside that disposable child, never inside this suite's
+   own process. The {e accept} side's own bounded waits (the TLS handshake and the
+   handshake-preamble read, both ~10s) remain uncovered on a real clock, for the reason above --
+   ~10s eats most of this suite's own 15s-per-test watchdog budget. The {e dial} side's equivalent
+   new timeout, added in this file alongside the fix, sidesteps that by racing the real handshake
+   against a virtual [Eio_mock.Clock] instead of the real one, so it does not have this problem and
+   is covered.
 
    Port choice: distinct, non-overlapping port ranges per test (19301-19303, 19311-19312,
-   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372, 19391) so
-   a re-run or a future added test in this file can't collide even if an earlier
+   19321-19323, 19331-19333, 19341-19342, 19351, 19352, 19353, 19361-19362, 19371-19372, 19391,
+   19410) so a re-run or a future added test in this file can't collide even if an earlier
    test's sockets are still winding down -- [Tcp.create] itself passes [~reuse_addr:true] to
    [Eio.Net.listen], but distinct ports sidestep the question entirely rather than relying on
    that. [Tcp.create] does not expose its internal listening socket, so there is no way to ask it
    for an OS-assigned ephemeral (port 0) address from outside; fixed, spread-out ports are the
-   only option here. *)
+   only option here. Note [19410] is dialed directly with raw sockets, never through [Tcp.create]
+   or [with_mesh] -- it belongs to a probe process forked from this file, not a peer in this file's
+   own [Eio_main.run]. *)
 
 open Riptide_transport
 
@@ -988,6 +997,174 @@ let test_accept_loop_caps_concurrent_connections () =
     true
     (!max_active_observed <= max_connections)
 
+(* -- Area 9: EMFILE on accept must not kill the listener (Task 29) -- *)
+
+(* [tcp_emfile_probe.ml] (its own top comment has the full design) is a standalone process, built
+   as a separate dune executable, whose entire job is to bring up one real
+   [Riptide_transport.Tcp.t] and then run forever. It is forked+exec'd here under a real,
+   shell-level [ulimit -n] -- lowering THIS suite's own process's fd budget would break every
+   other test sharing it (see this file's own top comment); a disposable child process pays that
+   cost instead, and only it. This is the same fork+exec-under-a-lowering-[ulimit] technique
+   [test_file_storage.ml]'s own [run_o_direct_probe] uses for a real, non-EINVAL EFBIG (Task 19),
+   substituting [-n] (RLIMIT_NOFILE, what actually governs EMFILE) for [-f] (RLIMIT_FSIZE).
+
+   Unlike that probe, this one is long-lived by design (it blocks forever until killed, or until
+   it dies on its own past the fatal threshold this test exists to exercise) -- so its stdout and
+   stderr are redirected to a plain file, not a pipe drained to EOF: a pipe would risk blocking the
+   child on a full buffer while this test is still busy flooding connections and has not read
+   anything yet, and [Eio.traceln] (see [Eio.Debug], confirmed live by reading
+   [core/debug.ml]'s own [default_traceln]) already flushes stderr after every line, so a plain
+   file gives byte-exact, immediately-visible output without needing a background reader. *)
+let tcp_emfile_probe_path = "./tcp_emfile_probe.exe"
+
+let start_emfile_probe ~ulimit_n ~port ~log_path =
+  let log_fd = Unix.openfile log_path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
+  match Unix.fork () with
+  | 0 ->
+    (try
+       Unix.dup2 log_fd Unix.stdout;
+       Unix.dup2 log_fd Unix.stderr;
+       Unix.close log_fd;
+       Unix.execv "/bin/sh"
+         [| "/bin/sh"; "-c";
+            Printf.sprintf "ulimit -n %d && exec %s %d" ulimit_n
+              (Filename.quote tcp_emfile_probe_path) port
+         |]
+     with _ -> Unix._exit 127)
+  | child_pid ->
+    Unix.close log_fd;
+    child_pid
+
+(* [Unix.WNOHANG] so this never blocks: [(0, _)] means the child has not changed state (i.e. is
+   still running), any other result means it has exited (or, in principle, been stopped/signalled
+   -- [run_accept_loop]'s own fatal path re-raises, which surfaces as a plain uncaught-exception
+   exit, not a signal, so [WEXITED]/[WSIGNALED] are not distinguished here). *)
+let emfile_probe_alive pid =
+  match Unix.waitpid [ Unix.WNOHANG ] pid with
+  | 0, _ -> true
+  | _, _ -> false
+  | exception Unix.Unix_error (Unix.ECHILD, _, _) -> false
+
+let read_whole_file path =
+  let ic = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic))
+
+let contains_substring ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i = (i + nl <= hl) && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+(* Calibrated by a live run against today's (pre-fix) code, recorded in this task's own report:
+   with [ulimit_n = 30] and 6 fds already spent by the probe's own startup (the listening socket,
+   the RNG source, a couple of dynamic-linker/runtime fds), 50 concurrently-held raw connections
+   (comfortably above the ~24 remaining) reliably drive real, sustained [EMFILE] on the probe's own
+   [accept(2)] -- confirmed starting within the first ~15 consecutive failures and continuing
+   uninterrupted. [num_flood_connections] is deliberately kept at or below [listen_backlog] (64,
+   see that constant above): the kernel completes the TCP handshake for anything within the
+   backlog whether or not the server's [accept(2)] ever successfully dequeues it, so every flood
+   connection's own [Eio.Net.connect] returns promptly instead of one beyond the backlog blocking
+   this test's own controller fiber on kernel-level SYN retries for far longer than intended (up to
+   real [tcp_syn_retries] backoff, which can run well past this suite's 15s watchdog). 9s of
+   sustained pressure is comfortably past [accept_max_consecutive_errors *. accept_error_backoff]
+   (~6.4s, the OLD code's own fatal threshold) while still safely under the 15s watchdog once
+   probe startup and the final recovery check are added in. *)
+let test_emfile_on_accept_does_not_kill_the_listener () =
+  let port = 19410 in
+  let ulimit_n = 30 in
+  let num_flood_connections = 50 in
+  let pressure_duration = 9.0 in
+  let log_path = Filename.temp_file "tcp_emfile_probe" ".log" in
+  Fun.protect
+    ~finally:(fun () -> try Sys.remove log_path with Sys_error _ -> ())
+    (fun () ->
+      let child_pid = start_emfile_probe ~ulimit_n ~port ~log_path in
+      Fun.protect
+        ~finally:(fun () ->
+          (* Best-effort teardown: this test never asks the probe to shut down gracefully (there
+             is nothing graceful to ask for -- see [tcp_emfile_probe.ml]'s own comment), so a plain
+             SIGKILL plus a reaping [waitpid] is enough to avoid leaking either the process or a
+             zombie entry, whether the probe is still alive at this point or already exited on its
+             own. *)
+          (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
+          let rec reap () =
+            match Unix.waitpid [] child_pid with
+            | _ -> ()
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+            | exception Unix.Unix_error (Unix.ECHILD, _, _) -> ()
+          in
+          reap ())
+        (fun () ->
+          Eio_main.run @@ fun env ->
+          let net = Eio.Stdenv.net env in
+          let clock = Eio.Stdenv.clock env in
+          let addr : Eio.Net.Sockaddr.stream = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+          Eio.Switch.run (fun sw ->
+              (* Bounded poll-connect: the same "not listening yet" idiom [Tcp.connect_to]'s own
+                 dial loop uses, needed here because this probe's readiness has no other signal
+                 this test synchronizes on. *)
+              let rec wait_for_listener n =
+                if n <= 0 then
+                  Alcotest.failf
+                    "tcp_emfile_probe never started listening on port %d within budget -- see %s \
+                     for its own stdout/stderr"
+                    port log_path
+                else
+                  match Eio.Net.connect ~sw net addr with
+                  | flow -> (try Eio.Flow.close flow with End_of_file | Eio.Io _ -> ())
+                  | exception Eio.Io _ ->
+                    Eio.Time.sleep clock 0.05;
+                    wait_for_listener (n - 1)
+              in
+              wait_for_listener 100;
+              (* The flood: raw sockets, no TLS -- the point is a bare accepted fd held open on
+                 the SERVER side, not a completed handshake. Every successful connect is held open
+                 (read/written to not at all) for [pressure_duration] by its own fiber, which
+                 closes it once that fiber's own sleep elapses; [Eio.Fiber.all] therefore does not
+                 return until the full pressure window has elapsed AND every connection has been
+                 released. *)
+              let held = ref 0 in
+              Eio.Fiber.all
+                (List.init num_flood_connections (fun _ () ->
+                     match Eio.Net.connect ~sw net addr with
+                     | flow ->
+                       incr held;
+                       Eio.Time.sleep clock pressure_duration;
+                       (try Eio.Flow.close flow with End_of_file | Eio.Io _ -> ())
+                     | exception (Eio.Io _ | End_of_file) -> ()));
+              Alcotest.(check bool)
+                (Printf.sprintf
+                   "the fd-exhaustion flood actually got through at the TCP level -- at least half \
+                    of %d attempted connections were accepted by the kernel (got %d); otherwise \
+                    this test is not exercising real EMFILE pressure at all"
+                   num_flood_connections !held)
+                true
+                (!held >= num_flood_connections / 2);
+              Alcotest.(check bool)
+                (Printf.sprintf
+                   "the probe (a real OS process under a real ulimit -n %d) is still alive after \
+                    %.1fs of sustained accept-time fd exhaustion -- the pre-fix code re-raises and \
+                    kills the listener once consecutive EMFILE failures cross \
+                    accept_max_consecutive_errors (~6.4s); see %s for the probe's own log"
+                   ulimit_n pressure_duration log_path)
+                true
+                (emfile_probe_alive child_pid);
+              (* Recovery: with the flood released, a brand-new connection must still be
+                 acceptABLE -- proof the *listener*, not merely the OS process, is still doing its
+                 job, rather than e.g. wedged with every fd still consumed. *)
+              (match Eio.Net.connect ~sw net addr with
+              | flow -> (try Eio.Flow.close flow with End_of_file | Eio.Io _ -> ())
+              | exception exn ->
+                Alcotest.failf
+                  "listener did not accept a fresh connection after the flood was released: %s (see \
+                   %s for the probe's own log)"
+                  (Printexc.to_string exn) log_path);
+              let log = read_whole_file log_path in
+              Alcotest.(check bool)
+                "the probe's own log shows it actually hit a real EMFILE (Too many open files), not \
+                 some other failure mode"
+                true
+                (contains_substring ~needle:"Too many open files" log))))
+
 let tests =
   [ ("three-peer mesh: bidirectional delivery on every pairwise connection", `Quick,
       test_three_peer_mesh_bidirectional_delivery);
@@ -1020,5 +1197,7 @@ let tests =
     ("send refuses an id outside the configured membership", `Quick,
       test_send_refuses_an_id_outside_the_configured_membership);
     ("accept loop caps the number of concurrently accepted connections", `Quick,
-      test_accept_loop_caps_concurrent_connections)
+      test_accept_loop_caps_concurrent_connections);
+    ("EMFILE on accept does not kill the listener", `Quick,
+      test_emfile_on_accept_does_not_kill_the_listener)
   ]
