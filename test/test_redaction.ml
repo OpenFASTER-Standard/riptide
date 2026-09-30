@@ -103,6 +103,23 @@ let test_redaction_is_per_record () =
    mutation that deleting [~adata] from both Kek.wrap and Kek.unwrap left the whole suite green.
    The real attack is a swap, so the test performs the swap: copy e1's wrapped-DEK blob verbatim
    onto e2's slot, so the lookup genuinely SUCCEEDS and only the AAD binding can reject it. *)
+
+(* Task 24: the raw KV value is no longer just Kek.wrap's own output -- it is now
+   Redaction_store.encode_record's [event_id]-prefixed record ([lib/crypto/redaction_store.ml]:
+   "<len>:<event_id><wrapped>"). [encode_record]/[decode_record] are private to that module, so
+   this mirrors their exact format by hand, the same way this test file already duplicates other
+   modules' private on-disk layout details for a deeper assertion than their public interface alone
+   would allow (see [test_file_kv_store.ml]'s own [owner_marker_name]/[key_hash_hex] literals for
+   the established precedent). This lets the assertions below reach the true wrapped-DEK bytes
+   directly, so they still pin WHERE the swap is rejected (at Kek.unwrap itself, via the AAD) rather
+   than at the record's own outer encoding. *)
+let strip_embedded_event_id_prefix record =
+  match String.index_opt record ':' with
+  | None -> Alcotest.fail "record does not start with a length-prefixed event_id"
+  | Some colon_idx ->
+    let len = int_of_string (String.sub record 0 colon_idx) in
+    String.sub record (colon_idx + 1 + len) (String.length record - colon_idx - 1 - len)
+
 let test_wrapped_dek_is_bound_to_its_event_id () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun dir ->
@@ -117,32 +134,69 @@ let test_wrapped_dek_is_bound_to_its_event_id () =
       let ct = Redaction_store.encrypt_for_storage store ~event_id:"e1" v in
       (* Sanity: the blob really is there, and really does open its own record -- otherwise the
          assertion below could pass for the trivial reason the old test did. *)
-      let wrapped_e1 =
+      let record_e1 =
         match Riptide_storage.File_kv_store.get kv ~key:"e1" with
         | Some w -> w
         | None -> Alcotest.fail "e1's wrapped DEK should be in the keystore"
       in
+      let wrapped_e1 = strip_embedded_event_id_prefix record_e1 in
       Alcotest.(check bool) "e1 decrypts under its own event_id before the swap" true
         (Redaction_store.decrypt store ~event_id:"e1" ct = Some v);
-      (* The attack: the attacker has keystore write access and moves a wrapped DEK to another
-         record's slot, hoping it silently authenticates there. *)
-      Riptide_storage.File_kv_store.put kv ~key:"e2" wrapped_e1;
-      Alcotest.(check bool) "the swapped-in blob is genuinely present at e2 -- the keystore lookup \
+      (* The attack: the attacker has keystore write access and moves a wrapped DEK record to
+         another record's slot, hoping it silently authenticates there. The whole record moves
+         (embedded event_id prefix and all) -- exactly what a real attacker with only keystore
+         write access, not this module's own source, can do. *)
+      Riptide_storage.File_kv_store.put kv ~key:"e2" record_e1;
+      Alcotest.(check bool) "the swapped-in record is genuinely present at e2 -- the keystore lookup \
                              now SUCCEEDS, so only the AAD binding can reject it"
         true
-        (Riptide_storage.File_kv_store.get kv ~key:"e2" = Some wrapped_e1);
+        (Riptide_storage.File_kv_store.get kv ~key:"e2" = Some record_e1);
       Alcotest.(check bool) "a wrapped DEK moved onto another record's slot fails to unwrap there" true
         (Redaction_store.decrypt store ~event_id:"e2" ct = None);
       (* Pin WHERE that rejection happens: at the KEK unwrap itself, because of the AAD, and not
          at some later ciphertext/decode step that happens to also yield None. Asserted against
-         Kek directly, on the very same blob, so dropping [~adata] from Kek.wrap/unwrap fails here
-         loudly instead of silently leaving the suite green. *)
+         Kek directly, on the true wrapped-DEK bytes (the embedded event_id prefix stripped off),
+         so dropping [~adata] from Kek.wrap/unwrap fails here loudly instead of silently leaving the
+         suite green -- see [unwrap_dek]'s own comment in redaction_store.ml for why Redaction_store
+         itself deliberately never gates on the embedded event_id the way this direct Kek-level
+         assertion is free to, for a plain diagnostic purpose, here in the test alone. *)
       Alcotest.(check bool) "the same blob unwraps under its own AAD" true
         (Kek.unwrap kek ~aad:"e1" wrapped_e1 <> None);
       Alcotest.(check (option string)) "but not under another record's AAD" None
         (Kek.unwrap kek ~aad:"e2" wrapped_e1);
       Alcotest.(check bool) "e1 is untouched by the attack and still opens normally" true
         (Redaction_store.decrypt store ~event_id:"e1" ct = Some v))
+
+(* -- Task 24: Redaction_store.enumerate_event_ids. The plan's own sketch test used a
+   [Redaction_store.wrap] function that does not exist on this module's real surface -- the real
+   write path is [encrypt_for_storage] -- and asserted recoverability "via enumeration alone",
+   which is the property actually worth pinning: before this task, the KV store's own keys are
+   hashed away before they ever touch disk (see [kv_store_intf.ml]'s [fold] doc and
+   [file_kv_store.ml]'s [path_for]), so nothing short of an external log of every [event_id] ever
+   written could recover this set. This test proves that log is no longer needed. *)
+let test_enumerate_event_ids_recovers_every_event_id_with_no_external_log () =
+  with_store (fun store ->
+      let v i = Riptide.Value.Scalar (Riptide.Value.String (Printf.sprintf "secret-%d" i)) in
+      ignore (Redaction_store.encrypt_for_storage store ~event_id:"evt-1" (v 1));
+      ignore (Redaction_store.encrypt_for_storage store ~event_id:"evt-2" (v 2));
+      ignore (Redaction_store.encrypt_for_storage store ~event_id:"evt-3" (v 3));
+      let found = List.sort compare (Redaction_store.enumerate_event_ids store) in
+      Alcotest.(check (list string))
+        "every event_id that was ever encrypt_for_storage'd is recoverable via enumeration alone, \
+         with no external log ever consulted"
+        [ "evt-1"; "evt-2"; "evt-3" ] found)
+
+(* [redact] deletes the KV entry entirely, so enumeration must reflect that too -- a redacted
+   event_id must not still show up as if it were live. *)
+let test_enumerate_event_ids_does_not_include_a_redacted_event_id () =
+  with_store (fun store ->
+      let v = Riptide.Value.Scalar (Riptide.Value.String "sensitive") in
+      ignore (Redaction_store.encrypt_for_storage store ~event_id:"stays" v);
+      ignore (Redaction_store.encrypt_for_storage store ~event_id:"goes" v);
+      Redaction_store.redact store ~event_id:"goes";
+      let found = List.sort compare (Redaction_store.enumerate_event_ids store) in
+      Alcotest.(check (list string)) "only the non-redacted event_id remains enumerable" [ "stays" ]
+        found)
 
 (* -- Subtask 4.8's [Redaction_store] half: [create] must itself verify [kv] was actually built
    with its own [owner_tag], not just document the convention every real call site already
@@ -569,4 +623,10 @@ let tests =
       test_unencrypted_retry_in_the_uncommitted_window_is_still_a_no_op );
     ("encryption with merge_key is rejected", `Quick, test_encryption_with_merge_key_is_rejected);
     ("without encryption payloads are unchanged", `Quick, test_without_encryption_payloads_are_unchanged);
+    ( "Task 24: enumerate_event_ids recovers every event_id with no external log",
+      `Quick,
+      test_enumerate_event_ids_recovers_every_event_id_with_no_external_log );
+    ( "Task 24: enumerate_event_ids does not include a redacted event_id",
+      `Quick,
+      test_enumerate_event_ids_does_not_include_a_redacted_event_id );
   ]

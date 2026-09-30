@@ -42,4 +42,31 @@ module type S = sig
       never be resurrected, the same class of bug this project already
       found and fixed once in [File_storage.wal_truncate_after]. No-op if
       the key was never put. *)
+
+  val fold : t -> init:'a -> (key:string -> 'a -> 'a) -> 'a
+  (** [fold t ~init f] applies [f] once to each key currently present in [t] (i.e. every key that
+      has been [put] and not since [delete]d), threading an accumulator through starting from
+      [init]. Added to close audit finding Storage-Important-6 (Task 24): enumerating a store's
+      contents used to require an external log of every key ever written, which
+      {!Riptide_crypto.Redaction_store} (Task 6/Decision 4's keystore) has no such log for on its
+      own.
+
+      {b [key] here is this store's own INTERNAL identifier for the record — NOT necessarily the
+      original string a caller passed to [put].} [get]/[put]/[delete] above already make
+      [key:string] deliberately opaque: nothing in this module type promises a backend stores that
+      string in the clear. {!Riptide_storage.File_kv_store}, the one real implementer as of this
+      writing, does not: every key is hashed via SHA-256 before it ever touches disk (see
+      [file_kv_store.ml]'s [path_for]), and only that hash — never the original key — is persisted,
+      as the record's own filename. So for that backend, the [key] passed to [f] is the
+      64-lowercase-hex-character content hash of whatever string was originally [put], and there is
+      no way, structurally, to invert a SHA-256 hash back to its pre-image: {b [fold] cannot, and
+      does not claim to, recover an original key a backend never stored in the clear.} A different,
+      hypothetical backend that genuinely does store keys in the clear could honestly hand back the
+      real original string here instead — but that is a fact about that backend, not something this
+      module type requires or [fold]'s own contract can promise in general.
+
+      {b No ordering guarantee whatsoever.} The order in which [f] is applied across the keys
+      currently present is unspecified: not insertion order, not any order stable across two calls
+      against the same unmodified [t], nothing. A caller that needs a stable order must sort the
+      result itself. *)
 end

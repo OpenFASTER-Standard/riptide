@@ -178,6 +178,7 @@ module Blocking_kv_store : sig
   val get : t -> key:string -> string option
   val put : t -> key:string -> string -> unit
   val delete : t -> key:string -> unit
+  val fold : t -> init:'a -> (key:string -> 'a -> 'a) -> 'a
 end = struct
   type t = { tbl : (string, string) Hashtbl.t; mutable blocked : string list; cond : Eio.Condition.t }
 
@@ -198,6 +199,13 @@ end = struct
 
   let put t ~key value = Hashtbl.replace t.tbl key value
   let delete t ~key = Hashtbl.remove t.tbl key
+
+  (* Kv_store_intf.S.fold (Task 24). This mock's own key space is a plain in-memory [Hashtbl],
+     never hashed away the way [Riptide_storage.File_kv_store]'s is -- so, unlike that backend,
+     [key] here genuinely is the same original string a caller [put], not an internal identifier.
+     [Hashtbl.fold]'s own iteration order is unspecified, matching [Kv_store_intf.S.fold]'s own "no
+     ordering guarantee" contract. *)
+  let fold t ~init f = Hashtbl.fold (fun key _ acc -> f ~key acc) t.tbl init
 end
 
 module GMB = Riptide_materialize.Materializer.Make (G_set) (Blocking_kv_store)

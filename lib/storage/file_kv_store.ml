@@ -297,14 +297,21 @@ let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
 (* Task 18: [dir_path/xx/yy/<hash>] -- see this file's top comment ("Sharded by hash prefix") for
    the full rationale. [xx] is [hash]'s first 2 hex characters, [yy] its next 2 (characters 2-3);
    both are always present since [hash_to_hex] always produces a fixed-length (64-character)
-   lowercase hex string, never anything shorter. *)
+   lowercase hex string, never anything shorter.
+
+   Split out of [path_for] below (Task 24) so [get_by_hash] can build the same sharded location
+   directly from an already-computed hash, without hashing it a second time the way [path_for]
+   itself does for an arbitrary caller key. *)
+let path_from_hash t hash =
+  Filename.concat t.dir_path
+    (Filename.concat (String.sub hash 0 2) (Filename.concat (String.sub hash 2 2) hash))
+
 let path_for t ~key =
   let hash =
     Riptide.Value.hash_to_hex
       (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key)))
   in
-  Filename.concat t.dir_path
-    (Filename.concat (String.sub hash 0 2) (Filename.concat (String.sub hash 2 2) hash))
+  path_from_hash t hash
 
 (* Atomic counter to make each [durable_write] call's temp-file suffix unique. Closed audit
    finding (Task 16): concurrent fibers [put]ting the *same* key with a fixed temp-file suffix
@@ -797,3 +804,73 @@ let delete t ~key =
      [t.dir_path] -- see [fsync_dir]'s own comment (Critical fix, post-Task-18 review) for why
      fsyncing [t.dir_path] itself would durabilize nothing this [unlink] actually touched. *)
   fsync_dir ~dir_path:(Filename.dirname path)
+
+(* Task 24: the read counterpart [fold] below's own contract requires. [fold] can only ever hand
+   its callback this store's OWN internal identifier (the content-hash filename -- see
+   [Kv_store_intf.S.fold]'s doc comment for the full reasoning), never a caller's original [put]
+   key, since that original string is never itself persisted. [get] cannot be reused to read such a
+   value back: [get t ~key:hash] would hash [hash] a SECOND time via [path_for] and look for a file
+   at [path_from_hash t (hash_of hash)] -- an entirely different, essentially never-existing
+   location, not [path_from_hash t hash] itself. [get_by_hash] is the direct counterpart: it treats
+   its argument as an already-computed internal identifier, builds the record's path straight from
+   it via [path_from_hash], and never re-hashes. *)
+let get_by_hash t ~hash = durable_read t (path_from_hash t hash)
+
+(* [Kv_store_intf.S.fold]: walks the sharded (Task 18) two-level directory tree, applying [f] to
+   every real per-key record file it finds -- see [kv_store_intf.mli]'s own [fold] doc for what
+   [key] actually is here (this store's own internal identifier, i.e. exactly the 64-lowercase-hex
+   filename [path_for]/[path_from_hash] use, never the original caller-supplied key, which this
+   backend never persists in the clear).
+
+   Reuses [sweep_stale_temp_files]'s own directory-vs-leaf discrimination technique verbatim
+   (successfully [Eio.Path.read_dir]-ing an entry is a sound directory test, since the installed
+   Eio 0.12 exposes no [kind]/[stat] to check first instead -- see this file's top comment) --
+   applied here to VISIT every real leaf, rather than to unlink some of them.
+
+   A leaf is only ever passed to [f] if its own basename is exactly the 64-lowercase-hex-character
+   shape [path_for]'s [hash_to_hex] output always has ([is_real_key_filename] below) -- this
+   excludes the owner marker ([owner_marker_name], which starts with a dot), the lock file
+   ([".riptide-lock"]), and any stray [*.put.*.tmp] crash-debris file [is_stale_temp_file] would
+   also recognize: none of those names can ever collide with 64 lowercase hex characters. No claim
+   about visitation ORDER is made or relied on here, matching [kv_store_intf.mli]'s own [fold] doc
+   exactly: [Eio.Path.read_dir]'s own ordering is unspecified. *)
+let is_lowercase_hex_char c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+
+let is_real_key_filename basename =
+  String.length basename = 64
+  &&
+  let ok = ref true in
+  String.iter (fun c -> if not (is_lowercase_hex_char c) then ok := false) basename;
+  !ok
+
+let fold t ~init f =
+  let visit_leaf_dir entries acc =
+    List.fold_left
+      (fun acc basename -> if is_real_key_filename basename then f ~key:basename acc else acc)
+      acc entries
+  in
+  let visit_top_level_entry acc top_basename =
+    let top_path_str = Filename.concat t.dir_path top_basename in
+    match Eio.Path.read_dir Eio.Path.(t.fs / top_path_str) with
+    | shard1_entries ->
+      List.fold_left
+        (fun acc shard1_basename ->
+          let shard1_path_str = Filename.concat top_path_str shard1_basename in
+          match Eio.Path.read_dir Eio.Path.(t.fs / shard1_path_str) with
+          | shard2_entries -> visit_leaf_dir shard2_entries acc
+          | exception Eio.Io _ ->
+            (* Defensive, mirroring [sweep_stale_temp_files]'s own top comment: a leaf found one
+               level too shallow. Can't happen for anything [durable_write] itself produces under
+               the current, always-sharded [path_for], but a real key file found here would still
+               need visiting rather than being silently skipped just because of where it sits. *)
+            if is_real_key_filename shard1_basename then f ~key:shard1_basename acc else acc)
+        acc shard1_entries
+    | exception Eio.Io _ ->
+      (* A top-level leaf: the owner marker, the lock file, or -- defensively -- a stray file.
+         Never a real key file: [path_for] always shards two levels deep, so a genuine per-key
+         record can never live directly at [t.dir_path]'s own top level. *)
+      if is_real_key_filename top_basename then f ~key:top_basename acc else acc
+  in
+  match Eio.Path.read_dir Eio.Path.(t.fs / t.dir_path) with
+  | top_entries -> List.fold_left visit_top_level_entry init top_entries
+  | exception Eio.Io _ -> init (* directory doesn't exist yet -- nothing to fold over *)

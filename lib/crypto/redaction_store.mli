@@ -208,7 +208,21 @@ val encrypt_for_storage : t -> event_id:string -> Riptide.Value.value -> string
     written -- garbage, not data loss.
 
     Overwrites any DEK already stored at [event_id]. A caller that reuses an [event_id] for a
-    second record therefore destroys the first; see this module's header on [event_id] uniqueness. *)
+    second record therefore destroys the first; see this module's header on [event_id] uniqueness.
+
+    {b Task 24: the stored record's VALUE is no longer just the wrapped-DEK bytes -- it is [event_id]
+    itself (in the clear), length-prefixed, followed immediately by the wrapped DEK.} [event_id] is
+    not made any less secret by this: it was already the plaintext GCM additional authenticated
+    data {!Kek.wrap} takes, so it was never confidential to begin with (see this module's header).
+    This closes a real, previously-open gap instead: {!Riptide_storage.File_kv_store} (the one real
+    [kv] backend) hashes every KV key via SHA-256 before it ever touches disk, so the KV key
+    [event_id] alone was never recoverable from what is actually on disk -- enumerating this
+    keystore's contents required an external log of every [event_id] ever written. Embedding
+    [event_id] in the value itself is what makes {!enumerate_event_ids} below possible with no such
+    log. See {!Riptide_storage.Kv_store_intf.S.fold}'s own doc comment for the general shape of this
+    problem (this store's keys are its own internal, hashed identifiers, never the original string a
+    caller [put]), and this module's own [.ml] ([encode_record]/[decode_record]) for the exact,
+    length-prefixed wire format this produces. *)
 
 val decrypt : t -> event_id:string -> string -> Riptide.Value.value option
 (** [decrypt t ~event_id ciphertext] looks up [event_id]'s wrapped DEK, unwraps it under the KEK,
@@ -220,7 +234,40 @@ val decrypt : t -> event_id:string -> string -> Riptide.Value.value option
     it), the KEK is the wrong one, the ciphertext was tampered with, or the recovered plaintext is
     not a well-formed {!Riptide.Value.canonical_encode} encoding. "Redacted" and "unrecoverable for
     some other reason" are the same observable outcome by design -- a caller learning which one it
-    was would be learning something about a payload that is supposed to be gone. *)
+    was would be learning something about a payload that is supposed to be gone.
+
+    {b Task 24:} the keystore entry now also carries an embedded copy of its own [event_id] (see
+    {!encrypt_for_storage}'s own doc comment), but this lookup path deliberately never trusts or
+    even inspects it for its own correctness -- it always authenticates under the CALLER-SUPPLIED
+    [event_id] (this function's own argument, i.e. the KV lookup key) as GCM AAD, exactly as before
+    this task, and simply ignores the embedded copy. This is a considered choice, not an oversight:
+    see [unwrap_dek] in this module's own [.ml] for why even a cheap plaintext cross-check against
+    the embedded copy was deliberately rejected, not merely not added -- it would make the AAD-swap
+    attack test_wrapped_dek_is_bound_to_its_event_id (test_redaction.ml) exercises fail for the
+    wrong reason, masking rather than proving the real AAD-based protection. The embedded copy is
+    read only by {!enumerate_event_ids} below, which has no security property riding on it. *)
+
+val enumerate_event_ids : t -> string list
+(** [enumerate_event_ids t] returns every [event_id] this keystore currently holds a wrapped DEK
+    for -- i.e. every [event_id] that has been {!encrypt_for_storage}d and not since {!redact}ed --
+    with no external log replay needed (Task 24).
+
+    Before this task, this was not possible from the keystore alone: {!Riptide_storage.File_kv_store}
+    hashes every KV key before it ever reaches disk, so nothing about the [event_id]s themselves
+    survived on disk in a form anything could enumerate. {!encrypt_for_storage} now embeds
+    [event_id] in the clear inside the record's own VALUE for exactly this reason; this function
+    folds over the keystore's internal (hashed) identifiers via
+    {!Riptide_storage.File_kv_store.fold}, reads each one back via
+    {!Riptide_storage.File_kv_store.get_by_hash}, and decodes the embedded [event_id] out.
+
+    No ordering guarantee on the returned list, matching {!Riptide_storage.Kv_store_intf.S.fold}'s
+    own "no ordering guarantee whatsoever" -- sort the result if a caller needs a stable order.
+
+    A record that fails to decode in the expected embedded-[event_id] format is skipped rather than
+    raising, so one bad or foreign record does not prevent enumerating every other, legitimate one
+    -- see this module's own [.ml] ([enumerate_event_ids]'s comment) for why that specific failure
+    mode is believed unreachable in practice for a keystore this module fully controls the format
+    of, and for the honest disclosure of what silently skipping it actually costs. *)
 
 val redact : t -> event_id:string -> unit
 (** [redact t ~event_id] deletes [event_id]'s wrapped DEK from the keystore. This is the whole of

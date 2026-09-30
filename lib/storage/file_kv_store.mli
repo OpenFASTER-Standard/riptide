@@ -49,6 +49,28 @@
 
 include Kv_store_intf.S
 
+val get_by_hash : t -> hash:string -> string option
+(** [get_by_hash t ~hash] reads the record whose own INTERNAL IDENTIFIER -- what [path_for]
+    (private) computes for a caller's key, and exactly what {!fold} (inherited from
+    {!Kv_store_intf.S}, see its own doc comment) hands to its callback as [key] -- is exactly
+    [hash], without hashing it again the way {!get} hashes whatever ARBITRARY caller-supplied key
+    it is given.
+
+    {b Calling [get t ~key:hash] is NOT equivalent to this, and will not find the same record}
+    except by an astronomically unlikely SHA-256 second-preimage: {!get} always treats its own
+    [~key] as an opaque, yet-to-be-hashed caller key (matching {!Kv_store_intf.S.get}'s own
+    contract), never as an already-computed internal identifier, so it would hash [hash] a SECOND
+    time and look in an entirely different, essentially never-existing location.
+
+    This is the read this store's own {!fold} contract makes necessary (Task 24): {!fold} can only
+    ever hand back this store's internal identifier, never a caller's original [put] key (see its
+    doc comment for why: that original string is never itself persisted anywhere on disk), so
+    reading a folded record's value back requires this function specifically, not {!get}.
+
+    [None] under exactly the same conditions {!get} itself returns [None] for: no record currently
+    has this internal identifier (never put under any key that hashes to it, or since [delete]d),
+    or the stored record fails its own checksum. *)
+
 val max_value_size : int
 (** The hard upper bound, in bytes, on a single value this backend can store: one aligned data
     slot. {!Kv_store_intf.S.put} raises [Invalid_argument] naming this limit for anything larger,

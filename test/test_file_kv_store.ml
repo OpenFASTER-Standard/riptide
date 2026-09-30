@@ -989,6 +989,77 @@ let test_o_direct_downgrade_guard_matches_only_einval () =
         (contains ~needle:"Eio.Io _ when h.direct_capable" body))
     [ "perform_write"; "perform_read" ]
 
+(* -- Task 24: Kv_store_intf.S.fold. The plan's own sketch test asserted [fold] visits the ORIGINAL
+   keys ["a"; "b"; "c"] -- that is false for this backend and would only pass by coincidence (it
+   never would, since [path_for] hashes every key before it ever touches disk; see this file's top
+   comment and [kv_store_intf.ml]'s own [fold] doc). The real, honest assertion this test makes
+   instead: [fold] visits exactly the SET of each put key's own content hash -- computed here via
+   the same public [key_hash_hex] helper this file already uses for [real_path_for] above, not via
+   any private hook into [path_for] itself -- once each, no more, no fewer, and no visit of the
+   owner marker or lock file's own names either. *)
+let test_fold_visits_every_key_currently_present () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      let original_keys = [ "a"; "b"; "c" ] in
+      List.iter (fun k -> File_kv_store.put t ~key:k "v") original_keys;
+      let expected_hashes = List.sort compare (List.map key_hash_hex original_keys) in
+      let seen = File_kv_store.fold t ~init:[] (fun ~key acc -> key :: acc) in
+      Alcotest.(check (list string))
+        "fold visits exactly each put key's own content hash, once each -- never the original key \
+         strings themselves, which this backend never persists in the clear"
+        expected_hashes (List.sort compare seen))
+
+(* A store with nothing put yet still has an owner marker and a lock file sitting in its top-level
+   directory once [create] has run -- [fold] must not mistake either for a real key. *)
+let test_fold_over_an_empty_store_visits_nothing () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      Alcotest.(check int) "an empty store folds to nothing -- the owner marker and lock file are \
+                            not mistaken for real keys"
+        0
+        (File_kv_store.fold t ~init:0 (fun ~key:_ acc -> acc + 1)))
+
+(* [fold] must reflect [delete] -- a key removed before the fold must not still be visited. *)
+let test_fold_does_not_visit_a_deleted_key () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      File_kv_store.put t ~key:"stays" "v1";
+      File_kv_store.put t ~key:"goes" "v2";
+      File_kv_store.delete t ~key:"goes";
+      let seen = File_kv_store.fold t ~init:[] (fun ~key acc -> key :: acc) in
+      Alcotest.(check (list string)) "only the surviving key's hash is visited"
+        [ key_hash_hex "stays" ] seen)
+
+(* Task 24: [get_by_hash] is the read counterpart [fold]'s own contract makes necessary -- [get]
+   cannot be reused with a hash [fold] hands back (it would hash that hash a second time). This
+   pins the actual, real-world composition [Redaction_store.enumerate_event_ids] depends on: fold
+   for hashes, then [get_by_hash] each one back to its stored value. *)
+let test_get_by_hash_reads_back_what_fold_finds () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let t = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"test" dir in
+      File_kv_store.put t ~key:"k" "the-value";
+      let hash =
+        match File_kv_store.fold t ~init:[] (fun ~key acc -> key :: acc) with
+        | [ h ] -> h
+        | _ -> Alcotest.fail "expected fold to find exactly one key"
+      in
+      Alcotest.(check string) "fold's own key is exactly this key's content hash" (key_hash_hex "k")
+        hash;
+      Alcotest.(check (option string)) "get_by_hash reads back the value fold's hash points at"
+        (Some "the-value") (File_kv_store.get_by_hash t ~hash);
+      Alcotest.(check (option string))
+        "get, by contrast, does NOT find the same record when handed that same hash as an opaque \
+         key -- it would hash the hash a second time and land somewhere else entirely"
+        None (File_kv_store.get t ~key:hash))
+
 let test_downgrade_marks_direct_incapable_before_attempting_the_reopen () =
   let source = read_file file_kv_store_source_path in
   let body = top_level_binding_body source "downgrade_to_dsync_only" in
@@ -1077,4 +1148,12 @@ let tests =
     ( "Task 19 Bug 2: downgrade marks direct_capable false before attempting the reopen",
       `Quick,
       test_downgrade_marks_direct_incapable_before_attempting_the_reopen );
+    ( "Task 24: fold visits exactly each put key's own content hash, once each",
+      `Quick,
+      test_fold_visits_every_key_currently_present );
+    ("Task 24: fold over an empty store visits nothing", `Quick, test_fold_over_an_empty_store_visits_nothing);
+    ("Task 24: fold does not visit a deleted key", `Quick, test_fold_does_not_visit_a_deleted_key);
+    ( "Task 24: get_by_hash reads back what fold finds, unlike get on the same hash",
+      `Quick,
+      test_get_by_hash_reads_back_what_fold_finds );
   ]
