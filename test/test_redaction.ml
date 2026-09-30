@@ -431,6 +431,63 @@ let test_rotate_kek_second_call_after_a_partial_failure_is_resumable () =
             (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:id ct = None))
         cts)
 
+(* Task 25 re-review (Important): the resumability fallback ("try this call's old_kek, then this
+   call's new_kek") has a real, documented precondition -- a resumed call MUST pass the SAME
+   ~new_kek the abandoned attempt used. This pins the false-positive that follows if it doesn't:
+   an entry already rotated to kek2 by an interrupted first attempt is wrapped under NEITHER of a
+   second call's two candidates (kek1, the still-current t.kek, and kek3, a genuinely different
+   replacement key) -- so it raises Undecryptable_entry even though it is perfectly intact and
+   trivially recoverable by retrying with kek2. redaction_store.mli's own [rotate_kek] doc
+   documents exactly this as the "REAL PRECONDITION" disclosure; this test proves the documented
+   behavior is what the code actually does, not merely what the prose claims. *)
+let test_rotate_kek_resumed_with_a_different_new_kek_than_the_abandoned_attempt_raises () =
+  with_two_kek_store (fun ~kv ~kek1 ~kek2 ~store ->
+      let kek3 = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let ids = [ "e1"; "e2"; "e3" ] in
+      let cts =
+        List.map (fun id -> (id, Redaction_store.encrypt_for_storage store ~event_id:id (value_for id))) ids
+      in
+      (* First attempt, interrupted after 2 of 3 entries rotated to kek2 -- [store]'s own kek is
+         still kek1, exactly as a real interrupted rotate_kek would leave it. Both "e1" and "e2"
+         are now wrapped under kek2 and are the ones the resumed call below will misdiagnose;
+         "e3" is left genuinely under kek1 and would rotate cleanly if reached first (harmless --
+         not what this test is pinning down). *)
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e1";
+      simulate_one_rotation_step ~kv ~old_kek:kek1 ~new_kek:kek2 "e2";
+      (* The resuming call uses kek3, NOT kek2 -- the precondition violation under test. Which of
+         "e1"/"e2" is reported is NOT asserted: {!Riptide_storage.File_kv_store.fold}'s own
+         enumeration order is explicitly unspecified (see [enumerate_event_ids]'s own uses of it
+         elsewhere in this file), so either could be visited, and raise, first. *)
+      let raised_event_id =
+        match Redaction_store.rotate_kek store ~new_kek:kek3 with
+        | () ->
+          Alcotest.fail
+            "expected rotate_kek to raise Undecryptable_entry when resumed with a DIFFERENT \
+             ~new_kek than the abandoned attempt used"
+        | exception Redaction_store.Undecryptable_entry event_id -> event_id
+      in
+      Alcotest.(check bool)
+        "the exception names one of the two already-rotated (misdiagnosed, but perfectly intact) \
+         entries, not e3 (which was never touched by the first attempt)"
+        true
+        (raised_event_id = "e1" || raised_event_id = "e2");
+      (* Both misdiagnosed entries are proven intact: they still open cleanly under kek2, the key
+         the (simulated) first attempt actually used -- neither corrupted nor lost, just wrapped
+         under a key this second call never tried. *)
+      List.iter
+        (fun id ->
+          let _, ct = List.find (fun (id', _) -> id' = id) cts in
+          Alcotest.(check bool) (Printf.sprintf "%s is genuinely intact under kek2, not corrupted" id)
+            true
+            (Redaction_store.decrypt_with store ~kek:kek2 ~event_id:id ct = Some (value_for id)))
+        [ "e1"; "e2" ];
+      (* And store's own kek never moved -- the failed, wrong-key resume changed nothing about
+         [t] itself, regardless of whether "e3" got rewritten to kek3 along the way before the
+         exception fired. *)
+      let after_ct = Redaction_store.encrypt_for_storage store ~event_id:"after" (value_for "after") in
+      Alcotest.(check bool) "store's own kek is unchanged after the failed, wrong-key resume" true
+        (Redaction_store.decrypt_with store ~kek:kek1 ~event_id:"after" after_ct = Some (value_for "after")))
+
 let test_rotate_kek_raises_on_an_entry_undecryptable_under_either_key () =
   with_two_kek_store (fun ~kv ~kek1 ~kek2:new_kek ~store ->
       let good_ct = Redaction_store.encrypt_for_storage store ~event_id:"good" (value_for "good") in
@@ -910,6 +967,10 @@ let tests =
     ( "Task 25: a second rotate_kek call after a partial failure is resumable",
       `Quick,
       test_rotate_kek_second_call_after_a_partial_failure_is_resumable );
+    ( "Task 25 re-review (Important): resuming with a different new_kek than the abandoned \
+       attempt raises on an intact entry",
+      `Quick,
+      test_rotate_kek_resumed_with_a_different_new_kek_than_the_abandoned_attempt_raises );
     ( "Task 25: rotate_kek raises on an entry undecryptable under either key",
       `Quick,
       test_rotate_kek_raises_on_an_entry_undecryptable_under_either_key );

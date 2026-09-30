@@ -308,7 +308,21 @@ val enumerate_event_ids : t -> string list
 exception Undecryptable_entry of string
 (** Raised by {!rotate_kek} for the [event_id] of an entry whose wrapped DEK authenticates under
     neither the key rotation started with nor the key it is rotating to. See {!rotate_kek}'s own
-    doc for why this is a deliberate, loud failure rather than a silent skip. *)
+    doc for why this is a deliberate, loud failure rather than a silent skip -- and, critically,
+    for a real precondition on resuming an interrupted rotation whose violation raises this exact
+    exception on perfectly intact data, not just on genuine corruption.
+
+    The payload is the bare [event_id] (so a catching caller can act on it programmatically,
+    e.g. to list every affected entry across a batch), but this module also registers a
+    {!Printexc.register_printer} for it: the human-facing message
+    ({!Printexc.to_string}/an uncaught top-level backtrace) additionally explains both possible
+    root causes and suggests the wrong-resume-key one first, since misdiagnosing a recoverable
+    "wrong key used to resume" state as "my data is corrupted" during an active KEK-compromise
+    incident is a real, costly mistake this module can cheaply help an operator avoid -- even
+    though it cannot mechanically tell the two apart (see {!rotate_kek}'s doc for why not: {e any}
+    key material that could disambiguate them, e.g. a fingerprint of the key actually in the
+    stored wrap, is exactly the kind of thing this module's sibling {!Kek} module deliberately
+    never exposes). *)
 
 val rotate_kek : t -> new_kek:Kek.t -> unit
 (** [rotate_kek t ~new_kek] is the KEK-compromise remediation path: before this function existed,
@@ -354,6 +368,40 @@ val rotate_kek : t -> new_kek:Kek.t -> unit
     extra, cheap {!Kek.unwrap} attempt, and turns "an operator must reconstruct partial progress by
     hand before it's safe to try again" into "just call [rotate_kek] again."
 
+    {b Why trying old-then-new is unambiguous, not merely convenient:} an entry can never
+    plausibly authenticate under {e both} candidate keys. {!Kek.unwrap} is AES-256-GCM
+    authenticated decryption -- succeeding under the wrong key (or the wrong [~aad], which here is
+    always this same [event_id] either way) requires forging a 128-bit GCM tag, at ~2^-128 odds.
+    So for any real entry, at most one of the two [unwrap_dek_with] attempts below can ever
+    succeed; "tries old, falls back to new" never has to arbitrate a genuine ambiguity between the
+    two outcomes, it only ever distinguishes "not yet rotated" from "already rotated" cleanly.
+
+    {b A REAL PRECONDITION this resumability design places on the caller, stated plainly: a
+    resumed call MUST pass the exact same [~new_kek] the abandoned attempt used.} The fallback
+    above only ever tries two keys -- THIS call's own [old_kek] (whatever [t.kek] is right now)
+    and THIS call's own [new_kek] (the argument just passed) -- it has no way to try a THIRD key
+    it was never told about. Concretely: [rotate_kek t ~new_kek:kek2] is interrupted after
+    rewrapping some entries to [kek2], leaving [t.kek] still [kek1]; if the resuming call is
+    instead [rotate_kek t ~new_kek:kek3] (a different replacement key -- plausible if an operator
+    regenerates a fresh key on retry rather than reusing the abandoned attempt's), every
+    already-[kek2]-wrapped entry now fails to unwrap under BOTH this call's candidates ([kek1] and
+    [kek3]) -- it is wrapped under neither. Those entries raise {!Undecryptable_entry} below even
+    though they are perfectly intact and trivially recoverable (by retrying with [kek2]). This is
+    a real, disclosed false-positive in the corruption diagnosis just below, not a hypothetical
+    edge case: {b always resume an interrupted rotation with the identical [~new_kek] the
+    abandoned attempt was given.} See {!Undecryptable_entry}'s own doc for how its exception
+    message is written to actively steer an operator toward suspecting exactly this, rather than
+    assuming genuine corruption, the moment it fires.
+
+    {b Idempotent in final state, not in I/O cost.} A redundant call with the SAME [~new_kek] --
+    after a rotation already completed, or racing an equivalent concurrent call -- is harmless and
+    converges to the identical end state ([t.kek = new_kek], every entry wrapped under it), but is
+    not a cheap no-op: every entry still gets read, its DEK unwrapped, re-wrapped, and rewritten to
+    disk, exactly as a real rotation would, because nothing here distinguishes "trivially
+    already-correct" from "needs rewriting" any more cheaply than actually trying the unwrap.
+    Calling [rotate_kek] with a [~new_kek] equal to [t.kek] already (e.g. immediately after a
+    successful rotation) still pays this full pass over every entry for zero effect.
+
     {b A record that fails to unwrap under EITHER key raises {!Undecryptable_entry}[ event_id],
     immediately, stopping the rotation right there} -- deliberately {b not} the same
     "cannot-distinguish, skip silently" tolerance {!enumerate_event_ids} uses for its own two
@@ -361,17 +409,23 @@ val rotate_kek : t -> new_kek:Kek.t -> unit
     coherently to begin with (a concurrent delete racing the fold; a foreign write this module
     never produced). This is a different situation: {!enumerate_event_ids} just found this exact
     [event_id] to be live and readable moments before, in the very same call -- for it to then not
-    open under either key this rotation knows about is a real, otherwise-silent corruption case,
-    surfacing on an operation whose entire job is re-keying every entry it can see. Skipping it
-    silently would leave a permanently stuck entry (undecryptable forever once rotation
-    eventually completes and [t] drops the old key, with no signal anywhere that this ever
-    happened). Raising instead stops the rotation with the offending [event_id] named, leaves that
-    entry and everything {!enumerate_event_ids} had not yet reached still under the OLD key (fully
-    recoverable, since [t.kek] is untouched by a failed call), and leaves every entry already
-    rotated earlier in this same call intact and readable under [new_kek] -- consistent with this
-    codebase's established preference for a loud, investigable failure over a quiet, unrecoverable
-    one (e.g. this module's own {!redact} durability disclosures, or the project's Task 13
-    superblock-rebuild and Task 21 exception-narrowing work).
+    open under either key this rotation knows about is {e usually} real, otherwise-silent
+    corruption on an operation whose entire job is re-keying every entry it can see -- {b but, per
+    the precondition above, can also be a perfectly intact entry rotated by an abandoned earlier
+    call that used a different [~new_kek]} than this one. Skipping either case silently would
+    leave a permanently stuck entry (undecryptable forever once rotation eventually completes and
+    [t] drops the old key, with no signal anywhere that this ever happened). Raising instead stops
+    the rotation with the offending [event_id] named, leaves that entry and everything
+    {!enumerate_event_ids} had not yet reached still under the OLD key (fully recoverable, since
+    [t.kek] is untouched by a failed call), and leaves every entry already rotated earlier in this
+    same call intact and readable under [new_kek] -- consistent with this codebase's established
+    preference for a loud, investigable failure over a quiet, unrecoverable one (e.g. this
+    module's own {!redact} durability disclosures, or the project's Task 13 superblock-rebuild and
+    Task 21 exception-narrowing work). The two possible root causes are genuinely indistinguishable
+    from inside this function (both look identical: "neither key opens it"), which is exactly why
+    {!Undecryptable_entry}'s own message names both candidates and suggests the wrong-resume-key
+    explanation first, rather than reporting a bare "corrupted" that would send an operator
+    straight to assuming data loss.
 
     {b Concurrency.} [t]'s [kek] field is genuinely mutable as of this task (it was immutable
     before) -- calling [rotate_kek] concurrently with itself, or with a concurrent

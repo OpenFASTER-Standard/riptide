@@ -205,6 +205,33 @@ let enumerate_event_ids t =
    a silent skip. *)
 exception Undecryptable_entry of string
 
+(* Task 25 re-review (Important): the payload stays the bare [event_id] (so a catching caller can
+   still act on it programmatically), but a registered exception printer makes the HUMAN-facing
+   message (whatever [Printexc.to_string]/an uncaught backtrace shows) actively steer an operator
+   toward the right diagnosis instead of a bare "corrupted". See redaction_store.mli's own
+   [Undecryptable_entry] and [rotate_kek] docs for the full argument this exists to address: this
+   exact exception fires both for genuine corruption AND for a perfectly intact entry rotated by
+   an earlier, abandoned call that used a DIFFERENT [~new_kek] than this one -- indistinguishable
+   from inside this function (see [rotate_kek] below), but the second cause is far more likely in
+   practice and trivially recoverable (retry with the right [~new_kek]), so the message leads with
+   it. Deliberately does NOT attempt to name the actual keys involved -- {!Kek.t} exposes no raw
+   bytes or fingerprint for exactly this module's own stated reasons (kek.mli's header), and
+   inventing a diagnostic-only exception to that would be new, security-relevant surface for a
+   cheap error-message improvement that does not need it. *)
+let () =
+  Printexc.register_printer (function
+    | Undecryptable_entry event_id ->
+      Some
+        (Printf.sprintf
+           "Redaction_store.Undecryptable_entry(%S): this entry's wrapped DEK authenticates under \
+            neither key rotate_kek tried (the key it started this call with, and ~new_kek). Two \
+            possible causes, indistinguishable from here: (1, more likely) you are resuming an \
+            interrupted rotation with a DIFFERENT ~new_kek than the abandoned attempt used -- this \
+            entry is probably perfectly intact, already rotated to that OTHER key; retry with the \
+            same ~new_kek the earlier call used. (2) genuine data corruption unrelated to rotation. \
+            See redaction_store.mli's rotate_kek doc for the full explanation." event_id)
+    | _ -> None)
+
 (* Task 25: the KEK-compromise remediation path -- see redaction_store.mli's own [rotate_kek] doc
    for the full design argument (resumability and corrupted-entry judgment calls, both stated and
    justified there, not just here).
@@ -218,15 +245,25 @@ exception Undecryptable_entry of string
    [encrypt_for_storage] already uses (write-temp-then-rename, Tasks 15/16), so this function adds
    no new atomicity of its own, it only reuses what already exists. If unwrapping under [old_kek]
    fails, try [new_kek] before giving up: a successful unwrap there means this entry was already
-   rotated by an earlier, interrupted call to [rotate_kek], and is left untouched rather than
-   rewritten (see the .mli for why this resumability choice was made deliberately, not merely
-   picked). If NEITHER key opens it, raise [Undecryptable_entry] immediately -- real corruption
-   unrelated to rotation, since [enumerate_event_ids] found this exact entry live and readable
-   moments earlier in this very call.
+   rotated by an earlier, interrupted call to [rotate_kek] THAT USED THIS SAME [new_kek], and is
+   left untouched rather than rewritten (see the .mli for why this resumability choice was made
+   deliberately, not merely picked). The two [unwrap_dek_with] attempts below can never both
+   succeed for a real entry -- that would require forging a 128-bit GCM tag under the wrong key,
+   ~2^-128 odds -- so this fallback never has a genuine ambiguity to arbitrate between "not yet
+   rotated" and "already rotated". If NEITHER key opens it, raise [Undecryptable_entry] --
+   normally real corruption unrelated to rotation (this exact entry was live and readable moments
+   earlier, in [enumerate_event_ids]'s own fold, in this very call), but see the .mli's own REAL
+   PRECONDITION disclosure: this ALSO fires, on perfectly intact data, if a resumed call is given a
+   DIFFERENT [~new_kek] than the abandoned attempt it is resuming -- always reuse the same
+   [~new_kek] across a resume.
 
    Only once every [event_id] has been handled without raising does [t]'s own [kek] field actually
    change -- a partial failure therefore always leaves [t] still pointed at [old_kek], regardless
-   of how many individual entries were already rewritten under [new_kek] before the failure. *)
+   of how many individual entries were already rewritten under [new_kek] before the failure.
+   Note also (Task 25 re-review, Minor 2): a redundant call with a [~new_kek] already fully applied
+   (a repeat success, or a same-key race) is harmless but not free -- every entry is still read,
+   unwrapped, and rewritten; this function has no cheap way to detect "already exactly this" short
+   of doing the unwrap it would do anyway. *)
 let rotate_kek t ~new_kek =
   let old_kek = t.kek in
   List.iter
