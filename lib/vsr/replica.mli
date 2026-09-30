@@ -72,6 +72,57 @@ type status = Normal | View_change
     ["Normal"]/["ViewChange"] there — renamed here only for OCaml's own constructor-casing
     convention, no semantic change. *)
 
+type append_refusal =
+  | Fault_injection_cap
+  | Entry_rejected
+  | Out_of_sequence
+  | Eviction_blocked
+  | Storage_fault
+(** The five durable-WAL-append refusal shapes this module classifies — see {!append_refusals}
+    below for the full per-shape account (what each backend condition means, which are transient,
+    and the I2 / subtask 3.7 / Task 12 history behind why they are told apart at all instead of one
+    blanket catch) and [replica.ml]'s own [append_refusal] type doc comment for the complete
+    reasoning and the message-prefix matching that produces them. Exposed here as its own type —
+    rather than only through {!append_refusals}'s stringly-typed [(name, count)] pairs — solely so
+    {!replica_event} below can carry one of these per [Append_refused] occurrence, without
+    re-encoding the same five shapes a second, parallel way. *)
+
+type replica_event =
+  | Append_refused of append_refusal
+  | Status_changed of { old_status : status; new_status : status }
+  | Commit_decreased of { old_commit : int; new_commit : int }
+(** [?on_event]'s payload (Task 34, audit-remediation Group 7 — see {!create}/{!restart}) — a
+    CLOSED variant, deliberately not left open for ad hoc extension, covering exactly three
+    concepts this module already classifies or mutates elsewhere, and nothing beyond them:
+
+    {ul
+    {- [Append_refused r] — a durable WAL append this replica just declined, classified into one of
+       {!append_refusal}'s five already-established shapes. Fired from the exact point
+       {!append_refusals}'s own per-shape counter is incremented, so the two are always in
+       lockstep: this event is a synchronous, per-occurrence replay of that counter's increments,
+       not a second, independent classification.}
+    {- [Status_changed { old_status; new_status }] — {!status} moving between [Normal] and
+       [View_change], fired at each of the four real actions that assign it (the same four
+       {!status}'s own doc comment names: {!check_timeout}'s [TimerSendSVC] and
+       {!handle_message}'s [Start_view_change] dispatch move it to [View_change]; the
+       [Do_view_change]-driven [SendSV] and {!handle_message}'s [Start_view] dispatch move it back
+       to [Normal]). {b Not} fired by the test-support [for_test_set_view] below, which sets
+       [status] directly to construct a test state no real action produced — reporting a
+       "transition" for a state nothing transitioned into would misrepresent what this event
+       means.}
+    {- [Commit_decreased { old_commit; new_commit }] — {!commit_number} genuinely LOWERED: the one
+       case [?on_commit_advanced] {b deliberately filters out} (see that parameter's own doc
+       comment on {!create} for the real [SendSV] 1 {b ->} 0 drop it exists to hide from a
+       monotonic watermark consumer). This event is for a different kind of consumer — one that
+       wants to observe the decrease itself, e.g. to log or alarm on it — and is fired from the
+       same single writer that already enforces [?on_commit_advanced]'s "exactly once per genuine
+       increase" contract, so neither hook can be forgotten by a future fifth [commit_number]
+       writer any more than the other already can.}}
+
+    See {!create}'s own doc comment on [?on_event] for the full call-convention guarantees
+    (synchronous, inline, not retroactive, and — for the two view-change-adjacent sites — what
+    replica state is/isn't settled at the moment it fires). *)
+
 type t
 (** One replica's mutable state: its log, op-number, commit-number, view-change
     status/view-number/last-normal-view, (primary-only) per-peer acknowledgment high-water marks,
@@ -107,6 +158,7 @@ val volatile_storage : unit -> storage
 
 val create :
   ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->
+  ?on_event:(replica_event -> unit) ->
   my_id:int ->
   replica_count:int ->
   svc_limit:int ->
@@ -254,10 +306,29 @@ val create :
     the split above that inference is simply false at [handle_start_view], the very site where
     follower catch-up happens). The commit advance being reported is real and final regardless of
     what those fields read. If a consumer genuinely needs post-action view state, it must do that
-    work after {!propose}/{!handle_message} returns, not inside the hook. *)
+    work after {!propose}/{!handle_message} returns, not inside the hook.
+
+    {b [?on_event], if supplied, follows the exact same call convention as [?on_commit_advanced]
+    above} — invoked {b synchronously and inline}, from the same caller's own stack, never queued or
+    deferred, so a hook that blocks blocks the protocol exactly the same way [send] and
+    [?on_commit_advanced] do. Unlike [?on_commit_advanced] it is not scoped to commit progress
+    alone — see {!replica_event}'s own doc comment for the three things it reports
+    ([Append_refused]/[Status_changed]/[Commit_decreased]) and the exact site each is fired from.
+
+    {b Nothing is durable yet when it fires, for the same reason [?on_commit_advanced] isn't} —
+    [persist_superblock] always runs after every hook invoked from the same action returns, so a
+    [Status_changed] or [Commit_decreased] a consumer durably records itself can survive a crash
+    this replica's own state did not.
+
+    {b Not invoked retroactively, matching [?on_commit_advanced]}: {!restart} fires nothing for
+    state recovered from the superblock (in particular, a replica recovering mid-view-change status
+    fires no [Status_changed] for it), only for the first real transition/refusal/decrease that
+    happens AFTER construction. Omitting it is the zero-cost default and leaves behaviour
+    bit-for-bit identical to before this parameter existed. *)
 
 val restart :
   ?on_commit_advanced:(old_commit:int -> new_commit:int -> unit) ->
+  ?on_event:(replica_event -> unit) ->
   my_id:int ->
   replica_count:int ->
   svc_limit:int ->
@@ -270,10 +341,11 @@ val restart :
     state. Same argument validation as {!create}, and the same [Invalid_argument] cases for
     [my_id]/[replica_count]/[svc_limit] — but no emptiness requirement, since recovering existing
     durable state is the point. An empty backend (no superblock AND an empty WAL) is accepted and
-    yields exactly {!create}'s [Init] state — that is first boot, and it keeps working. [?on_commit_advanced]
-    and the trailing [()] mean exactly what they mean on {!create} (see there) — including that
-    nothing is reported retroactively for the [commit_number] this constructor RECOVERS, which is
-    the case a restart-time consumer has to handle for itself.
+    yields exactly {!create}'s [Init] state — that is first boot, and it keeps working.
+    [?on_commit_advanced], [?on_event], and the trailing [()] mean exactly what they mean on
+    {!create} (see there) — including that nothing is reported retroactively for the
+    [commit_number]/[status] this constructor RECOVERS, which is the case a restart-time consumer
+    has to handle for itself.
 
     {b Raises [Invalid_argument] — fail-stop — if the superblock is unusable while the WAL is NOT
     empty}, i.e. if [superblock_read] returns [None] (fewer than a majority of copies verify and
@@ -520,6 +592,35 @@ val is_committed : t -> Riptide.Value.value -> bool
     [=] — see {!propose}'s own doc comment for why: [Value.value]'s [Float] case is
     content-addressed by raw bit pattern (`lib/value.mli`), and this module stays consistent with
     that identity notion throughout rather than introducing a second one. *)
+
+val svc_count : t -> int
+(** [svc_count t] is VSR.tla's own [aux_svc_count[r]] (VSR.tla:41) — how many times
+    {!check_timeout} has fired [TimerSendSVC] since this replica's timeout budget was last reset;
+    {!check_timeout}'s own guard blocks a further [TimerSendSVC] once this reaches the [svc_limit]
+    {!create}/{!restart} were given (see that function's own doc comment). See [t]'s own doc
+    comment on [replica.ml] for the disclosed divergence from the literal TLA+ transcription: unlike
+    [aux_svc_count], which never resets in the abstract spec, this resets to [0] on every real
+    [View_change -> Normal] transition ([SendSV] unconditionally; [ReceiveSV] only when the
+    transition is real, never on a duplicate/replayed [Start_view] this replica is already [Normal]
+    for) — giving each new failure a fresh budget rather than permanently exhausting it after
+    [svc_limit] timeouts. Exposed read-only, the same way {!status}/{!view_number}/{!commit_number}
+    are: genuine protocol state a caller or test may need to inspect, not a test-only concern. *)
+
+val peer_op_number : t -> peer:int -> int option
+(** [peer_op_number t ~peer] is this replica's cumulative high-water mark of [peer]'s highest
+    ACKNOWLEDGED op-number — VSR.tla's own [rep_peer_op_number[r]], maintained solely by
+    {!handle_message}'s [Prepare_ok] handling (see that field's own doc comment on [t] in
+    [replica.ml]). {b Primary-only bookkeeping, harmless but simply never populated on a backup} —
+    calling this on a backup, and calling it for a [peer] this replica has never accepted a
+    [Prepare_ok] from, both return [None]; the two are indistinguishable from outside, by design
+    (the underlying table's own invariant — every key present is always a valid replica id in
+    [1, replica_count], enforced solely at insertion — means there is no separate "id not
+    recognized" case for this accessor to report either; an out-of-range [peer] simply cannot be a
+    key and so also reads [None]). {b Volatile}: reset to empty by {!restart} (VSR.tla:599-601, one
+    of the four fields [CrashRestart] deliberately does not recover — see {!restart}'s own doc
+    comment), never durable, so [None] right after a restart does not mean "this peer never
+    acknowledged anything", only "not recorded since the last (re)start". Exposed read-only for the
+    same reason {!svc_count} above is. *)
 
 val propose : t -> Riptide.Value.value -> unit
 (** [propose t v] is VSR.tla's [ReceiveClientRequest(v)] (VSR.tla:91-102) — the entry point an

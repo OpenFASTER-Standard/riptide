@@ -2139,6 +2139,131 @@ let test_on_commit_advanced_from_receive_sv_on_a_still_normal_backup () =
    [test_restart_reports_nothing_retroactively_then_fires_on_the_next_real_advance] in
    test_vsr_replica_recovery.ml, which shares that file's [fresh_storage] durable-state helper. *)
 
+(* ---- Task 34 (audit-remediation Group 7): ?on_event, peer_op_number, svc_count ----
+
+   The three [replica_event] shapes are each driven from a real, already-established scenario this
+   suite (or its sibling, test_vsr_replica_recovery.ml) already exercises for OTHER reasons, rather
+   than a synthetic one invented just for this hook: [Commit_decreased] reuses
+   [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic]'s own real SendSV 1 -> 0
+   drop; [Status_changed] reuses [check_timeout]'s real Normal -> View_change transition;
+   [Append_refused] reuses [test_refusal_fault_injection_cap_is_counted_as_its_own_shape]'s own
+   fixture (test_vsr_replica_recovery.ml) -- the simplest of the five [append_refusal] shapes to
+   trigger without a real on-disk backend. *)
+
+let is_commit_decreased = function Replica.Commit_decreased _ -> true | _ -> false
+
+let test_on_event_reports_a_commit_number_decrease () =
+  (* Identical setup to
+     [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic]/
+     [test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease] above: real Prepare
+     traffic establishes commit_number = 1, then a forced view-change episode whose own
+     HighestCommitNumber is 0 drives SendSV's unconditional 1 -> 0 assignment -- the documented
+     view-change-lowers-commit case [?on_commit_advanced] itself deliberately does not report. *)
+  let events = ref [] in
+  let send, _sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send
+      ~on_event:(fun e -> events := e :: !events) ()
+  in
+  Replica.handle_message t ~sender:5 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 5 }));
+  Replica.handle_message t ~sender:5 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 5 }));
+  Alcotest.(check int) "a real Prepare exchange establishes commit_number = 1 before view-change" 1
+    (Replica.commit_number t);
+  (* [for_test_set_view] sets [status] directly -- per [replica_event]'s own doc comment, this must
+     NOT fire a [Status_changed] event, since no real action produced this transition. Checked
+     below via the final event count. *)
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:6 ~last_normal_view:0;
+  Replica.handle_message t ~sender:2 (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:2);
+  Replica.handle_message t ~sender:3 (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:3);
+  Replica.handle_message t ~sender:4 (dvc_msg ~v:6 ~log:[] ~last_normal_view:0 ~n:0 ~k:0 ~i:4);
+  Alcotest.(check bool) "the view change completed" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "commit_number really did DROP to 0 (SendSV is unconditional)" 0
+    (Replica.commit_number t);
+  Alcotest.(check bool) "a Commit_decreased event was emitted" true (List.exists is_commit_decreased !events);
+  Alcotest.(check bool) "and it carries the exact 1 -> 0 values" true
+    (List.exists
+       (function Replica.Commit_decreased { old_commit = 1; new_commit = 0 } -> true | _ -> false)
+       !events);
+  Alcotest.(check int)
+    "exactly one Status_changed event fired -- the real SendSV View_change -> Normal transition; \
+     for_test_set_view's own direct write above did NOT fire a second one"
+    1
+    (List.length (List.filter (function Replica.Status_changed _ -> true | _ -> false) !events));
+  Alcotest.(check bool) "and it is that View_change -> Normal transition" true
+    (List.exists
+       (function
+         | Replica.Status_changed { old_status = Replica.View_change; new_status = Replica.Normal } -> true
+         | _ -> false)
+       !events)
+
+let test_on_event_reports_status_transitions () =
+  (* [check_timeout]'s real Normal -> View_change transition (TimerSendSVC) -- the simplest of the
+     four real [t.status <-] sites to drive directly. *)
+  let events = ref [] in
+  let send, _sent = capturing_send () in
+  let t =
+    Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send
+      ~on_event:(fun e -> events := e :: !events) ()
+  in
+  Replica.for_test_set_view_number t 1;
+  Alcotest.(check bool) "PRECONDITION: Normal before any timeout" true (Replica.status t = Replica.Normal);
+  Replica.check_timeout t;
+  Alcotest.(check bool) "check_timeout really did move it to View_change" true
+    (Replica.status t = Replica.View_change);
+  Alcotest.(check bool) "a Status_changed Normal -> View_change event was emitted" true
+    (List.exists
+       (function
+         | Replica.Status_changed { old_status = Replica.Normal; new_status = Replica.View_change } -> true
+         | _ -> false)
+       !events)
+
+let test_on_event_reports_an_append_refusal () =
+  let events = ref [] in
+  let send, _sent = capturing_send () in
+  let backend =
+    Riptide_storage.Fault_injecting_storage.create
+      ~prng:(Riptide_sim.Prng.create 1)
+      ~fault_config:
+        { Riptide_storage.Fault_injecting_storage.default_fault_config with corrupt_probability = 1.0 }
+      ~replication_quorum:1 (* faults_max = 0 -- the very first corrupting append is refused outright. *)
+      ~underlying:(module Riptide_storage.Memory_storage)
+      (Riptide_storage.Memory_storage.create ())
+  in
+  let storage = Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) backend in
+  let t =
+    Replica.create ~my_id:1 ~replica_count:3 ~svc_limit:3 ~send ~storage
+      ~on_event:(fun e -> events := e :: !events) ()
+  in
+  Replica.handle_message t ~sender:3 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 3 }));
+  Alcotest.(check int) "PRECONDITION: append_refusals really did count this as fault_injection_cap" 1
+    (List.assoc "fault_injection_cap" (Replica.append_refusals t));
+  Alcotest.(check bool) "an Append_refused Fault_injection_cap event was emitted" true
+    (List.exists (function Replica.Append_refused Replica.Fault_injection_cap -> true | _ -> false) !events)
+
+let test_svc_count_is_a_real_accessor () =
+  let send, _sent = capturing_send () in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send () in
+  Replica.for_test_set_view_number t 1;
+  Alcotest.(check int) "svc_count starts at 0 (Init)" 0 (Replica.svc_count t);
+  Replica.check_timeout t;
+  Alcotest.(check int) "svc_count is a real accessor: it observes check_timeout's own real increment" 1
+    (Replica.svc_count t)
+
+let test_peer_op_number_is_a_real_accessor () =
+  let send, _sent = capturing_send () in
+  let t = create_at_view_1 ~my_id:1 ~replica_count:5 ~send in
+  Replica.propose t (v "a");
+  Replica.propose t (v "b");
+  Alcotest.(check (option int)) "peer 2 has never acked: None" None (Replica.peer_op_number t ~peer:2);
+  Replica.handle_message t ~sender:2 (Message.encode (Message.Prepare_ok { view = 1; n = 2; i = 2 }));
+  Alcotest.(check (option int))
+    "peer_op_number is a real accessor: it observes handle_prepare_ok's own cumulative high-water \
+     mark"
+    (Some 2) (Replica.peer_op_number t ~peer:2);
+  Replica.handle_message t ~sender:2 (Message.encode (Message.Prepare_ok { view = 1; n = 1; i = 2 }));
+  Alcotest.(check (option int)) "a lower, stale-looking ack does not regress the recorded mark" (Some 2)
+    (Replica.peer_op_number t ~peer:2)
+
 let tests =
   [
     (* Fix-round M2/M3 (task-1-review.md): Primary(v)/view_number/last_normal_view coverage *)
@@ -2373,5 +2498,14 @@ let tests =
        test_vsr_replica_recovery.ml, alongside their four sibling refusal-classification tests,
        and rewrote them for Important-1's narrowed classification -- see that file's own "storage_fault"
        section. *)
+    (* Task 34 (audit-remediation Group 7): ?on_event, peer_op_number, svc_count *)
+    ( "34: on_event reports a real Commit_decreased (SendSV's own unconditional 1 -> 0 drop), and \
+       does NOT report for_test_set_view's own direct status write as a transition",
+      `Quick,
+      test_on_event_reports_a_commit_number_decrease );
+    ("34: on_event reports a real Status_changed (check_timeout's own Normal -> View_change)", `Quick, test_on_event_reports_status_transitions);
+    ("34: on_event reports a real Append_refused (fault_injection_cap)", `Quick, test_on_event_reports_an_append_refusal);
+    ("34: svc_count is a real, public accessor", `Quick, test_svc_count_is_a_real_accessor);
+    ("34: peer_op_number is a real, public accessor", `Quick, test_peer_op_number_is_a_real_accessor);
   ]
   @ create_invalid_arg_tests

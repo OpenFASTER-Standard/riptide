@@ -120,21 +120,37 @@ instead gains:
 ```
 
 Before a ring write would overwrite (evict) an existing slot, if the predicate returns `false`, the
-write backs off with a bounded retry/backoff; if backpressure persists past a configurable
-threshold, it raises a loud, distinguishable exception — never a silent data loss, and never a
-silent, signal-free wedge either (the original subtask 3.7 failure mode this whole effort exists to
-close). `Batch_commit` supplies the predicate: an op-number is safe to evict once its write is
-above the current materialization watermark (tracked internally, updated after each
-`materialize_up_to` call), or if the write at that op-number never opted into materialization at
-all.
+write is refused immediately — never a silent data loss, and never a silent, signal-free wedge
+either (the original subtask 3.7 failure mode this whole effort exists to close). `Batch_commit`
+supplies the predicate: an op-number is safe to evict once its write is above the current
+materialization watermark (tracked internally, updated after each `materialize_up_to` call), or if
+the write at that op-number never opted into materialization at all.
 
-**Real design questions the implementation plan must resolve, not fixed here:** the exact shape of
-the backoff/threshold (a fixed op-number lag count? a time-based budget? both?); where the
+**Correction (Task 34, audit-remediation): the bounded-retry/threshold/"loud, distinguishable
+exception" mechanism this paragraph originally sketched was never built that way, for either the
+eviction-blocked case above or a real disk-full condition — there is no retry/backoff loop inside
+`File_storage` at all, and nothing "raises" an exception that reaches an operator.** What actually
+shipped, across two later tasks: subtask 3.7 itself classifies a refused eviction as
+`Eviction_blocked`, and Task 12 (Decision 3.3, closing Storage-Important-1) separately classifies a
+*real* resource-exhaustion condition out of the backend — `ENOSPC` (disk full), `EDQUOT`, `EIO`, or
+`ENOMEM` — as `Storage_fault`. Both are two of `Replica.append_refusal`'s five closed shapes
+(`lib/vsr/replica.ml`): `durable_append` catches the underlying exception immediately, one call
+site, no retry loop, and turns it into a quiet, classified refusal (the append simply isn't
+acknowledged) rather than anything that propagates or alarms. The "loud" part is real but
+different from what this paragraph described: `append_refusals` (subtask 3.7) promotes the
+per-shape counts to a production-facing, non-test-only accessor, and Task 34 additionally fires
+each refusal synchronously through `Replica`'s new `?on_event` hook as `Append_refused refusal`, so
+a caller can observe a disk-full condition (or any of the other four shapes) the instant it
+happens instead of only polling a counter.
+
+**Real design questions the implementation plan must resolve, not fixed here:** where the
 materialization watermark itself is durably tracked (in-memory only, reconstructed at replica
 restart by re-scanning committed-but-unmaterialized entries? or persisted alongside the
 materializer's own KV store?); whether `on_commit_advanced` needs to be re-invoked (replayed) for
 commits the replica already knew about at restart, so a restarted replica's materializer catches
-up correctly.
+up correctly. (The backoff/threshold question this list originally posed alongside these two is
+now moot — see the correction above: the implementation plan resolved it by not building a
+backoff/threshold mechanism at all.)
 
 **Testing:** a real multi-replica scenario (mirroring the just-merged Task 9's own adversarial
 harness conventions) where a follower's ring genuinely would have evicted an unmaterialized entry

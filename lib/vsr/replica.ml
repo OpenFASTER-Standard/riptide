@@ -275,6 +275,33 @@ let classify_append_refusal msg =
     Some Eviction_blocked
   else None
 
+(* TASK 34 (audit-remediation Group 7): the domain-agnostic observability hook's own event payload.
+   A CLOSED variant, deliberately not left open for ad hoc extension -- covering exactly three
+   concepts this module already classifies or mutates elsewhere, and nothing beyond them:
+
+   [Append_refused r] -- the same five shapes [append_refusal] above classifies and
+     [append_refusals] counts. Fired from [durable_append]'s own two refusal arms, at the exact
+     point each already increments its counter, so this is a synchronous, per-occurrence replay of
+     those increments, not a second, independent classification.
+   [Status_changed] -- [status] moving between [Normal] and [View_change], fired at each of the
+     four real actions that assign [t.status] (see [status]'s own doc comment in replica.mli for
+     exactly which ones). NOT fired by the test-support [for_test_set_view], which sets [t.status]
+     directly to build a test state no real action produced.
+   [Commit_decreased] -- [commit_number] genuinely LOWERED: the one case [on_commit_advanced]
+     itself deliberately filters out (see that field's own comment above on the [try_send_sv] 1 ->
+     0 drop it exists to hide from a monotonic watermark consumer). This event is for a DIFFERENT
+     kind of consumer, one that wants to observe the decrease itself. Fired from the same single
+     writer, [advance_commit_number] below, that already enforces [on_commit_advanced]'s "exactly
+     once per genuine increase" contract -- so neither hook can be forgotten by a future fifth
+     [commit_number] writer any more than the other already can.
+
+   See replica.mli's own doc comment on this type, and on [?on_event] (the [create]/[restart]
+   parameter this drives), for the full call-convention guarantees. *)
+type replica_event =
+  | Append_refused of append_refusal
+  | Status_changed of { old_status : status; new_status : status }
+  | Commit_decreased of { old_commit : int; new_commit : int }
+
 (* One received DOVIEWCHANGE, as an element of VSR.tla's own [rep_recv_dvc[r]] (VSR.tla:34, typed
    [SUBSET [message]] -- a set of message RECORDS). Exactly the six fields [SendDVC]'s own record
    literal carries (VSR.tla:222-224), minus [type]/[dest] (constant/implied here -- see
@@ -442,6 +469,14 @@ type t = {
          [test_on_commit_advanced_does_not_fire_on_sendsv_commit_number_decrease] in
          test_vsr_replica.ml). Reporting that decrease as an "advance" would drive a watermark
          consumer backwards. *)
+  on_event : (replica_event -> unit) option;
+      (* Task 34 (audit-remediation Group 7): the second, more general observability hook --
+         supplied (or not) at [create]/[restart] time and never reassigned afterwards, same
+         immutability rationale as [on_commit_advanced] above. [None] is the zero-cost default
+         every pre-existing caller gets. Invoked through [fire_event] below at exactly the sites
+         [replica_event]'s own doc comment names (durable_append's two refusal arms, the four real
+         [t.status <-] sites, and [advance_commit_number]'s own decrease case) -- never a second,
+         independently-maintained observation of the same state. *)
   append_refusals : int array;
       (* I2: one counter per {!append_refusal}, indexed by [append_refusal_index]. Pure
          diagnostics -- nothing in the protocol ever reads it -- but it is what makes the three
@@ -522,7 +557,7 @@ let validate_create_args ~fn ~my_id ~replica_count ~svc_limit =
    [rep_recv_dvc] and [rep_sent_dvc], and every one of them is initialized below, unconditionally,
    for both entry points. *)
 let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
-    ~commit_number ~status ~on_commit_advanced =
+    ~commit_number ~status ~on_commit_advanced ~on_event =
   {
     my_id;
     replica_count;
@@ -541,25 +576,50 @@ let make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_norm
     peer_op_number = Hashtbl.create (max 1 (replica_count - 1));
     send;
     on_commit_advanced;
+    on_event;
     append_refusals = Array.make (List.length append_refusal_kinds) 0;
   }
+
+(* Task 34's single call point for [t.on_event] -- every one of the three [replica_event] firing
+   sites below (durable_append's two refusal arms, [set_status], [advance_commit_number]'s own
+   decrease case) goes through this rather than matching [t.on_event] directly, so the "None is the
+   zero-cost default" behaviour is written exactly once. *)
+let fire_event t event = match t.on_event with None -> () | Some f -> f event
 
 (* The SINGLE writer of [t.commit_number] in this module (verified: [grep 'commit_number <-'] finds
    exactly this one assignment). Every action that advances commit progress goes through here, which
    is what makes [?on_commit_advanced] impossible to forget when a future action is added.
 
-   The [new_commit > old_commit] gate is load-bearing, not defensive padding -- see the
-   [on_commit_advanced] field's own comment above for the real, tested [try_send_sv] decrease it
-   exists to filter out. The ASSIGNMENT stays unconditional, exactly as each of the four call sites
-   had it before this hook existed: this helper changes only what is OBSERVED, never what is
-   stored, so no protocol behaviour moves. *)
+   The [new_commit > old_commit] gate on [on_commit_advanced] is load-bearing, not defensive
+   padding -- see the [on_commit_advanced] field's own comment above for the real, tested
+   [try_send_sv] decrease it exists to filter out. The ASSIGNMENT stays unconditional, exactly as
+   each of the four call sites had it before this hook existed: this helper changes only what is
+   OBSERVED, never what is stored, so no protocol behaviour moves.
+
+   Task 34 adds the symmetric [new_commit < old_commit] arm, firing [Commit_decreased] on
+   [t.on_event] for EXACTLY the case [on_commit_advanced] above deliberately does not report -- see
+   [replica_event]'s own doc comment for why a second hook exists for this rather than loosening
+   [on_commit_advanced]'s own contract. *)
 let advance_commit_number t new_commit =
   let old_commit = t.commit_number in
   t.commit_number <- new_commit;
-  if new_commit > old_commit then
-    match t.on_commit_advanced with None -> () | Some f -> f ~old_commit ~new_commit
+  if new_commit > old_commit then (
+    match t.on_commit_advanced with None -> () | Some f -> f ~old_commit ~new_commit)
+  else if new_commit < old_commit then fire_event t (Commit_decreased { old_commit; new_commit })
 
-let create ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
+(* Task 34's single writer of [t.status], symmetric to [advance_commit_number] above: every real
+   protocol action that moves [t.status] goes through here (the four sites [status]'s own doc
+   comment in replica.mli names), so [on_event]'s [Status_changed] firing cannot be forgotten by a
+   future fifth site any more than [advance_commit_number]'s callers can forget [on_commit_advanced]
+   above. Deliberately NOT used by the test-support [for_test_set_view], which sets [t.status]
+   directly to build a test state no real action produced -- see [replica_event]'s own doc comment
+   for why firing a "transition" event there would misrepresent what this hook reports. *)
+let set_status t new_status =
+  let old_status = t.status in
+  t.status <- new_status;
+  if new_status <> old_status then fire_event t (Status_changed { old_status; new_status })
+
+let create ?on_commit_advanced ?on_event ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.create" ~my_id ~replica_count ~svc_limit;
   (* [wal_highest_durable_op_number], not [wal_highest_op_number] (Task 13 re-review finding 2).
      The question this guard asks is "is this backend VIRGIN?", and a backend holding one slot whose
@@ -576,7 +636,7 @@ let create ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage (
        on";
   let t =
     make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number:0 (* VSR.tla's [Init] (:206) *)
-      ~last_normal_view:0 ~op_number:0 ~commit_number:0 ~status:Normal ~on_commit_advanced
+      ~last_normal_view:0 ~op_number:0 ~commit_number:0 ~status:Normal ~on_commit_advanced ~on_event
   in
   (* Claim the backend immediately, so this replica's very first durable state is a well-formed
      superblock rather than "nothing at all" -- otherwise a crash before the first client request
@@ -611,6 +671,8 @@ let view_number t = t.view_number
 let last_normal_view t = t.last_normal_view
 let status t = t.status
 let entries t = Replica_log.to_list t.log
+let svc_count t = t.svc_count
+let peer_op_number t ~peer = Hashtbl.find_opt t.peer_op_number peer
 
 (* ---- Test-support surface: NOT part of the protocol. ----
    [t] is abstract, and the real protocol never lets anything other than the view-change actions
@@ -857,6 +919,7 @@ let durable_append t ~op_number (v : Value.value) =
     | Some refusal ->
       let i = append_refusal_index refusal in
       t.append_refusals.(i) <- t.append_refusals.(i) + 1;
+      fire_event t (Append_refused refusal);
       false
     | None -> invalid_arg msg)
   | exception
@@ -865,6 +928,7 @@ let durable_append t ~op_number (v : Value.value) =
       | Unix.Unix_error (Unix.(ENOSPC | EIO | ENOMEM | EUNKNOWNERR 122), _, _) ) ->
     let i = append_refusal_index Storage_fault in
     t.append_refusals.(i) <- t.append_refusals.(i) + 1;
+    fire_event t (Append_refused Storage_fault);
     false
 
 (* The durable half of [SendSV]/[ReceiveSV]'s wholesale log replacement, and of VSR.tla's
@@ -1097,7 +1161,7 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    an empty backend (no superblock AND no WAL) is FIRST BOOT, not a lost superblock, and must
    still yield exactly [create]'s [Init] state -- otherwise [restart] stops being usable as a
    general entry point at all. *)
-let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage () =
+let restart ?on_commit_advanced ?on_event ~my_id ~replica_count ~svc_limit ~send ~storage () =
   validate_create_args ~fn:"Replica.restart" ~my_id ~replica_count ~svc_limit;
   let durable = Option.bind (storage.superblock_read ()) superblock_decode in
   if durable = None && storage.wal_highest_durable_op_number () > 0 then
@@ -1145,7 +1209,7 @@ let restart ?on_commit_advanced ~my_id ~replica_count ~svc_limit ~send ~storage 
     make ~my_id ~replica_count ~svc_limit ~send ~storage ~view_number ~last_normal_view ~op_number
       ~commit_number
       ~status:(if view_number > last_normal_view then View_change else Normal)
-      ~on_commit_advanced
+      ~on_commit_advanced ~on_event
   in
   (* Also the DURABLE reading (Task 13 re-review finding 2), so this condition cannot read FALSE for
      a backend that is in fact still holding something above the superblock's own [op_number].
@@ -1467,7 +1531,7 @@ let handle_start_view_change t ~(v : int) ~(i : int) =
        unconditionally (no majority needed to START a view change this way; see VSR.tla's own
        comment at ReceiveHigherSVC for the "assume-mode, not increment-mode" citation). *)
     t.view_number <- v;
-    t.status <- View_change;
+    set_status t View_change;
     t.recv_svc <- Int_set.singleton i;
     Hashtbl.reset t.recv_dvc;
     t.sent_dvc <- false;
@@ -1834,7 +1898,7 @@ let try_send_sv t =
               (* Disclosed divergence -- see [svc_count]'s own doc comment on [t]. Unconditional
                  here because [HasDvcQuorum] already restricts this action to [status =
                  View_change], so reaching this point IS a real View_change -> Normal transition. *);
-              t.status <- Normal (* VSR.tla:510 *);
+              set_status t Normal (* VSR.tla:510 *);
               persist_superblock t;
               let bytes =
                 Message.encode
@@ -1988,7 +2052,7 @@ let check_timeout t =
   else begin
     let v = t.view_number + 1 in
     t.view_number <- v;
-    t.status <- View_change;
+    set_status t View_change;
     t.recv_svc <- Int_set.empty;
     Hashtbl.reset t.recv_dvc;
     t.sent_dvc <- false;
@@ -2229,7 +2293,7 @@ let handle_start_view t ~(v : int) ~(log : Value.value list) ~(n : int) ~(k : in
        StartView for a view this replica is already Normal in; an unconditional reset would let such
        duplicates refresh the timeout budget indefinitely and quietly nullify [svc_limit]. Must be
        read BEFORE the [status <- Normal] write below. *)
-    t.status <- Normal (* VSR.tla:577 *);
+    set_status t Normal (* VSR.tla:577 *);
     persist_superblock t
     (* One write for all four durable fields this action moves (op_number, commit_number,
        view_number, last_normal_view), AFTER the WAL has already been rewritten by
