@@ -403,11 +403,23 @@ let instantiate ~tier ~module_bytes ~host =
 (* Real containment for the (possibly-infinite) guest call: forks a genuine OS process to make
    it, relays any host-function calls the child makes back to the parent's real [host_functions]
    (via [t.sink], flipped to [Relay] only in the child -- see top comment), and SIGKILLs the
-   child if it hasn't finished within [fuel_budget_seconds]. Returns the guest's raw (ptr, len)
-   result pair on success -- `invoke` still does the final guest-memory read itself, in the
-   parent, since that memory is shared (copy-on-write) and untouched by the child after it
-   reports done. *)
-let run_contained t func ~arg_ptr ~arg_len : (int * int, string) result =
+   child if it hasn't finished within [fuel_budget_seconds]. Returns the guest's own result BYTES
+   on success, already read out of guest memory -- by the child itself, not the parent.
+
+   That last part is load-bearing, not a style choice: guest linear memory is exactly as subject
+   to copy-on-write as everything else fork duplicates. A first version of this function had the
+   child send back the raw (result_ptr, result_len) pair and left `invoke` to read those bytes
+   out of guest memory itself, in the parent, afterwards -- which is wrong for any non-empty
+   result, since whatever the guest (or this loader's own [read_materialized]/[propose_write]
+   host-closure implementations, which write their return values into guest memory) wrote during
+   the call landed only in the *child's* private, post-fork copy of that memory page, never the
+   parent's. Caught live by `test_read_materialized_relays_a_known_value_back_to_the_guest`
+   (got 8 zero bytes back instead of "VALUE123" -- right length, since the ptr/len pair itself
+   crossed the pipe fine, but the bytes at that address in the *parent's* memory view were never
+   touched) and `test_propose_write_relays_the_hosts_denial_back_to_the_guest` (a status byte the
+   guest itself wrote via `i32.store8` came back as the pre-call zero, not the guest's own
+   write) -- both real regression tests now, not just a design note. *)
+let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
   let req_r, req_w = Unix.pipe ~cloexec:false () in
   let resp_r, resp_w = Unix.pipe ~cloexec:false () in
   match Unix.fork () with
@@ -421,10 +433,11 @@ let run_contained t func ~arg_ptr ~arg_len : (int * int, string) result =
          W.Wasmtime.func_call_list func [ Val.Int32 arg_ptr; Val.Int32 arg_len ] ~n_outputs:2
        with
        | [ Val.Int32 result_ptr; Val.Int32 result_len ] ->
-         let payload = Bytes.create 8 in
-         Bytes.set_int32_be payload 0 (Int32.of_int result_ptr);
-         Bytes.set_int32_be payload 4 (Int32.of_int result_len);
-         Pipe_protocol.write_msg req_w ~tag:'D' payload
+         (* Read the result bytes HERE, in the child, while [memory] still reflects this
+            process's own (possibly just-written-to) view of it -- see this function's own doc
+            comment above for exactly why that matters. *)
+         let result_bytes = W.Memory.to_string memory ~pos:result_ptr ~len:result_len in
+         Pipe_protocol.write_msg req_w ~tag:'D' (Bytes.of_string result_bytes)
        | _ -> Pipe_protocol.write_msg req_w ~tag:'E' (Bytes.of_string "guest entrypoint did not return (ptr, len)")
      with
      | W.Trap { message } -> Pipe_protocol.write_msg req_w ~tag:'E' (Bytes.of_string message)
@@ -485,9 +498,7 @@ let run_contained t func ~arg_ptr ~arg_len : (int * int, string) result =
             loop ()
           | 'D' ->
             ignore (Unix.waitpid [] child_pid);
-            let result_ptr = Bytes.get_int32_be payload 0 |> Int32.to_int in
-            let result_len = Bytes.get_int32_be payload 4 |> Int32.to_int in
-            finish (Ok (result_ptr, result_len))
+            finish (Ok payload)
           | 'E' ->
             ignore (Unix.waitpid [] child_pid);
             finish (Error (Bytes.to_string payload))
@@ -517,9 +528,5 @@ let invoke t ~entrypoint ~arg =
              with exn -> Error (Printexc.to_string exn))
           with
           | Error msg -> Error msg
-          | Ok () -> (
-            match run_contained t func ~arg_ptr:arg_scratch_offset ~arg_len:(Bytes.length arg) with
-            | Error msg -> Error msg
-            | Ok (result_ptr, result_len) -> (
-              try Ok (Bytes.of_string (W.Memory.to_string memory ~pos:result_ptr ~len:result_len))
-              with exn -> Error (Printexc.to_string exn)))))))
+          | Ok () ->
+            run_contained t func ~memory ~arg_ptr:arg_scratch_offset ~arg_len:(Bytes.length arg)))))

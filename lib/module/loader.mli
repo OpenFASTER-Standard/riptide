@@ -74,4 +74,12 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     functions the guest calls during [invoke] (this task's own ["log"], potentially
     ["read_materialized"]/["propose_write"]) are relayed back to the real, caller-supplied
     {!host_functions} regardless of which process actually runs the guest, so their side effects
-    are always observed by [invoke]'s own caller. *)
+    are always observed by [invoke]'s own caller. The guest's own result bytes are read out of
+    its linear memory by that same forked child, before it reports back — not by the parent
+    afterwards, since guest memory is exactly as copy-on-write as everything else the fork
+    duplicates, and only the child's own writes (its own return value; whatever
+    ["read_materialized"]/["propose_write"]'s host-closure marshaling wrote into that memory
+    during the call) are visible from inside it (see [loader.ml]'s [run_contained] for the real
+    bug this caused and fixed the first time this loader actually returned non-empty guest
+    results). Each [invoke] call costs a real `fork`, non-trivial relative to an in-process call
+    — a real, measurable cost Task 6's reactor should account for, not assume away. *)

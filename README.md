@@ -88,3 +88,50 @@ commit, or a production (real-socket) network implementation — those are separ
 task-master subtasks (3.1, 3.3, 3.5) that will be built against this validated substrate, per the
 spec's own required sequencing (this proof-of-concept exists specifically to happen *before* that
 work is architected).
+
+## WASM toolchain setup (wasmtime) — required patch after `opam install wasmtime`
+
+`lib/module/loader.ml` (Task 5, subtask 3) runs real, compiled WASM via the `wasmtime` opam
+package (`v0.0.3`). As pinned by that package's own opam file, it links against
+`libwasmtime.0.22.0`, whose vendored `raw-cpuid` crate panics
+(`assertion failed: res.eax == 0`) the instant ANY compiled WASM function is actually called, on
+some modern CPUs (confirmed on this project's own dev box, an Intel Xeon Platinum 8581C exposing
+AMX/AVX-512-FP16 CPUID leaves that plainly didn't exist when that crate version was written circa
+2020) — a hard environment/library-version bug, independent of anything in this repo's own code.
+
+**After `opam install wasmtime`, before building anything that uses it, apply
+`patches/wasmtime-0.0.3-cpuid-and-gc-safety.patch`** and rebuild the package in place:
+
+```bash
+# 1. Swap the pinned libwasmtime (0.22.0) for wasmtime's official v49.0.1 C-API release, whose
+#    updated raw-cpuid no longer trips on modern CPUID leaves. (The wasmtime opam wrapper's own
+#    API surface it binds — non-"wasmtime_"-prefixed classic wasm_c_api — is unaffected by this
+#    version jump; see the patch's own top comments for exactly what did change and how it's
+#    handled.)
+LIBDIR="$OPAM_SWITCH_PREFIX/lib/libwasmtime"
+curl -sL https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.1/wasmtime-v49.0.1-x86_64-linux-c-api.tar.xz \
+  -o /tmp/wasmtime-v49.tar.xz
+tar xf /tmp/wasmtime-v49.tar.xz -C /tmp
+rm -rf "$LIBDIR/include" "$LIBDIR/lib"
+cp -r /tmp/wasmtime-v49.0.1-x86_64-linux-c-api/include "$LIBDIR/include"
+cp -r /tmp/wasmtime-v49.0.1-x86_64-linux-c-api/lib "$LIBDIR/lib"
+
+# 2. Apply the patch to opam's own extracted source checkout of the wasmtime OCaml package, then
+#    rebuild and reinstall it into the switch.
+SRC="$OPAM_SWITCH_PREFIX/.opam-switch/sources/wasmtime.0.0.3"
+patch -p1 -d "$SRC" < patches/wasmtime-0.0.3-cpuid-and-gc-safety.patch
+(cd "$SRC" && dune build @install -p wasmtime -j 4 && dune install wasmtime --prefix "$OPAM_SWITCH_PREFIX")
+```
+
+The patch (against pristine `wasmtime.0.0.3` source, `LaurentMazare/ocaml-wasmtime@v0.0.3`) does
+three things, each explained in detail in its own top-of-file comment in the patched sources:
+adapts `bindings.ml`/`wrappers.ml`/`wrappers.mli` to v49's renamed/removed convenience functions
+and vec-based calling convention (dropping WASI/`Linker`/`extern_ref` support, unused by this
+repo's own hand-rolled ABI); and fixes two real, pre-existing GC-liveness bugs in the upstream
+binding (a host-import function not kept reachable for its instance's full lifetime, and a
+`Foreign.funptr`→`static_funptr` coercion only protecting the coerced value instead of the
+original closure ctypes-foreign's own registry keys off) that surfaced once real WASM execution
+was possible against this box's CPU for the first time. Verified live: the patch applies cleanly
+(`patch -p1`) to a byte-identical fresh checkout of the pristine source and the result builds; see
+`.superpowers/sdd/2026-09-30-layer0-layer2-boundary/task-3-report.md` for the full diagnostic
+trail (every standalone repro, in order, with exact error text) behind each of the three changes.

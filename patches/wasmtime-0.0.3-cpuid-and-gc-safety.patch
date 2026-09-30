@@ -1,0 +1,854 @@
+diff -ruN a/src/stubs/bindings.ml b/src/stubs/bindings.ml
+--- a/src/stubs/bindings.ml	2021-01-13 20:50:59.000000000 +0000
++++ b/src/stubs/bindings.ml	2026-09-30 10:36:46.028784817 +0000
+@@ -1,5 +1,31 @@
+ open! Ctypes
+ 
++(* Patched locally (Riptide Task 3, 2026-09-30) to link against libwasmtime v49.0.1 instead of
++   the originally-pinned 0.22.0: 0.22.0's vendored `raw-cpuid` crate panics
++   (`assertion failed: res.eax == 0` in `raw-cpuid-8.1.2/src/lib.rs:295`) the moment ANY compiled
++   WASM function is actually called, on this box's CPU (a Xeon Platinum 8581C with AMX/AVX-512-FP16
++   -- CPUID leaves that didn't exist yet when that crate version was written) -- verified live to
++   be unrelated to threads/forking/this OCaml binding's own code: a minimal C program linked
++   directly against the 0.22.0 .so crashes identically on `wasm_func_call`, and the exact same
++   program linked against v49.0.1 (both single-threaded and from a spawned pthread) succeeds. See
++   `lib/module/loader.ml`'s own top comment for the full story and `task-3-report.md` for the
++   evidence.
++
++   v49 removed a handful of the "wasmtime_"-prefixed convenience functions this file originally
++   bound (`wasmtime_new_module`/`wasmtime_new_instance`/`wasmtime_config_interruptable_set`/
++   `wasmtime_config_static_memory_*_set`, and the whole `Wasmtime.Linker`/`Wasi_*` surface --
++   modern wasmtime moved those to a completely different, `wasmtime_context_t`-based API not
++   worth adopting wholesale for this task). None of that is used by Riptide's own hand-rolled ABI
++   (Decision 3), so it's simply removed here rather than ported. What Riptide DOES need all still
++   exists as the plain, non-"wasmtime_"-prefixed `wasm_c_api` (the portable, engine-agnostic
++   surface: `wasm_module_new`, `wasm_instance_new`, `wasm_func_new`, `wasm_func_call`, ...) --
++   verified present with a stable ABI in v49.0.1 by nm(1) and a real C program, exactly as they
++   were in 0.22.0. Two of those did change shape between 0.22.0 and v49.0.1 in a way this file
++   has to track: `wasm_instance_new`'s imports and `wasm_func_call`'s args/results moved from raw
++   `T*`+count pairs to `wasm_*_vec_t*` (a vec struct), and `wasm_func_callback_t` (the host
++   function callback signature) moved the same way. `Val_vec` already existed in this file
++   (unused, for `wasm_val_vec_delete` alone) and is now used for real. *)
++
+ module C (F : Cstubs.FOREIGN) = struct
+   open! F
+ 
+@@ -80,18 +106,17 @@
+     let t : t typ = ptr struct_
+     let copy = foreign "wasm_val_copy" (t @-> t @-> returning void)
+     let delete = foreign "wasm_val_delete" (t @-> returning void)
+-    let extern_ref = foreign "wasmtime_externref_new" (string @-> t @-> returning void)
+-
+-    let extern_ref_with_finalizer =
+-      foreign
+-        "wasmtime_externref_new_with_finalizer"
+-        (ptr void
+-        @-> static_funptr Ctypes.(ptr void @-> returning void)
+-        @-> t
+-        @-> returning void)
+ 
+-    let extern_ref_data =
+-      foreign "wasmtime_externref_data" (t @-> ptr (ptr void) @-> returning bool)
++    (* All extern_ref support dropped: not just the finalizer variant (one of the handful of
++       symbols v49 removed outright, confirmed via nm), but the plain [wasmtime_externref_new]
++       too -- it changed to a wasmtime_context_t-based signature in v49, entirely incompatible
++       with the old 2-arg (string, out val) shape this file used to bind. Riptide own ABI
++       (Decision 3) never uses extern_ref (only Int32 val kinds cross the host/guest boundary),
++       so this is simply not ported; the separate, pre-existing [Wasmtime.Extern_ref] top-level
++       module (untouched here) is patched to raise instead of calling a now-nonexistent
++       binding. Val.Kind.Any_ref/Func_ref remain in the OCaml-level type (unchanged, matches
++       upstream) but constructing one would now fail loudly -- fine, since nothing in this
++       codebase does. *)
+   end
+ 
+   module Val_vec = struct
+@@ -101,9 +126,15 @@
+ 
+     let struct_ : struct_ typ = structure "wasm_val_vec_t"
+     let size = field struct_ "size" size_t
+-    let data = field struct_ "data" (ptr Val.t)
++    (* [wasm_val_t] is a small value type, not a heap-referenced resource, so unlike
++       [Extern_vec]/etc. this vec's [data] is a contiguous array of *structs*
++       ([wasm_val_t*]), not an array of pointers ([wasm_val_t**]) -- [ptr Val.struct_], not
++       [ptr Val.t] (which is already itself a pointer type). *)
++    let data = field struct_ "data" (ptr Val.struct_)
+     let () = seal struct_
+     let t : t typ = ptr struct_
++    let new_uninitialized = foreign "wasm_val_vec_new_uninitialized" (t @-> size_t @-> returning void)
++    let new_empty = foreign "wasm_val_vec_new_empty" (t @-> returning void)
+     let delete = foreign "wasm_val_vec_delete" (t @-> returning void)
+   end
+ 
+@@ -165,7 +196,6 @@
+     let new_ =
+       foreign "wasm_functype_new" (Val_type_vec.t @-> Val_type_vec.t @-> returning t)
+ 
+-    let new_0_0 = foreign "wasm_functype_new_0_0" (void @-> returning t)
+     let delete = foreign "wasm_functype_delete" (t @-> returning void)
+   end
+ 
+@@ -177,15 +207,22 @@
+     let struct_ : struct_ typ = structure "wasm_func_t"
+     let t : t typ = ptr struct_
+ 
++    (* [wasm_func_callback_t] takes/returns [wasm_val_vec_t*] as of v49 (was raw [wasm_val_t*]
++       in 0.22.0) -- see this file's top comment. *)
+     let new_ =
+       foreign
+         "wasm_func_new"
+         (Store.t
+         @-> Func_type.t
+-        @-> static_funptr Ctypes.(Val.t @-> Val.t @-> returning Trap.t)
++        @-> static_funptr Ctypes.(Val_vec.t @-> Val_vec.t @-> returning Trap.t)
+         @-> returning t)
+ 
+     let delete = foreign "wasm_func_delete" (t @-> returning void)
++
++    (* [wasm_func_call]'s args/results are [wasm_val_vec_t*] as of v49 (was raw [wasm_val_t*] +
++       separate counts in 0.22.0's "wasmtime_func_call" convenience wrapper, which this file no
++       longer binds at all -- see top comment). *)
++    let call = foreign "wasm_func_call" (t @-> Val_vec.t @-> Val_vec.t @-> returning Trap.t)
+   end
+ 
+   module Global = struct
+@@ -239,6 +276,10 @@
+     let data = field struct_ "data" (ptr Extern.t)
+     let () = seal struct_
+     let t : t typ = ptr struct_
++    let new_empty = foreign "wasm_extern_vec_new_empty" (t @-> returning void)
++
++    let new_ = foreign "wasm_extern_vec_new" (t @-> size_t @-> ptr Extern.t @-> returning void)
++
+     let delete = foreign "wasm_extern_vec_delete" (t @-> returning void)
+   end
+ 
+@@ -250,6 +291,7 @@
+     let struct_ : struct_ typ = structure "wasm_module_t"
+     let t : t typ = ptr struct_
+     let delete = foreign "wasm_module_delete" (t @-> returning void)
++    let new_ = foreign "wasm_module_new" (Store.t @-> Byte_vec.t @-> returning t)
+   end
+ 
+   module Instance = struct
+@@ -261,91 +303,39 @@
+     let t : t typ = ptr struct_
+     let delete = foreign "wasm_instance_delete" (t @-> returning void)
+ 
++    (* imports is a [wasm_extern_vec_t*] as of v49 (was a raw [wasm_extern_t* const*] + implicit
++       count-from-module in 0.22.0) -- see this file's top comment. *)
+     let new_ =
+       foreign
+         "wasm_instance_new"
+-        (Store.t @-> Module.t @-> ptr Extern.t @-> ptr Trap.t @-> returning t)
++        (Store.t @-> Module.t @-> Extern_vec.t @-> ptr Trap.t @-> returning t)
+ 
+     let exports = foreign "wasm_instance_exports" (t @-> Extern_vec.t @-> returning void)
+   end
+ 
+-  (* wasmtime.h specific bits *)
+-  module Error = struct
+-    type t = unit ptr
+-
+-    let t : t typ = ptr void
+-    let message = foreign "wasmtime_error_message" (t @-> Byte_vec.t @-> returning void)
+-    let delete = foreign "wasmtime_error_delete" (t @-> returning void)
+-  end
+-
+-  module Wasi_config = struct
+-    type t = unit ptr
+-
+-    let t : t typ = ptr void
+-    let new_ = foreign "wasi_config_new" (void @-> returning t)
+-    let delete = foreign "wasi_config_delete" (t @-> returning void)
+-    let inherit_argv = foreign "wasi_config_inherit_argv" (t @-> returning void)
+-    let inherit_env = foreign "wasi_config_inherit_env" (t @-> returning void)
+-    let inherit_stdin = foreign "wasi_config_inherit_stdin" (t @-> returning void)
+-    let inherit_stdout = foreign "wasi_config_inherit_stdout" (t @-> returning void)
+-    let inherit_stderr = foreign "wasi_config_inherit_stderr" (t @-> returning void)
+-
+-    let preopen_dir =
+-      foreign "wasi_config_preopen_dir" (t @-> string @-> string @-> returning bool)
+-  end
+-
+-  module Wasi_instance = struct
+-    type t = unit ptr
+-
+-    let t : t typ = ptr void
+-
+-    let new_ =
+-      foreign
+-        "wasi_instance_new"
+-        (Store.t @-> string @-> Wasi_config.t @-> ptr Trap.t @-> returning t)
+-
+-    let delete = foreign "wasi_instance_delete" (t @-> returning void)
+-  end
+-
++  (* wasmtime.h specific bits. Only the pieces still both present AND ABI-unchanged in v49 are
++     kept (config feature flags, and [wat2wasm] whose input moved from a [wasm_byte_vec_t*] to a
++     raw [char*, size_t] pair -- see this file's top comment). Removed entirely: [Error] (only
++     needed by the "wasmtime_"-prefixed convenience functions this file no longer uses -- classic
++     [wasm_c_api] reports failure via [Trap]/null-return instead), [Linker], [Wasi_config],
++     [Wasi_instance] (module-linking/WASI are no part of Riptide's own hand-rolled ABI, Decision
++     3), and the four `interruptable`/`static_memory_*` config setters (removed from wasmtime
++     itself by v49; superseded by epoch-interruption/fuel and the memory-reservation config
++     family, neither adopted here -- see `lib/module/loader.ml`'s own top comment for how this
++     loader compensates). *)
+   module Wasmtime = struct
+-    module Linker = struct
++    module Error = struct
+       type t = unit ptr
+ 
+       let t : t typ = ptr void
+-      let new_ = foreign "wasmtime_linker_new" (Store.t @-> returning t)
+-      let delete = foreign "wasmtime_linker_delete" (t @-> returning void)
+-
+-      let define_wasi =
+-        foreign "wasmtime_linker_define_wasi" (t @-> Wasi_instance.t @-> returning Error.t)
+-
+-      let define_instance =
+-        foreign
+-          "wasmtime_linker_define_instance"
+-          (t @-> Byte_vec.t @-> Instance.t @-> returning Error.t)
+-
+-      let instantiate =
+-        foreign
+-          "wasmtime_linker_instantiate"
+-          (t @-> Module.t @-> ptr Instance.t @-> ptr Trap.t @-> returning Error.t)
+-
+-      let module_ =
+-        foreign
+-          "wasmtime_linker_module"
+-          (t @-> Byte_vec.t @-> Module.t @-> returning Error.t)
+-
+-      let get_default =
+-        foreign
+-          "wasmtime_linker_get_default"
+-          (t @-> Byte_vec.t @-> ptr Func.t @-> returning Error.t)
++      let message = foreign "wasmtime_error_message" (t @-> Byte_vec.t @-> returning void)
++      let delete = foreign "wasmtime_error_delete" (t @-> returning void)
+     end
+ 
+     module Config = struct
+       let debug_info_set =
+         foreign "wasmtime_config_debug_info_set" (Config.t @-> bool @-> returning void)
+ 
+-      let interruptable_set =
+-        foreign "wasmtime_config_interruptable_set" (Config.t @-> bool @-> returning void)
+-
+       let max_wasm_stack_set =
+         foreign
+           "wasmtime_config_max_wasm_stack_set"
+@@ -371,51 +361,9 @@
+         foreign
+           "wasmtime_config_wasm_multi_value_set"
+           (Config.t @-> bool @-> returning void)
+-
+-      let static_memory_maximum_size_set =
+-        foreign
+-          "wasmtime_config_static_memory_maximum_size_set"
+-          (Config.t @-> int64_t @-> returning void)
+-
+-      let static_memory_guard_size_set =
+-        foreign
+-          "wasmtime_config_static_memory_guard_size_set"
+-          (Config.t @-> int64_t @-> returning void)
+-
+-      let dynamic_memory_guard_size_set =
+-        foreign
+-          "wasmtime_config_dynamic_memory_guard_size_set"
+-          (Config.t @-> int64_t @-> returning void)
+     end
+ 
+     let wat2wasm =
+-      foreign "wasmtime_wat2wasm" (Byte_vec.t @-> Byte_vec.t @-> returning Error.t)
+-
+-    let new_module =
+-      foreign
+-        "wasmtime_module_new"
+-        (Engine.t @-> Byte_vec.t @-> ptr Module.t @-> returning Error.t)
+-
+-    let func_call =
+-      foreign
+-        "wasmtime_func_call"
+-        (Func.t
+-        @-> ptr Val.struct_
+-        @-> size_t
+-        @-> ptr Val.struct_
+-        @-> size_t
+-        @-> ptr Trap.t
+-        @-> returning Error.t)
+-
+-    let new_instance =
+-      foreign
+-        "wasmtime_instance_new"
+-        (Store.t
+-        @-> Module.t
+-        @-> ptr Extern.t
+-        @-> size_t
+-        @-> ptr Instance.t
+-        @-> ptr Trap.t
+-        @-> returning Error.t)
++      foreign "wasmtime_wat2wasm" (string @-> size_t @-> Byte_vec.t @-> returning Error.t)
+   end
+ end
+diff -ruN a/src/wrapper/extern_ref.ml b/src/wrapper/extern_ref.ml
+--- a/src/wrapper/extern_ref.ml	2021-01-13 20:50:59.000000000 +0000
++++ b/src/wrapper/extern_ref.ml	2026-09-30 10:36:46.033784817 +0000
+@@ -1,13 +1,20 @@
+ open! Base
+ open! Import
+ 
++(* Patched locally (Riptide Task 3, 2026-09-30): [wasmtime_externref_new] changed to a
++   wasmtime_context_t-based signature in v49 (this package now links against v49.0.1, not the
++   originally-pinned 0.22.0 -- see ../stubs/bindings.ml's top comment for the full story), so the
++   binding this used to call no longer exists. Riptide own ABI (Decision 3) never uses
++   extern_ref (only Int32 val kinds cross the host/guest boundary between Riptide and a guest
++   module), so this is a real, tested error rather than a port of a capability nothing calls. *)
++
+ type t = W.Val.t
+ 
+-let of_string str =
+-  let t = Ctypes.allocate_n W.Val.struct_ ~count:1 in
+-  W.Val.extern_ref str t;
+-  Caml.Gc.finalise W.Val.delete t;
+-  t
++let of_string (_ : string) : t =
++  failwith
++    "Extern_ref.of_string: not supported by this locally-patched wasmtime build (v49 changed \
++     wasmtime_externref_new to a context-based signature this package does not port; unused by \
++     Riptide's own ABI)"
+ 
+ module Private = struct
+   let to_val = Fn.id
+diff -ruN a/src/wrapper/wrappers.ml b/src/wrapper/wrappers.ml
+--- a/src/wrapper/wrappers.ml	2021-01-13 20:50:59.000000000 +0000
++++ b/src/wrapper/wrappers.ml	2026-09-30 10:36:46.030784817 +0000
+@@ -1,3 +1,23 @@
++(* Patched locally (Riptide Task 3, 2026-09-30) to match this same directory's patched
++   `bindings.ml` (linking against libwasmtime v49.0.1 instead of the originally-pinned 0.22.0) --
++   see that file's own top comment for the full story. Structural changes from upstream, mirrored
++   here:
++   - [Engine.create] drops `?interruptable`/`?static_memory_maximum_size`/
++     `?static_memory_guard_size`/`?dynamic_memory_guard_size` (the underlying config setters no
++     longer exist in v49 -- see `lib/module/loader.ml`'s own top comment for how the loader
++     compensates).
++   - [Wasmtime.new_module] now takes a [Store.t] (was [Engine.t]) -- classic `wasm_module_new` is
++     store-scoped, unlike the removed `wasmtime_new_module` convenience wrapper which was
++     engine-scoped.
++   - [Wasmtime.new_instance]/[Wasmtime.func_call_list] (and [func_call0]/[func_call1]/
++     [func_call2]/[func_call]) are reimplemented on top of classic `wasm_instance_new`/
++     `wasm_func_call`, whose imports/args/results are now [wasm_val_vec_t]/[wasm_extern_vec_t]
++     structs rather than raw arrays+counts -- both still report failure the classic way (trap or
++     null-return), so the old `wasmtime_error_t`-based [fail_on_error] path these used to also
++     need is simply gone.
++   - [Wasmtime.Linker], [Wasi_instance], [Func.of_func_0_0], and [Val]'s extern_ref helpers are
++     removed outright (unused by Riptide's own hand-rolled ABI, Decision 3; some of their
++     underlying symbols were removed or changed shape in v49 anyway). *)
+ open Base
+ open Import
+ 
+@@ -8,33 +28,22 @@
+ 
+   let create
+       ?debug_info
+-      ?interruptable
+       ?max_wasm_stack
+       ?reference_types
+       ?simd
+       ?bulk_memory
+       ?multi_value
+-      ?static_memory_maximum_size
+-      ?static_memory_guard_size
+-      ?dynamic_memory_guard_size
+       ()
+     =
+     let config =
+       let t = W.Config.new_ () in
+       Option.iter debug_info ~f:(W.Wasmtime.Config.debug_info_set t);
+-      Option.iter interruptable ~f:(W.Wasmtime.Config.interruptable_set t);
+       Option.iter max_wasm_stack ~f:(fun sz ->
+           Unsigned.Size_t.of_int sz |> W.Wasmtime.Config.max_wasm_stack_set t);
+       Option.iter reference_types ~f:(W.Wasmtime.Config.reference_types_set t);
+       Option.iter simd ~f:(W.Wasmtime.Config.simd_set t);
+       Option.iter bulk_memory ~f:(W.Wasmtime.Config.bulk_memory_set t);
+       Option.iter multi_value ~f:(W.Wasmtime.Config.multi_value_set t);
+-      Option.iter static_memory_maximum_size ~f:(fun sz ->
+-          Int64.of_int sz |> W.Wasmtime.Config.static_memory_maximum_size_set t);
+-      Option.iter static_memory_guard_size ~f:(fun sz ->
+-          Int64.of_int sz |> W.Wasmtime.Config.static_memory_guard_size_set t);
+-      Option.iter dynamic_memory_guard_size ~f:(fun sz ->
+-          Int64.of_int sz |> W.Wasmtime.Config.dynamic_memory_guard_size_set t);
+       (* The ownership of the config is passed so no finalizer is added. *)
+       t
+     in
+@@ -156,8 +165,9 @@
+     | P Int64 -> Int64 (Ctypes.getf op W.Val.i64 |> Int64.to_int_exn)
+     | P Float32 -> Float32 (Ctypes.getf op W.Val.f32)
+     | P Float64 -> Float64 (Ctypes.getf op W.Val.f64)
+-    | P Any_ref -> Extern_ref (Extern_ref.Private.of_val ptr)
+-    | P Func_ref -> failwith "func_ref returned results are not supported"
++    | P Any_ref | P Func_ref ->
++      failwith "Any_ref/Func_ref results are not supported (extern_ref support was dropped, see \
++                bindings.ml's top comment)"
+ 
+   let to_struct t struct_ =
+     let kind = Val.kind t |> kind_to_c |> Unsigned.UInt8.of_int in
+@@ -168,30 +178,28 @@
+     | Int64 i -> Ctypes.setf op W.Val.i64 (Int64.of_int_exn i)
+     | Float32 f -> Ctypes.setf op W.Val.f32 f
+     | Float64 f -> Ctypes.setf op W.Val.f64 f
+-    | Extern_ref _ -> assert false
++    | Extern_ref _ ->
++      failwith "Extern_ref values are not supported (extern_ref support was dropped, see \
++                bindings.ml's top comment)"
+ 
+-  let copy t ptr =
+-    match (t : Val.t) with
+-    | Extern_ref extern_ref -> W.Val.copy ptr (Extern_ref.Private.to_val extern_ref)
+-    | _ -> Ctypes.( !@ ) ptr |> to_struct t
++  let copy t ptr = Ctypes.( !@ ) ptr |> to_struct t
+ end
+ 
+ module Func_type = struct
++  (* [val_type] allocates a fresh [wasm_valtype_t*] on every call -- deliberately NOT memoized
++     per kind the way the original upstream code did (via a per-kind [Lazy.t], reused across
++     every [Func_type.create] call). Patched locally (Riptide Task 3, 2026-09-30, alongside the
++     v49 library swap -- see bindings.ml's top comment): verified live that v49's
++     [wasm_functype_new] takes ownership of the valtype pointers handed to it (each functype's
++     own [wasm_functype_delete] frees its component valtypes), unlike whatever 0.22.0 did --
++     reusing one shared, memoized pointer across multiple functypes then double-frees it the
++     moment more than one of those functypes gets GC-finalized (reproduced live: `Gc.full_major
++     ()` after creating two [Func.of_func_list] closures both taking a single [i32] argument
++     aborted the process with "double free detected in tcache 2"; a minimal standalone repro
++     isolated it to exactly this cache). A fresh, uniquely-owned valtype every call means each
++     functype owns a disjoint set of pointers, so at most one free ever happens per pointer
++     regardless of how many functypes/kinds are created. *)
+   let val_type kind = V.kind_to_c kind |> Unsigned.UInt8.of_int |> W.Val_type.new_
+-  let val_type_i32 = lazy (val_type (P Int32))
+-  let val_type_i64 = lazy (val_type (P Int64))
+-  let val_type_f32 = lazy (val_type (P Float32))
+-  let val_type_f64 = lazy (val_type (P Float64))
+-  let val_type_any_ref = lazy (val_type (P Any_ref))
+-  let val_type_func_ref = lazy (val_type (P Func_ref))
+-
+-  let val_type = function
+-    | Val.Kind.P Int32 -> Lazy.force val_type_i32
+-    | P Int64 -> Lazy.force val_type_i64
+-    | P Float32 -> Lazy.force val_type_f32
+-    | P Float64 -> Lazy.force val_type_f64
+-    | P Any_ref -> Lazy.force val_type_any_ref
+-    | P Func_ref -> Lazy.force val_type_func_ref
+ 
+   let create ~args ~results =
+     let vec_list l =
+@@ -212,59 +220,84 @@
+ module Func = struct
+   type t = W.Func.t
+ 
++  (* Builds a [wasm_val_vec_t*] pointing at [count] freshly-allocated (uninitialized) vals --
++     used for the results side of a call, which the callee fills in. *)
++  let allocate_val_vec count =
++    let vec = Ctypes.allocate_n W.Val_vec.struct_ ~count:1 in
++    W.Val_vec.new_uninitialized vec (Unsigned.Size_t.of_int count);
++    vec
++
++  let val_vec_data vec = Ctypes.getf (Ctypes.( !@ ) vec) W.Val_vec.data
++  let val_vec_size vec = Ctypes.getf (Ctypes.( !@ ) vec) W.Val_vec.size |> Unsigned.Size_t.to_int
++
+   let of_func store func_type f =
++    (* [raw_callback] is bound separately from its [coerce]d [static_funptr] form -- fixed
++       locally (Riptide Task 3, 2026-09-30, found while porting to v49; see bindings.ml's top
++       comment) after reproducing a real, pre-existing bug in the upstream code (which only ever
++       named the *coerced* value, inlining the raw lambda straight into the [coerce] call): under
++       real GC pressure (a [Gc.full_major ()] between creating a host-import function and the
++       guest actually calling it), the call into a host function raised
++       [Ctypes_ffi_stubs.CallToExpiredClosure] even though the *coerced* value was kept alive via
++       the exact [keep_alive callback] pattern already below. `coerce (Foreign.funptr ty)
++       (static_funptr ty) f` marshals via ctypes-foreign's own internal, GC-independent closure
++       registry, keyed off the raw lambda [f] itself, not off whatever value [coerce] happens to
++       return -- [keep_alive] on the *coerced* result (a bare function-pointer-shaped value by
++       then) does nothing to keep that registry entry from expiring, because it never made the
++       original [f] itself into a real OCaml GC root. Naming [raw_callback] and keeping *that*
++       alive (in addition to the coerced [callback], for good measure) closes the gap: reproduced
++       fixed live via a minimal standalone repro (see task-3-report.md). *)
++    let raw_callback args results =
++      try
++        f args results;
++        Ctypes.from_voidp W.Trap.struct_ Ctypes.null
++      with
++      | exn ->
++        (* The returned message should end with a 0 byte and the size
++          should reflect this additional byte. *)
++        let byte_vec = Exn.to_string exn ^ "\000" |> Byte_vec.of_string in
++        let trap = W.Trap.new_ store byte_vec in
++        Caml.Gc.finalise
++          (fun _trap ->
++            keep_alive byte_vec (* [trap] is not freed as the ownership is passed. *))
++          trap;
++        trap
++    in
+     let callback =
+       let open Ctypes in
+       coerce
+-        (Foreign.funptr (W.Val.t @-> W.Val.t @-> returning W.Trap.t))
+-        (static_funptr (W.Val.t @-> W.Val.t @-> returning W.Trap.t))
+-        (fun args results ->
+-          try
+-            f args results;
+-            Ctypes.from_voidp W.Trap.struct_ Ctypes.null
+-          with
+-          | exn ->
+-            (* The returned message should end with a 0 byte and the size
+-              should reflect this additional byte. *)
+-            let byte_vec = Exn.to_string exn ^ "\000" |> Byte_vec.of_string in
+-            let trap = W.Trap.new_ store byte_vec in
+-            Caml.Gc.finalise
+-              (fun _trap ->
+-                keep_alive byte_vec (* [trap] is not freed as the ownership is passed. *))
+-              trap;
+-            trap)
++        (Foreign.funptr (W.Val_vec.t @-> W.Val_vec.t @-> returning W.Trap.t))
++        (static_funptr (W.Val_vec.t @-> W.Val_vec.t @-> returning W.Trap.t))
++        raw_callback
+     in
+     let t = W.Func.new_ store func_type callback in
+     if Ctypes.is_null t then failwith "Func.new returned null";
+     Caml.Gc.finalise
+       (fun t ->
++        keep_alive raw_callback;
+         keep_alive callback;
+         keep_alive func_type;
+         W.Func.delete t)
+       t;
+     t
+ 
+-  let of_func_0_0 store f =
+-    let func_type = W.Func_type.new_0_0 () in
+-    Caml.Gc.finalise (fun func_type -> W.Func_type.delete func_type) func_type;
+-    of_func store func_type (fun _args _results -> f ())
+-
+   let of_func_list ~args ~results store f =
+     let func_type = Func_type.create ~args ~results in
+     Caml.Gc.finalise (fun func_type -> W.Func_type.delete func_type) func_type;
+-    of_func store func_type (fun args_val results_val ->
+-        let args =
+-          List.mapi args ~f:(fun idx _arg_type -> Ctypes.( +@ ) args_val idx |> V.of_ptr)
+-        in
++    of_func store func_type (fun args_vec results_vec ->
++        let n_args = val_vec_size args_vec in
++        let args_data = val_vec_data args_vec in
++        let args = List.init n_args ~f:(fun idx -> Ctypes.( +@ ) args_data idx |> V.of_ptr) in
+         let r = f args in
+-        if List.length r <> List.length results
++        let n_results = val_vec_size results_vec in
++        if List.length r <> n_results
+         then
+           Printf.failwithf
+             "callback returned %d values, expected %d"
+             (List.length r)
+-            (List.length results)
++            n_results
+             ();
+-        List.iteri r ~f:(fun idx val_ -> V.copy val_ (Ctypes.( +@ ) results_val idx)))
++        let results_data = val_vec_data results_vec in
++        List.iteri r ~f:(fun idx val_ -> V.copy val_ (Ctypes.( +@ ) results_data idx)))
+ 
+   let of_func ~args ~results store f =
+     of_func_list
+@@ -338,117 +371,77 @@
+     t
+ end
+ 
+-module Wasi_instance = struct
+-  type t = W.Wasi_instance.t
+-
+-  let create
+-      ?(inherit_argv = false)
+-      ?(inherit_env = false)
+-      ?(inherit_stdin = false)
+-      ?(inherit_stdout = false)
+-      ?(inherit_stderr = false)
+-      ?(preopen_dirs = [])
+-      store
+-      name
+-    =
+-    let trap = Ctypes.allocate W.Trap.t (Ctypes.from_voidp W.Trap.struct_ Ctypes.null) in
+-    let name =
+-      match name with
+-      | `wasi_unstable -> "wasi_unstable"
+-      | `wasi_snapshot_preview -> "wasi_snapshot_preview1"
+-    in
+-    (* It seems that the rust implementation of wasi_instance_new takes
+-       ownership of the config via a Box<_>. *)
+-    let config = W.Wasi_config.new_ () in
+-    if Ctypes.is_null config then failwith "Wasi_config.new retuned null";
+-    if inherit_argv then W.Wasi_config.inherit_argv config;
+-    if inherit_env then W.Wasi_config.inherit_env config;
+-    if inherit_stdin then W.Wasi_config.inherit_stdin config;
+-    if inherit_stdout then W.Wasi_config.inherit_stdout config;
+-    if inherit_stderr then W.Wasi_config.inherit_stderr config;
+-    List.iter preopen_dirs ~f:(fun (dir1, dir2) ->
+-        ignore (W.Wasi_config.preopen_dir config dir1 dir2 : bool));
+-    let t = W.Wasi_instance.new_ store name config trap in
+-    Ctypes.( !@ ) trap |> Trap.maybe_fail;
+-    if Ctypes.is_null t then failwith "Wasi_instance.new returned null";
+-    Caml.Gc.finalise
+-      (fun t ->
+-        keep_alive (config, store);
+-        W.Wasi_instance.delete t)
+-      t;
+-    t
+-end
+-
+ module Wasmtime = struct
+   let fail_on_error error =
+     if not (Ctypes.is_null error)
+     then (
+       let message =
+-        Byte_vec.with_finalise ~f:(fun message -> W.Error.message error message)
++        Byte_vec.with_finalise ~f:(fun message -> W.Wasmtime.Error.message error message)
+         |> Byte_vec.to_string
+       in
+-      W.Error.delete error;
++      W.Wasmtime.Error.delete error;
+       failwith message)
+ 
+   let wat_to_wasm ~wat =
+-    Byte_vec.with_finalise ~f:(fun wasm -> W.Wasmtime.wat2wasm wat wasm |> fail_on_error)
+-
+-  let new_module engine ~wasm =
+-    let modl =
+-      Ctypes.allocate W.Module.t (Ctypes.from_voidp W.Module.struct_ Ctypes.null)
+-    in
+-    W.Wasmtime.new_module engine wasm modl |> fail_on_error;
+-    let modl = Ctypes.( !@ ) modl in
+-    if Ctypes.is_null modl then failwith "new_module returned null";
++    Byte_vec.with_finalise ~f:(fun wasm ->
++        W.Wasmtime.wat2wasm wat (String.length wat |> Unsigned.Size_t.of_int) wasm
++        |> fail_on_error)
++
++  (* Store-scoped, unlike the removed `wasmtime_new_module` this replaces (which was
++     engine-scoped) -- see this file's own top comment. *)
++  let new_module store ~wasm =
++    let modl = W.Module.new_ store wasm in
++    if Ctypes.is_null modl then failwith "new_module returned null (invalid module)";
+     Caml.Gc.finalise
+       (fun modl ->
+-        keep_alive engine;
++        keep_alive store;
+         W.Module.delete modl)
+       modl;
+     modl
+ 
+   let new_instance ?(imports = []) store modl =
+-    let instance =
+-      Ctypes.allocate W.Instance.t (Ctypes.from_voidp W.Instance.struct_ Ctypes.null)
+-    in
++    let imports_vec = Ctypes.allocate_n W.Extern_vec.struct_ ~count:1 in
++    let n_imports = List.length imports in
++    if n_imports = 0
++    then W.Extern_vec.new_empty imports_vec
++    else (
++      let arr = Ctypes.CArray.of_list W.Extern.t imports in
++      W.Extern_vec.new_ imports_vec (Unsigned.Size_t.of_int n_imports) (Ctypes.CArray.start arr));
+     let trap = Ctypes.allocate W.Trap.t (Ctypes.from_voidp W.Trap.struct_ Ctypes.null) in
+-    let n_imports = List.length imports |> Unsigned.Size_t.of_int in
+-    let imports = Ctypes.CArray.of_list W.Extern.t imports in
+-    W.Wasmtime.new_instance
+-      store
+-      modl
+-      (Ctypes.CArray.start imports)
+-      n_imports
+-      instance
+-      trap
+-    |> fail_on_error;
++    let instance = W.Instance.new_ store modl imports_vec trap in
+     keep_alive imports;
+     Ctypes.( !@ ) trap |> Trap.maybe_fail;
+-    let instance = Ctypes.( !@ ) instance in
+     if Ctypes.is_null instance then failwith "new_instance returned null";
++    (* Bug fix (Riptide Task 3, 2026-09-30, found while porting to v49 -- see bindings.ml's top
++       comment): the original upstream code only called [keep_alive imports] once, right here,
++       up through the [Instance.new_] call itself -- not for the instance's own lifetime. Once
++       [new_instance] returns, nothing kept a host function passed via [~imports] (its callback
++       closure, in particular) reachable for as long as the *instance* built from it stays
++       alive, even though wasmtime may call back into that host function at any later point
++       during the instance's lifetime (whenever the guest calls it). Reproduced live: creating a
++       host import function, instantiating a module that imports it, then forcing a `Gc.full_major
++       ()` before actually invoking the guest's entrypoint segfaults/double-frees, because the
++       import's underlying [wasm_func_t]/callback trampoline can already be collected+finalized
++       by then. Threading [imports] through this finalizer (the same pattern already used for
++       [store]/[modl] below) closes the gap: it keeps every host function reachable for exactly
++       as long as the instance built from it is. *)
+     Caml.Gc.finalise
+       (fun instance ->
+-        keep_alive (store, modl);
++        keep_alive (store, modl, imports);
+         W.Instance.delete instance)
+       instance;
+     instance
+ 
+   let func_call_list func args ~n_outputs =
+-    let trap = Ctypes.allocate W.Trap.t (Ctypes.from_voidp W.Trap.struct_ Ctypes.null) in
+     let n_args = List.length args in
+-    let args_ = Ctypes.allocate_n W.Val.struct_ ~count:n_args in
+-    List.iteri args ~f:(fun idx val_ -> V.copy val_ (Ctypes.( +@ ) args_ idx));
+-    let outputs = Ctypes.allocate_n W.Val.struct_ ~count:n_outputs in
+-    W.Wasmtime.func_call
+-      func
+-      args_
+-      (Unsigned.Size_t.of_int n_args)
+-      outputs
+-      (Unsigned.Size_t.of_int n_outputs)
+-      trap
+-    |> fail_on_error;
+-    Ctypes.( !@ ) trap |> Trap.maybe_fail;
+-    List.init n_outputs ~f:(fun idx -> Ctypes.( +@ ) outputs idx |> V.of_ptr)
++    let args_vec = Func.allocate_val_vec n_args in
++    let args_data = Func.val_vec_data args_vec in
++    List.iteri args ~f:(fun idx val_ -> V.copy val_ (Ctypes.( +@ ) args_data idx));
++    let results_vec = Func.allocate_val_vec n_outputs in
++    let trap = W.Func.call func args_vec results_vec in
++    Trap.maybe_fail trap;
++    let results_data = Func.val_vec_data results_vec in
++    List.init n_outputs ~f:(fun idx -> Ctypes.( +@ ) results_data idx |> V.of_ptr)
+ 
+   let func_call0 func args =
+     match func_call_list func args ~n_outputs:0 with
+@@ -469,57 +462,4 @@
+     Val.Kind.wrap_tuple args input_tuple
+     |> func_call_list func ~n_outputs:(Val.Kind.arity results)
+     |> Val.Kind.unwrap_tuple results
+-
+-  module Linker = struct
+-    type t = W.Wasmtime.Linker.t
+-
+-    let create store =
+-      let t = W.Wasmtime.Linker.new_ store in
+-      Caml.Gc.finalise
+-        (fun t ->
+-          keep_alive store;
+-          W.Wasmtime.Linker.delete t)
+-        t;
+-      t
+-
+-    let define_wasi t wasi_instance =
+-      W.Wasmtime.Linker.define_wasi t wasi_instance |> fail_on_error
+-
+-    let define_instance t ~name instance =
+-      W.Wasmtime.Linker.define_instance t name instance |> fail_on_error
+-
+-    let instantiate t modl =
+-      let instance =
+-        Ctypes.allocate W.Instance.t (Ctypes.from_voidp W.Instance.struct_ Ctypes.null)
+-      in
+-      let trap =
+-        Ctypes.allocate W.Trap.t (Ctypes.from_voidp W.Trap.struct_ Ctypes.null)
+-      in
+-      W.Wasmtime.Linker.instantiate t modl instance trap |> fail_on_error;
+-      Ctypes.( !@ ) trap |> Trap.maybe_fail;
+-      let instance = Ctypes.( !@ ) instance in
+-      if Ctypes.is_null instance then failwith "instantiate returned null";
+-      Caml.Gc.finalise
+-        (fun instance ->
+-          keep_alive t;
+-          W.Instance.delete instance)
+-        instance;
+-      instance
+-
+-    let module_ t ~name modl = W.Wasmtime.Linker.module_ t name modl |> fail_on_error
+-
+-    let get_default t ~name =
+-      let func =
+-        Ctypes.allocate W.Func.t (Ctypes.from_voidp W.Func.struct_ Ctypes.null)
+-      in
+-      W.Wasmtime.Linker.get_default t name func |> fail_on_error;
+-      let func = Ctypes.( !@ ) func in
+-      if Ctypes.is_null func then failwith "Linker.get_default returned null";
+-      Caml.Gc.finalise
+-        (fun func ->
+-          keep_alive t;
+-          W.Func.delete func)
+-        func;
+-      func
+-  end
+ end
+diff -ruN a/src/wrapper/wrappers.mli b/src/wrapper/wrappers.mli
+--- a/src/wrapper/wrappers.mli	2021-01-13 20:50:59.000000000 +0000
++++ b/src/wrapper/wrappers.mli	2026-09-30 10:36:46.031784817 +0000
+@@ -1,5 +1,10 @@
+-(* A low-level but hopefully type safe version of the API. *)
+-open! Base
++(* Patched locally (Riptide Task 3, 2026-09-30) to match this same directory's patched
++   `wrappers.ml`/`bindings.ml` (v49.0.1, not the originally-pinned 0.22.0) -- see `bindings.ml`'s
++   own top comment for the full story. [Engine.create] lost its `?interruptable`/
++   `?static_memory_*` params (setters no longer exist in v49); [Wasmtime.new_module] now takes a
++   [Store.t] instead of an [Engine.t]; [Wasmtime.Linker] and [Wasi_instance] are removed
++   (unused by Riptide's own hand-rolled ABI, Decision 3, and some of their underlying symbols
++   don't exist in v49 either). *)
+ 
+ exception Trap of { message : string }
+ 
+@@ -8,15 +13,11 @@
+ 
+   val create
+     :  ?debug_info:bool
+-    -> ?interruptable:bool
+     -> ?max_wasm_stack:int
+     -> ?reference_types:bool
+     -> ?simd:bool
+     -> ?bulk_memory:bool
+     -> ?multi_value:bool
+-    -> ?static_memory_maximum_size:int
+-    -> ?static_memory_guard_size:int
+-    -> ?dynamic_memory_guard_size:int
+     -> unit
+     -> t
+ end
+@@ -43,8 +44,6 @@
+ module Func : sig
+   type t
+ 
+-  val of_func_0_0 : Store.t -> (unit -> unit) -> t
+-
+   val of_func
+     :  args:'a Val.Kind.tuple
+     -> results:'b Val.Kind.tuple
+@@ -87,35 +86,9 @@
+   val exports : t -> Extern.t list
+ end
+ 
+-module Wasi_instance : sig
+-  type t
+-
+-  val create
+-    :  ?inherit_argv:bool
+-    -> ?inherit_env:bool
+-    -> ?inherit_stdin:bool
+-    -> ?inherit_stdout:bool
+-    -> ?inherit_stderr:bool
+-    -> ?preopen_dirs:(string * string) list
+-    -> Store.t
+-    -> [ `wasi_unstable | `wasi_snapshot_preview ]
+-    -> t
+-end
+-
+ module Wasmtime : sig
+-  module Linker : sig
+-    type t
+-
+-    val create : Store.t -> t
+-    val define_wasi : t -> Wasi_instance.t -> unit
+-    val define_instance : t -> name:Byte_vec.t -> Instance.t -> unit
+-    val instantiate : t -> Module.t -> Instance.t
+-    val module_ : t -> name:Byte_vec.t -> Module.t -> unit
+-    val get_default : t -> name:Byte_vec.t -> Func.t
+-  end
+-
+-  val wat_to_wasm : wat:Byte_vec.t -> Byte_vec.t
+-  val new_module : Engine.t -> wasm:Byte_vec.t -> Module.t
++  val wat_to_wasm : wat:string -> Byte_vec.t
++  val new_module : Store.t -> wasm:Byte_vec.t -> Module.t
+   val new_instance : ?imports:Extern.t list -> Store.t -> Module.t -> Instance.t
+   val func_call0 : Func.t -> Val.t list -> unit
+   val func_call1 : Func.t -> Val.t list -> Val.t
