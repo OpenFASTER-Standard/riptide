@@ -79,11 +79,39 @@ def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True)
 
 
-def tracked_files():
+def source_files(roots):
+    """Every file under `roots`, preferring git's own index, falling back to a filesystem walk.
+
+    The fallback is not a convenience: this script is wired into `dune test` (see the root `dune`
+    file), and dune runs it inside `_build/default`, which has the sources copied in but is itself
+    ignored by git -- so `git ls-files` there SUCCEEDS and returns nothing at all, rather than
+    failing. Hence the fallback triggers on "git gave us no source files under these roots", not
+    merely on "git errored": the quiet-empty case is the one that actually happens.
+
+    Dot-directories are skipped in the walk so dune's own per-library artifact directories
+    (`lib/.riptide_module.objs/...`) can never be mistaken for sources -- there is no `.ml` in them
+    today, but a future dune version emitting a preprocessed copy there would otherwise show up as a
+    second, phantom call site.
+    """
+
+    def under_roots(paths):
+        return [
+            f
+            for f in paths
+            if f.endswith(".ml") and any(f == r or f.startswith(r.rstrip("/") + "/") for r in roots)
+        ]
+
     r = git("ls-files")
-    if r.returncode != 0:
-        sys.exit("error: not a git repository (or git unavailable)")
-    return r.stdout.split()
+    if r.returncode == 0:
+        from_git = under_roots(r.stdout.split())
+        if from_git:
+            return from_git, "git ls-files"
+    walked = []
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            walked.extend(os.path.join(dirpath, fn) for fn in filenames)
+    return under_roots(walked), "filesystem walk (no git-tracked sources visible from here)"
 
 
 def strip_comments_and_strings(src):
@@ -220,11 +248,7 @@ def else_branch_extent(code, guard_idx):
 
 def main(argv):
     roots = [a for a in argv if not a.startswith("--")] or list(DEFAULT_ROOTS)
-    files = [
-        f
-        for f in tracked_files()
-        if f.endswith(".ml") and any(f == r or f.startswith(r.rstrip("/") + "/") for r in roots)
-    ]
+    files, discovery = source_files(roots)
     if not files:
         print(f"error: no .ml files found under {roots}", file=sys.stderr)
         return 2
@@ -350,7 +374,7 @@ def main(argv):
         + f" ({EXPECTED_CALL_SITE}:{line_of(stripped[EXPECTED_CALL_SITE], calls[0][0])}), it is "
         "inside Batch_commit.propose, it evaluates ~authorize over every write in the batch first, "
         f"and it sits behind the `{DENIAL_GUARD}` guard "
-        f"({len(files)} .ml files scanned)"
+        f"({len(files)} .ml files scanned via {discovery})"
     )
     return 0
 

@@ -1,0 +1,31 @@
+; Decision 7's structural bypass audit, wired into `dune test` (fix-wave round 2, re-review finding).
+;
+; `scripts/check-authorization-checkpoint` proves the claim both the design spec and
+; `batch_commit.mli` present as THE proof that no write can reach the replicated log without passing
+; the authorization checkpoint. Until this rule existed, nothing ran it automatically: this repo has
+; no CI beyond the task-status workflow, so `dune test` is its only automatic gate, and a second
+; `Riptide_vsr.Replica.propose` caller introduced in `lib/` tomorrow would have passed `dune build`
+; and `dune test` cleanly while both documents went on claiming otherwise. A proof nothing runs is
+; prose.
+;
+; Two details worth knowing rather than rediscovering:
+;   - The action runs with `_build/default` as its working directory, which is exactly why the script
+;     needs (and has) a filesystem-walk fallback for source discovery -- the sources are copied in
+;     there, but `.git` is not, so `git ls-files` cannot work. Running it from the repo root by hand
+;     (`scripts/check-authorization-checkpoint`) uses git instead; the script reports which mode it
+;     used, so the two are never confused.
+;   - `(glob_files_rec lib/*.ml)` is the dependency, not just the script: without it, dune would
+;     happily cache a passing result across a later edit to a `lib/` source file, which is the one
+;     thing this check must never do.
+;
+; `scripts/check-citations` is deliberately NOT wired in the same way: it is a whole-repo
+; documentation-hygiene aid with a disclosed, nonzero baseline of known warnings (see its own
+; docstring), not a binary safety invariant, and it reads `git blame` for its `--drifted` mode, which
+; a build sandbox has no repository for.
+(rule
+ (alias runtest)
+ (deps
+  scripts/check-authorization-checkpoint
+  (glob_files_rec lib/*.ml))
+ (action
+  (run python3 %{dep:scripts/check-authorization-checkpoint} lib)))
