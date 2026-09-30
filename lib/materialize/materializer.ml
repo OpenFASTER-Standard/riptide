@@ -28,10 +28,10 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
      way [write] used to). This is verified directly against Eio's own single-domain, cooperative
      scheduling semantics (per [Eio.Fiber]'s own documentation: within a domain, only one fiber
      runs at a time, and a fiber is only suspended in favor of another when it performs an
-     operation that can block): [Hashtbl.find_opt] and [Hashtbl.add] below do no I/O and contain
-     no such operation, so whichever fiber reaches this function first runs the whole
-     find-then-maybe-create-then-add sequence to completion before any other fiber gets a chance
-     to run -- there is no window in which a second fiber could observe [None] for a key the
+     operation that can block): [Hashtbl.find_opt] and [Hashtbl.replace] below do no I/O and
+     contain no such operation, so whichever fiber reaches this function first runs the whole
+     find-then-maybe-create-then-insert sequence to completion before any other fiber gets a
+     chance to run -- there is no window in which a second fiber could observe [None] for a key the
      first fiber has already decided to create a mutex for but not yet inserted. (This reasoning
      is specific to a single OS domain; it would not hold if a future caller ran multiple Eio
      domains against one shared [t], which nothing in this codebase does today.)
