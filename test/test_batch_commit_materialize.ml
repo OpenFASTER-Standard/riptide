@@ -100,7 +100,7 @@ let test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal () 
             let payload =
               lww_to_value { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String (Printf.sprintf "v%d" i)); timestamp = Int64.of_int i }
             in
-            Batch_commit.propose (Batch_commit.create ~replica ())
+            Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ())
               ~idempotency_key:(Printf.sprintf "k%d" i) ~materialize:sink
               [
                 {
@@ -192,9 +192,11 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
              confirmed via committed_envelopes below since already_committed itself isn't
              exposed by this module's .mli) but nothing is materialized yet (confirmed via
              M.read returning Last_write_wins.bottom, its documented "never written" sentinel). *)
-          let h = Batch_commit.create ~replica () in
+          let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
           Batch_commit.propose h ~idempotency_key [ write ];
-          Alcotest.(check int) "batch committed on the first (sink-less) call" 1
+          (* 1 real write + 1 synthetic authorization-decision write (task-master Task 5,
+             subtask 5) -- see test_batch_commit.ml's own dedicated test for that write's shape. *)
+          Alcotest.(check int) "batch committed on the first (sink-less) call" 2
             (List.length (Batch_commit.committed_envelopes replica));
           Alcotest.(check int64) "nothing materialized yet for merge_key (still Last_write_wins.bottom)"
             Last_write_wins.bottom.timestamp (M.read materializer ~merge_key).timestamp;
@@ -205,7 +207,7 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
              sink for a batch that was already committed. *)
           Batch_commit.propose h ~idempotency_key ~materialize:sink [ write ];
           Alcotest.(check int) "still exactly one committed batch -- the retry did not double-propose"
-            1 (List.length (Batch_commit.committed_envelopes replica));
+            2 (List.length (Batch_commit.committed_envelopes replica));
           let converged = M.read materializer ~merge_key in
           Alcotest.(check bool) "materialize fired on the retry call for an already-committed batch"
             true
@@ -254,7 +256,7 @@ let propose_one_write replica ~idempotency_key ~merge_key ~timestamp ~value_str 
       merge_key;
     }
   in
-  Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key [ write ]
+  Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key [ write ]
 
 let make_materializer kv_dir env sw =
   let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
@@ -276,7 +278,9 @@ let test_materialize_up_to_drains_the_whole_committed_prefix () =
       propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
       propose_one_write replica ~idempotency_key:"k2" ~merge_key:(Some "mk") ~timestamp:2 ~value_str:"v2";
       propose_one_write replica ~idempotency_key:"k3" ~merge_key:(Some "mk") ~timestamp:3 ~value_str:"v3";
-      Alcotest.(check int) "3 batches committed on the solo replica" 3
+      (* 3 batches x (1 real write + 1 synthetic authorization-decision write each) = 6 envelopes
+         -- task-master Task 5, subtask 5. *)
+      Alcotest.(check int) "3 batches committed on the solo replica" 6
         (List.length (Batch_commit.committed_envelopes replica));
       let materializer = make_materializer kv_dir env sw in
       let sink = make_sink materializer in
@@ -361,11 +365,14 @@ let test_materialize_up_to_skips_writes_with_no_merge_key () =
   (* One batch, one committed entry, carrying BOTH writes -- a mix within the same batch, not two
      separate batches, so a bug that materialized "everything in a committed batch regardless of
      merge_key" would be caught here. *)
-  Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k-mixed"
+  Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k-mixed"
     [ write_with_key; write_without_key ];
   Alcotest.(check int) "one batch (op-number) committed" 1 (Replica.commit_number replica);
+  (* Both real writes, plus the batch's own synthetic authorization-decision write
+     (task-master Task 5, subtask 5) -- which also carries merge_key = None, so it does not
+     change the "one materialized key" assertion below. *)
   Alcotest.(check int) "both writes of the batch published as envelopes (envelope publishing is \
-                         orthogonal to materialization)" 2
+                         orthogonal to materialization)" 3
     (List.length (Batch_commit.committed_envelopes replica));
   let materialized_keys = ref [] in
   let sink : Batch_commit.materialize_sink =
@@ -457,7 +464,7 @@ let test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for
         timestamp = 1L
       }
   in
-  Batch_commit.propose (Batch_commit.create ~replica:primary ()) ~idempotency_key:"k-never-commits"
+  Batch_commit.propose (Batch_commit.create ~replica:primary ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k-never-commits"
     [
       {
         Batch_commit.actor;
@@ -621,7 +628,7 @@ let test_one_oversized_write_in_a_batch_does_not_block_sibling_materialization (
          placing the poisoned write ahead of the sibling in the very same batch is exactly the
          shape that proves the sibling was never even attempted before this fix. *)
       tolerating_the_known_overflow_exception (fun () ->
-          Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k-mixed-batch" ~materialize:sink
+          Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k-mixed-batch" ~materialize:sink
             [ poison_write ~merge_key:"poison-mk"; small_write ~merge_key:"sibling-mk" ~value_str:"sibling-value" ]);
       let sibling = M.read materializer ~merge_key:"sibling-mk" in
       Alcotest.(check bool) "the sibling key materialized despite the other write's overflow" true
@@ -675,7 +682,7 @@ let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned
       let replica = create_solo_volatile () in
       (* One batch, two writes, no ~materialize sink -- nothing materialized synchronously;
          materialize_up_to alone drains it below, against a fresh materializer. *)
-      Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k-mixed-batch-replay"
+      Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k-mixed-batch-replay"
         [ poison_write ~merge_key:"poison-mk2"; small_write ~merge_key:"sibling-mk2" ~value_str:"sibling-value2" ];
       Alcotest.(check int) "one batch (op-number) committed" 1 (Replica.commit_number replica);
       let materializer = make_materializer kv_dir env sw in

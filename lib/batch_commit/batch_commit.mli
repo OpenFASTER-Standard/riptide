@@ -37,32 +37,69 @@ type write = {
     this field existed -- while a field present but not shaped like this module's own encoding
     voids the whole write, exactly like a malformed [actor]/[causation]/[correlation]/[payload]. *)
 
+type decision =
+  | Allow
+  | Deny of string
+(** The result of evaluating one {!write} against whatever authorization policy governs the {!t}
+    handle it is proposed through -- see {!create}'s own [~authorize] parameter and {!propose}'s
+    own "Authorization" section for exactly when and how this is consulted. [Deny]'s [string] is a
+    human-readable reason for logs/debugging only; nothing in this module parses, compares, or
+    persists it -- a denied batch is refused in full (see {!propose}), so no [Deny] reason itself
+    ever reaches the replicated log. *)
+
+val allow_all : write -> decision
+(** The explicit, visible "no real policy yet" choice. {!create}'s own [~authorize] is a REQUIRED
+    argument specifically so every call site has to say so out loud rather than silently
+    inheriting a default -- this is the honest default every existing call site in this codebase
+    passes until a real Layer 2 authorization policy exists (task-master Task 6, the reactor
+    wiring that supplies a real one). Returns [Allow] for every {!write}, unconditionally. *)
+
+val authorization_denials : unit -> int
+(** [authorization_denials ()] is how many times {!propose}'s own universal authorization
+    checkpoint has refused a WHOLE batch -- because {!create}'s own [~authorize] returned
+    [Deny _] for at least one of its writes -- over this process's lifetime. Shaped exactly like
+    {!materialize_write_failures}: a monotonic, process-lifetime count, never reset. The useful
+    reading is a delta between two samples, not an absolute value in isolation. *)
+
 type t
-(** A handle pairing one {!Riptide_vsr.Replica.t} with a deployment-level
+(** A handle pairing one {!Riptide_vsr.Replica.t} with deployment-level policy: a mandatory
+    [authorize] function (task-master Task 5, subtask 5 -- the universal authorization checkpoint
+    every write through this module passes through, real client writes today and, from a later
+    task in this same plan, sandboxed-WASM-module writes too) and an optional
     [require_encryption] policy (task-master subtask 5.3, audit-remediation design spec Decision
     5.3, closing the finding that {!propose}'s own [require_encryption] check and the [~encryption]
     gap it exists to catch previously lived at the EXACT SAME call site -- a call site careless
     enough to forget [~encryption] was, by construction, equally likely to forget
     [~require_encryption:true] too). Only {!propose} needs this handle: every other function in
     this module ({!committed_envelopes}, {!materialize_up_to},
-    {!write_at_op_number_has_merge_key}, etc.) has nothing to do with encryption policy and keeps
-    taking a bare {!Riptide_vsr.Replica.t} directly, unchanged.
+    {!write_at_op_number_has_merge_key}, etc.) has nothing to do with authorization or encryption
+    policy and keeps taking a bare {!Riptide_vsr.Replica.t} directly, unchanged.
 
     Abstract, matching this codebase's own established convention for every other handle type
     ({!Riptide_materialize.Materializer.Make.t}, {!Riptide_crypto.Redaction_store.t},
     {!Riptide_storage.File_kv_store.t} are all abstract with explicit accessor functions, never an
-    exposed record) -- not because this record needs to hide anything (it is exactly two plain
+    exposed record) -- not because this record needs to hide anything (it is exactly three plain
     fields), but so a future field can be added to it without breaking every existing caller's
     pattern match. *)
 
-val create : replica:Riptide_vsr.Replica.t -> ?require_encryption:bool -> unit -> t
-(** [create ~replica ?require_encryption ()] builds a handle over [replica] with [require_encryption]
-    (default [false], matching {!propose}'s own pre-existing default -- this constructor changes
-    WHERE the policy is set, never its default value) as the policy every {!propose} call through
-    this handle enforces unless overridden per-call. A deployment that wants "every write through
-    this path is encrypted, no exceptions" as an enforced invariant sets [~require_encryption:true]
-    ONCE here, at the one place that builds the handle, rather than trusting every {!propose} call
-    site scattered through its own code to remember [~require_encryption:true] unaided. *)
+val create :
+  replica:Riptide_vsr.Replica.t -> authorize:(write -> decision) -> ?require_encryption:bool -> unit -> t
+(** [create ~replica ~authorize ?require_encryption ()] builds a handle over [replica] with
+    [authorize] as the mandatory universal authorization policy every {!propose} call through this
+    handle consults for every write of every batch (see {!propose}'s "Authorization" section), and
+    [require_encryption] (default [false], matching {!propose}'s own pre-existing default -- this
+    constructor changes WHERE the policy is set, never its default value) as the encryption policy
+    every {!propose} call through this handle enforces unless overridden per-call.
+
+    [authorize] has NO default -- unlike [require_encryption], which has always defaulted to
+    [false], this parameter is REQUIRED so that "no real policy yet" is something every call site
+    states out loud, via {!allow_all}, rather than something the type signature quietly assumes
+    for it. A deployment that wants "every write through this path is encrypted, no exceptions" as
+    an enforced invariant sets [~require_encryption:true] ONCE here, at the one place that builds
+    the handle, rather than trusting every {!propose} call site scattered through its own code to
+    remember [~require_encryption:true] unaided -- the same reasoning now applies to [~authorize]
+    itself: a deployment's real policy lives here, once, not at each of {!propose}'s many call
+    sites. *)
 
 val replica : t -> Riptide_vsr.Replica.t
 (** [replica t] is the {!Riptide_vsr.Replica.t} [t] was built from -- needed by any caller that
@@ -371,6 +408,42 @@ val propose :
     without having to remember anything itself -- the per-call override above still exists for the
     rare, deliberate exception, but the default a careless call site falls back to is now the
     deployment's own choice, not silent plaintext.
+
+    {b Authorization} (task-master Task 5, subtask 5 -- the universal, mandatory checkpoint every
+    write through this module passes through): before any other guard below that can actually
+    cause a commit -- i.e. before the idempotency-key/commit-membership check that follows --
+    [Batch_commit.t]'s own [~authorize] (supplied once, at {!create} time) is evaluated against
+    EVERY write in [writes], unconditionally, on EVERY call, whether or not [idempotency_key] is
+    already committed or merely appended. If any write's [authorize w] returns [Deny reason], this
+    function increments {!authorization_denials} and returns -- doing nothing else at all: no
+    write is proposed, and the materialize step below does not run either, even if [?materialize]
+    was supplied. A batch is one atomic, indivisible unit, so a single denied write refuses the
+    WHOLE batch, not just itself -- there is no partial-batch commit path anywhere in this module,
+    and authorization does not create one. (A caller relying on the empty-[writes] materialize-only
+    idiom described below is unaffected by this in practice: [List.exists] over an empty list is
+    vacuously [false], so an empty batch is never denied by construction, whatever [~authorize]
+    is.)
+
+    If every write is [Allow], this function proceeds as described below, with ONE addition: when
+    [writes] and [Batch_commit.replica t]'s log together mean a real proposal happens (i.e. inside
+    the same "not already in the log" guard the paragraph below describes), one additional,
+    synthetic {!write} recording the decision is appended to the writes actually encoded and
+    passed to {!Riptide_vsr.Replica.propose} -- [actor = "riptide.module.authz"],
+    [causation]/[correlation] copied from [writes]'s own first element (making it a real,
+    causally-linked member of the same batch, not a freestanding fact), [merge_key = None], and a
+    [payload] recording [idempotency_key] and the fact the batch was allowed. This write commits,
+    chains, and decodes exactly like any other write in the batch -- {!committed_envelopes} yields
+    one extra envelope per successfully-proposed batch as a result, which every caller comparing
+    envelope counts against a proposed-write count must account for. It carries no [merge_key], so
+    it is invisible to materialization, and it is never encrypted even when [?encryption] is
+    supplied -- it is a fact ABOUT the batch's authorization, not user payload data, so it is
+    deliberately excluded from the encrypted-payload/redaction story the rest of this comment
+    describes.
+
+    A denied batch's key is consequently NEVER added to the log at all (unlike an empty batch,
+    which is refused earlier, before authorization is even consulted, by the guard below) -- a
+    later call under the same [idempotency_key] with a permissive [~authorize] (or against a
+    different handle) is a genuine first attempt, not a blocked retry.
 
     Checks first whether [idempotency_key] already appears among the batches in
     [Batch_commit.replica t]'s own log -- the WHOLE log as {!Riptide_vsr.Replica.entries} reports

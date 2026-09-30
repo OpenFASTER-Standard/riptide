@@ -1473,7 +1473,7 @@ let make_lww_materializer ~env ~sw dir =
 
 let propose_lww_write replica ~idempotency_key ~timestamp ~value_str =
   Riptide_batch_commit.Batch_commit.propose
-    (Riptide_batch_commit.Batch_commit.create ~replica ())
+    (Riptide_batch_commit.Batch_commit.create ~replica ~authorize:Riptide_batch_commit.Batch_commit.allow_all ())
     ~idempotency_key
     [
       {
@@ -1834,7 +1834,8 @@ let test_eviction_blocked_actually_increments_when_may_evict_is_wired () =
              durably appended anywhere without evicting op 1, which the predicate refuses. *)
           for n = 1 to tiny_ring_capacity + 3 do
             Riptide_batch_commit.Batch_commit.propose
-              (Riptide_batch_commit.Batch_commit.create ~replica:r ())
+              (Riptide_batch_commit.Batch_commit.create ~replica:r
+                 ~authorize:Riptide_batch_commit.Batch_commit.allow_all ())
               ~idempotency_key:(Printf.sprintf "k%d" n)
               [
                 {

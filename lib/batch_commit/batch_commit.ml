@@ -155,18 +155,54 @@ let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : boo
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
-(* Construction-time require_encryption policy (task-master subtask 5.3, audit-remediation design
-   spec Decision 5.3) -- see batch_commit.mli's own [t]/[create]/[replica] doc comments for the
-   full rationale. Only [propose] consumes [require_encryption]; every other function in this
-   module keeps taking a bare [Riptide_vsr.Replica.t] directly, so this type exists purely to give
-   [propose] somewhere to read a deployment-wide default from. *)
+(* Universal authorization checkpoint (task-master Task 5, subtask 5) -- see batch_commit.mli's
+   own [decision]/[allow_all]/[authorization_denials]/[create]/[propose] doc comments for the full
+   contract. [decision] is deliberately NOT [bool]: a [Deny] carries a human-readable reason for
+   logs/debugging, matching this codebase's own established preference (see
+   [Riptide_materialize.Materializer.Value_too_large] and [Riptide_vsr.Replica]'s own
+   [append_refusals] reason strings) for a diagnosable failure shape over a bare boolean, even
+   though nothing in this module parses or compares the reason itself -- a denied batch is
+   refused in full, so the reason never reaches the replicated log. *)
+type decision =
+  | Allow
+  | Deny of string
+
+let allow_all (_ : write) : decision = Allow
+
+(* Shaped exactly like [materialize_write_failures_count] below (and, before it,
+   [Riptide_vsr.Replica.append_refusals]): a single, process-lifetime, monotonically-increasing
+   counter, never reset. See batch_commit.mli's own [authorization_denials] doc comment. *)
+let authorization_denials_count = ref 0
+let authorization_denials () = !authorization_denials_count
+
+(* Construction-time authorize/require_encryption policy (task-master Task 5, subtask 5;
+   task-master subtask 5.3, audit-remediation design spec Decision 5.3) -- see batch_commit.mli's
+   own [t]/[create]/[replica] doc comments for the full rationale. Only [propose] consumes either
+   field; every other function in this module keeps taking a bare [Riptide_vsr.Replica.t]
+   directly, so this type exists purely to give [propose] somewhere to read deployment-wide policy
+   from. *)
 type t = {
   replica : Riptide_vsr.Replica.t;
+  authorize : write -> decision;
   require_encryption : bool;
 }
 
-let create ~replica ?(require_encryption = false) () = { replica; require_encryption }
+let create ~replica ~authorize ?(require_encryption = false) () = { replica; authorize; require_encryption }
 let replica (t : t) = t.replica
+
+(* The synthetic write [propose] appends to a batch it actually proposes, once every one of the
+   batch's real writes is [Allow]ed -- see batch_commit.mli's own [propose] "Authorization"
+   section. A plain Record, the same encoding style every other payload in this codebase's test
+   suite and this module's own doc examples use: [idempotency_key] so the decision is
+   self-describing without needing to be paired with its batch by position, and [decision] so the
+   shape has room for a future non-binary policy outcome without a wire-format change, even though
+   today it is always ["allow"] (a [Deny] never reaches this function -- see [propose] below). *)
+let authorization_decision_payload ~(idempotency_key : string) : Value.value =
+  Value.Record
+    [
+      ("idempotency_key", Value.Scalar (Value.String idempotency_key));
+      ("decision", Value.Scalar (Value.String "allow"));
+    ]
 
 (* ---- per-write materialize failure counting (task-master audit-remediation Task 21) ----
 
@@ -380,43 +416,70 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
         "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
          (~encryption): the materialized accumulator is outside the redaction keystore, so \
          deleting the DEK would not erase it");
-  if writes <> [] && not (already_in_log replica ~idempotency_key) then begin
-    (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,
-       and not a line earlier: encrypting mints a fresh DEK and overwrites the keystore entry for
-       this event_id. Doing that on a retry of a batch already in the log -- committed OR merely
-       appended-and-awaiting-quorum -- would orphan the DEK for a ciphertext that is (or is about
-       to become) immutably committed, permanently destroying a record nobody asked to redact.
-       [already_in_log], not [already_committed], is the guard precisely because the
-       appended-but-uncommitted window is the normal state of every multi-replica propose; see
-       [already_in_log]'s own comment for the full failure mode this closes. *)
-    let writes_to_propose =
-      match encryption with
-      | None -> writes
-      | Some sink ->
-        List.mapi
-          (fun index (w : write) ->
-            { w with payload = sink.encrypt ~event_id:(redaction_event_id ~idempotency_key ~index) w.payload })
-          writes
-    in
-    Riptide_vsr.Replica.propose replica (batch_to_value ~idempotency_key writes_to_propose)
-  end;
-  (* Deliberately NOT gated behind "did THIS call perform the durable commit" -- a batch
-     committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
-     above) is materialized here just the same. This makes materialization safe to retry: if a
-     process crashes between Replica.propose's durable commit and the materialize step below,
-     the very next propose call for the SAME idempotency_key -- even though already_in_log
-     above makes it skip re-proposing -- still reaches this point and re-attempts the
-     materialize. Note the two guards are deliberately DIFFERENT questions and must stay so:
-     re-proposing is gated on "is this key anywhere in the log at all" (see already_in_log), while
-     materializing is gated on "is it COMMITTED", since materializing an entry that has not yet
-     reached quorum would publish state the cluster has not agreed on. That re-attempt is safe because Materializer.write is a read-join-put over a
-     lattice: joining the same value into an already-converged accumulator is a no-op by the
-     lattice laws (idempotent), so re-materializing an already-materialized write changes
-     nothing. See batch_commit.mli's own [propose] doc comment for the corrected, full account
-     of this behavior. *)
-  match materialize with
-  | None -> ()
-  | Some sink -> (
+  (* Universal authorization checkpoint (task-master Task 5, subtask 5) -- see batch_commit.mli's
+     own [propose] "Authorization" section for the full contract. Evaluated for EVERY write in
+     [writes], unconditionally, on EVERY call, before the idempotency-key/commit-membership check
+     below (the only guard past this point that can actually cause a commit). [List.exists] over
+     an empty [writes] is vacuously [false], so the empty-[writes]-plus-[~materialize] drain idiom
+     documented below is never denied by construction, whatever [~authorize] is. *)
+  let denied = List.exists (fun (w : write) -> match t.authorize w with Deny _ -> true | Allow -> false) writes in
+  if denied then incr authorization_denials_count
+  else begin
+    if writes <> [] && not (already_in_log replica ~idempotency_key) then begin
+      (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,
+         and not a line earlier: encrypting mints a fresh DEK and overwrites the keystore entry for
+         this event_id. Doing that on a retry of a batch already in the log -- committed OR merely
+         appended-and-awaiting-quorum -- would orphan the DEK for a ciphertext that is (or is about
+         to become) immutably committed, permanently destroying a record nobody asked to redact.
+         [already_in_log], not [already_committed], is the guard precisely because the
+         appended-but-uncommitted window is the normal state of every multi-replica propose; see
+         [already_in_log]'s own comment for the full failure mode this closes. *)
+      let writes_with_encryption =
+        match encryption with
+        | None -> writes
+        | Some sink ->
+          List.mapi
+            (fun index (w : write) ->
+              { w with payload = sink.encrypt ~event_id:(redaction_event_id ~idempotency_key ~index) w.payload })
+            writes
+      in
+      (* The authorization-decision write (batch_commit.mli's own [propose] "Authorization"
+         section): appended LAST, after encryption, and never itself encrypted -- it records a
+         fact ABOUT this batch's authorization, not user payload data, so it is deliberately
+         outside the encrypted-payload/redaction story above. [causation]/[correlation] copied
+         from [writes]'s own first element (available here: this whole block is reached only when
+         [writes <> []]) make it a real, causally-linked member of the same atomic batch rather
+         than a freestanding fact. *)
+      let first_write = List.hd writes in
+      let authorization_decision_write : write =
+        {
+          actor = "riptide.module.authz";
+          causation = first_write.causation;
+          correlation = first_write.correlation;
+          payload = authorization_decision_payload ~idempotency_key;
+          merge_key = None;
+        }
+      in
+      let writes_to_propose = writes_with_encryption @ [ authorization_decision_write ] in
+      Riptide_vsr.Replica.propose replica (batch_to_value ~idempotency_key writes_to_propose)
+    end;
+    (* Deliberately NOT gated behind "did THIS call perform the durable commit" -- a batch
+       committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
+       above) is materialized here just the same. This makes materialization safe to retry: if a
+       process crashes between Replica.propose's durable commit and the materialize step below,
+       the very next propose call for the SAME idempotency_key -- even though already_in_log
+       above makes it skip re-proposing -- still reaches this point and re-attempts the
+       materialize. Note the two guards are deliberately DIFFERENT questions and must stay so:
+       re-proposing is gated on "is this key anywhere in the log at all" (see already_in_log), while
+       materializing is gated on "is it COMMITTED", since materializing an entry that has not yet
+       reached quorum would publish state the cluster has not agreed on. That re-attempt is safe because Materializer.write is a read-join-put over a
+       lattice: joining the same value into an already-converged accumulator is a no-op by the
+       lattice laws (idempotent), so re-materializing an already-materialized write changes
+       nothing. See batch_commit.mli's own [propose] doc comment for the corrected, full account
+       of this behavior. *)
+    match materialize with
+    | None -> ()
+    | Some sink -> (
     (* Materialize the writes that are actually COMMITTED under this key, read back out of the
        committed bytes -- never the [writes] argument this call happened to be handed (Task 9's
        end-to-end adversarial proof, 2026-09-23; see that task's report and
@@ -476,6 +539,7 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
           | None -> ()
           | Some merge_key -> materialize_write_catching sink ~merge_key w.payload)
         committed_writes)
+  end
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =
   let seen_keys = Hashtbl.create 16 in

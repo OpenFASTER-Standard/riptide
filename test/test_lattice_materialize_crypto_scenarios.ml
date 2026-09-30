@@ -403,7 +403,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
      they reject each other's messages outright. *)
   Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
   let primary = replicas.(0) in
-  let primary_handle = Batch_commit.create ~replica:primary () in
+  let primary_handle = Batch_commit.create ~replica:primary ~authorize:Batch_commit.allow_all () in
 
   let deliver ~drop_probability =
     while not (Queue.is_empty inflight) do
@@ -457,7 +457,7 @@ let run_scenario ~env ~sw ~seed ~phases ~make_fault_storage =
         List.iter
           (fun (key, writes) ->
             if redrain_everything || not (Hashtbl.mem drained (i, key)) then begin
-              Batch_commit.propose (Batch_commit.create ~replica:r ()) ~idempotency_key:key
+              Batch_commit.propose (Batch_commit.create ~replica:r ~authorize:Batch_commit.allow_all ()) ~idempotency_key:key
                 ~materialize:(mat_sink materializers.(i)) writes;
               (* Only stop re-offering a key once it has actually been materialized, i.e. once this
                  replica really holds it committed -- offering it again while it is still
@@ -817,7 +817,7 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
   in
   Array.iter (fun r -> Replica.for_test_set_view_number r 1) replicas;
   let primary = replicas.(0) in
-  let primary_handle = Batch_commit.create ~replica:primary () in
+  let primary_handle = Batch_commit.create ~replica:primary ~authorize:Batch_commit.allow_all () in
   let materializers =
     Array.init replica_count (fun i ->
         let dir = Filename.concat mat_root (string_of_int i) in
@@ -853,7 +853,7 @@ let test_a_primary_storage_fault_halts_materialization_exactly_with_commit () =
     (fun i r ->
       List.iter
         (fun n ->
-          Batch_commit.propose (Batch_commit.create ~replica:r ())
+          Batch_commit.propose (Batch_commit.create ~replica:r ~authorize:Batch_commit.allow_all ())
             ~idempotency_key:(Printf.sprintf "b%d" n)
             ~materialize:(mat_sink materializers.(i))
             [])
@@ -1172,7 +1172,7 @@ let with_watermark_cluster ~env ~sw ~wiring f =
     in
     (* No [~materialize] anywhere, ever, and only ever against the primary: every accumulator below
        is populated exclusively by [?on_commit_advanced]. *)
-    Batch_commit.propose (Batch_commit.create ~replica:replicas.(0) ())
+    Batch_commit.propose (Batch_commit.create ~replica:replicas.(0) ~authorize:Batch_commit.allow_all ())
       ~idempotency_key:(Printf.sprintf "k%d" n)
       [ write_of ?merge_key payload ]
   in
@@ -1737,7 +1737,7 @@ let test_materialization_is_a_function_of_the_committed_log () =
   let fs = Eio.Stdenv.fs env in
   let ma = make_materializer ~sw ~fs dir_a and mb = make_materializer ~sw ~fs dir_b in
   let replica = create_solo () in
-  let h = Batch_commit.create ~replica () in
+  let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
   let committed = write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ "committed" ])) in
   let regenerated = write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ "NEVER-COMMITTED" ])) in
   (* Replica A's client proposes, then retries the same idempotency key with a regenerated batch --
@@ -1746,7 +1746,9 @@ let test_materialization_is_a_function_of_the_committed_log () =
   Batch_commit.propose h ~idempotency_key:"k1" ~materialize:(mat_sink ma) [ committed ];
   Batch_commit.propose h ~idempotency_key:"k1" ~materialize:(mat_sink ma) [ regenerated ];
   Batch_commit.propose h ~idempotency_key:"k1" ~materialize:(mat_sink mb) [ committed ];
-  Alcotest.(check int) "the retry appended nothing: exactly one committed envelope" 1
+  (* The one real write, plus its batch's own synthetic authorization-decision write
+     (task-master Task 5, subtask 5) -- the retry itself still appended nothing. *)
+  Alcotest.(check int) "the retry appended nothing: exactly one committed envelope" 2
     (List.length (Batch_commit.committed_envelopes replica));
   (* Pre-fix: A = [NEVER-COMMITTED; committed], B = [committed] -- a durable, permanent divergence
      over a payload that is in no committed entry on any replica, which no later join can undo
@@ -1769,7 +1771,7 @@ let test_a_redacted_records_plaintext_cannot_re_enter_via_materialization () =
   in
   let materializer = make_materializer ~sw ~fs mat_dir in
   let replica = create_solo () in
-  let h = Batch_commit.create ~replica () in
+  let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
   let payload = G_set.to_value (G_set.of_list [ crypto_marker ]) in
   (* Call 1 commits the payload as CIPHERTEXT. No merge_key, so [propose]'s mutual-exclusion guard
      is satisfied and says nothing. *)
@@ -1813,7 +1815,7 @@ let test_encrypted_and_materialized_is_still_rejected () =
         (~encryption): the materialized accumulator is outside the redaction keystore, so deleting \
         the DEK would not erase it")
     (fun () ->
-      Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
+      Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
         [ write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ "x" ])) ]);
   Alcotest.(check int) "and nothing was committed" 0
     (List.length (Batch_commit.committed_envelopes replica))
@@ -1827,7 +1829,7 @@ let test_a_replica_can_materialize_its_own_commit_stream_without_the_writes () =
   Eio.Switch.run @@ fun sw ->
   let materializer = make_materializer ~sw ~fs:(Eio.Stdenv.fs env) dir in
   let replica = create_solo () in
-  let h = Batch_commit.create ~replica () in
+  let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
   Batch_commit.propose h ~idempotency_key:"k1"
     [ write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ "from-the-log" ])) ];
   Alcotest.(check (list string)) "nothing materialized yet -- no sink was supplied" []
@@ -1838,8 +1840,9 @@ let test_a_replica_can_materialize_its_own_commit_stream_without_the_writes () =
   Alcotest.(check (list string)) "the committed batch's own writes were materialized"
     [ "from-the-log" ]
     (G_set.elements (M.read materializer ~merge_key:"mk"));
-  Alcotest.(check int) "and the empty call proposed nothing" 1
-    (List.length (Batch_commit.committed_envelopes replica))
+  Alcotest.(check int) "and the empty call proposed nothing -- still just the one real write plus \
+                        its own synthetic authorization-decision write"
+    2 (List.length (Batch_commit.committed_envelopes replica))
 
 
 (* ---------------------------------------------------------------------------------------------
@@ -1888,7 +1891,7 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
   Eio.Switch.run @@ fun sw ->
   let materializer = make_materializer ~sw ~fs:(Eio.Stdenv.fs env) dir in
   let replica = create_solo () in
-  let h = Batch_commit.create ~replica () in
+  let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
   let propose n =
     Batch_commit.propose h
       ~idempotency_key:(Printf.sprintf "k%d" n)
@@ -1947,8 +1950,11 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
     true
     (!failed_at > 0 && !failed_at < 400);
   (* The part that makes this a divergence rather than a clean rejection: the overflowing write is
-     durably COMMITTED, and is not in the accumulator. *)
-  Alcotest.(check int) "the overflowing batch committed anyway" !failed_at
+     durably COMMITTED, and is not in the accumulator. Each of the [!failed_at] proposed batches
+     contributes 2 envelopes -- its own real write plus its own synthetic authorization-decision
+     write (task-master Task 5, subtask 5), which never reaches the materializer (merge_key = None)
+     and so plays no part in the overflow itself. *)
+  Alcotest.(check int) "the overflowing batch committed anyway" (2 * !failed_at)
     (List.length (Batch_commit.committed_envelopes replica));
   Alcotest.(check int) "but the accumulator holds one element fewer" (!failed_at - 1)
     (List.length (G_set.elements (M.read materializer ~merge_key:"mk")));
@@ -2058,7 +2064,7 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
     in
     let replica = create_solo () in
     let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
-    Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
+    Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
       [ write_of payload ];
     let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
     Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0"
@@ -2101,8 +2107,9 @@ let test_a_shared_kv_directory_is_rejected_at_construction () =
     true
     (Redaction_store.decrypt_value store2 ~event_id envelope.Riptide.Envelope.payload
     = Some (canonical payload));
-  Alcotest.(check int) "the committed log still holds exactly the one record" 1
-    (List.length (Batch_commit.committed_envelopes replica))
+  Alcotest.(check int) "the committed log still holds exactly the one record, plus its own \
+                        synthetic authorization-decision write"
+    2 (List.length (Batch_commit.committed_envelopes replica))
 
 (* ---------------------------------------------------------------------------------------------
    THE SAME HAZARD, STILL LIVE FOR A PAIR THAT AGREES ON ONE TAG -- the running proof of the
@@ -2152,7 +2159,7 @@ let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () 
     in
     let replica = create_solo () in
     let payload = secret_payload_with "RIPTIDE-COLLISION-VICTIM" in
-    Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
+    Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(enc_sink store)
       [ write_of payload ];
     let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
     Alcotest.(check string) "the keystore key is a plain, publicly derivable string" "2:k1#0"
@@ -2184,8 +2191,9 @@ let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () 
     Alcotest.(check (list string)) "while the accumulator write itself succeeded normally"
       [ "innocent-accumulator-value" ]
       (G_set.elements (M.read mat ~merge_key:event_id));
-    Alcotest.(check int) "and the committed log still holds the (now unopenable) record" 1
-      (List.length (Batch_commit.committed_envelopes replica));
+    Alcotest.(check int) "and the committed log still holds the (now unopenable) record, plus its \
+                          own synthetic authorization-decision write"
+      2 (List.length (Batch_commit.committed_envelopes replica));
     (* DIRECTION 2's setup, silent in the other direction and true for ANY [decode]: the
        keystore's own [put] never reads first, so encrypting a record whose derived [event_id]
        collides with an EXISTING [merge_key] overwrites that accumulator with wrapped-DEK bytes,
@@ -2219,7 +2227,7 @@ let test_using_the_same_owner_tag_on_both_sides_still_destroys_a_wrapped_dek () 
   Alcotest.(check bool)
     "the encrypted record is now permanently unreadable, and nothing raised to say so" true
     (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = None);
-  Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k2" ~encryption:(enc_sink store)
+  Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k2" ~encryption:(enc_sink store)
     [ write_of (secret_payload_with "RIPTIDE-COLLISION-VICTIM-2") ];
   Alcotest.(check (list string))
     "the accumulator's value is silently gone, replaced by a wrapped DEK" []

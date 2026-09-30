@@ -736,10 +736,13 @@ let write_of payload : Batch_commit.write =
 let test_committed_envelope_hashes_ciphertext_and_survives_redaction () =
   with_store (fun store ->
       let replica = create_solo () in
-      Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(sink_of store)
+      Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(sink_of store)
         [ write_of secret ];
       let keyed = Batch_commit.committed_envelopes_keyed replica in
-      Alcotest.(check int) "one committed envelope" 1 (List.length keyed);
+      (* The encrypted write, plus its batch's own synthetic (unencrypted) authorization-decision
+         write (task-master Task 5, subtask 5) -- List.hd below is still the encrypted write, since
+         the synthetic write is always appended LAST. *)
+      Alcotest.(check int) "one committed envelope" 2 (List.length keyed);
       let event_id, envelope = List.hd keyed in
 
       (* (a) The committed envelope's payload is ciphertext, not the plaintext value. *)
@@ -780,13 +783,20 @@ let test_each_write_in_a_batch_is_independently_redactable () =
   with_store (fun store ->
       let replica = create_solo () in
       let v i = Riptide.Value.Scalar (Riptide.Value.String (Printf.sprintf "secret-%d" i)) in
-      Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(sink_of store)
+      Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(sink_of store)
         [ write_of (v 0); write_of (v 1); write_of (v 2) ];
       let keyed = Batch_commit.committed_envelopes_keyed replica in
-      Alcotest.(check int) "three committed envelopes" 3 (List.length keyed);
-      Alcotest.(check int) "three distinct event_ids" 3
+      (* 3 real, encrypted writes plus the batch's own synthetic (unencrypted)
+         authorization-decision write (task-master Task 5, subtask 5), always appended LAST -- so
+         the first 3 entries are still exactly [write_of (v 0); write_of (v 1); write_of (v 2)],
+         in order. *)
+      Alcotest.(check int) "three real committed envelopes, plus one synthetic authorization-decision \
+                            write"
+        4 (List.length keyed);
+      Alcotest.(check int) "four distinct event_ids (one per write, including the synthetic one)" 4
         (List.length (List.sort_uniq compare (List.map fst keyed)));
-      let event_id1, envelope1 = List.nth keyed 1 in
+      let real_writes_keyed = List.filteri (fun i _ -> i < 3) keyed in
+      let event_id1, envelope1 = List.nth real_writes_keyed 1 in
       Redaction_store.redact store ~event_id:event_id1;
       List.iteri
         (fun i (event_id, (e : Riptide.Envelope.envelope)) ->
@@ -795,7 +805,7 @@ let test_each_write_in_a_batch_is_independently_redactable () =
             (Printf.sprintf "write %d recoverable = %b" i (i <> 1))
             true
             (Redaction_store.decrypt_value store ~event_id e.payload = expected))
-        keyed;
+        real_writes_keyed;
       ignore envelope1)
 
 (* A retry of an already-committed idempotency_key must NOT re-encrypt: doing so would mint a
@@ -804,14 +814,15 @@ let test_each_write_in_a_batch_is_independently_redactable () =
 let test_retrying_an_already_committed_batch_does_not_orphan_its_dek () =
   with_store (fun store ->
       let replica = create_solo () in
-      let h = Batch_commit.create ~replica () in
+      let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
       Batch_commit.propose h ~idempotency_key:"k1" ~encryption:(sink_of store)
         [ write_of secret ];
       let event_id, envelope = List.hd (Batch_commit.committed_envelopes_keyed replica) in
       Batch_commit.propose h ~idempotency_key:"k1" ~encryption:(sink_of store)
         [ write_of secret ];
-      Alcotest.(check int) "the retry added no second envelope" 1
-        (List.length (Batch_commit.committed_envelopes replica));
+      Alcotest.(check int) "the retry added no second envelope -- still the one encrypted write plus \
+                            its own synthetic authorization-decision write"
+        2 (List.length (Batch_commit.committed_envelopes replica));
       Alcotest.(check bool) "the committed ciphertext still decrypts after the retry" true
         (Redaction_store.decrypt_value store ~event_id envelope.Riptide.Envelope.payload = Some secret))
 
@@ -881,7 +892,7 @@ let with_store_and_cluster ~replica_count f =
 let test_retrying_an_uncommitted_batch_in_a_cluster_keeps_it_decryptable () =
   with_store_and_cluster ~replica_count:3 (fun ~store ~replicas ~deliver_all ->
       let primary = replicas.(0) in
-      let h = Batch_commit.create ~replica:primary () in
+      let h = Batch_commit.create ~replica:primary ~authorize:Batch_commit.allow_all () in
       Batch_commit.propose h ~idempotency_key:"k1" ~encryption:(sink_of store) [ write_of secret ];
       (* The window itself, asserted rather than assumed -- if commit were synchronous here (as it
          is for replica_count = 1) this test would be testing nothing. *)
@@ -900,7 +911,9 @@ let test_retrying_an_uncommitted_batch_in_a_cluster_keeps_it_decryptable () =
       Alcotest.(check int) "the batch committed via a real f + 1 = 2 PrepareOk quorum" 1
         (Replica.commit_number primary);
       let keyed = Batch_commit.committed_envelopes_keyed primary in
-      Alcotest.(check int) "exactly one committed envelope" 1 (List.length keyed);
+      Alcotest.(check int) "exactly one committed envelope, plus its own synthetic \
+                            authorization-decision write"
+        2 (List.length keyed);
       let event_id, envelope = List.hd keyed in
       (* The whole point: the record that actually committed is still readable. Pre-fix this is
          None -- the keystore holds the retry's DEK, the log holds the first attempt's
@@ -917,7 +930,7 @@ let test_retrying_an_uncommitted_batch_in_a_cluster_keeps_it_decryptable () =
 let test_unencrypted_retry_in_the_uncommitted_window_is_still_a_no_op () =
   with_store_and_cluster ~replica_count:3 (fun ~store:_ ~replicas ~deliver_all ->
       let primary = replicas.(0) in
-      let h = Batch_commit.create ~replica:primary () in
+      let h = Batch_commit.create ~replica:primary ~authorize:Batch_commit.allow_all () in
       Batch_commit.propose h ~idempotency_key:"k1" [ write_of secret ];
       Alcotest.(check int) "appended, not committed" 0 (Replica.commit_number primary);
       Batch_commit.propose h ~idempotency_key:"k1" [ write_of secret ];
@@ -925,7 +938,9 @@ let test_unencrypted_retry_in_the_uncommitted_window_is_still_a_no_op () =
         (List.length (Replica.entries primary));
       deliver_all ();
       let envelopes = Batch_commit.committed_envelopes primary in
-      Alcotest.(check int) "one committed envelope" 1 (List.length envelopes);
+      Alcotest.(check int) "one committed envelope, plus its own synthetic authorization-decision \
+                            write"
+        2 (List.length envelopes);
       Alcotest.(check bool) "payload is the plaintext value, untouched" true
         ((List.hd envelopes).Riptide.Envelope.payload = secret))
 
@@ -943,7 +958,7 @@ let test_encryption_with_merge_key_is_rejected () =
            "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
             (~encryption): the materialized accumulator is outside the redaction keystore, so \
             deleting the DEK would not erase it")
-        (fun () -> Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" ~encryption:(sink_of store) [ w ]);
+        (fun () -> Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" ~encryption:(sink_of store) [ w ]);
       Alcotest.(check int) "nothing was committed" 0
         (List.length (Batch_commit.committed_envelopes replica)))
 
@@ -951,9 +966,10 @@ let test_encryption_with_merge_key_is_rejected () =
    derived event_ids are still available for callers that key anything else off them. *)
 let test_without_encryption_payloads_are_unchanged () =
   let replica = create_solo () in
-  Batch_commit.propose (Batch_commit.create ~replica ()) ~idempotency_key:"k1" [ write_of secret ];
+  Batch_commit.propose (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()) ~idempotency_key:"k1" [ write_of secret ];
   let envelopes = Batch_commit.committed_envelopes replica in
-  Alcotest.(check int) "one committed envelope" 1 (List.length envelopes);
+  Alcotest.(check int) "one committed envelope, plus its own synthetic authorization-decision write"
+    2 (List.length envelopes);
   Alcotest.(check bool) "payload is the plaintext value, untouched" true
     ((List.hd envelopes).Riptide.Envelope.payload = secret)
 

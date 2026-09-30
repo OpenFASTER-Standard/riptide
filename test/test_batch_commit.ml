@@ -24,8 +24,11 @@ let w ~actor ~causation ~correlation ?(merge_key = None) payload : Batch_commit.
    this file that only needs propose's pre-existing per-call ?require_encryption override (not
    the new handle-level policy itself, which gets its own dedicated tests below) can build a
    plain, default-policy handle inline via this helper rather than repeating
-   [Batch_commit.create ~replica ()] at every call site. *)
-let bc ?require_encryption replica = Batch_commit.create ~replica ?require_encryption ()
+   [Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ()] at every call site.
+   [~authorize:Batch_commit.allow_all] is this file's own explicit, visible "no real policy yet"
+   choice (task-master Task 5, subtask 5) -- every test below that needs to exercise a real
+   [Deny] decision builds its own handle directly instead of going through this helper. *)
+let bc ?require_encryption replica = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ?require_encryption ()
 
 (* Real encryption_sink construction against a real Redaction_store, for the
    require_encryption tests below -- reusing test_redaction.ml's own with_tmp_dir/with_store/
@@ -223,8 +226,9 @@ let test_malformed_batch_does_not_burn_its_idempotency_key () =
   let envelopes = Batch_commit.committed_envelopes t in
   Alcotest.(check int)
     "a later well-formed batch under the SAME key DOES materialize -- the malformed attempt never \
-     burned the key"
-    1 (List.length envelopes);
+     burned the key -- as its own real write plus its synthetic authorization-decision write \
+     (task-master Task 5, subtask 5)"
+    2 (List.length envelopes);
   match (List.hd envelopes).payload with
   | Value.Record [ ("name", Value.Scalar (Value.String name)) ] ->
     Alcotest.(check string) "the well-formed retry's own payload lands" "real-retry" name
@@ -351,7 +355,11 @@ let test_propose_produces_correct_envelopes () =
       w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "r2") (record_value "second");
     ];
   let envelopes = Batch_commit.committed_envelopes t in
-  Alcotest.(check int) "propose commits both writes" 2 (List.length envelopes);
+  (* 2 real writes + 1 synthetic authorization-decision write (task-master Task 5, subtask 5) --
+     see test_propose_appends_a_synthetic_authorization_decision_write below for a test dedicated
+     to that write's own shape. *)
+  Alcotest.(check int) "propose commits both writes, plus the synthetic authorization-decision write"
+    3 (List.length envelopes);
   Alcotest.(check bool) "the resulting chain verifies" true (Log.verify_chain_list envelopes)
 
 let test_propose_skips_a_key_already_committed () =
@@ -360,8 +368,9 @@ let test_propose_skips_a_key_already_committed () =
   let actor = "actor-1" in
   Batch_commit.propose h ~idempotency_key:"dup"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "first-call") ];
-  Alcotest.(check int) "one write committed after the first call" 1
-    (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int) "one write plus its synthetic authorization-decision write committed after \
+                        the first call"
+    2 (List.length (Batch_commit.committed_envelopes t));
   (* A second call with the SAME key -- must be a genuine no-op on the underlying replicated log,
      not just "produces the same decoded result by coincidence": assert op_number (the raw log
      length) does NOT grow, proving propose itself skipped calling Replica.propose at all, rather
@@ -371,7 +380,7 @@ let test_propose_skips_a_key_already_committed () =
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "second-call") ];
   Alcotest.(check int) "propose did not grow the underlying replicated log for a duplicate key"
     op_number_before (List.length (Replica.entries t));
-  Alcotest.(check int) "still exactly one committed envelope, from the first call" 1
+  Alcotest.(check int) "still exactly the first call's two envelopes, none from the second call" 2
     (List.length (Batch_commit.committed_envelopes t))
 
 (* This test used to pin the OPPOSITE behaviour, under the name
@@ -409,8 +418,9 @@ let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
   let actor = "actor-1" in
   Batch_commit.propose h ~idempotency_key:key
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "lands-fine") ];
-  Alcotest.(check int) "a real batch under the same key is committed, not swallowed" 1
-    (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int) "a real batch under the same key is committed, not swallowed -- its own real \
+                        write plus its synthetic authorization-decision write"
+    2 (List.length (Batch_commit.committed_envelopes t));
   Alcotest.(check int) "and it is the log's first and only entry" 1 (List.length (Replica.entries t))
 
 let test_propose_with_different_keys_both_land () =
@@ -422,7 +432,10 @@ let test_propose_with_different_keys_both_land () =
   Batch_commit.propose h ~idempotency_key:"key-b"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "b") ];
   let envelopes = Batch_commit.committed_envelopes t in
-  Alcotest.(check int) "two distinct keys both commit" 2 (List.length envelopes);
+  (* 2 distinct keys x (1 real write + 1 synthetic authorization-decision write each) = 4. *)
+  Alcotest.(check int) "two distinct keys both commit, each with its own synthetic \
+                        authorization-decision write"
+    4 (List.length envelopes);
   Alcotest.(check bool) "the resulting chain verifies" true (Log.verify_chain_list envelopes)
 
 (* Deployment-level policy primitive (task-master subtask 4.5): a deployment that wants to
@@ -445,7 +458,9 @@ let test_require_encryption_true_with_a_real_sink_succeeds () =
       let actor = "actor-1" in
       Batch_commit.propose (bc t) ~idempotency_key:"k2" ~require_encryption:true ~encryption:(sink_of store)
         [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ];
-      Alcotest.(check int) "the batch committed" 1 (List.length (Batch_commit.committed_envelopes t)))
+      Alcotest.(check int) "the batch committed: the encrypted write plus its own (unencrypted) \
+                            synthetic authorization-decision write"
+        2 (List.length (Batch_commit.committed_envelopes t)))
 
 (* Review Focus: require_encryption must not mask or confuse the pre-existing merge_key +
    ~encryption rejection (from the just-merged plan's own Task 6) -- one clear failure, not two
@@ -482,7 +497,7 @@ let test_require_encryption_true_still_raises_for_the_pre_existing_merge_key_rea
    that forgot ~encryption. *)
 let test_handle_level_require_encryption_catches_a_call_site_that_forgot_it () =
   let t = create_solo () in
-  let h = Batch_commit.create ~replica:t ~require_encryption:true () in
+  let h = Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all ~require_encryption:true () in
   let actor = "actor-1" in
   Alcotest.check_raises
     "a propose call with no ~encryption sink is refused by the handle's own stored policy, with no \
@@ -499,12 +514,96 @@ let test_handle_level_require_encryption_catches_a_call_site_that_forgot_it () =
    call site even under a deployment-wide encrypt-everything policy. *)
 let test_per_call_require_encryption_override_still_works_against_a_true_handle_policy () =
   let t = create_solo () in
-  let h = Batch_commit.create ~replica:t ~require_encryption:true () in
+  let h = Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all ~require_encryption:true () in
   let actor = "actor-1" in
   Batch_commit.propose h ~idempotency_key:"k-handle-override" ~require_encryption:false
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ];
-  Alcotest.(check int) "the plaintext batch committed despite the handle's own require_encryption:true" 1
-    (List.length (Batch_commit.committed_envelopes (Batch_commit.replica h)))
+  Alcotest.(check int) "the plaintext batch committed despite the handle's own require_encryption:true \
+                        -- the write plus its synthetic authorization-decision write"
+    2 (List.length (Batch_commit.committed_envelopes (Batch_commit.replica h)))
+
+(* Task-master Task 5, subtask 5: the universal, mandatory authorization checkpoint. See
+   batch_commit.mli's own [create]/[propose] doc comments for the full contract this and the two
+   tests below pin. *)
+let test_propose_refuses_the_whole_batch_when_any_write_is_denied () =
+  let t = create_solo () in
+  let deny_second = ref false in
+  let authorize (w : Batch_commit.write) =
+    if !deny_second && w.merge_key = Some "b" then Batch_commit.Deny "test denial" else Batch_commit.Allow
+  in
+  let h = Batch_commit.create ~replica:t ~authorize () in
+  let actor = "actor-1" in
+  Batch_commit.propose h ~idempotency_key:"k1"
+    [
+      w ~actor ~causation:(fake_event_id "c1") ~correlation:(fake_event_id "c1") ~merge_key:(Some "a")
+        (record_value "1");
+      w ~actor ~causation:(fake_event_id "c1") ~correlation:(fake_event_id "c1") ~merge_key:(Some "b")
+        (record_value "2");
+    ];
+  deny_second := true;
+  let before = Batch_commit.authorization_denials () in
+  Batch_commit.propose h ~idempotency_key:"k2"
+    [
+      w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "c2") ~merge_key:(Some "a")
+        (record_value "3");
+      w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "c2") ~merge_key:(Some "b")
+        (record_value "4");
+    ];
+  Alcotest.(check int) "denial counted" (before + 1) (Batch_commit.authorization_denials ());
+  (* k1's own 2 writes plus its own synthetic authorization-decision write = 3. k2 was denied on
+     its second write, so NONE of k2's writes -- not even the first, allowed one -- ever reached
+     the log: a batch is one atomic, indivisible unit, so a single denied write refuses the whole
+     batch, not just itself. *)
+  Alcotest.(check int) "the whole batch was refused, not just the denied write" 3
+    (List.length (Batch_commit.committed_envelopes t))
+
+(* Directly pins the synthetic authorization-decision write's own shape (batch_commit.mli's own
+   [propose] "Authorization" section) -- the count-only assertions elsewhere in this file (and
+   across the rest of this codebase's test suite, migrated by this same task) only prove ONE extra
+   envelope appears per successfully-proposed batch; this test proves what that envelope actually
+   IS. *)
+let test_propose_appends_a_synthetic_authorization_decision_write () =
+  let t = create_solo () in
+  let h = Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all () in
+  let actor = "actor-1" in
+  let c = fake_event_id "c" and r = fake_event_id "r" in
+  Batch_commit.propose h ~idempotency_key:"k-authz-write"
+    [ w ~actor ~causation:c ~correlation:r (record_value "real-write") ];
+  let envelopes = Batch_commit.committed_envelopes t in
+  Alcotest.(check int) "one real write plus one synthetic authorization-decision write" 2
+    (List.length envelopes);
+  let real_envelope = List.nth envelopes 0 and authz_envelope = List.nth envelopes 1 in
+  Alcotest.(check string) "the real write's own actor is unaffected" actor real_envelope.actor;
+  Alcotest.(check string) "the synthetic write's actor identifies it as the authz module"
+    "riptide.module.authz" authz_envelope.actor;
+  Alcotest.(check bool)
+    "the synthetic write is causally linked to the batch's own first write, not freestanding" true
+    (String.equal authz_envelope.causation c && String.equal authz_envelope.correlation r);
+  Alcotest.(check bool) "the resulting chain, including the synthetic write, verifies end to end" true
+    (Log.verify_chain_list envelopes);
+  match authz_envelope.payload with
+  | Value.Record fields -> (
+    match (List.assoc_opt "idempotency_key" fields, List.assoc_opt "decision" fields) with
+    | Some (Value.Scalar (Value.String key)), Some (Value.Scalar (Value.String decision)) ->
+      Alcotest.(check string) "the decision payload records this batch's own idempotency_key"
+        "k-authz-write" key;
+      Alcotest.(check string) "the decision payload records the allow decision" "allow" decision
+    | _ -> Alcotest.fail "unexpected authorization-decision payload field shape")
+  | _ -> Alcotest.fail "unexpected authorization-decision payload shape"
+
+let test_allow_all_is_the_explicit_no_policy_choice () =
+  (* Every existing test/call site's own use of ~authorize:Batch_commit.allow_all continues to
+     behave exactly as it did before this task, modulo the one synthetic
+     authorization-decision write every successfully-proposed batch now earns (its own shape
+     pinned once, directly, by test_propose_appends_a_synthetic_authorization_decision_write
+     above -- not re-pinned at every migrated call site). *)
+  let t = create_solo () in
+  let h = Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all () in
+  let actor = "actor-1" in
+  Batch_commit.propose h ~idempotency_key:"k"
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "c") (record_value "1") ];
+  Alcotest.(check int) "committed: the real write plus its synthetic authorization-decision write" 2
+    (List.length (Batch_commit.committed_envelopes t))
 
 let tests =
   [
@@ -537,4 +636,10 @@ let tests =
       test_handle_level_require_encryption_catches_a_call_site_that_forgot_it);
     ("a per-call require_encryption:false override still works against a true handle policy", `Quick,
       test_per_call_require_encryption_override_still_works_against_a_true_handle_policy);
+    ("a denied write refuses the whole batch, not just itself", `Quick,
+      test_propose_refuses_the_whole_batch_when_any_write_is_denied);
+    ("an allowed batch's own synthetic authorization-decision write has the expected shape", `Quick,
+      test_propose_appends_a_synthetic_authorization_decision_write);
+    ("allow_all is the explicit, visible no-policy-yet choice", `Quick,
+      test_allow_all_is_the_explicit_no_policy_choice);
   ]
