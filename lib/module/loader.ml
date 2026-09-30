@@ -886,6 +886,25 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
   let rec loop () = match step () with `Continue -> loop () | `Done result -> result in
   loop ()
 
+(* Never-raising, tolerated-error close -- the same idempotent-close idiom [cleanup] above already
+   relies on, factored out so the setup path below can reuse it verbatim rather than re-deriving it. *)
+let close_quietly fd = try Unix.close fd with Unix.Unix_error _ -> ()
+
+(* Both containment pipes, or nothing: if the SECOND [Unix.pipe] fails (EMFILE/ENFILE under a real
+   fd-table exhaustion -- not exotic, it is the same resource class Task 3's own [cleanup] exists to
+   protect), the first pair's two descriptors are closed before the failure propagates. Without this
+   they leaked, permanently, on exactly the path where descriptors are already scarce (re-review
+   finding, which also reproduced [Unix.Unix_error(EMFILE, "pipe", "")] escaping {!invoke} uncaught --
+   see [run_contained]'s own handling below for the second half of that fix). *)
+let create_containment_pipes () =
+  let req_r, req_w = Unix.pipe ~cloexec:false () in
+  match Unix.pipe ~cloexec:false () with
+  | resp_r, resp_w -> (req_r, req_w, resp_r, resp_w)
+  | exception exn ->
+    close_quietly req_r;
+    close_quietly req_w;
+    raise exn
+
 (* Real containment for the (possibly-infinite) guest call: forks a genuine OS process to make
    it, relays any host-function calls the child makes back to the parent's real [host_functions]
    (via [t.sink], flipped to [Relay] only in the child -- see top comment), and (via
@@ -906,25 +925,6 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
    touched) and `test_propose_write_relays_the_hosts_denial_back_to_the_guest` (a status byte the
    guest itself wrote via `i32.store8` came back as the pre-call zero, not the guest's own
    write) -- both real regression tests now, not just a design note. *)
-(* Never-raising, tolerated-error close -- the same idempotent-close idiom [cleanup] above already
-   relies on, factored out so the setup path below can reuse it verbatim rather than re-deriving it. *)
-let close_quietly fd = try Unix.close fd with Unix.Unix_error _ -> ()
-
-(* Both containment pipes, or nothing: if the SECOND [Unix.pipe] fails (EMFILE/ENFILE under a real
-   fd-table exhaustion -- not exotic, it is the same resource class Task 3's own [cleanup] exists to
-   protect), the first pair's two descriptors are closed before the failure propagates. Without this
-   they leaked, permanently, on exactly the path where descriptors are already scarce (re-review
-   finding, which also reproduced [Unix.Unix_error(EMFILE, "pipe", "")] escaping {!invoke} uncaught --
-   see [run_contained]'s own handling below for the second half of that fix). *)
-let create_containment_pipes () =
-  let req_r, req_w = Unix.pipe ~cloexec:false () in
-  match Unix.pipe ~cloexec:false () with
-  | resp_r, resp_w -> (req_r, req_w, resp_r, resp_w)
-  | exception exn ->
-    close_quietly req_r;
-    close_quietly req_w;
-    raise exn
-
 let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
   (* Setup failures ([Unix.pipe], [Unix.fork]) are part of {!invoke}'s ordinary [Error] contract,
      not exceptions it lets through -- and every descriptor already obtained is released on the way

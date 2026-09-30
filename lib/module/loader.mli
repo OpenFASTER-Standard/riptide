@@ -253,23 +253,37 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     and EFBIG) and checks both halves: that [invoke] returns [Error] rather than raising, and that the
     process's own [/proc/self/fd] count is identical either side of the failure. Against the
     unguarded code that same probe reports [PROBE-RESULT raised: Unix.Unix_error(Unix.EMFILE,
-    "pipe", "")] and [PROBE-FDS before=7 after=9] — the escape and the two-descriptor leak, both real.
+    "pipe", "")], and a [PROBE-FDS] count exactly TWO HIGHER after the failed call than before it —
+    the escape and the first pipe's leaked pair, both real. Only that [+2] delta is load-bearing and
+    only it is asserted: the absolute counts depend on how many descriptors the probe process itself
+    happens to hold at startup, which varies by environment, so no specific pair of numbers is quoted
+    here as though it were fixed.
 
-    What remains outside any guard, stated precisely rather than claimed away: the two [Unix.close]
-    calls with which the parent drops the child's own pipe ends immediately after a successful fork.
-    Those close descriptors this same function created moments earlier, so [EBADF] — [close]'s only
-    documented failure for them — is unreachable by construction. Both are re-raised on purpose rather than swallowed — they say the
-    PROCESS is in trouble, not that this one guest call failed, and OCaml convention is not to turn
-    either into an ordinary result. [loader.ml]'s own [step] re-raises them (having run [cleanup]
-    first, so no zombie or descriptor leaks on the way out), [cleanup] itself re-raises rather than
-    retrying them (retrying is exactly wrong for a process already out of resources, and this is the
-    only way [cleanup] can raise at all), and {!Riptide_module.Reactor}'s own dispatch mirrors the
-    same two for the same reason — pinned end to end by
+    {b Why [Out_of_memory] and [Stack_overflow] propagate, and nothing else does.} Each of those two
+    is re-raised on purpose rather than swallowed: each says the PROCESS is in trouble, not that this
+    one guest call failed, and OCaml convention is not to turn either of them into an ordinary
+    result. [loader.ml]'s own [step] re-raises [Out_of_memory]/[Stack_overflow] (having run [cleanup]
+    first, so no zombie or descriptor leaks on the way out); [cleanup] itself re-raises those same two
+    rather than retrying them (retrying is exactly wrong for a process already out of resources, and
+    raising them is the only way [cleanup] can raise at all); and {!Riptide_module.Reactor}'s own
+    dispatch mirrors the pair for the same reason — pinned end to end by
     [test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowing_them] in
     test_module_reactor.ml, where a host closure raising [Stack_overflow] is asserted to propagate
     all the way out. Note the deliberate asymmetry with {!instantiate}, which raises [Failure] for
     its own setup-time rejections: failing to SET UP a guest is the caller's own problem to see
     immediately, whereas failing DURING a guest call is data about the guest.
+
+    (The two exceptions are named outright above rather than carried by a pronoun, deliberately.
+    This paragraph opened with "Both ..." until a re-review found that, after this file was
+    hand-recovered mid-fix-wave, the sentence had come to sit downstream of the [Unix.close]
+    paragraph below and so read as a claim about those calls instead — the third time this one
+    paragraph has been found wrong. Anything that re-introduces a pronoun here re-introduces that
+    failure mode; keep the names.)
+
+    What remains outside any guard, stated precisely rather than claimed away: the two [Unix.close]
+    calls with which the parent drops the child's own pipe ends immediately after a successful fork.
+    Those close descriptors this same function created moments earlier, so [EBADF] — [close]'s only
+    documented failure for them — is unreachable by construction.
 
     **Known, disclosed, deliberately-not-engineered-around interaction**: this test suite's own
     external per-test watchdog (`test_riptide.ml`'s [Suite_timeout], a SIGALRM-driven safety net
