@@ -1907,6 +1907,34 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
   Alcotest.(check bool)
     "the dedicated materialize-write-failure counter observed at least this stall" true
     (Batch_commit.materialize_write_failures () > failures_before);
+  (* Minor 2 (Task 21 review fix round 1): confirm the counted failure really IS the KV backend's
+     size-cap case specifically, not just "some Invalid_argument happened somewhere" -- restoring
+     in spirit the message-content assertion this test used to make by catching the exception
+     escaping [propose] directly, which is no longer possible now that [propose] catches and counts
+     it internally (see the doc comment above). Reproduces it directly instead: calling
+     [M.write materializer ~merge_key:"mk"] with the SAME element that just failed inside [propose]
+     is a pure re-join of the identical current accumulator with the identical new value (the
+     accumulator is unchanged by the failed [propose] call above), so it deterministically hits the
+     identical size cap again and must raise the SAME, narrowly-typed
+     [Riptide_materialize.Materializer.Value_too_large] -- never a bare [Invalid_argument] -- naming
+     the backend's own size limit. *)
+  (match
+     (try
+        M.write materializer ~merge_key:"mk"
+          (G_set.of_list [ Printf.sprintf "element-%04d" !failed_at ]);
+        None
+      with Riptide_materialize.Materializer.Value_too_large msg -> Some msg)
+   with
+  | Some msg ->
+    Alcotest.(check bool)
+      "the reproduced failure is specifically Value_too_large and names the backend's value-size \
+       limit, confirming the counted failure is the size-cap case, not some other Invalid_argument"
+      true
+      (contains ~needle:"exceeds this store's max value size" msg)
+  | None ->
+    Alcotest.fail
+      "expected Materializer.Value_too_large to be reproducible by re-joining the same failing \
+       element into the same (unchanged) accumulator");
   Alcotest.(check bool)
     "the fold really does hit File_kv_store's 4096-byte value cap (measured: at the 195th element)"
     true

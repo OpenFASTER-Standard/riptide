@@ -1,3 +1,24 @@
+exception Value_too_large of string
+(** Raised by {!Make.write} when the merged accumulator's encoded size exceeds the underlying
+    [KV]'s own value-size bound (see {!Make.write}'s own doc comment for the full account of when
+    and why this happens, and what it means for the accumulator). Carries the same message
+    [KV.put]'s own [Invalid_argument] raised, unchanged.
+
+    Declared here, at this module's own top level, rather than nested inside {!Make}'s functor
+    body: {!Make} is a generative functor, so a type or exception declared inside its body would
+    be a genuinely different one per application, unusable by a caller that only ever holds an
+    erased sink over an unknown concrete [L]/[KV] (see
+    {!Riptide_batch_commit.Batch_commit.materialize_sink}). One shared, top-level exception lets
+    such a caller catch this ONE specific, documented failure shape by name regardless of which
+    lattice or KV backend actually raised it -- the same precedent
+    {!Riptide_vsr.Replica.Sender_mismatch} already sets in lib/vsr/replica.mli.
+
+    {b Deliberately narrower than "any [Invalid_argument] raised anywhere inside [write]"}: only
+    the [KV.put] call itself is wrapped and translated into this exception. A [decode]/[encode]
+    bug of the caller's own (e.g. {!Riptide.Value.canonical_encode}'s own documented
+    duplicate-Record/Map-key [Invalid_argument]) is a genuine value-layer contract violation and
+    still propagates as a plain, uncaught [Invalid_argument] -- never conflated with this. *)
+
 module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_intf.S) : sig
   type t
   (** Incremental, lattice-based accumulator over a durable key-value store. Each [merge_key]
@@ -88,7 +109,10 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       bound -- while a real [KV] backend's single value is bounded
       ({!Riptide_storage.File_kv_store.max_value_size}, 4096 bytes, is the only backend this repo
       ships). Once [encode]'s output for the merged accumulator exceeds that, [KV.put] raises
-      [Invalid_argument] and nothing is stored, so THIS write is silently absent from the
+      [Invalid_argument], which [write] catches -- narrowly, wrapped tightly around just that one
+      call, {b not} around [decode]/[L.join]/[encode] themselves, see {!Value_too_large}'s own doc
+      comment for why that narrowness is load-bearing -- and re-raises as {!Value_too_large} of the
+      same message. Nothing is stored, so THIS write is silently absent from the
       accumulator while remaining wherever the caller put it -- in
       {!Riptide_batch_commit.Batch_commit.propose}'s case, durably committed to the replicated log,
       since the fold deliberately runs only after commit. The accumulator is left at its last good

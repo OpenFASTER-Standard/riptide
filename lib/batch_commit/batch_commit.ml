@@ -157,11 +157,14 @@ type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value
 
 (* ---- per-write materialize failure counting (task-master audit-remediation Task 21) ----
 
-   {!Riptide_materialize.Materializer.write} can raise [Invalid_argument] when the joined
-   accumulator's encoded size exceeds the KV backend's own [max_value_size] -- see that function's
-   own WARNING in materializer.mli for the full, deliberately-unfixed account (unbounded
-   accumulator growth vs. a bounded KV value size; NOT relitigated here). Before this counter and
-   {!materialize_write_catching} existed, that exception propagated straight out of whichever loop
+   {!Riptide_materialize.Materializer.write} can raise {!Riptide_materialize.Materializer.Value_too_large}
+   when the joined accumulator's encoded size exceeds the KV backend's own [max_value_size] -- see
+   that function's own WARNING in materializer.mli for the full, deliberately-unfixed account
+   (unbounded accumulator growth vs. a bounded KV value size; NOT relitigated here). Before this
+   counter and {!materialize_write_catching} existed, that exception (then a bare [Invalid_argument]
+   -- {!Riptide_materialize.Materializer.Value_too_large} was introduced by this same task's review
+   fix round specifically so this catch could stop being a blanket [Invalid_argument], see
+   {!materialize_write_catching}'s own comment below) propagated straight out of whichever loop
    invoked [write] -- [propose]'s own single-batch fold, or [materialize_up_to]'s replay walk --
    aborting every OTHER write still queued in that loop, not just the one that actually overflowed.
 
@@ -180,13 +183,28 @@ let materialize_write_failures_count = ref 0
 
 let materialize_write_failures () = !materialize_write_failures_count
 
-(* Catches ONLY [Invalid_argument] -- {!Riptide_materialize.Materializer.write}'s own documented
-   single failure shape -- and nothing else, matching this codebase's own established discipline
-   for narrow, documented-shape catches elsewhere: see {!Riptide_vsr.Replica.durable_append}'s own
+(* Catches ONLY {!Riptide_materialize.Materializer.Value_too_large} -- and NOT a blanket
+   [Invalid_argument] -- matching this codebase's own established discipline for narrow,
+   documented-shape catches elsewhere: see {!Riptide_vsr.Replica.durable_append}'s own
    [Storage_fault] classification in lib/vsr/replica.ml for the STYLE precedent (catch exactly the
    documented shape, count it, and let anything else propagate as a genuine contract violation
-   rather than laundering it into "safe to skip"). An unrecognized exception shape out of [write]
-   is a backend contract violation and must still crash loudly, not be absorbed here.
+   rather than laundering it into "safe to skip").
+
+   Review fix (this task's own review, round 1): the FIRST cut of this helper caught a blanket
+   [Invalid_argument], which is wider than intended -- [sink.write] for a real [Materializer.t]
+   runs [Materializer.write]'s WHOLE body (decode, [L.join], AND [encode]), not just the final
+   [KV.put] size-cap check, and a caller's own [encode] (e.g.
+   {!Riptide.Value.canonical_encode}'s own documented duplicate-Record/Map-key rejection) can raise
+   an UNRELATED [Invalid_argument] that is a genuine value-layer bug, not the size cap. Catching
+   every [Invalid_argument] here would have silently absorbed and miscounted that as "the
+   documented size cap" the moment a real caller or a Map-merging lattice used this path (latent
+   today only because the one lattice this repo ships, [Last_write_wins], has a trivial scalar
+   encode that cannot hit it). {!Riptide_materialize.Materializer.write} now raises the narrowly
+   distinct {!Riptide_materialize.Materializer.Value_too_large} for exactly the size-cap case
+   (wrapped tightly around just its own [KV.put] call -- see that exception's own doc comment), so
+   catching that ONE exception type here, instead of any [Invalid_argument], is what actually
+   restores the "an unrecognized exception shape propagates as a contract violation" guarantee for
+   this call site specifically.
 
    Shared by BOTH [propose]'s materialize step and [materialize_up_to]'s replay loop, so the two
    loops cannot drift into different catch behaviour -- exactly the "one shared helper" this task
@@ -194,7 +212,7 @@ let materialize_write_failures () = !materialize_write_failures_count
 let materialize_write_catching (sink : materialize_sink) ~(merge_key : string) (payload : Value.value) : unit =
   match sink.write ~merge_key payload with
   | () -> ()
-  | exception Invalid_argument _ -> incr materialize_write_failures_count
+  | exception Riptide_materialize.Materializer.Value_too_large _ -> incr materialize_write_failures_count
 
 (* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
    step: walks the committed prefix up to [through_commit_number] (not just the one batch
@@ -402,10 +420,16 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
 
        Reading the committed bytes closes both structurally rather than case by case: a committed
        batch's own [merge_key]s and payloads are the only thing that can ever be materialized, so
-       the accumulator is a function of the committed log alone -- the same input every replica
-       agrees on -- and an encrypted batch (whose committed writes all carry [merge_key = None],
-       enforced by the guard above at the only moment encryption can happen) can contribute
-       nothing to it no matter what a later caller passes.
+       the accumulator is a function of the committed log plus each key's own size-bound write
+       history -- {b not} of the committed log alone (task-master audit-remediation Task 21
+       narrowed this claim; see [materialize_write_failures] below and batch_commit.mli's own
+       corrected account for why: a write can be silently and PERMANENTLY skipped if
+       {!Riptide_materialize.Materializer.write} raises [Value_too_large] for it, but that outcome
+       is itself a deterministic function of the write's own payload and the KV backend's fixed
+       size bound, never of timing or which replica evaluates it, so this is still the same input
+       every replica agrees on) -- and an encrypted batch (whose committed writes all carry
+       [merge_key = None], enforced by the guard above at the only moment encryption can happen)
+       can contribute nothing to it no matter what a later caller passes.
 
        [None] here is exactly the "not committed on this replica (yet)" case the old
        [already_committed t = false] test covered before this function replaced it: nothing to

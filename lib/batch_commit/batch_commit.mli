@@ -156,10 +156,13 @@ val materialize_write_failures : unit -> int
 (** [materialize_write_failures ()] is how many individual writes {!propose}'s own materialize step
     and {!materialize_up_to}'s replay walk have, TOGETHER, had refused by
     {!Riptide_materialize.Materializer.write} over this process's lifetime -- i.e. how many times
-    [write] raised [Invalid_argument] because the joined accumulator's encoded size exceeded the KV
-    backend's own bound (see {!Riptide_materialize.Materializer.write}'s own WARNING for the full,
-    deliberately-unfixed account of why that can happen; this counter does not change when or
-    whether it happens, only whether a caller can OBSERVE that it did).
+    [write] raised {!Riptide_materialize.Materializer.Value_too_large} because the joined
+    accumulator's encoded size exceeded the KV backend's own bound (see
+    {!Riptide_materialize.Materializer.write}'s own WARNING for the full, deliberately-unfixed
+    account of why that can happen; this counter does not change when or whether it happens, only
+    whether a caller can OBSERVE that it did). Counts ONLY that one, narrowly-classified exception,
+    never a blanket [Invalid_argument] -- see {!Riptide_materialize.Materializer.Value_too_large}'s
+    own doc comment for exactly what is and is not counted here, and why the distinction matters.
 
     Shaped like {!Riptide_vsr.Replica.append_refusals} on purpose -- {b a monotonic,
     process-lifetime count that never resets}, so the useful reading is a delta between two samples
@@ -172,8 +175,9 @@ val materialize_write_failures : unit -> int
     {!Riptide_vsr.Replica.append_refusals} itself, which would couple that lower, more foundational
     module to a failure mode entirely of this higher one's own making.
 
-    Before this counter existed (task-master audit-remediation Task 21), a write's
-    [Invalid_argument] propagated straight out of whichever loop called it, silently aborting every
+    Before this counter existed (task-master audit-remediation Task 21), a write's overflow
+    (then a bare [Invalid_argument] -- {!Riptide_materialize.Materializer.Value_too_large} did not
+    exist yet either) propagated straight out of whichever loop called it, silently aborting every
     OTHER write still queued in that same loop -- see {!propose} and {!materialize_up_to}'s own doc
     comments for the corrected account of what happens to a write like this now (counted here, and
     skipped, rather than aborting anything past it). *)
@@ -359,10 +363,11 @@ val propose :
     - {b The accumulator is a function of the committed log plus each key's own size-bound write
       history}, not of the committed log alone (task-master audit-remediation Task 21 narrowed this
       claim: see {!materialize_write_failures} for why). Both this function and
-      {!materialize_up_to} now catch a per-write [Invalid_argument] out of
-      {!Riptide_materialize.Materializer.write} (its own KV backend's value-size bound exceeded --
-      see that function's own WARNING), count it via {!materialize_write_failures}, and move on to
-      the next write rather than aborting -- so a write can be silently and PERMANENTLY skipped,
+      {!materialize_up_to} now catch a per-write {!Riptide_materialize.Materializer.Value_too_large}
+      out of {!Riptide_materialize.Materializer.write} (its own KV backend's value-size bound
+      exceeded -- see that function's own WARNING), count it via {!materialize_write_failures}, and
+      move on to the next write rather than aborting -- so a write can be silently and PERMANENTLY
+      skipped,
       exactly like {!Riptide_materialize.Materializer.write}'s own already-documented "a later,
       smaller write to the same key still succeeds, and the gap never surfaces again" behaviour.
       This is still every real replica's accumulator, not a source of divergence: whether a given

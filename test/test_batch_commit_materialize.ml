@@ -592,12 +592,19 @@ let small_write ~merge_key ~value_str =
     merge_key = Some merge_key;
   }
 
-(* Tolerates today's pre-fix behaviour (Materializer.write's Invalid_argument propagating straight
-   out of propose/materialize_up_to) without asserting on it either way -- this test's whole point
-   is what happens to the OTHER write/batch afterwards, not whether the call itself raises.
-   Post-fix, neither loop ever raises for this documented failure shape at all, so this becomes a
-   no-op try around a call that always returns normally. *)
-let tolerating_the_known_overflow_exception f = try f () with Invalid_argument _ -> ()
+(* Tolerates today's pre-fix behaviour (Materializer.write's overflow exception propagating
+   straight out of propose/materialize_up_to) without asserting on it either way -- this test's
+   whole point is what happens to the OTHER write/batch afterwards, not whether the call itself
+   raises. Post-fix, neither loop ever raises for this documented failure shape at all, so this
+   becomes a no-op try around a call that always returns normally.
+
+   Catches {!Riptide_materialize.Materializer.Value_too_large} specifically, matching
+   [materialize_write_catching]'s own narrowed catch (Task 21 review fix round 1, Important 2) --
+   {b not} a blanket [Invalid_argument]: this helper exists only to tolerate the one documented,
+   pre-fix escape shape, and a genuinely different [Invalid_argument] (e.g. a real bug elsewhere in
+   the call chain) must still fail this test loudly rather than being silently swallowed here too. *)
+let tolerating_the_known_overflow_exception f =
+  try f () with Riptide_materialize.Materializer.Value_too_large _ -> ()
 
 let test_one_oversized_write_in_a_batch_does_not_block_sibling_materialization () =
   Eio_main.run @@ fun env ->
@@ -649,6 +656,39 @@ let test_restart_replay_does_not_permanently_stop_after_one_poisoned_key () =
         true
         (Batch_commit.materialize_write_failures () > failures_before))
 
+(* Minor 1 (Task 21 review fix round 1): the test above only ever exercised materialize_up_to's
+   OUTER loop continuing past a poisoned BATCH (one write per batch, across two batches) -- it
+   never proved materialize_up_to's own INNER loop (the one over a single batch's own writes)
+   continues past a poisoned WRITE to a SIBLING write in that SAME batch, the shape
+   test_one_oversized_write_in_a_batch_does_not_block_sibling_materialization above already proves
+   for [propose]'s materialize step. Deleting materialize_write_catching's use inside
+   materialize_up_to's own inner [List.iter] (while leaving it in propose's) would leave every
+   existing materialize_up_to test green, since none of them puts two merge_key writes in one
+   batch. This closes that gap directly. *)
+let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned_batch () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      (* One batch, two writes, no ~materialize sink -- nothing materialized synchronously;
+         materialize_up_to alone drains it below, against a fresh materializer. *)
+      Batch_commit.propose replica ~idempotency_key:"k-mixed-batch-replay"
+        [ poison_write ~merge_key:"poison-mk2"; small_write ~merge_key:"sibling-mk2" ~value_str:"sibling-value2" ];
+      Alcotest.(check int) "one batch (op-number) committed" 1 (Replica.commit_number replica);
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      let failures_before = Batch_commit.materialize_write_failures () in
+      tolerating_the_known_overflow_exception (fun () ->
+          Batch_commit.materialize_up_to replica ~materialize:sink
+            ~through_commit_number:(Replica.commit_number replica));
+      let sibling = M.read materializer ~merge_key:"sibling-mk2" in
+      Alcotest.(check bool)
+        "the sibling write in the SAME poisoned batch still materialized via materialize_up_to's \
+         own inner loop"
+        true (sibling <> Last_write_wins.bottom);
+      Alcotest.(check bool) "the poisoned write was counted as a materialize failure" true
+        (Batch_commit.materialize_write_failures () > failures_before))
+
 let tests =
   [
     ( "a write's own merge_key survives WAL ring eviction that genuinely destroys the raw entry",
@@ -682,4 +722,7 @@ let tests =
     ( "materialize_up_to's restart replay does not permanently stop after one poisoned key -- a \
        later batch still materializes (Task 21)",
       `Quick, test_restart_replay_does_not_permanently_stop_after_one_poisoned_key );
+    ( "materialize_up_to's own inner loop continues to a sibling write within the same poisoned \
+       batch (Task 21 review fix round 1, Minor 1)",
+      `Quick, test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned_batch );
   ]

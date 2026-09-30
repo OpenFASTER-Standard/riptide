@@ -1,3 +1,8 @@
 (library
  (name riptide_batch_commit)
- (libraries riptide riptide_vsr))
+ ; riptide_materialize is depended on ONLY for its top-level, lattice/KV-independent
+ ; Materializer.Value_too_large exception (see batch_commit.ml's materialize_write_catching) --
+ ; this module still never becomes a functor over, or otherwise hardcodes, a concrete
+ ; Riptide_lattice.Lattice_intf.S/Riptide_storage.Kv_store_intf.S choice; materialize_sink stays
+ ; the same erased `write : merge_key:string -> Value.value -> unit` closure it always was.
+ (libraries riptide riptide_vsr riptide_materialize))
