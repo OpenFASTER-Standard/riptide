@@ -1462,7 +1462,9 @@ let make_lww_materializer ~env ~sw dir =
   (materializer, sink)
 
 let propose_lww_write replica ~idempotency_key ~timestamp ~value_str =
-  Riptide_batch_commit.Batch_commit.propose replica ~idempotency_key
+  Riptide_batch_commit.Batch_commit.propose
+    (Riptide_batch_commit.Batch_commit.create ~replica ())
+    ~idempotency_key
     [
       {
         Riptide_batch_commit.Batch_commit.actor = "actor-1";

@@ -19,6 +19,14 @@ let create_solo () =
 let w ~actor ~causation ~correlation ?(merge_key = None) payload : Batch_commit.write =
   { actor; causation; correlation; payload; merge_key }
 
+(* Batch_commit.propose now takes a Batch_commit.t handle (task-master subtask 5.3), not a bare
+   Riptide_vsr.Replica.t -- see batch_commit.mli's own [create]/[t] doc comments. Every test in
+   this file that only needs propose's pre-existing per-call ?require_encryption override (not
+   the new handle-level policy itself, which gets its own dedicated tests below) can build a
+   plain, default-policy handle inline via this helper rather than repeating
+   [Batch_commit.create ~replica ()] at every call site. *)
+let bc ?require_encryption replica = Batch_commit.create ~replica ?require_encryption ()
+
 (* Real encryption_sink construction against a real Redaction_store, for the
    require_encryption tests below -- reusing test_redaction.ml's own with_tmp_dir/with_store/
    sink_of pattern rather than inventing a new one (this file has no other need for a real
@@ -210,7 +218,7 @@ let test_malformed_batch_does_not_burn_its_idempotency_key () =
   Alcotest.(check int) "the malformed attempt itself contributes zero envelopes" 0
     (List.length (Batch_commit.committed_envelopes t));
   let actor = "actor-1" in
-  Batch_commit.propose t ~idempotency_key:key
+  Batch_commit.propose (bc t) ~idempotency_key:key
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "real-retry") ];
   let envelopes = Batch_commit.committed_envelopes t in
   Alcotest.(check int)
@@ -337,7 +345,7 @@ let test_uncommitted_tail_is_excluded () =
 let test_propose_produces_correct_envelopes () =
   let t = create_solo () in
   let actor = "actor-1" in
-  Batch_commit.propose t ~idempotency_key:"k1"
+  Batch_commit.propose (bc t) ~idempotency_key:"k1"
     [
       w ~actor ~causation:(fake_event_id "c1") ~correlation:(fake_event_id "r1") (record_value "first");
       w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "r2") (record_value "second");
@@ -348,8 +356,9 @@ let test_propose_produces_correct_envelopes () =
 
 let test_propose_skips_a_key_already_committed () =
   let t = create_solo () in
+  let h = bc t in
   let actor = "actor-1" in
-  Batch_commit.propose t ~idempotency_key:"dup"
+  Batch_commit.propose h ~idempotency_key:"dup"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "first-call") ];
   Alcotest.(check int) "one write committed after the first call" 1
     (List.length (Batch_commit.committed_envelopes t));
@@ -358,7 +367,7 @@ let test_propose_skips_a_key_already_committed () =
      length) does NOT grow, proving propose itself skipped calling Replica.propose at all, rather
      than proposing again and relying on decode-side dedup to hide it. *)
   let op_number_before = List.length (Replica.entries t) in
-  Batch_commit.propose t ~idempotency_key:"dup"
+  Batch_commit.propose h ~idempotency_key:"dup"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "second-call") ];
   Alcotest.(check int) "propose did not grow the underlying replicated log for a duplicate key"
     op_number_before (List.length (Replica.entries t));
@@ -377,6 +386,7 @@ let test_propose_skips_a_key_already_committed () =
    batch at all, and this test pins the guard instead. *)
 let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
   let t = create_solo () in
+  let h = bc t in
   let key = "k-empty-burns-key" in
   (* No writes and no ~materialize sink: the call could not have had any effect even before the
      guard, so it raises rather than silently doing nothing. *)
@@ -387,17 +397,17 @@ let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
         contributing no envelopes, silently swallowing any later real batch under it), and with no \
         sink there is nothing to materialize either. Pass the batch's writes, or pass ~materialize \
         to drive an already-committed batch into a materializer.")
-    (fun () -> Batch_commit.propose t ~idempotency_key:key []);
+    (fun () -> Batch_commit.propose h ~idempotency_key:key []);
   Alcotest.(check int) "nothing reached the replicated log" 0 (List.length (Replica.entries t));
   (* The same shape WITH a sink is the supported drain idiom, so it does not raise -- and it still
      must not write an empty batch. Nothing is committed under this key yet, so it is simply
      inert. *)
-  Batch_commit.propose t ~idempotency_key:key ~materialize:{ write = (fun ~merge_key:_ _ -> assert false) } [];
+  Batch_commit.propose h ~idempotency_key:key ~materialize:{ write = (fun ~merge_key:_ _ -> assert false) } [];
   Alcotest.(check int) "the drain idiom against an unknown key proposes nothing either" 0
     (List.length (Replica.entries t));
   (* And the key is still free: a real batch under it lands normally. *)
   let actor = "actor-1" in
-  Batch_commit.propose t ~idempotency_key:key
+  Batch_commit.propose h ~idempotency_key:key
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "lands-fine") ];
   Alcotest.(check int) "a real batch under the same key is committed, not swallowed" 1
     (List.length (Batch_commit.committed_envelopes t));
@@ -405,10 +415,11 @@ let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
 
 let test_propose_with_different_keys_both_land () =
   let t = create_solo () in
+  let h = bc t in
   let actor = "actor-1" in
-  Batch_commit.propose t ~idempotency_key:"key-a"
+  Batch_commit.propose h ~idempotency_key:"key-a"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "a") ];
-  Batch_commit.propose t ~idempotency_key:"key-b"
+  Batch_commit.propose h ~idempotency_key:"key-b"
     [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "b") ];
   let envelopes = Batch_commit.committed_envelopes t in
   Alcotest.(check int) "two distinct keys both commit" 2 (List.length envelopes);
@@ -425,14 +436,14 @@ let test_require_encryption_rejects_a_plaintext_propose () =
     (Invalid_argument
        "Batch_commit.propose: require_encryption is true but no ~encryption sink was supplied")
     (fun () ->
-      Batch_commit.propose t ~idempotency_key:"k1" ~require_encryption:true
+      Batch_commit.propose (bc t) ~idempotency_key:"k1" ~require_encryption:true
         [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ])
 
 let test_require_encryption_true_with_a_real_sink_succeeds () =
   with_store (fun store ->
       let t = create_solo () in
       let actor = "actor-1" in
-      Batch_commit.propose t ~idempotency_key:"k2" ~require_encryption:true ~encryption:(sink_of store)
+      Batch_commit.propose (bc t) ~idempotency_key:"k2" ~require_encryption:true ~encryption:(sink_of store)
         [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ];
       Alcotest.(check int) "the batch committed" 1 (List.length (Batch_commit.committed_envelopes t)))
 
@@ -457,8 +468,43 @@ let test_require_encryption_true_still_raises_for_the_pre_existing_merge_key_rea
             (~encryption): the materialized accumulator is outside the redaction keystore, so \
             deleting the DEK would not erase it")
         (fun () ->
-          Batch_commit.propose t ~idempotency_key:"k3" ~require_encryption:true ~encryption:(sink_of store)
+          Batch_commit.propose (bc t) ~idempotency_key:"k3" ~require_encryption:true ~encryption:(sink_of store)
             [ bad_write ]))
+
+(* Task-master subtask 5.3 (audit-remediation Decision 5.3): require_encryption moves from a
+   purely per-call flag to a construction-time policy stored on the new Batch_commit.t handle,
+   precisely because the tests above show the mitigation and the gap it exists to catch living at
+   the EXACT SAME call site -- a call site careless enough to forget ~encryption was, by
+   construction, equally likely to forget ~require_encryption:true too. A handle-level policy lets
+   a deployment set it once, centrally, at the one place that builds the handle, so every propose
+   call site inherits it without having to remember anything itself. This test proves the handle's
+   own stored policy alone -- no per-call ~require_encryption at all -- is what catches a call site
+   that forgot ~encryption. *)
+let test_handle_level_require_encryption_catches_a_call_site_that_forgot_it () =
+  let t = create_solo () in
+  let h = Batch_commit.create ~replica:t ~require_encryption:true () in
+  let actor = "actor-1" in
+  Alcotest.check_raises
+    "a propose call with no ~encryption sink is refused by the handle's own stored policy, with no \
+     ~require_encryption passed at the call site at all"
+    (Invalid_argument
+       "Batch_commit.propose: require_encryption is true but no ~encryption sink was supplied")
+    (fun () ->
+      Batch_commit.propose h ~idempotency_key:"k-handle-policy"
+        [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ])
+
+(* The other half of the same contract (batch_commit.mli's own [propose] doc comment): a per-call
+   ~require_encryption, when supplied, OVERRIDES the handle's stored policy for that one call --
+   including turning it off, an intentional, deliberate opt-out an operator might need for a single
+   call site even under a deployment-wide encrypt-everything policy. *)
+let test_per_call_require_encryption_override_still_works_against_a_true_handle_policy () =
+  let t = create_solo () in
+  let h = Batch_commit.create ~replica:t ~require_encryption:true () in
+  let actor = "actor-1" in
+  Batch_commit.propose h ~idempotency_key:"k-handle-override" ~require_encryption:false
+    [ w ~actor ~causation:(fake_event_id "c") ~correlation:(fake_event_id "r") (record_value "hello") ];
+  Alcotest.(check int) "the plaintext batch committed despite the handle's own require_encryption:true" 1
+    (List.length (Batch_commit.committed_envelopes (Batch_commit.replica h)))
 
 let tests =
   [
@@ -487,4 +533,8 @@ let tests =
       test_require_encryption_true_with_a_real_sink_succeeds);
     ("require_encryption:true still raises for the pre-existing merge_key + encryption reason", `Quick,
       test_require_encryption_true_still_raises_for_the_pre_existing_merge_key_reason);
+    ("handle-level require_encryption:true catches a call site that forgot ~encryption", `Quick,
+      test_handle_level_require_encryption_catches_a_call_site_that_forgot_it);
+    ("a per-call require_encryption:false override still works against a true handle policy", `Quick,
+      test_per_call_require_encryption_override_still_works_against_a_true_handle_policy);
   ]

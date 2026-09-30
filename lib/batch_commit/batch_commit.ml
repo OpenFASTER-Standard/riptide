@@ -155,6 +155,19 @@ let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : boo
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
+(* Construction-time require_encryption policy (task-master subtask 5.3, audit-remediation design
+   spec Decision 5.3) -- see batch_commit.mli's own [t]/[create]/[replica] doc comments for the
+   full rationale. Only [propose] consumes [require_encryption]; every other function in this
+   module keeps taking a bare [Riptide_vsr.Replica.t] directly, so this type exists purely to give
+   [propose] somewhere to read a deployment-wide default from. *)
+type t = {
+  replica : Riptide_vsr.Replica.t;
+  require_encryption : bool;
+}
+
+let create ~replica ?(require_encryption = false) () = { replica; require_encryption }
+let replica (t : t) = t.replica
+
 (* ---- per-write materialize failure counting (task-master audit-remediation Task 21) ----
 
    {!Riptide_materialize.Materializer.write} can raise {!Riptide_materialize.Materializer.Value_too_large}
@@ -298,8 +311,17 @@ let write_at_op_number_has_merge_key (t : Riptide_vsr.Replica.t) ~(op_number : i
 let redaction_event_id ~idempotency_key ~index =
   Printf.sprintf "%d:%s#%d" (String.length idempotency_key) idempotency_key index
 
-let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_encryption = false)
+let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool option)
     ?(materialize : materialize_sink option) ?(encryption : encryption_sink option) (writes : write list) : unit =
+  let replica = t.replica in
+  (* The EFFECTIVE policy for this one call: a supplied ~require_encryption overrides [t]'s own
+     stored policy (an unusual, deliberate per-call exception remains possible); omitted, [t]'s own
+     policy -- set once, centrally, at {!create} time -- applies. See batch_commit.mli's own
+     [propose] doc comment for why this moved off a bare per-call flag (task-master subtask 5.3,
+     audit-remediation design spec Decision 5.3): a per-call flag alone sits at the exact same call
+     site as ~encryption itself, so a call site careless enough to forget one was equally likely to
+     forget the other. *)
+  let require_encryption = Option.value require_encryption ~default:t.require_encryption in
   (* Deployment-level policy: a deployment that wants to enforce "every write through this path
      must be encrypted" previously had no way to say so -- ~encryption was purely opt-in per call,
      so an ordinary caller that simply forgot it produced a silent plaintext write with no error
@@ -320,9 +342,9 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
      right thing to do, and the guard is unconditional rather than "only when the key is new".
 
      Only the PROPOSE half is suppressed; the materialize step below still runs, because
-     [propose t ~idempotency_key ~materialize []] is this module's own documented way for a replica
-     to drive its own committed batch into its own materializer (see batch_commit.mli), and that
-     idiom must stay safe on a replica that has not yet learned of the batch -- a normal, expected
+     [propose t ~idempotency_key ~materialize:sink []] is this module's own documented way for a
+     replica to drive its own committed batch into its own materializer (see batch_commit.mli),
+     and that idiom must stay safe on a replica that has not yet learned of the batch -- a normal, expected
      state in any multi-replica cluster, not a caller error. Raising there instead would turn an
      ordinary replication lag into an exception.
 
@@ -351,7 +373,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
         "Batch_commit.propose: a write with merge_key = Some _ cannot also be encrypted \
          (~encryption): the materialized accumulator is outside the redaction keystore, so \
          deleting the DEK would not erase it");
-  if writes <> [] && not (already_in_log t ~idempotency_key) then begin
+  if writes <> [] && not (already_in_log replica ~idempotency_key) then begin
     (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,
        and not a line earlier: encrypting mints a fresh DEK and overwrites the keystore entry for
        this event_id. Doing that on a retry of a batch already in the log -- committed OR merely
@@ -369,7 +391,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
             { w with payload = sink.encrypt ~event_id:(redaction_event_id ~idempotency_key ~index) w.payload })
           writes
     in
-    Riptide_vsr.Replica.propose t (batch_to_value ~idempotency_key writes_to_propose)
+    Riptide_vsr.Replica.propose replica (batch_to_value ~idempotency_key writes_to_propose)
   end;
   (* Deliberately NOT gated behind "did THIS call perform the durable commit" -- a batch
      committed by an earlier call (or by this call, in the degenerate replica_count = 1 case
@@ -438,7 +460,7 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
        rather than the argument, ANY replica holding the committed batch can materialize its own
        commit stream -- including with an empty [writes] list -- which is what lets each replica
        feed its own materializer and converge. *)
-    match committed_writes_for t ~idempotency_key with
+    match committed_writes_for replica ~idempotency_key with
     | None -> ()
     | Some committed_writes ->
       List.iter

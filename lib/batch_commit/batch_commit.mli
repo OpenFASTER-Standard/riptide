@@ -37,6 +37,40 @@ type write = {
     this field existed -- while a field present but not shaped like this module's own encoding
     voids the whole write, exactly like a malformed [actor]/[causation]/[correlation]/[payload]. *)
 
+type t
+(** A handle pairing one {!Riptide_vsr.Replica.t} with a deployment-level
+    [require_encryption] policy (task-master subtask 5.3, audit-remediation design spec Decision
+    5.3, closing the finding that {!propose}'s own [require_encryption] check and the [~encryption]
+    gap it exists to catch previously lived at the EXACT SAME call site -- a call site careless
+    enough to forget [~encryption] was, by construction, equally likely to forget
+    [~require_encryption:true] too). Only {!propose} needs this handle: every other function in
+    this module ({!committed_envelopes}, {!materialize_up_to},
+    {!write_at_op_number_has_merge_key}, etc.) has nothing to do with encryption policy and keeps
+    taking a bare {!Riptide_vsr.Replica.t} directly, unchanged.
+
+    Abstract, matching this codebase's own established convention for every other handle type
+    ({!Riptide_materialize.Materializer.Make.t}, {!Riptide_crypto.Redaction_store.t},
+    {!Riptide_storage.File_kv_store.t} are all abstract with explicit accessor functions, never an
+    exposed record) -- not because this record needs to hide anything (it is exactly two plain
+    fields), but so a future field can be added to it without breaking every existing caller's
+    pattern match. *)
+
+val create : replica:Riptide_vsr.Replica.t -> ?require_encryption:bool -> unit -> t
+(** [create ~replica ?require_encryption ()] builds a handle over [replica] with [require_encryption]
+    (default [false], matching {!propose}'s own pre-existing default -- this constructor changes
+    WHERE the policy is set, never its default value) as the policy every {!propose} call through
+    this handle enforces unless overridden per-call. A deployment that wants "every write through
+    this path is encrypted, no exceptions" as an enforced invariant sets [~require_encryption:true]
+    ONCE here, at the one place that builds the handle, rather than trusting every {!propose} call
+    site scattered through its own code to remember [~require_encryption:true] unaided. *)
+
+val replica : t -> Riptide_vsr.Replica.t
+(** [replica t] is the {!Riptide_vsr.Replica.t} [t] was built from -- needed by any caller that
+    also calls one of this module's OTHER functions (all of which still take a bare
+    {!Riptide_vsr.Replica.t}, e.g. {!committed_envelopes}, {!materialize_up_to}) or
+    {!Riptide_vsr.Replica}'s own functions (e.g. {!Riptide_vsr.Replica.commit_number},
+    {!Riptide_vsr.Replica.entries}) against the same underlying replica a [t] wraps. *)
+
 val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope list
 (** [committed_envelopes t] is the real, hash-chained Envelope view of everything durably
     committed on [t] so far -- a PURE function, fully recomputed from scratch on every call (no
@@ -293,7 +327,7 @@ val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int ->
     as before this mechanism existed). *)
 
 val propose :
-  Riptide_vsr.Replica.t ->
+  t ->
   idempotency_key:string ->
   ?require_encryption:bool ->
   ?materialize:materialize_sink ->
@@ -302,33 +336,44 @@ val propose :
   unit
 (** [propose t ~idempotency_key ?require_encryption ?materialize ?encryption writes] proposes
     [writes] as one atomic batch through
-    {!Riptide_vsr.Replica.propose} -- matching that function's own fire-and-forget convention: no
-    return value, no client acknowledgment. Telling a caller whether/when their batch committed is
-    explicitly out of scope here (task-master Task 9's job).
+    {!Riptide_vsr.Replica.propose} (i.e. against [Batch_commit.replica t]) -- matching that
+    function's own fire-and-forget convention: no return value, no client acknowledgment. Telling
+    a caller whether/when their batch committed is explicitly out of scope here (task-master
+    Task 9's job).
 
     Like the underlying {!Riptide_vsr.Replica.propose} itself, this is a silent no-op (not an
-    error) unless [t] is currently the primary in [Normal] status -- see that function's own doc
-    comment for the exact guard.
+    error) unless [Batch_commit.replica t] is currently the primary in [Normal] status -- see that
+    function's own doc comment for the exact guard.
 
-    {b [require_encryption]} (default [false]) is a deployment-level policy primitive, checked
-    first, before every other guard in this function: if [true] and no [?encryption] sink is
-    supplied, this raises [Invalid_argument] rather than silently proposing plaintext. {!encryption_sink}
-    above is deliberately opt-in per call -- policy for whether a given call site encrypts lives at
-    that call site, not inside this mechanism, matching {!materialize_sink}'s own framing -- but
-    that leaves a real gap for a deployment that wants "every write through this path is
-    encrypted, no exceptions" as an enforced invariant rather than a convention every call site has
-    to remember unaided. A real deployment choosing to run encrypted should always pass
-    [~require_encryption:true] from its own calling code, not merely pass [~encryption] and hope no
-    call site elsewhere in the same deployment forgets it.
+    {b [require_encryption]}, when supplied, OVERRIDES [t]'s own stored policy (set at
+    {!create} time) for this ONE call -- an unusual, deliberate per-call opt-out remains possible
+    even under a handle whose own policy is [true]. When omitted, [t]'s own stored policy applies.
+    Either way, the EFFECTIVE policy is checked first, before every other guard in this function:
+    if [true] and no [?encryption] sink is supplied, this raises [Invalid_argument] rather than
+    silently proposing plaintext. {!encryption_sink} above is deliberately opt-in per call --
+    policy for whether a given call site encrypts lives at that call site, not inside this
+    mechanism, matching {!materialize_sink}'s own framing -- but that alone would leave a real gap
+    for a deployment that wants "every write through this path is encrypted, no exceptions" as an
+    enforced invariant rather than a convention every call site has to remember unaided.
 
-    Checks first whether [idempotency_key] already appears among the batches in [t]'s own log --
-    the WHOLE log as {!Riptide_vsr.Replica.entries} reports it, including the
-    replicated-but-not-yet-committed tail, not merely the committed prefix -- reusing the same
-    batch decode {!committed_envelopes} uses, and is a no-op if so. For an unencrypted batch this
-    is purely an optimization, avoiding unboundedly bloating the replicated log with duplicate
-    no-op entries from a client that retries many times: what makes an unencrypted duplicate
-    {e safe} is {!committed_envelopes}'s own first-wins-per-key dedup on the READ side, which holds
-    regardless of how many times [propose] is called with the same key.
+    {b Why this moved from a per-call flag to a construction-time handle policy} (task-master
+    subtask 5.3, audit-remediation design spec Decision 5.3): a per-call [~require_encryption] on
+    its own does not close that gap -- it sits at the EXACT SAME call site as [~encryption] itself,
+    so a call site careless enough to forget [~encryption] was, by construction, equally likely to
+    forget [~require_encryption:true] too. Storing the policy on [t] instead lets a deployment set
+    it ONCE, centrally, wherever it builds its handle(s), so every {!propose} call site inherits it
+    without having to remember anything itself -- the per-call override above still exists for the
+    rare, deliberate exception, but the default a careless call site falls back to is now the
+    deployment's own choice, not silent plaintext.
+
+    Checks first whether [idempotency_key] already appears among the batches in
+    [Batch_commit.replica t]'s own log -- the WHOLE log as {!Riptide_vsr.Replica.entries} reports
+    it, including the replicated-but-not-yet-committed tail, not merely the committed prefix --
+    reusing the same batch decode {!committed_envelopes} uses, and is a no-op if so. For an
+    unencrypted batch this is purely an optimization, avoiding unboundedly bloating the replicated
+    log with duplicate no-op entries from a client that retries many times: what makes an
+    unencrypted duplicate {e safe} is {!committed_envelopes}'s own first-wins-per-key dedup on the
+    READ side, which holds regardless of how many times [propose] is called with the same key.
 
     {b For an encrypted batch ([?encryption]) the same check is load-bearing for correctness, not
     an optimization}, and that is why it spans the uncommitted tail rather than only the committed
@@ -337,10 +382,10 @@ val propose :
     {b Materialization} (task-master subtask 3.7's own closing mechanism -- see {!write}'s own
     [merge_key] doc comment): when [?materialize] is given, this function re-runs the SAME
     [idempotency_key] commit-membership check {!committed_envelopes}'s own decode already
-    performs (i.e., is this batch now among [t]'s committed batches, whether committed by THIS
-    call or an earlier one?) -- reusing that existing commit-confirmation mechanism rather than
-    adding a new, separate one. If and only if the batch is committed, every write of that
-    {b committed} batch carrying [merge_key = Some k] has its [payload] handed to
+    performs (i.e., is this batch now among [Batch_commit.replica t]'s committed batches, whether
+    committed by THIS call or an earlier one?) -- reusing that existing commit-confirmation
+    mechanism rather than adding a new, separate one. If and only if the batch is committed, every
+    write of that {b committed} batch carrying [merge_key = Some k] has its [payload] handed to
     [materialize.write ~merge_key:k] -- synchronously, before this call returns.
 
     {b What is materialized is decoded from the committed bytes, never from the [writes] argument
