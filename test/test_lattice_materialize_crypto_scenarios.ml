@@ -57,6 +57,7 @@
 
 open Riptide_batch_commit
 open Riptide_crypto
+open Riptide_lattice_conformance
 open Riptide_storage
 open Riptide_vsr
 

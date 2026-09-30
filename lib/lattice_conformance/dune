@@ -1,0 +1,3 @@
+(library
+ (name riptide_lattice_conformance)
+ (libraries riptide_lattice alcotest qcheck-core))

@@ -1,4 +1,5 @@
 open Riptide_lattice
+open Riptide_lattice_conformance
 
 (* A deliberately broken instance, used only to prove the harness is non-vacuous —
    NOT registered in test_riptide.ml, only invoked directly by the one test below.

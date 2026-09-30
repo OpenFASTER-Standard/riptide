@@ -1,4 +1,4 @@
-(* test/lattice_conformance.ml
+(* lib/lattice_conformance/lattice_conformance.ml
 
    The [Lattice_intf.S] analogue of [test_transport_shared.ml]/[test_storage_shared.ml]'s own
    pattern: a reusable, functor-free test body that never references a concrete lattice instance
@@ -7,7 +7,11 @@
    (commutativity, associativity, idempotency, and [bottom] as identity) as real, runnable
    Alcotest test cases. Any concrete instance (e.g. [Last_write_wins], or a future lattice type)
    is conformance-checked by simply calling [tests] against it, the same way
-   [Test_storage_shared.Make_storage_tests] is instantiated per storage backend. *)
+   [Test_storage_shared.Make_storage_tests] is instantiated per storage backend.
+
+   Promoted from [test/lattice_conformance.ml] into a real, installable library (rather than a
+   test-only module) so that a downstream consumer of this codebase who is not part of its own
+   test suite can conformance-check a NEW lattice type they define, not just this repo's own. *)
 
 let tests (type a) (module L : Riptide_lattice.Lattice_intf.S with type t = a)
     (arb : a QCheck.arbitrary) (label : string) : unit Alcotest.test_case list =
