@@ -1203,11 +1203,18 @@
             "id": 21,
             "title": "[4.3] A useful error message names the merge_key",
             "description": "A useful error message names the merge_key",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Materializer.write's overflow Invalid_argument includes the merge_key, not just byte counts, making the one existing signal actionable.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "4c42aefb11071b48d16636845ead34e2a96178b6",
+                "a6e409559a01049272a4799b41d9c3506d5e1c74"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 22,
