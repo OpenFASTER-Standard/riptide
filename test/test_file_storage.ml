@@ -1147,13 +1147,24 @@ let source_index_of ~needle haystack =
 let top_level_binding_body source name =
   let lines = String.split_on_char '\n' source in
   let starts_binding line = String.length line > 4 && String.sub line 0 4 = "let " in
+  (* Word-boundary check on the character right after [name]: without it, looking up
+     ["perform_write"] would also match a line starting [let perform_write_from_string ...],
+     silently returning the wrong binding's body (masked today only by [find]'s first-match-wins
+     order happening to favor the shorter name -- fragile, not a guarantee). An OCaml identifier
+     continues with a letter/digit/["_"]/["'"], so anything else (or end-of-line, e.g. a
+     zero-argument binding like [let foo =]) means [name] really ends here. *)
+  let is_ident_char c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_' || c = '\''
+  in
   let rec find = function
     | [] -> Alcotest.failf "no top-level binding %S found in %s" name file_storage_source_path
     | line :: rest ->
+      let name_end = 4 + String.length name in
       if
         starts_binding line
-        && String.length line >= 4 + String.length name
+        && String.length line >= name_end
         && String.sub line 4 (String.length name) = name
+        && (String.length line = name_end || not (is_ident_char line.[name_end]))
       then
         let rec take acc = function
           | [] -> List.rev acc

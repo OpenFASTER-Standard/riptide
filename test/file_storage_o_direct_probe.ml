@@ -56,6 +56,15 @@ let o_direct_flag_set fd =
       in
       loop ())
 
+(* Coupled BY CONVENTION ONLY to [file_storage.ml]'s own [slot_alignment]/[header_slot_size]
+   (both 4096) and to [test_file_storage.ml]'s own [run_o_direct_probe] call site's
+   [ulimit_f_blocks:40] -- there is no shared constant or assertion tying the three together
+   (Task 19 review, Minor finding). If [file_storage.ml]'s slot size ever changes, this probe's
+   header-fits/data-overflows math (see [test_file_storage.ml]'s own comment just above its
+   [file_storage_o_direct_probe_path] definition for the full arithmetic) silently stops matching
+   reality. Judged safe to leave coupled-by-convention rather than plumbed through as a shared
+   constant: a mismatch fails LOUDLY (the probe's designed EFBIG stops reproducing, so the RED/GREEN
+   test itself fails to observe the expected transition) rather than silently mis-passing. *)
 let ring_capacity = 8
 
 let () =

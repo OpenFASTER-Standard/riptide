@@ -280,11 +280,21 @@ let read_file path =
 let top_level_binding_body source name =
   let lines = String.split_on_char '\n' source in
   let starts_binding line = String.length line > 4 && String.sub line 0 4 = "let " in
+  (* Word-boundary check on the character right after [name] -- see [test_file_storage.ml]'s own
+     copy of this helper (Task 19 review, Minor finding) for the full rationale: without it,
+     looking up a short binding name would also match a longer one sharing its prefix (e.g.
+     ["perform_write"] vs. [let perform_write_from_string ...]), silently returning the wrong
+     binding's body. *)
+  let is_ident_char c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_' || c = '\''
+  in
   let rec find = function
     | [] -> Alcotest.failf "no top-level binding %S found in %s" name file_kv_store_source_path
     | line :: rest ->
-      if starts_binding line && String.length line >= 4 + String.length name
-         && String.sub line 4 (String.length name) = name then
+      let name_end = 4 + String.length name in
+      if starts_binding line && String.length line >= name_end
+         && String.sub line 4 (String.length name) = name
+         && (String.length line = name_end || not (is_ident_char line.[name_end])) then
         let rec take acc = function
           | [] -> List.rev acc
           | l :: tl ->
