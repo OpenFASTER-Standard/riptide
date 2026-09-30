@@ -186,6 +186,101 @@ let test_enumerate_event_ids_recovers_every_event_id_with_no_external_log () =
          with no external log ever consulted"
         [ "evt-1"; "evt-2"; "evt-3" ] found)
 
+(* Review finding (Important, first round): [enumerate_event_ids]'s two [None -> acc] silent-skip
+   branches (decode failure on a record read back successfully; [get_by_hash] itself returning
+   [None] for a hash [fold] just yielded) were previously prose-justified only, with no test
+   exercising either. This closes that: plants a GARBAGE value directly via
+   [File_kv_store.put], bypassing [Redaction_store] entirely (simulating either a foreign write
+   into this keystore's directory, or a future format drift this module's own encode/decode pair
+   didn't anticipate), alongside one real [encrypt_for_storage]'d entry. "not-a-valid-record"
+   contains no [':'], so [decode_record] hits its very first [None] case
+   ([String.index_opt raw ':' = None]) -- this is a REAL, checksummed [File_kv_store] record (so
+   [get_by_hash] returns [Some "not-a-valid-record"]), which is exactly what makes it a decode
+   failure specifically, not a [get_by_hash]-returns-[None] case (covered separately below). *)
+let test_enumerate_event_ids_skips_an_undecodable_record_without_raising () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
+          dir
+      in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let store = Redaction_store.create ~kv ~kek in
+      ignore
+        (Redaction_store.encrypt_for_storage store ~event_id:"valid-event"
+           (Riptide.Value.Scalar (Riptide.Value.String "sensitive")));
+      (* A real, durably-stored, correctly-checksummed [File_kv_store] record whose VALUE is not
+         shaped like [encode_record]'s output at all -- [Redaction_store] itself never wrote this;
+         nothing about [File_kv_store]'s own contract prevents another writer (or a bug) from
+         doing so. *)
+      Riptide_storage.File_kv_store.put kv ~key:"garbage" "not-a-valid-record";
+      let found = Redaction_store.enumerate_event_ids store in
+      Alcotest.(check (list string))
+        "the undecodable record is silently skipped -- only the real event_id is recovered, and \
+         nothing raised"
+        [ "valid-event" ] found)
+
+(* Same finding, the OTHER silent-skip branch: [get_by_hash] itself returning [None] for a hash
+   [fold] legitimately yielded. The doc's own account of this (redaction_store.ml,
+   [enumerate_event_ids]'s comment) is "the record was deleted between fold's directory listing and
+   this read, or it failed its own checksum" -- the checksum-failure half of that is reproducible
+   deterministically, with no concurrency required: write a syntactically-real key file (64
+   lowercase hex characters, so [fold]'s own [is_real_key_filename] check accepts it and visits it)
+   directly at its own computed sharded path, containing bytes that are not a valid
+   [header_slot_size]-then-[data_slot_size] record at all -- so [File_kv_store.get_by_hash]'s own
+   checksum verification genuinely fails and returns [None], independent of and prior to
+   [Redaction_store]'s own [decode_record] ever running on it. This is the SAME underlying
+   [Kv_store_intf.S.get]-style "cannot distinguish never-written from corrupted" ambiguity as the
+   deleted-mid-fold race the doc comment also describes -- not independently distinguishable from
+   it in a realistic single-threaded test, since both collapse into the exact same [get_by_hash]
+   [None] outcome by construction; this test exercises that shared outcome directly rather than via
+   a genuine race, since a real race would be inherently flaky to script from a test. *)
+let key_hash_hex key =
+  Riptide.Value.hash_to_hex
+    (Riptide.Value.content_hash (Riptide.Value.Scalar (Riptide.Value.String key)))
+
+let plant_a_corrupt_leaf_file_at_its_own_sharded_path dir key =
+  let hash = key_hash_hex key in
+  let shard1 = Filename.concat dir (String.sub hash 0 2) in
+  let shard2 = Filename.concat shard1 (String.sub hash 2 2) in
+  (try Unix.mkdir shard1 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  (try Unix.mkdir shard2 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let path = Filename.concat shard2 hash in
+  let oc = open_out_bin path in
+  output_string oc "not a valid header+data record -- too short, wrong checksum, garbage bytes";
+  close_out oc
+
+let test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun dir ->
+      Eio.Switch.run @@ fun sw ->
+      let kv =
+        Riptide_storage.File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:Redaction_store.owner_tag
+          dir
+      in
+      let kek = Kek.of_raw (Mirage_crypto_rng.generate 32) in
+      let store = Redaction_store.create ~kv ~kek in
+      ignore
+        (Redaction_store.encrypt_for_storage store ~event_id:"valid-event"
+           (Riptide.Value.Scalar (Riptide.Value.String "sensitive")));
+      (* A real, [fold]-visitable leaf (a syntactically valid 64-lowercase-hex filename, in its own
+         correct shard subdirectory) whose CONTENT fails [File_kv_store]'s own checksum -- so
+         [get_by_hash] returns [None] for this hash even though [fold] visited it. *)
+      plant_a_corrupt_leaf_file_at_its_own_sharded_path dir "corrupt-key";
+      (* Sanity: confirm the premise -- [get_by_hash] genuinely returns [None] for this hash, not
+         [Some] something [decode_record] merely happens to reject; otherwise this test would
+         exercise the same decode-failure branch the previous test already covers, not this one. *)
+      Alcotest.(check (option string)) "the planted leaf's own hash reads back as None (checksum \
+                                        failure), not Some"
+        None
+        (Riptide_storage.File_kv_store.get_by_hash kv ~hash:(key_hash_hex "corrupt-key"));
+      let found = Redaction_store.enumerate_event_ids store in
+      Alcotest.(check (list string))
+        "the checksum-failing hash is silently skipped -- only the real event_id is recovered, and \
+         nothing raised"
+        [ "valid-event" ] found)
+
 (* [redact] deletes the KV entry entirely, so enumeration must reflect that too -- a redacted
    event_id must not still show up as if it were live. *)
 let test_enumerate_event_ids_does_not_include_a_redacted_event_id () =
@@ -626,6 +721,13 @@ let tests =
     ( "Task 24: enumerate_event_ids recovers every event_id with no external log",
       `Quick,
       test_enumerate_event_ids_recovers_every_event_id_with_no_external_log );
+    ( "Task 24 review (Important): enumerate_event_ids skips an undecodable record without raising",
+      `Quick,
+      test_enumerate_event_ids_skips_an_undecodable_record_without_raising );
+    ( "Task 24 review (Important): enumerate_event_ids skips a hash whose record fails its own \
+       checksum without raising",
+      `Quick,
+      test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising );
     ( "Task 24: enumerate_event_ids does not include a redacted event_id",
       `Quick,
       test_enumerate_event_ids_does_not_include_a_redacted_event_id );

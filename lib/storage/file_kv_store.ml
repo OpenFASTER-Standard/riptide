@@ -653,6 +653,57 @@ let check_or_write_owner_marker ~fs ~dir_path tag =
    [durable_write] to produce under the current, always-sharded [path_for], but a cheap safety net
    against exactly this file's own kind of change) is still found and swept, not silently
    skipped because it happens to sit above where the walk expects a leaf. *)
+(* Task 24 review (Minor 1): [sweep_stale_temp_files] below and [fold] further down used to each
+   carry their own ~25-line copy of this exact two-level shard-directory walk, differing only in
+   what happens at each LEAF found -- exactly the kind of duplication that would need synchronized
+   edits in two places if the sharding depth ever changes again (the way Task 18 itself changed it
+   from flat to two levels). Factored out here instead: one 2-level [Eio.Path.read_dir]/[Eio.Io]-
+   catch walk, generalized only over [leaf], not over depth (this is deliberately NOT a
+   general-purpose arbitrary-depth walker -- just the exact 2-level shape both callers already
+   share).
+
+   {b Directory-vs-leaf discrimination, unchanged from before this extraction:} the installed Eio
+   0.12 has no [kind]/[stat] existence check (see this file's top comment for the general "try the
+   operation, catch [Eio.Io]" pattern this module uses everywhere for exactly this gap), so every
+   entry at every level is discriminated by attempting [Eio.Path.read_dir] on it: success means it
+   really is a directory (POSIX's own [opendir] on a non-directory reliably raises ENOTDIR, so this
+   is a sound discriminator, not a heuristic), in which case it is recursed into one more level;
+   [Eio.Io] means it is a leaf. [leaf] is invoked for a leaf at any of the three levels a leaf can
+   legitimately or defensively turn up at: the normal case is the deepest (shard-2) level, where
+   real per-key files and legitimate temp-file debris both live; the shallower levels (a leaf found
+   directly under a shard-1 directory, or directly under [dir_path] itself) are defensive-only
+   safety nets against a leaf ending up somewhere shallower than the current, always-two-level
+   [path_for] would ever put it -- not reachable through this module's own normal write path today,
+   but still visited rather than silently skipped, matching the discipline each of this walk's two
+   original, pre-extraction copies already applied on their own.
+
+   [leaf] receives the leaf's own basename and its full path string, and threads an accumulator
+   through exactly like [List.fold_left] -- [sweep_stale_temp_files] below uses [unit] as its
+   accumulator and does its unlinking as a side effect inside [leaf]; [fold] further down uses the
+   caller's real ['a]. *)
+let walk_sharded_tree ~fs ~dir_path ~init ~leaf =
+  let visit_leaf_dir dir_str entries acc =
+    List.fold_left
+      (fun acc basename -> leaf ~path_str:(Filename.concat dir_str basename) ~basename acc)
+      acc entries
+  in
+  let visit_top_level_entry acc top_basename =
+    let top_path_str = Filename.concat dir_path top_basename in
+    match Eio.Path.read_dir Eio.Path.(fs / top_path_str) with
+    | shard1_entries ->
+      List.fold_left
+        (fun acc shard1_basename ->
+          let shard1_path_str = Filename.concat top_path_str shard1_basename in
+          match Eio.Path.read_dir Eio.Path.(fs / shard1_path_str) with
+          | shard2_entries -> visit_leaf_dir shard1_path_str shard2_entries acc
+          | exception Eio.Io _ -> leaf ~path_str:shard1_path_str ~basename:shard1_basename acc)
+        acc shard1_entries
+    | exception Eio.Io _ -> leaf ~path_str:top_path_str ~basename:top_basename acc
+  in
+  match Eio.Path.read_dir Eio.Path.(fs / dir_path) with
+  | top_entries -> List.fold_left visit_top_level_entry init top_entries
+  | exception Eio.Io _ -> init (* directory doesn't exist yet or can't be read; that's fine *)
+
 let sweep_stale_temp_files ~fs ~dir_path =
   (* Match stale temp files: the pattern used by [durable_write] is [key_path].put.[pid].[counter].tmp.
      Distinguish from real key files (exactly 64 lowercase hex, no ".put."), the owner marker
@@ -668,35 +719,10 @@ let sweep_stale_temp_files ~fs ~dir_path =
     contains_substring basename ".put." &&
     String.length basename > 4 && String.sub basename (String.length basename - 4) 4 = ".tmp"
   in
-  let unlink_leaf_if_stale path_str basename =
-    if is_stale_temp_file basename then
-      try Eio.Path.unlink Eio.Path.(fs / path_str)
-      with Eio.Io _ -> () (* Ignore errors: file already gone, or already handled by concurrent create *)
-  in
-  (* Applies [unlink_leaf_if_stale] to every entry of [dir_str], which the caller has already
-     confirmed (by successfully [read_dir]-ing it) really is a directory of leaf files -- used
-     both for the deepest (shard-2) level and, defensively, for anything found one level too
-     shallow (see the top comment above). *)
-  let sweep_leaf_dir dir_str entries =
-    List.iter (fun basename -> unlink_leaf_if_stale (Filename.concat dir_str basename) basename) entries
-  in
-  (* One entry at [dir_path]'s own top level: either a shard-1 directory (descend one more level)
-     or a leaf (top-level owner marker/lock file, or -- defensively -- a stray temp file). *)
-  let visit_top_level_entry top_basename =
-    let top_path_str = Filename.concat dir_path top_basename in
-    match Eio.Path.read_dir Eio.Path.(fs / top_path_str) with
-    | shard1_entries ->
-      List.iter
-        (fun shard1_basename ->
-          let shard1_path_str = Filename.concat top_path_str shard1_basename in
-          match Eio.Path.read_dir Eio.Path.(fs / shard1_path_str) with
-          | shard2_entries -> sweep_leaf_dir shard1_path_str shard2_entries
-          | exception Eio.Io _ -> unlink_leaf_if_stale shard1_path_str shard1_basename)
-        shard1_entries
-    | exception Eio.Io _ -> unlink_leaf_if_stale top_path_str top_basename
-  in
-  try List.iter visit_top_level_entry (Eio.Path.read_dir Eio.Path.(fs / dir_path))
-  with Eio.Io _ -> () (* Directory doesn't exist yet or can't be read; that's fine *)
+  walk_sharded_tree ~fs ~dir_path ~init:() ~leaf:(fun ~path_str ~basename () ->
+      if is_stale_temp_file basename then
+        try Eio.Path.unlink Eio.Path.(fs / path_str)
+        with Eio.Io _ -> () (* Ignore errors: file already gone, or already handled by concurrent create *))
 
 (* Same try-[mkdir]-then-ignore-[Eio.Io] pattern as [file_storage.ml:277] -- see this file's
    top comment for why (no [Eio.Path.kind] existence check exists in the installed Eio 0.12). The
@@ -816,16 +842,11 @@ let delete t ~key =
    it via [path_from_hash], and never re-hashes. *)
 let get_by_hash t ~hash = durable_read t (path_from_hash t hash)
 
-(* [Kv_store_intf.S.fold]: walks the sharded (Task 18) two-level directory tree, applying [f] to
-   every real per-key record file it finds -- see [kv_store_intf.mli]'s own [fold] doc for what
-   [key] actually is here (this store's own internal identifier, i.e. exactly the 64-lowercase-hex
-   filename [path_for]/[path_from_hash] use, never the original caller-supplied key, which this
-   backend never persists in the clear).
-
-   Reuses [sweep_stale_temp_files]'s own directory-vs-leaf discrimination technique verbatim
-   (successfully [Eio.Path.read_dir]-ing an entry is a sound directory test, since the installed
-   Eio 0.12 exposes no [kind]/[stat] to check first instead -- see this file's top comment) --
-   applied here to VISIT every real leaf, rather than to unlink some of them.
+(* [Kv_store_intf.S.fold]: walks the sharded (Task 18) two-level directory tree via
+   [walk_sharded_tree] above, applying [f] to every real per-key record file it finds -- see
+   [kv_store_intf.mli]'s own [fold] doc for what [key] actually is here (this store's own internal
+   identifier, i.e. exactly the 64-lowercase-hex filename [path_for]/[path_from_hash] use, never
+   the original caller-supplied key, which this backend never persists in the clear).
 
    A leaf is only ever passed to [f] if its own basename is exactly the 64-lowercase-hex-character
    shape [path_for]'s [hash_to_hex] output always has ([is_real_key_filename] below) -- this
@@ -844,33 +865,5 @@ let is_real_key_filename basename =
   !ok
 
 let fold t ~init f =
-  let visit_leaf_dir entries acc =
-    List.fold_left
-      (fun acc basename -> if is_real_key_filename basename then f ~key:basename acc else acc)
-      acc entries
-  in
-  let visit_top_level_entry acc top_basename =
-    let top_path_str = Filename.concat t.dir_path top_basename in
-    match Eio.Path.read_dir Eio.Path.(t.fs / top_path_str) with
-    | shard1_entries ->
-      List.fold_left
-        (fun acc shard1_basename ->
-          let shard1_path_str = Filename.concat top_path_str shard1_basename in
-          match Eio.Path.read_dir Eio.Path.(t.fs / shard1_path_str) with
-          | shard2_entries -> visit_leaf_dir shard2_entries acc
-          | exception Eio.Io _ ->
-            (* Defensive, mirroring [sweep_stale_temp_files]'s own top comment: a leaf found one
-               level too shallow. Can't happen for anything [durable_write] itself produces under
-               the current, always-sharded [path_for], but a real key file found here would still
-               need visiting rather than being silently skipped just because of where it sits. *)
-            if is_real_key_filename shard1_basename then f ~key:shard1_basename acc else acc)
-        acc shard1_entries
-    | exception Eio.Io _ ->
-      (* A top-level leaf: the owner marker, the lock file, or -- defensively -- a stray file.
-         Never a real key file: [path_for] always shards two levels deep, so a genuine per-key
-         record can never live directly at [t.dir_path]'s own top level. *)
-      if is_real_key_filename top_basename then f ~key:top_basename acc else acc
-  in
-  match Eio.Path.read_dir Eio.Path.(t.fs / t.dir_path) with
-  | top_entries -> List.fold_left visit_top_level_entry init top_entries
-  | exception Eio.Io _ -> init (* directory doesn't exist yet -- nothing to fold over *)
+  walk_sharded_tree ~fs:t.fs ~dir_path:t.dir_path ~init ~leaf:(fun ~path_str:_ ~basename acc ->
+      if is_real_key_filename basename then f ~key:basename acc else acc)

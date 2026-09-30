@@ -131,13 +131,21 @@ let decrypt t ~event_id ciphertext =
    event_id out of whatever record is found there.
 
    {b Two distinct "missing" outcomes below, treated deliberately differently, per this task's own
-   instruction not to silently swallow what should be impossible:}
+   instruction not to silently swallow what should be impossible. Both are exercised by real,
+   running tests (test_redaction.ml), not prose alone -- review finding, first round: neither
+   branch had a test at all.}
    - [get_by_hash] returning [None] (the record was deleted -- e.g. a concurrent {!redact} -- or
      failed its own checksum, between [fold]'s directory listing and this read) is an ORDINARY,
      expected race on a live store, exactly the same "cannot distinguish never-written from
      corrupted" ambiguity {!Riptide_storage.Kv_store_intf.S.get} already documents. Skipped
      silently, the same way a caller retrying a lookup after a redaction would see nothing there
-     either.
+     either. The checksum-failure half of this is exercised deterministically (no genuine race
+     needed to reproduce the same [None] outcome) by
+     test_enumerate_event_ids_skips_a_hash_whose_record_fails_its_own_checksum_without_raising,
+     which plants a syntactically-real, checksum-failing leaf file directly at its own computed
+     sharded path -- that test's own comment explains why this is not independently distinguishable
+     from the deleted-mid-fold race in a realistic single-threaded test (both collapse into the
+     same [get_by_hash] [None]).
    - [decode_record] failing on bytes that DID read back successfully is a different matter: every
      record in this keystore's own directory is written exclusively by this module's own
      {!encrypt_for_storage}, always via [encode_record], so a successfully-checksummed record that
@@ -155,7 +163,11 @@ let decrypt t ~event_id ciphertext =
      [encrypt_for_storage]'s own write path can produce it, and {!create}'s own [~owner] guard (see
      [redaction_store.mli]) is this codebase's actual defense against the "foreign write" half of
      that risk; this function's own silence on a decode failure is a deliberately accepted,
-     disclosed gap, not an oversight. *)
+     disclosed gap, not an oversight. Exercised by
+     test_enumerate_event_ids_skips_an_undecodable_record_without_raising, which plants a real,
+     correctly-checksummed [File_kv_store] record whose value is simply not shaped like
+     [encode_record]'s output, via [File_kv_store.put] directly (bypassing this module entirely, the
+     same way a foreign writer would). *)
 let enumerate_event_ids t =
   Riptide_storage.File_kv_store.fold t.kv ~init:[] (fun ~key acc ->
       match Riptide_storage.File_kv_store.get_by_hash t.kv ~hash:key with

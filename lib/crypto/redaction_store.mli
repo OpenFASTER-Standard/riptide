@@ -222,7 +222,16 @@ val encrypt_for_storage : t -> event_id:string -> Riptide.Value.value -> string
     log. See {!Riptide_storage.Kv_store_intf.S.fold}'s own doc comment for the general shape of this
     problem (this store's keys are its own internal, hashed identifiers, never the original string a
     caller [put]), and this module's own [.ml] ([encode_record]/[decode_record]) for the exact,
-    length-prefixed wire format this produces. *)
+    length-prefixed wire format this produces.
+
+    {b No migration for records written before this format existed.} A pre-Task-24 wrapped-DEK
+    record (raw {!Kek.wrap} output, no embedded [event_id] prefix) fails {!decrypt}'s internal
+    decode of the new format and is therefore treated exactly like a genuinely redacted or corrupt
+    entry -- observably indistinguishable from a real {!redact}, per {!decrypt}'s own documented
+    "deliberately indistinguishable failures" contract. No migration was requested and none is
+    performed; this is disclosed here only so a future reader is not surprised by an old-format
+    record going silently unreadable after upgrading past this change, on a project that is
+    pre-1.0 with no real deployed data to migrate. *)
 
 val decrypt : t -> event_id:string -> string -> Riptide.Value.value option
 (** [decrypt t ~event_id ciphertext] looks up [event_id]'s wrapped DEK, unwraps it under the KEK,
