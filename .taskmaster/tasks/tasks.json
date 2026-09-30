@@ -481,7 +481,7 @@
         "id": "5",
         "title": "Define the Layer 0/Layer 2 boundary - treat it as provisional",
         "description": "The WASM Component loading ABI, session-type protocol checking, SFI-sandbox-baseline isolation with optional microVM tier, and the mandatory admission/conformance gate. Per the ThirdPartyResources to CRD lesson, expect this to need real revision after Task 6 - that's healthy, not failure.",
-        "status": "in-progress",
+        "status": "done",
         "priority": "high",
         "dependencies": [
           "4",
@@ -494,31 +494,56 @@
             "id": 1,
             "title": "Define the WASM Component loading ABI (WIT interfaces)",
             "description": "The frozen, stable surface modules plug into. Strictly downward-only dependencies enforced structurally, not by convention - the OSGi/'distributed monolith' microservices lesson: physical separation alone doesn't prevent dependency hell.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: a module cannot depend on anything not explicitly exposed through this interface.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "579f0cc2928c6bc8d5e35d5ac7902078d0819b6c",
+                "655d3dca70925a9c2802f5ef6e0f2a33f14a3205"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-09-30T16:46:42.697Z"
           },
           {
             "id": 2,
             "title": "Implement session-type protocol checking for module/core interaction",
             "description": "Local, compositional, compile-time conformance checking for message-sequencing - genuinely more practical than coalgebra/bisimulation, which even MongoDB found impractical against real running code. Session types only check sequencing safety, not business invariants - that stays a separate, Layer 2 concern.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: a module violating its declared interaction protocol is rejected at load time, not at runtime.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "6b9e6dfcb39642cdfc6d756058ffa71dd1639ae7",
+                "6cdce4dbbb3c5dfb7cb8127295e602f49a48512f"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-09-30T16:46:42.704Z"
           },
           {
             "id": 3,
             "title": "Implement uniform SFI-sandbox isolation with optional hardware-virtualization microVM tier",
             "description": "WASM's own software-fault-isolation is the universal baseline (proven on Cortex-M0/M3/M4 with zero virtualization silicon); hardware-virtualization microVM (Firecracker-style, AOT-compile-once-snapshot-restore-in-milliseconds) is an optional STRONGER tier used wherever hardware supports it - never a weaker tier for 'trusted' code. No module ever shares a heap with the core or with another module.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: a module that would crash the host under weaker isolation must be contained under the chosen isolation model on every supported hardware tier.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "579f0cc2928c6bc8d5e35d5ac7902078d0819b6c",
+                "4e1f2c6d6d4a0beee4f0343cafea57f8b8cf5c16",
+                "ebc1f3ac3a4896a79ffc00e7462d2eeb5a55757e"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-09-30T16:46:42.708Z"
           },
           {
             "id": 4,
@@ -541,14 +566,23 @@
             "id": 5,
             "title": "Implement the mandatory authorization decision point (mechanism only, no policy)",
             "description": "Every write/read passes a mandatory checkpoint, and the decision itself is a logged, causally-linked fact. The actual policy model (RBAC/ABAC/ReBAC) is Layer 2, built against this checkpoint, not baked into it - this was stated too strongly as an RBAC/ABAC mandate earlier in design; corrected here to just the checkpoint being mandatory.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: no write can bypass the checkpoint under any code path, verified by exhaustive call-site audit plus fuzzing.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "b1b86f525c361025698d34de25a05e844b0e96ff",
+                "d13d9c1ec72dead7125ec0a2765ad8a31cf04349",
+                "4bca8c4e27b1c813f87a9a292ee7ae582179a275"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-09-30T16:46:42.713Z"
           }
         ],
-        "updatedAt": "2026-09-30T14:18:47.666Z"
+        "updatedAt": "2026-09-30T16:46:42.713Z"
       },
       {
         "id": "6",
@@ -1433,9 +1467,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-30T14:18:47.666Z",
+      "lastModified": "2026-09-30T16:46:42.714Z",
       "taskCount": 12,
-      "completedCount": 5,
+      "completedCount": 6,
       "tags": [
         "master"
       ]
