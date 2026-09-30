@@ -1246,11 +1246,21 @@
             "id": 24,
             "title": "[5.2] Kv_store_intf.S gains enumeration; Redaction_store gains KEK rotation",
             "description": "Kv_store_intf.S gains enumeration; Redaction_store gains KEK rotation",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Add val fold to Kv_store_intf.S. Store each wrapped-DEK record's plaintext event_id alongside the wrapped bytes. Add Redaction_store.rotate_kek, folding over the keystore, unwrapping under the old KEK and rewrapping under the new one, per-entry-atomic.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "97115e130b10a556cd61369c1d97536d1c9ad157",
+                "d52e4292aea6aa1a6e456dc5c315c5c9d265a76d",
+                "3ca9e5689245e65dc4497043b28237d17976fba3",
+                "a92172f6cf6357e3d846d4a17ce6630757aa514a",
+                "a34f2c4ee6570e6b8d2238bd4bc8dca12cccb006"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 25,
