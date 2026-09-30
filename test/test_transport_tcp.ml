@@ -938,6 +938,16 @@ let test_accept_loop_caps_concurrent_connections () =
             is enough, the same reasoning [file_storage.ml]'s single-fiber-per-replica model
             relies on elsewhere in this codebase. *)
          let active = ref 0 in
+         (* Task 28 review, Minor finding: the peak-count assertion below alone doesn't prove every
+            client eventually got through -- only that whichever ones did never exceeded the cap.
+            A connection genuinely stuck in the kernel backlog receives zero bytes and can only
+            ever hit the [Error `Timeout] branch (never a TLS exception -- there is nothing to send
+            a TLS alert about), so the [Tls_alert]/[Tls_failure]/[End_of_file]/[Eio.Io] branch below
+            is not expected to fire in this test at all; a [succeeded] counter makes that
+            expectation an explicit, checked assertion instead of an implicit one, and is robust
+            against a future refactor that changed the queuing mechanism in a way that silently
+            dropped connections instead of queuing them. *)
+         let succeeded = ref 0 in
          let client_body i () =
            let flow = Eio.Net.connect ~sw net addr in
            match
@@ -960,9 +970,14 @@ let test_accept_loop_caps_concurrent_connections () =
              if !active > !max_active_observed then max_active_observed := !active;
              Eio.Time.sleep clock hold_time;
              decr active;
+             incr succeeded;
              (try Eio.Flow.close tls with End_of_file | Eio.Io _ -> ())
          in
          Eio.Fiber.all (List.init num_clients (fun i () -> client_body i ()));
+         Alcotest.(check int)
+           "every client's handshake eventually completed -- none was silently dropped instead of \
+            queued"
+           num_clients !succeeded;
          Eio.Switch.fail sw Concurrency_cap_test_done)
    with Concurrency_cap_test_done -> ());
   Alcotest.(check bool)

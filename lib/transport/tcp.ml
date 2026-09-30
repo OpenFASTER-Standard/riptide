@@ -653,6 +653,14 @@ let create ?max_connections ~sw ~net ~clock ~my_id ~peers ~tls () =
     | Some n -> n
     | None -> default_max_connections ~peers
   in
+  (* Task 28 review, Minor finding: fail fast and clearly, matching the precedent
+     [Eio.Net.run_server] itself already sets for this exact parameter name
+     ([net.mli]: "@raise Invalid_argument" for [max_connections <= 0]) -- confirmed real by reading
+     that function's own [invalid_arg "max_connections"] check. Without this, a caller-supplied
+     [~max_connections:0] would reach [Eio.Semaphore.make] with an unhelpful failure mode far from
+     this call, instead of a clear error naming the actual bad argument at the actual call site. *)
+  if max_connections <= 0 then
+    invalid_arg (Printf.sprintf "Tcp.create: ~max_connections must be positive, got %d" max_connections);
   let my_host, my_port =
     match List.find_opt (fun (id, _, _) -> id = my_id) peers with
     | Some (_, host, port) -> (host, port)
