@@ -1340,11 +1340,17 @@
             "id": 29,
             "title": "[7.1] Ring-wedge early warning, and a documented, tested resize-before-wedge procedure",
             "description": "Ring-wedge early warning, and a documented, tested resize-before-wedge procedure",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Add Storage_intf.S.ring_margin. Wire ?may_evict through every real File_storage.create call site so eviction_blocked actually increments. Add a test demonstrating copying live entries into a freshly created, larger-capacity File_storage before a wedge occurs; document this as the supported resize procedure.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "1b0378185d11e345cf766de2543516858390113e",
+                "2b384a855329827d70b24147ef9578a16daa6aa5"
+              ]
+            }
           },
           {
             "id": 30,
