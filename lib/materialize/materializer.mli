@@ -48,17 +48,32 @@ module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_
       in the same call (synchronous fold: the [write] returns only after the merged result is
       durable in {!KV.t}, making ring-eviction safe by construction).
 
-      WARNING: Not concurrency-safe for genuinely concurrent writers to the *same* [merge_key].
-      The implementation uses a read-join-put pattern: it reads the current value, computes the
-      join with the new value, then writes the result back. Because {!KV.get} and {!KV.put}
-      perform real async I/O and yield to other fibers, two concurrent [write] calls on the same
-      [merge_key] can both read the same stale value, compute different merges, and the second
-      [put] silently overwrites the first's contribution — a classic lost-update race.
+      {b Task 20: concurrent writers to the SAME [merge_key] on the SAME [t] are safe.} The
+      implementation still uses a read-join-put pattern internally -- it reads the current value,
+      computes the join with the new value, then writes the result back, and {!KV.get}/{!KV.put}
+      still perform real async I/O that yields to other fibers mid-call -- but [write] now holds a
+      private, per-[merge_key] {!Eio.Mutex.t} (created lazily, the first time any fiber writes
+      that key, and kept for the rest of [t]'s lifetime) around that whole sequence. Two fibers
+      can no longer both read the same stale value for one [merge_key] and race their [put]s: one
+      completes its full read-join-put before the other's even starts reading. The accumulator at
+      a given [merge_key] is therefore always the join of every value passed to a [write] call
+      that has returned, regardless of how many fibers wrote it concurrently or in what order --
+      before this fix, a live reproduction of 16 concurrent writers to one [merge_key] lost 15 of
+      them, deterministically (exactly 1 survivor, every run).
 
-      If multiple fibers must write the same [merge_key] concurrently, the caller must
-      serialize those writes itself (e.g., by using one fiber/serial queue per [merge_key]).
-      This limitation is inherited from {!Kv_store_intf.S}, which does not promise atomicity
-      across separate [get] + [put] calls.
+      This is per-[merge_key] mutual exclusion, not one lock over all of [t]: writers to two
+      DIFFERENT [merge_key]s are never serialized against each other and proceed fully
+      concurrently, exactly as before this fix -- only writers racing on the identical key wait on
+      one another.
+
+      The guarantee is scoped to writers sharing this one [t] value. A second [Materializer.t]
+      built by a separate {!create} call -- even one pointed at the very same underlying [kv] --
+      has its own, independent table of per-[merge_key] mutexes and is NOT serialized against the
+      first; nothing here prevents two different [t]s from racing each other's [KV.get]/[KV.put]
+      calls the original, unsafe way. This limitation is inherited from {!Kv_store_intf.S} exactly
+      as before, just narrowed from "every caller" to "every caller sharing one [t]": it still does
+      not promise atomicity of a [get] + [put] pair issued by two different [KV.t] handles (or two
+      different [Materializer.t]s over the same handle).
 
       WARNING, and it is reached by ordinary use rather than misuse: an accumulator is the join of
       every value ever written to its [merge_key], so for a grow-only lattice it grows without

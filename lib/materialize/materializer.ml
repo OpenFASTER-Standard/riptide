@@ -1,20 +1,58 @@
 module Make (L : Riptide_lattice.Lattice_intf.S) (KV : Riptide_storage.Kv_store_intf.S) = struct
-  type t = { kv : KV.t; decode : string -> L.t; encode : L.t -> string }
+  type t = {
+    kv : KV.t;
+    decode : string -> L.t;
+    encode : L.t -> string;
+    locks : (string, Eio.Mutex.t) Hashtbl.t;
+        (* Task 20: one [Eio.Mutex.t] per [merge_key] ever written through THIS [t], created
+           lazily by [mutex_for] and never removed -- see [mutex_for]'s own comment for why the
+           lazy lookup-or-create itself needs no lock of its own, and [materializer.mli]'s [write]
+           doc for the guarantee this buys and exactly how far it extends. *)
+  }
 
   let create ~kv ~owner ~decode ~encode =
     let actual = KV.owner kv in
     if actual <> owner then
       invalid_arg
         (Printf.sprintf "Materializer.create: kv is owned by %S, expected %S" actual owner);
-    { kv; decode; encode }
+    { kv; decode; encode; locks = Hashtbl.create 16 }
 
   let read t ~merge_key =
     match KV.get t.kv ~key:merge_key with
     | None -> L.bottom
     | Some s -> t.decode s
 
+  (* Task 20: look up [merge_key]'s mutex, creating it on first use. Two fibers racing to be the
+     first writer of a never-before-seen [merge_key] can never each create and insert their OWN
+     mutex (which would defeat the whole fix -- they'd hold different locks and still race the
+     way [write] used to): this codebase's Eio usage is single-domain, cooperative scheduling
+     throughout (see {!Riptide_storage.Aligned_buffer_pool}'s own doc comment for the same
+     argument made elsewhere), and a fiber only ever yields to another fiber at an actual
+     blocking operation. [Hashtbl.find_opt] and [Hashtbl.add] below do no I/O and contain no such
+     operation, so whichever fiber reaches this function first runs the whole
+     find-then-maybe-create-then-add sequence to completion before any other fiber gets a chance
+     to run -- there is no window in which a second fiber could observe [None] for a key the
+     first fiber has already decided to create a mutex for but not yet inserted. (This reasoning
+     is specific to a single OS domain; it would not hold if a future caller ran multiple Eio
+     domains against one shared [t], which nothing in this codebase does today.) *)
+  let mutex_for t ~merge_key =
+    match Hashtbl.find_opt t.locks merge_key with
+    | Some mutex -> mutex
+    | None ->
+      let mutex = Eio.Mutex.create () in
+      Hashtbl.add t.locks merge_key mutex;
+      mutex
+
   let write t ~merge_key value =
-    let current = read t ~merge_key in
-    let merged = L.join current value in
-    KV.put t.kv ~key:merge_key (t.encode merged)
+    (* [use_ro], not [use_rw]: [KV.put] can raise (e.g. {!Riptide_storage.File_kv_store}'s
+       documented size-cap [Invalid_argument]) without having written anything -- the
+       [merge_key]'s stored value is left exactly as it was, a consistent state despite the
+       exception, which is exactly the case [use_ro] (unlock and re-raise) is for. [use_rw] would
+       instead permanently disable this [merge_key]'s mutex on that same exception, contradicting
+       [materializer.mli]'s existing, deliberately-unfixed documentation that a subsequent
+       SMALLER write to the same [merge_key] must go on succeeding. *)
+    Eio.Mutex.use_ro (mutex_for t ~merge_key) (fun () ->
+        let current = read t ~merge_key in
+        let merged = L.join current value in
+        KV.put t.kv ~key:merge_key (t.encode merged))
 end
