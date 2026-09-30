@@ -90,7 +90,17 @@
      spec/tla/README.md's own known-simplification point 4 within a round or two and wedges the
      cluster in View_change for the remainder of the run, after which nothing commits and the
      safety check is vacuously satisfied. Firing on every replica at once ("a timeout storm") is
-     what keeps view changes completing and keeps real committed state accumulating to compare. *)
+     what keeps view changes completing and keeps real committed state accumulating to compare.
+     (Audit-remediation Task 32 changed a below-quorum replica's check_timeout from a bare no-op
+     into a retry of its own broadcast -- see replica.ml's own [try_forfeit_or_retry_view_change]
+     -- which narrows point 4's gap somewhat: a replica that only ever ADOPTED a higher view
+     passively now DOES eventually broadcast its own StartViewChange for it, on its own next
+     check_timeout call. This comment's own "within a round or two, for the remainder of the run"
+     claim has NOT been re-verified against that change -- a random-subset variant of this sweep
+     has never actually been run, before or after Task 32, so this remains the same
+     un-exercised design rationale it always was, not a pinned regression test; it is not asserted
+     that the claim is still exactly accurate at either boundary, only that it is not part of this
+     task's own scope to re-derive.) *)
 
 open Riptide
 open Riptide_vsr
@@ -1845,6 +1855,142 @@ let test_eviction_blocked_actually_increments_when_may_evict_is_wired () =
              actually hold"
             tiny_ring_capacity (Replica.commit_number r)))
 
+(* ---------------------------------------------------------------------------------------------
+   Task 32 (audit-remediation): "a stranded replica keeps retrying its view-change broadcast" --
+   a real VSR liveness bug the audit found by live reproduction: a replica whose own
+   [StartViewChange] broadcast is dropped by a transient partition never retries it, even after
+   the partition heals, and is stranded in [View_change] status forever.
+
+   ROOT CAUSE (confirmed by reading [lib/vsr/replica.ml] directly, not assumed): [has_dvc_quorum]
+   requires BOTH [is_primary t] for the NEW view AND an f+1 DVC-sender quorum, so before this
+   task's fix, [try_forfeit_view_change]'s own [if not (has_dvc_quorum t dvcs) then ()] branch was
+   a bare no-op for EVERY backup replica in [View_change] status, unconditionally -- not merely
+   "when short of a DVC quorum". [check_timeout]'s own [View_change] branch only ever calls
+   [try_forfeit_view_change], so a replica below that quorum -- primary-elect or plain backup --
+   had no mechanism to ever retry a dropped broadcast, no matter how many more timeouts fired.
+
+   HAND-DRIVEN, not Cluster/Sim_transport/Eio-based: this reproduction needs one precise, targeted
+   fault ("replica 2's own StartViewChange broadcast, specifically, is dropped for a while, then
+   heals") that the file's own randomized [Network.fault_config]/[Cluster.run] machinery has no
+   deterministic way to express, and no real transport or dispatch fiber is needed to exercise it
+   -- matching test_vsr_replica.ml's and test_vsr_replica_view_change.ml's own established
+   convention of driving real protocol actions via direct [Replica.check_timeout]/
+   [Replica.handle_message] calls instead. The 3-replica setup (replica 1 the initial primary,
+   pinned to view 1, then silently "crashes"; both surviving backups independently fire
+   check_timeout) mirrors test_vsr_replica_view_change.ml's own
+   [test_single_view_change_survives_primary_failure] -- see that test's own doc comment for
+   exactly why BOTH surviving backups, not one, are required for any view change to ever reach a
+   DVC quorum at all -- with exactly one new fault layered on top: replica 2's own broadcast never
+   arrives anywhere the first time. *)
+let test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned () =
+  let replica_count = 3 in
+  let svc_limit = 10 (* generous: this test is about the retry MECHANISM, not the budget bound --
+                         see test_vsr_replica.ml's own test_check_timeout_bounded_by_svc_limit for
+                         that separate property. *) in
+  (* [mailbox.(to_)] queues every [(sender, bytes)] pair currently addressed to replica [to_], in
+     send order. Delivery is driven explicitly by this test's own [deliver_all] below -- there is
+     no dispatch fiber and no real (simulated) transport here, unlike
+     test_vsr_replica_view_change.ml's Eio-based harness. *)
+  let mailbox = Array.make (replica_count + 1) [] in
+  (* Replica 2's own outbound [Start_view_change] broadcast is dropped for as long as this is
+     [true] -- simulating a transient partition on replica 2's own outbound link, the audit's own
+     framing. Nothing else is affected: messages TO replica 2, and every OTHER message type FROM
+     replica 2 (its own later DoViewChange/StartView), are delivered normally even while this is
+     [true]. Deliberately this narrow, rather than a general partition, so the reproduction
+     isolates exactly the one liveness gap this task fixes and nothing else. *)
+  let drop_r2_svc_broadcast = ref true in
+  let route ~from ~to_ bytes =
+    let is_r2_svc =
+      from = 2 && match Message.decode bytes with Message.Start_view_change _ -> true | _ -> false
+    in
+    if not (!drop_r2_svc_broadcast && is_r2_svc) then mailbox.(to_) <- (from, bytes) :: mailbox.(to_)
+  in
+  let replicas =
+    Array.init replica_count (fun i ->
+        let my_id = i + 1 in
+        let r =
+          Replica.create ~storage:(Replica.volatile_storage ()) ~my_id ~replica_count ~svc_limit
+            ~send:(fun ~to_ bytes -> route ~from:my_id ~to_ bytes) ()
+        in
+        Replica.for_test_set_view_number r 1 (* Primary(1) = 1, matching this suite's own convention *);
+        r)
+  in
+  (* Drains every mailbox, including messages newly enqueued BY the very deliveries this same call
+     makes, until a full pass over [1..replica_count] adds nothing new -- i.e. until the cluster is
+     fully quiescent given whatever has been sent so far. Replica 1 (the "dead" primary below) is
+     never handed to [Replica.handle_message] -- messages addressed to it simply accumulate
+     unread and are dropped here, exactly matching test_vsr_replica_view_change.ml's own
+     [stop]'d-replica convention for "this process is gone", just without a real fiber to stop. *)
+  let deliver_all () =
+    let progressed = ref true in
+    while !progressed do
+      progressed := false;
+      for to_ = 1 to replica_count do
+        match List.rev mailbox.(to_) with
+        | [] -> ()
+        | msgs ->
+          mailbox.(to_) <- [];
+          List.iter
+            (fun (sender, bytes) ->
+              progressed := true;
+              if to_ <> 1 then Replica.handle_message replicas.(to_ - 1) ~sender bytes)
+            msgs
+      done
+    done
+  in
+  let backup2 = replicas.(1) and backup3 = replicas.(2) in
+  (* Both surviving backups fire check_timeout independently, BEFORE any delivery -- each one's own
+     [recv_svc] starts genuinely empty from its own check_timeout's reset, so each decision is
+     independent rather than one adopting the other's already-broadcast view. *)
+  Replica.check_timeout backup2
+  (* Normal -> View_change, view 1 -> 2 (Primary(2) = 2, so replica 2 is primary-elect of the view
+     it is about to try for); broadcasts StartViewChange{v=2;i=2} to peers 1 and 3 -- DROPPED to 3
+     (and irrelevantly to dead replica 1) by [drop_r2_svc_broadcast] above. *);
+  Replica.check_timeout backup3
+  (* Normal -> View_change, view 1 -> 2; broadcasts StartViewChange{v=2;i=3} to peers 1 (dead) and
+     2 -- delivered normally: only replica 2's OWN broadcasts are dropped. *);
+  deliver_all ();
+  (* Replica 3's own broadcast reached replica 2: [ReceiveMatchingSVC] adds 3 to replica 2's own
+     [recv_svc], crossing SendDVC's [>= f] threshold (f = 1 at replica_count 3), so replica 2 sends
+     itself a DoViewChange (VSR.tla's own "f+1 ... INCLUDING ITSELF", VSR.tla:262-263) -- landing
+     exactly ONE distinct DVC sender (itself) in its own [recv_dvc]. Replica 3 never received
+     replica 2's own broadcast, so replica 3 has no reason to send ITS OWN DoViewChange to replica
+     2 -- replica 2 is one short of the f+1 = 2 [has_dvc_quorum] needs. *)
+  Alcotest.(check bool) "replica 2 holds exactly its own self-addressed DVC, none from replica 3" true
+    (Replica.for_test_recv_dvc_senders backup2 = [ 2 ]);
+  Alcotest.(check bool) "replica 2 has not completed its view change yet" true
+    (Replica.status backup2 = Replica.View_change);
+
+  (* THE BUG, reproduced RED against pre-fix code: [drive_n_more_timeouts_after_the_drop] in the
+     brief's own pseudocode. Before this task's fix, NOTHING below ever unsticks replica 2 again,
+     even once its outbound link heals -- [try_forfeit_view_change]'s own
+     [if not (has_dvc_quorum t dvcs) then ()] branch was a bare no-op regardless of [status]/
+     [is_primary], so a below-quorum replica had no mechanism to ever retry a dropped broadcast.
+     Bounded at 5 more check_timeout calls (an explicit, generous retry budget, not "until it
+     works") and stopped the instant replica 2 genuinely returns to Normal -- calling
+     [check_timeout] again on an already-Normal replica would start a genuinely NEW,
+     unrelated view-change episode (TimerSendSVC's own [status = Normal] guard), which would
+     defeat this test's own final assertion that [view_number] lands on exactly 2. *)
+  drop_r2_svc_broadcast := false (* the partition heals *);
+  let rec drive_until_normal_or_budget_exhausted budget =
+    if budget > 0 && Replica.status backup2 <> Replica.Normal then begin
+      Replica.check_timeout backup2;
+      deliver_all ();
+      drive_until_normal_or_budget_exhausted (budget - 1)
+    end
+  in
+  drive_until_normal_or_budget_exhausted 5;
+  Alcotest.(check bool) "the replica rejoins the cluster once the partition heals: status back to Normal"
+    true
+    (Replica.status backup2 = Replica.Normal);
+  Alcotest.(check bool) "it is the primary of the view it was trying to reach (Primary(2) = 2)" true
+    (Replica.is_primary backup2);
+  Alcotest.(check int)
+    "view_number landed on exactly 2 -- never bumped past it by a spurious extra episode" 2
+    (Replica.view_number backup2);
+  Alcotest.(check bool) "the other survivor converged too: also Normal, also at view 2" true
+    (Replica.status backup3 = Replica.Normal && Replica.view_number backup3 = 2)
+
 let tests =
   [
     ("adversarial multi-seed sweep, combined network and storage faults", `Quick,
@@ -1893,4 +2039,7 @@ let tests =
     ( "Task 31 (audit-remediation): eviction_blocked actually increments once ?may_evict is really \
        wired through run_on_file_storage's real File_storage.create call site", `Quick,
       test_eviction_blocked_actually_increments_when_may_evict_is_wired );
+    ( "Task 32 (audit-remediation): a dropped StartViewChange broadcast is retried, not abandoned, \
+       once the partition heals", `Quick,
+      test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned );
   ]

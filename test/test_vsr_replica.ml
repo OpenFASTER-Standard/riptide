@@ -680,22 +680,58 @@ let test_check_timeout_transitions_and_broadcasts_start_view_change () =
     (decoded_sent sent
     = [ (2, Message.Start_view_change { v = 1; i = 1 }); (3, Message.Start_view_change { v = 1; i = 1 }) ])
 
-let test_check_timeout_noop_when_already_view_change () =
-  (* Isolates the [status = "Normal"] guard specifically, independent of the svc_limit bound
-     (svc_limit is generous here) -- a naive implementation that dropped this guard would let a
-     second, back-to-back check_timeout call bump view_number again and re-broadcast. *)
+(* Task 32 (audit-remediation) rewrite of what used to be
+   [test_check_timeout_noop_when_already_view_change]. That name, and its sole final assertion ("no
+   additional StartViewChange broadcast for the blocked 2nd call"), described exactly the
+   below-DVC-quorum branch this task's fix changes: [my_id = 1] at [replica_count = 3] is
+   [Primary(1) = 1], but [recv_dvc] is empty (nothing has ever delivered a DVC here), so
+   [has_dvc_quorum] reads false for the same reason it would for a genuine BACKUP -- insufficient
+   DVC evidence, not a wrong primary (see [has_dvc_quorum]'s own doc comment on [t] in replica.ml).
+
+   The old single invariant genuinely SPLITS into two now-distinct halves, one still true and one
+   now the OPPOSITE of what it used to be:
+
+   - STILL true: a second, back-to-back check_timeout call while still below quorum does NOT start
+     a NEW view-change episode -- [view_number] is not bumped again, and [recv_svc]/[recv_dvc] are
+     not reset. Every action that DOES start a genuinely new episode ([check_timeout]'s own
+     Normal -> View_change transition, [ReceiveHigherSVC]) resets [recv_svc]/[recv_dvc]/[sent_dvc]
+     in the same step (see those actions' own doc comments) -- so "unchanged across the call" is
+     exactly what distinguishes "the same episode retried" from "a second episode started".
+   - NOW FALSE, BY DESIGN: it is no longer a no-op that sends nothing. The whole point of Task 32
+     is that this call retries the dropped/never-delivered broadcast instead of going silent
+     forever -- see replica.ml's own [try_forfeit_or_retry_view_change] doc comment, and
+     [test/test_dst_scenarios.ml]'s
+     [test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned] for the live,
+     end-to-end reproduction this unit-level test complements. *)
+let test_check_timeout_below_quorum_retries_without_starting_a_new_episode () =
   let send, sent = capturing_send () in
   let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:3 ~svc_limit:5 ~send () in
   Replica.check_timeout t;
   Alcotest.(check int) "1st timeout advances view_number to 1" 1 (Replica.view_number t);
-  let sent_after_first = sent () in
+  let view_after_first = Replica.view_number t in
+  let recv_svc_after_first = Replica.for_test_recv_svc_senders t in
+  let recv_dvc_after_first = Replica.for_test_recv_dvc_senders t in
+  let sent_after_first = decoded_sent sent in
   Replica.check_timeout t;
-  Alcotest.(check bool) "2nd back-to-back call is a no-op: status stays View_change (not bumped further)"
-    true
+  Alcotest.(check bool) "2nd back-to-back call does NOT start a new episode: still View_change" true
     (Replica.status t = Replica.View_change);
-  Alcotest.(check int) "view_number NOT advanced a second time" 1 (Replica.view_number t);
-  Alcotest.(check bool) "no additional StartViewChange broadcast for the blocked 2nd call" true
-    (sent () = sent_after_first)
+  Alcotest.(check int) "view_number NOT bumped a second time -- same episode, not a newer view"
+    view_after_first (Replica.view_number t);
+  Alcotest.(check bool) "recv_svc NOT reset by the retry -- more evidence could still accumulate toward \
+                         the same quorum"
+    true (Replica.for_test_recv_svc_senders t = recv_svc_after_first);
+  Alcotest.(check bool) "recv_dvc NOT reset by the retry either, for the same reason" true
+    (Replica.for_test_recv_dvc_senders t = recv_dvc_after_first);
+  Alcotest.(check bool)
+    "the 2nd call DOES issue a retry StartViewChange broadcast for the SAME view_number -- the \
+     opposite of what this test used to assert before Task 32"
+    true
+    (decoded_sent sent
+    = sent_after_first
+      @ [
+          (2, Message.Start_view_change { v = view_after_first; i = 1 });
+          (3, Message.Start_view_change { v = view_after_first; i = 1 });
+        ])
 
 let test_check_timeout_bounded_by_svc_limit () =
   (* Isolates the [svc_count < svc_limit] guard. Since nothing in THIS task's own scope can bring
@@ -2037,9 +2073,10 @@ let tests =
     ( "Task 2: check_timeout transitions to View_change and broadcasts StartViewChange",
       `Quick,
       test_check_timeout_transitions_and_broadcasts_start_view_change );
-    ( "Task 2: check_timeout is a no-op when already View_change (status guard)",
+    ( "Task 32 (audit-remediation): below quorum, check_timeout retries the SAME episode's \
+       broadcast rather than starting (or repeating) a no-op",
       `Quick,
-      test_check_timeout_noop_when_already_view_change );
+      test_check_timeout_below_quorum_retries_without_starting_a_new_episode );
     ("Task 2: check_timeout is bounded by svc_limit", `Quick, test_check_timeout_bounded_by_svc_limit);
     ( "Task 2: check_timeout resets recv_svc across episodes (task-2-review.md's M2)",
       `Quick,

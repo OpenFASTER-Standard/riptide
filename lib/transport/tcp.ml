@@ -159,8 +159,9 @@ let default_max_connections ~peers = max 16 (4 * List.length peers)
    from the same file for the same reason. Under that consumption model, this peer's inbox can
    legitimately have up to [List.length peers - 1] messages arrive in one genuine burst -- one from
    each other cluster member, e.g. every backup replying to the same broadcast at once (see
-   [try_forfeit_view_change] in [lib/vsr/replica.ml] for a concrete broadcast shape: "for peer = 1 to
-   replica_count, send") -- before the single dispatch loop gets back around to draining them.
+   [try_forfeit_or_retry_view_change] in [lib/vsr/replica.ml] for a concrete broadcast shape: "for
+   peer = 1 to replica_count, send") -- before the single dispatch loop gets back around to draining
+   them.
    [4 *] that gives headroom for a short RUN of such bursts (e.g. a view-change episode's
    StartViewChange immediately followed by DoViewChange, from every backup) to queue up across a
    few dispatch iterations without the reader fiber ever blocking on ordinary, non-adversarial

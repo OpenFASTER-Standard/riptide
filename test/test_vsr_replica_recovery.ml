@@ -196,6 +196,20 @@ let test_forfeit_view_change_when_quorum_cannot_complete () =
   Alcotest.(check bool) "a StartViewChange for the new view was broadcast to the other two replicas" true
     (decoded_sent sent = [ (1, Message.Start_view_change { v = 6; i = 2 }); (3, Message.Start_view_change { v = 6; i = 2 }) ])
 
+(* Task 32 (audit-remediation) REWROTE this test's final assertion. Before that task, everything
+   through "the single DVC's evidence was NOT thrown away" was already the real, still-true
+   behavior this test's own name describes ("ForfeitViewChange is NOT enabled below a DVC
+   quorum") -- VSR.tla:528-531's own guard, unchanged by Task 32. What used to follow, "nothing
+   broadcast", was a SEPARATE claim that happened to also be true under the OLD, buggy code: below
+   a DVC quorum, [check_timeout] used to be a bare no-op, full stop, for every replica in
+   [View_change] regardless of whether it was a genuine primary-elect (this test's own case,
+   [is_primary t] = true) or a plain backup (replica.ml's own [has_dvc_quorum] doc comment, and
+   test_dst_scenarios.ml's [test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned],
+   cover that other case). That was the audit's own finding -- a replica whose broadcast never
+   arrives anywhere has no way to ever retry it -- and Task 32's fix means this exact scenario now
+   DOES broadcast again: not a forfeit (still correctly refused: no NEW episode, no bumped view),
+   but a retry of the SAME view's StartViewChange, so peers who missed the first one (or arrive
+   late) still eventually hear from this replica. *)
 let test_no_forfeit_below_a_dvc_quorum () =
   let send, sent = capturing_send () in
   let _backend, storage = fresh_storage () in
@@ -210,7 +224,17 @@ let test_no_forfeit_below_a_dvc_quorum () =
   Alcotest.(check int) "view_number unchanged: no forfeit below a DVC quorum" 7 (Replica.view_number t);
   Alcotest.(check (list int)) "the single DVC's evidence was NOT thrown away" [ 1 ]
     (Replica.for_test_recv_dvc_senders t);
-  Alcotest.(check bool) "nothing broadcast" true (sent () = [])
+  Alcotest.(check bool)
+    "Task 32: below quorum, check_timeout retries the SAME view's StartViewChange broadcast \
+     instead of doing nothing"
+    true
+    (decoded_sent sent
+    = [
+        (1, Message.Start_view_change { v = 7; i = 2 });
+        (3, Message.Start_view_change { v = 7; i = 2 });
+        (4, Message.Start_view_change { v = 7; i = 2 });
+        (5, Message.Start_view_change { v = 7; i = 2 });
+      ])
 
 (* ============================================================================================
    The tri-state storage mapping (VSR.tla:100-170): a slot the replica can prove it never held
@@ -1592,10 +1616,19 @@ let with_cluster_and_storage ~replica_count ~svc_limit
         Eio.Switch.fail sw Cluster_test_done)
   with Cluster_test_done -> ()
 
-(* Same helper, and same reasoning, as test_vsr_replica_view_change.ml's own: several replicas'
-   timers must fire INDEPENDENTLY (no yields in between) for a 3-replica cluster's two survivors to
-   each broadcast their own StartViewChange, which is what gets EXACTLY f + 1 = 2 DoViewChanges to
-   the new primary. Every call after the first is a real, guard-enforced no-op. *)
+(* Same helper, and same reasoning, as test_vsr_replica_view_change.ml's own (a SEPARATE, purely
+   copy-pasted definition, not shared code -- see that file's own doc comment for the full
+   reasoning, repeated only in summary here): several replicas' timers must fire INDEPENDENTLY (no
+   yields in between) for a 3-replica cluster's two survivors to each broadcast their own
+   StartViewChange, which is what gets EXACTLY f + 1 = 2 DoViewChanges to the new primary.
+
+   {b Audit-remediation Task 32 changed what happens after the first call} -- it is no longer true
+   that every call after the first is a no-op that sends nothing: a replica already in
+   [View_change] and still below [has_dvc_quorum] now RETRIES its StartViewChange for the SAME view
+   instead (bounded by the same [svc_limit] budget), which is exactly what lets a dropped broadcast
+   eventually get through once this function calls [check_timeout] again. See
+   [lib/vsr/replica.ml]'s own [try_forfeit_or_retry_view_change] doc comment for the fix, and
+   [test/test_vsr_replica_view_change.ml]'s own copy of this comment for the fuller version. *)
 let fire_check_timeout_repeatedly r ~times =
   for _ = 1 to times do
     Replica.check_timeout r
@@ -2336,7 +2369,9 @@ let tests =
       `Quick,
       test_contested_op_blocks_completion_then_a_nack_quorum_resolves_it );
     ("ForfeitViewChange fires on a quorum that cannot complete", `Quick, test_forfeit_view_change_when_quorum_cannot_complete);
-    ("ForfeitViewChange is NOT enabled below a DVC quorum", `Quick, test_no_forfeit_below_a_dvc_quorum);
+    ( "ForfeitViewChange is NOT enabled below a DVC quorum (Task 32: but a retry broadcast now is)",
+      `Quick,
+      test_no_forfeit_below_a_dvc_quorum );
     ("a corrupt slot is neither shipped as an entry nor nacked", `Quick, test_corrupt_slot_is_neither_shipped_nor_nacked);
     ( "CrashRestart: durable state survives, volatile state is lost, status is reconstructed",
       `Quick,

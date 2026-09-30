@@ -1004,8 +1004,10 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    AND ROUND 3 (finding 1) RETRACTED THE ONE EXAMPLE OF SUCH A SOURCE THIS COMMENT USED TO OFFER: an
    external monitor of this replica's own traffic does NOT qualify, because DURABILITY PRECEDES
    OBSERVABILITY at every site in this file that moves any of the three fields -- [check_timeout],
-   [handle_start_view_change]'s higher-view branch, [try_forfeit_view_change] and [try_send_sv] all
-   [persist_superblock] and only THEN send, and [handle_start_view] raises
+   [handle_start_view_change]'s higher-view branch, [try_forfeit_or_retry_view_change]'s own
+   quorum-held (forfeit) branch, and [try_send_sv] all [persist_superblock] and only THEN send
+   (its own below-quorum retry branch moves none of the three fields at all, so there is nothing
+   for it to persist first -- see that function's own doc comment), and [handle_start_view] raises
    [view_number]/[last_normal_view] and sends nothing at all. An observed triple is therefore at best
    a lower bound and at worst wrong in either direction. The only source that qualifies is one
    SYNCHRONOUSLY COUPLED to the durable write (a mirrored copy of the RECORD, not of the messages);
@@ -1489,9 +1491,9 @@ let highest_commit_number (dvcs : dvc list) =
    range before it may complete. VSR.tla:403-409 is explicit that this is structural rather than
    cosmetic: with storage faults, the evidence needed to complete may simply not have arrived yet,
    so the coordinator must be able to WAIT (stay in View_change, keep accepting DVCs -- what
-   [try_send_sv] does by returning without effect) or GIVE UP ([try_forfeit_view_change]), and be
-   interrupted at any point by a higher view (the existing [handle_start_view_change] path, which
-   resets this whole accumulator).
+   [try_send_sv] does by returning without effect) or GIVE UP (the quorum-held branch of
+   [try_forfeit_or_retry_view_change]), and be interrupted at any point by a higher view (the
+   existing [handle_start_view_change] path, which resets this whole accumulator).
 
    The functions below transcribe, in the spec's own order: HasDvcQuorum, EntrySources/CanFill/
    FillValue, NackCount/ProvenAbsent, ValidCompletion/CanComplete/CompletionPoint. *)
@@ -1620,7 +1622,8 @@ let proven_absent t (dvcs : dvc list) ~op_number =
    So the admissible set is exactly the integers in [[max(highest_commit, highest_contested),
    fillable_prefix]], and its maximum -- CompletionPoint -- is [fillable_prefix] whenever that
    interval is non-empty. Returning [None] for an empty interval is [~CanComplete], which is
-   precisely [try_forfeit_view_change]'s own enabling condition below. *)
+   precisely the enabling condition of [try_forfeit_or_retry_view_change]'s own quorum-held
+   (forfeit) branch below. *)
 let completion_point t (dvcs : dvc list) ~(winner : dvc) ~highest_commit =
   let f = (t.replica_count - 1) / 2 in
   let n = winner.dvc_n in
@@ -1717,8 +1720,8 @@ let try_send_sv t =
                 from canonical evidence nor proven absent by a nack quorum. WAIT -- stay in
                 View_change with all evidence intact and keep accepting DVCs; more DVCs can only
                 ADD evidence, never remove it. Giving up is a separate, timer-driven decision
-                ([try_forfeit_view_change] below), never something this send path takes on its
-                own. *)
+                ([try_forfeit_or_retry_view_change]'s own quorum-held branch below), never
+                something this send path takes on its own. *)
         | Some l -> (
           let rec build o acc =
             if o > l then Some (List.rev acc)
@@ -1776,37 +1779,88 @@ let try_send_sv t =
               done
             end))
 
-(* ---- ForfeitViewChange (VSR.tla:542-556) ----
-   Enabled precisely when this replica has everything the OLD, storage-fault-unaware protocol
-   needed to complete -- primary of its own view, in View_change, holding a valid f+1 DVC quorum --
-   and STILL cannot complete, because at least one op in the candidate range is neither
-   reconstructible nor proven absent. That is the one situation storage-fault-awareness newly
-   creates and that no amount of waiting is GUARANTEED to resolve: the remaining f replicas may
-   all be unreachable, or may all report the same corrupt slot.
+(* ---- ForfeitViewChange (VSR.tla:542-556), PLUS Task 32's audit-remediation fix for the branch
+   VSR.tla never had to name at all ----
 
-   Effect: abandon this attempt at view+1 so a different replica -- one whose storage may be
-   intact where this one's is not -- gets to coordinate. The replica STAYS in View_change; it does
-   not fall back to Normal, because its durable view has already advanced.
+   This function now has two genuinely different jobs, selected by [has_dvc_quorum], not one:
 
-   Deliberately NOT enabled below a DVC quorum (VSR.tla:528-531): more DVCs only ever add
-   evidence, so forfeiting early would abandon an attempt that was still making progress.
+   1. QUORUM HELD, CANNOT COMPLETE -- ForfeitViewChange itself, unchanged from before this task.
+      Enabled precisely when this replica has everything the OLD, storage-fault-unaware protocol
+      needed to complete -- primary of its own view, in View_change, holding a valid f+1 DVC
+      quorum -- and STILL cannot complete, because at least one op in the candidate range is
+      neither reconstructible nor proven absent. That is the one situation storage-fault-awareness
+      newly creates and that no amount of waiting is GUARANTEED to resolve: the remaining f
+      replicas may all be unreachable, or may all report the same corrupt slot.
 
-   TWO DELIBERATE DIVERGENCES from the literal spec text, both disclosed:
+      Effect: abandon this attempt at view+1 so a different replica -- one whose storage may be
+      intact where this one's is not -- gets to coordinate. The replica STAYS in View_change; it
+      does not fall back to Normal, because its durable view has already advanced.
 
-   1. WHO DRIVES IT. In TLA+ this is an always-enabled disjunct of [Next], free to fire the
-      instant the quorum is reached. Firing it eagerly here would be wrong for a real deployment
-      -- the f+1st DVC and the DVC that resolves the contested op can arrive microseconds apart,
-      and an eager forfeit would abandon a completable view change every time. VSR.tla:536-537
-      says as much ("Bounded by ForfeitLimit ...; a real implementation bounds it with a timer"),
-      so this is driven from [check_timeout]: the caller's own "nothing is progressing" signal.
+   2. QUORUM NOT (YET) HELD -- Task 32's own fix, and NOT a VSR.tla action at all: the abstract
+      spec has no reason to name this branch, because it never models message loss in the first
+      place (research §2.1: TLA+'s [Broadcast] is unconditional delivery). A REAL deployment's
+      broadcast can simply not arrive -- at some, or even every, peer -- and before this task nothing
+      here ever retried it: this branch used to read [if not (has_dvc_quorum t dvcs) then ()], a
+      bare no-op, for every replica below quorum, unconditionally -- not only "the common case of
+      genuinely still waiting on peers", but ALSO the one where THIS replica's own most recent
+      broadcast (its very first, or an earlier retry) never reached anyone at all. [has_dvc_quorum]
+      requires BOTH [is_primary t] for the view this replica is trying to reach AND an f+1 DVC
+      quorum, so this is not even restricted to primary-elects: a plain BACKUP in View_change
+      (never primary of the view it's trying to reach, so [is_primary t] is false and
+      [has_dvc_quorum] can never become true no matter how much DVC evidence arrives) hit this exact
+      same no-op branch on every single check_timeout call, forever. That is the audit's own
+      finding, reproduced live in test_dst_scenarios.ml's
+      [test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned]: "a stranded replica",
+      not "a stranded primary-elect".
+
+      Effect: re-broadcast [Start_view_change] for THIS replica's CURRENT [view_number] -- never
+      bumped to [view_number + 1], because this is not a new attempt, it is the SAME episode trying
+      again. Correspondingly, [recv_svc]/[recv_dvc]/[sent_dvc] are left exactly as they are: more
+      responses can still accumulate toward this same episode's quorum (a retry adds a chance for
+      MORE evidence to arrive, it never invalidates evidence already held), so resetting any of the
+      three here would be throwing away real progress for no reason, unlike the genuine new-episode
+      resets ForfeitViewChange's own effects (below) and [check_timeout]'s own Normal branch both
+      perform. [svc_count] DOES increment, though -- this task's second, smaller fix
+      ("svc_count not incrementing on the below-quorum path"): every retry is a real attempt this
+      replica makes at eventually giving up and trying a NEWER view (exactly what an unbounded
+      retry loop would refuse to ever do), so it must count against the same [svc_limit] budget
+      [check_timeout]'s own Normal-branch timeouts and this function's own ForfeitViewChange effect
+      already share -- see divergence 2 below for why that budget is shared rather than separate.
+      No [persist_superblock] call: unlike every other action in this file that touches [t] with
+      DURABILITY PRECEDES OBSERVABILITY discipline, this branch changes NONE of [view_number]/
+      [last_normal_view]/[op_number]/[commit_number] -- the four fields the superblock actually
+      records -- so there is nothing new to make durable before sending.
+
+   TWO DELIBERATE DIVERGENCES from the literal spec text, both disclosed (both predate this task;
+   only re-cited here because [svc_count] is now touched by both of this function's branches, not
+   just one):
+
+   1. WHO DRIVES IT. In TLA+, ForfeitViewChange is an always-enabled disjunct of [Next], free to
+      fire the instant the quorum is reached. Firing it eagerly here would be wrong for a real
+      deployment -- the f+1st DVC and the DVC that resolves the contested op can arrive
+      microseconds apart, and an eager forfeit would abandon a completable view change every time.
+      VSR.tla:536-537 says as much ("Bounded by ForfeitLimit ...; a real implementation bounds it
+      with a timer"), so this is driven from [check_timeout]: the caller's own "nothing is
+      progressing" signal. The below-quorum retry above is driven the same way, for the same
+      reason: it is the timer's OWN "nothing progressed" signal that must trigger a retry, not
+      evidence arriving (evidence arriving is [handle_do_view_change]/[handle_start_view_change]'s
+      own job, already wired independently of this function).
    2. WHAT BOUNDS IT. The spec's [aux_forfeit_count < ForfeitLimit] is a state-space device. Here
-      the budget is [svc_count]/[svc_limit], shared with [TimerSendSVC] -- both are "this replica
-      gives up on the current view and tries to start a newer one", both are reset by a successful
-      return to Normal, and giving forfeits a second, independent budget would let a wedged
-      replica burn view numbers at twice the configured rate for no stated reason. *)
-let try_forfeit_view_change t =
+      the budget is [svc_count]/[svc_limit], shared with [TimerSendSVC] (and, as of this task, with
+      the retry branch above too) -- all three are "this replica spends one more attempt trying to
+      reach a view it is not yet the working primary of", all reset by a successful return to
+      Normal, and giving any of them a second, independent budget would let a wedged replica burn
+      through attempts at multiple times the configured rate for no stated reason. *)
+let try_forfeit_or_retry_view_change t =
   let dvcs = valid_dvcs t in
-  if not (has_dvc_quorum t dvcs) then ()
+  if not (has_dvc_quorum t dvcs) then begin
+    t.svc_count <- t.svc_count + 1 (* see this function's own doc comment, branch 2, and divergence
+                                       2 -- the shared [svc_limit] budget this bounds. *);
+    let bytes = Message.encode (Message.Start_view_change { v = t.view_number; i = t.my_id }) in
+    for peer = 1 to t.replica_count do
+      if peer <> t.my_id then t.send ~to_:peer bytes
+    done
+  end
   else
     let can_complete =
       match winning_dvc dvcs with
@@ -1836,28 +1890,33 @@ let try_forfeit_view_change t =
       done
     end
 
-(* ---- TimerSendSVC (VSR.tla:302-315), plus the forfeit escape's trigger ----
+(* ---- TimerSendSVC (VSR.tla:302-315), plus the forfeit/retry escape's trigger ----
    research §2.1: VSR.tla deliberately does not model real timeouts -- this is an unconditional,
    always-enabled (once its guard holds) action, not something driven by a clock; a caller decides
    when to invoke [check_timeout] (e.g. on an actual timer firing with no Prepare/heartbeat seen
    recently), matching the spec's own framing of it as "bounded by a state-space-limiting counter"
    rather than real wall-clock logic.
 
-   ONE ENTRY POINT, TWO ACTIONS, selected by status -- and they are disjoint by construction:
-   [TimerSendSVC] guards on [rep_status[r] = "Normal"] (VSR.tla:305) and [ForfeitViewChange]'s own
-   [HasDvcQuorum] guards on [rep_status[r] = "ViewChange"] (VSR.tla:489), so no call can ever
-   trigger both. Keeping them behind one function is what makes the caller's contract "tell the
-   replica that nothing has progressed recently" rather than "know which recovery action is
-   currently applicable", which the caller has no way to determine. *)
+   ONE ENTRY POINT, selected by status -- and the two top-level branches are disjoint by
+   construction: [TimerSendSVC] guards on [rep_status[r] = "Normal"] (VSR.tla:305), and the
+   [View_change] branch below (forfeit-or-retry, see [try_forfeit_or_retry_view_change]'s own doc
+   comment for why it is now two actions, not one) only ever runs when [status = "ViewChange"], so
+   no call can ever trigger both. Keeping them behind one function is what makes the caller's
+   contract "tell the replica that nothing has progressed recently" rather than "know which
+   recovery action is currently applicable", which the caller has no way to determine -- and Task
+   32's own fix preserves that contract exactly: [check_timeout] itself still does not need to know
+   whether a below-quorum replica is a primary-elect stuck on evidence or a plain backup that can
+   never do anything OTHER than retry; [try_forfeit_or_retry_view_change] decides that
+   internally, via [has_dvc_quorum]. *)
 let check_timeout t =
   if t.svc_count >= t.svc_limit then
     () (* [aux_svc_count[r] < StartViewOnTimerLimit] guard (VSR.tla:304) -- see [svc_count]'s own
           doc comment on [t] for why this bound is NOT permanent in this implementation despite
           [aux_svc_count] never resetting in the literal TLA+ transcription: [SendSV]/[ReceiveSV]
           reset it to 0 on every successful return to [Normal], giving each new failure its own
-          fresh budget. Bounds the forfeit path too -- see [try_forfeit_view_change]'s divergence
-          2. *)
-  else if t.status = View_change then try_forfeit_view_change t
+          fresh budget. Bounds the forfeit path AND the below-quorum retry path too -- see
+          [try_forfeit_or_retry_view_change]'s own divergence 2. *)
+  else if t.status = View_change then try_forfeit_or_retry_view_change t
   else begin
     let v = t.view_number + 1 in
     t.view_number <- v;

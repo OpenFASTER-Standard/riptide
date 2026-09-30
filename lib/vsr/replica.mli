@@ -333,7 +333,8 @@ val restart :
     monitoring/audit trail that recorded this replica's own view transitions" a safe source.} Every
     site in this module that moves [view_number]/[last_normal_view]/[commit_number] persists the
     superblock STRICTLY BEFORE the message that announces the change ([check_timeout],
-    [handle_start_view_change]'s higher-view branch, [try_forfeit_view_change], [try_send_sv]), and
+    [handle_start_view_change]'s higher-view branch, [try_forfeit_or_retry_view_change]'s own
+    quorum-held branch, [try_send_sv]), and
     [handle_start_view] — the backup side of a view change — persists a raised
     [view_number]/[last_normal_view] while sending NOTHING at all. So a source that merely OBSERVES
     this replica is reading one side or the other of that window and can be wrong in either
@@ -565,31 +566,54 @@ val propose : t -> Riptide.Value.value -> unit
     matching what VSR.tla's own [Next] would allow. *)
 
 val check_timeout : t -> unit
-(** {b Two actions behind one entry point, selected by [status]} — the second added by the
-    storage-fault-tolerant-recovery work:
+(** {b One entry point, selected by [status]}, and the [View_change] side is itself now two
+    further actions selected by [has_dvc_quorum] (audit-remediation Task 32 added the second of
+    the two — see below):
 
     - [status = Normal]: VSR.tla's [TimerSendSVC] (VSR.tla:302-315), described in full below.
-    - [status = View_change]: VSR.tla's [ForfeitViewChange] (VSR.tla:542-556) — the escape hatch
-      for a coordinator that holds a full [f+1] [DoViewChange] quorum and STILL cannot complete,
-      because some op in the candidate range is neither reconstructible from the quorum's readable
-      entries nor proven absent by a nack quorum. It bumps to [view + 1], clears the view-change
-      bookkeeping and broadcasts [StartViewChange], so a replica whose own storage may be intact
-      gets to coordinate instead; it deliberately does NOT return to [Normal] (this replica's
-      durable view has already advanced), and it deliberately does nothing at all below a quorum
-      (more [DoViewChange]s can only add evidence, so forfeiting early would abandon an attempt
-      that was still making progress — VSR.tla:528-531).
+    - [status = View_change], [has_dvc_quorum] true: VSR.tla's [ForfeitViewChange]
+      (VSR.tla:542-556) — the escape hatch for a coordinator that holds a full [f+1]
+      [DoViewChange] quorum and STILL cannot complete, because some op in the candidate range is
+      neither reconstructible from the quorum's readable entries nor proven absent by a nack
+      quorum. It bumps to [view + 1], clears the view-change bookkeeping and broadcasts
+      [StartViewChange] for the new view, so a replica whose own storage may be intact gets to
+      coordinate instead; it deliberately does NOT return to [Normal] (this replica's durable view
+      has already advanced), and it deliberately does not fire at all above a quorum whose
+      evidence CAN still complete (more [DoViewChange]s can only add evidence, so forfeiting early
+      would abandon an attempt that was still making progress — VSR.tla:528-531).
+    - [status = View_change], [has_dvc_quorum] false (audit-remediation Task 32, NOT a VSR.tla
+      action — the abstract spec has no reason to model this, since its own [Broadcast] is
+      unconditional delivery, VSR §2.1): re-broadcasts [StartViewChange] for this replica's
+      CURRENT [view_number] — the SAME episode retrying, never a new one — leaving [recv_svc],
+      [recv_dvc], and [sent_dvc] untouched (more responses can still accumulate toward the same
+      quorum; a retry only ever adds a chance at more evidence, never invalidates evidence already
+      held). [has_dvc_quorum] requires BOTH this replica being primary of the view it is trying to
+      reach AND an [f+1] DVC-sender quorum, so this branch is not restricted to a stuck
+      primary-elect: it is also what fires, every single time, for a plain backup in
+      [View_change] (which can never be primary of a view it hasn't won, so [has_dvc_quorum] is
+      never true for it no matter how much evidence arrives) — this is the fix for the audit's own
+      finding, "a stranded replica" whose dropped broadcast previously had no retry mechanism at
+      all. See {!Riptide_vsr.Replica}'s own [try_forfeit_or_retry_view_change] (internal,
+      [lib/vsr/replica.ml]) for the full citation and both divergences, and
+      [test/test_dst_scenarios.ml]'s
+      [test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned] for a live
+      reproduction and fix confirmation.
 
-      In the spec this is a free-firing [Next] disjunct; here it is timer-driven, because firing
-      it the instant a quorum is reached would abandon completable view changes whenever the
-      resolving message is merely a few microseconds behind the quorum-completing one
-      (VSR.tla:536-537 says a real implementation bounds it with a timer, and this is that). It
-      shares [svc_limit] as its budget with [TimerSendSVC] — both are "give up on this view and
-      try a newer one", and both budgets are reset by a successful return to [Normal].
+      Both [View_change]-status branches are timer-driven, not free-firing [Next] disjuncts as in
+      the spec, for the same reason: firing forfeit the instant a quorum is reached would abandon
+      completable view changes whenever the resolving message is merely a few microseconds behind
+      the quorum-completing one (VSR.tla:536-537 says a real implementation bounds it with a
+      timer, and this is that); firing a retry only from the timer, rather than from evidence
+      arriving, is what keeps it disjoint from {!handle_message}'s own dispatch, which already
+      handles evidence arriving on its own. Both share [svc_limit] as their budget with
+      [TimerSendSVC] — all three are "spend one more attempt at reaching a view this replica is
+      not yet the working primary of", and all three budgets are reset by a successful return to
+      [Normal].
 
-    The two are disjoint by construction ([TimerSendSVC] requires [Normal], the forfeit path
-    requires [View_change]), so one call can never trigger both, and a caller never has to know
-    which recovery action is currently applicable — it only has to report that nothing is
-    progressing.
+    [status = Normal] and [status = View_change] are disjoint by construction (the first requires
+    [Normal], the second requires [View_change]), so one call can never trigger more than one of
+    the three actions above, and a caller never has to know which recovery action is currently
+    applicable — it only has to report that nothing is progressing.
 
     [check_timeout t] is VSR.tla's [TimerSendSVC] (VSR.tla:161-174) — the entry point a caller
     invokes when it decides (by whatever real wall-clock/timer policy it uses — VSR.tla itself
@@ -603,33 +627,53 @@ val check_timeout : t -> unit
     guard in this module, a failing guard means the action simply isn't enabled: no exception, no
     state change, nothing sent.
 
-    {b The [status t = Normal] conjunct is a real, disclosed liveness gap, not just a guard}: a
-    replica that has already moved to [View_change] has NO mechanism anywhere in this module to
-    re-arm and try a NEWER view on its own, even if the view it's currently attempting also turns
-    out to have a dead primary. Two consecutive dead [Primary]-designates (e.g. a backup dies, then
-    the primary dies, and the next view's own [Primary] happens to be that already-dead backup) can
-    therefore wedge an entire live-quorum cluster in [View_change] PERMANENTLY — every further
-    {!check_timeout} call is a no-op, safety is completely unaffected (nothing committed is ever
-    lost or diverges), but no replica ever becomes primary again. See [spec/tla/README.md]'s "Known
-    simplifications, not omissions" list, point 3, for the full explanation, why this is
-    liveness-only, and why fixing it is real, separate design work out of scope here; see
-    [test/test_vsr_replica_view_change.ml]'s own regression test for a real, running reproduction.
+    {b The [status t = Normal] conjunct still marks a real, disclosed liveness gap, though
+    audit-remediation Task 32 narrowed exactly what the gap is}: a replica that has already moved
+    to [View_change] has NO mechanism anywhere in this module to re-arm and try a NEWER view on its
+    own, even if the view it's currently attempting also turns out to have a dead primary — THAT
+    part is unchanged, because the only path to a newer view (the forfeit branch of
+    [try_forfeit_or_retry_view_change]) still requires [has_dvc_quorum], which still requires this
+    replica to be PRIMARY of the view it's stuck in. Two consecutive dead [Primary]-designates
+    (e.g. a backup dies, then the primary dies, and the next view's own [Primary] happens to be
+    that already-dead backup) therefore still wedge an entire live-quorum cluster in [View_change]
+    PERMANENTLY — no survivor is EVER primary of that dead-end view, so none of them can ever
+    forfeit out of it, safety is completely unaffected (nothing committed is ever lost or
+    diverges), and no replica ever becomes primary again. What IS different since Task 32: further
+    {!check_timeout} calls on a wedged replica are no longer bare no-ops — they retry that same
+    dead-end view's [Start_view_change] broadcast (bounded by [svc_limit], shared with every other
+    use of that budget) until the budget is exhausted, at which point they genuinely do become
+    no-ops again, just for a different reason (budget exhaustion, not "[View_change] status means
+    nothing can happen"). See [spec/tla/README.md]'s "Known simplifications, not omissions" list,
+    point 3, for the full explanation, why this remains liveness-only, and why fixing THIS gap (a
+    replica re-arming to try a genuinely NEWER view on its own) is real, separate design work still
+    out of scope here; see [test/test_vsr_replica_view_change.ml]'s own
+    [test_two_dead_primary_designates_wedge_the_cluster_permanently] for a real, running
+    reproduction, updated by Task 32 to verify both halves — the wedge itself unchanged, and the
+    new retry traffic underneath it.
 
-    {b A related, MORE reachable gap, sharing this same broad root cause} (no replica in this
-    module ever sends a [Start_view_change] once it has left [Normal] status, by any path):
-    [ReceiveHigherSVC] (see {!handle_message}'s own doc comment, its [Start_view_change] dispatch
-    section) adopts a higher view it hears about from someone else's [Start_view_change] but never
-    re-broadcasts one of its own. A caller driving this function from a real per-replica wall-clock
-    timer (this module's own intended shape) MUST NOT assume that one replica detecting a dead
-    primary is always enough to recover the cluster on its own: with the survivors split between
-    active timer-firers and passive adopters, completing a view change can require as many as
-    [f + 1] of them to have fired [check_timeout] independently — worst case, exactly the dead-
-    primary scenario point 3 already covers — even though a fully-live cluster with no crash at
-    all needs only [f]. Survivors' timers firing at different times is the ordinary case for
-    independent real timers, not an edge case, and a timer policy that assumes "the first replica
-    to notice is enough" can wedge the cluster permanently on a SINGLE primary failure, with no
-    second failure required. See [spec/tla/README.md]'s same "Known simplifications, not
-    omissions" list, point 4, for the full mechanism and a live reproduction.
+    {b A related gap, SUBSTANTIALLY NARROWED (not fully closed) by Task 32}: before Task 32, no
+    replica in this module ever sent a [Start_view_change] once it had left [Normal] status, by any
+    path — [ReceiveHigherSVC] (see {!handle_message}'s own doc comment, its [Start_view_change]
+    dispatch section) adopts a higher view it hears about from someone else's [Start_view_change]
+    but never re-broadcasts one of its own AT THE MOMENT OF ADOPTING, and that part is still true.
+    What changed: a replica that adopted a higher view this way is now, by that same adoption,
+    sitting in [View_change] — and per the fix described just above, its OWN NEXT {!check_timeout}
+    call (whenever its own real wall-clock timer next fires, with no special action required from
+    the caller) now retries a [Start_view_change] broadcast for the view it adopted, rather than
+    doing nothing. Composed with [ReceiveMatchingSVC]/[SendDVC] (see {!handle_message}'s own doc
+    comment), this means a caller driving this function from a real, PERIODIC per-replica timer (the
+    shape this module's own docs already assume) no longer strictly needs every recovering
+    replica's FIRST-EVER post-crash timeout to land inside one narrow window for a view change to
+    complete — a passive adopter that missed that window can still supply the missing evidence on
+    its own later firing. This consequence follows directly from reading
+    [try_forfeit_or_retry_view_change]'s own code (the same mechanism
+    [test/test_dst_scenarios.ml]'s [test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned]
+    pins for a different scenario), but — unlike that test — this EXACT "passive adopter, one
+    further firing, no independent original timeout" shape has not been given its own dedicated
+    regression test as of this task, so treat the mechanism as verified and the precise boundary of
+    what it does and doesn't still require as not yet pinned. See [spec/tla/README.md]'s same
+    "Known simplifications, not omissions" list, point 4, for the original mechanism and a live
+    reproduction predating this fix.
 
     Otherwise: advances [view_number] to [view_number t + 1], moves [status] to [View_change],
     resets [recv_svc] to empty, [recv_dvc] to empty, and [sent_dvc] to [false] (VSR.tla:166-170 —

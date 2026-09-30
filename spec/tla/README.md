@@ -127,11 +127,26 @@ undermine the credibility every other claim in this file depends on.
    `f + 1`, a live quorum, and they correctly time out and complete a view change into the next
    view — but if `Primary` of THAT next view also happens to be the replica that was killed first
    (the backup), the cluster is now permanently stuck: all 3 survivors sit at
-   `status = "ViewChange"` forever, `check_timeout`'s own guard blocks every further call as a
-   no-op, and there is no other mechanism anywhere in this module's scope that re-arms the timer or
-   escalates the view while already mid-view-change. Real VSR/Viewstamped Replication Revisited
-   re-arms the view-change timer while already in `ViewChange` status specifically to handle this;
-   neither the original paper's formalization here nor this implementation does.
+   `status = "ViewChange"` forever, and there is no mechanism anywhere in this module's scope that
+   escalates any of them to a NEWER view while already mid-view-change. Real VSR/Viewstamped
+   Replication Revisited re-arms the view-change timer while already in `ViewChange` status
+   specifically to handle this; neither the original paper's formalization here nor this
+   implementation does.
+
+   **Audit-remediation Task 32 update**: `check_timeout`'s own guard blocking "every further call
+   as a no-op" is no longer accurate as stated — a replica below `HasDvcQuorum` (which includes
+   every one of these three survivors, permanently, since none of them is ever `Primary` of the
+   dead-end view) now RETRIES that same view's `STARTVIEWCHANGE` broadcast on every further call
+   instead of doing nothing, bounded by `svc_limit`. This does not close the wedge: retrying the
+   SAME view can never be what escalates a replica to a NEWER one — only the forfeit path can do
+   that, and forfeiting still requires `HasDvcQuorum`, i.e. still requires being `Primary` of the
+   view in question, which none of these three survivors ever is. So the wedge itself is unchanged
+   — see `replica.mli`'s own `check_timeout` doc comment, and
+   `test/test_vsr_replica_view_change.ml`'s `test_two_dead_primary_designates_wedge_the_cluster_permanently`
+   (updated by Task 32 to verify both halves: the wedge unchanged, and the new retry traffic
+   underneath it) — but "check_timeout's own guard blocks every further call as a no-op" must now
+   be read as "...blocks every further call as a no-op ONCE its own `svc_limit` retry budget is
+   exhausted", not immediately.
 
    Safety is completely unaffected — nothing is lost, nothing is corrupted, no committed entry
    becomes uncommitted or divergent; every replica's own log and `commit_number` simply stop
@@ -141,57 +156,71 @@ undermine the credibility every other claim in this file depends on.
    above — was not identified during this spec's own design or its TLC run; it surfaced only once
    real, running, multi-replica code was driven through an adversarial two-failure scenario Task 4
    itself did not originally construct. Not modeled or checked by `VSR.tla`/TLC at all (TLC checks
-   no liveness properties at this scope, per point 2's own note); fixing it for real (e.g.
-   re-triggering `TimerSendSVC` from within `View_change` status, or bounding how long a replica
-   waits there before trying a newer view) is real, separate design work, out of scope for this
-   plan.
+   no liveness properties at this scope, per point 2's own note); fixing THIS gap for real (e.g.
+   re-triggering `TimerSendSVC` from within `View_change` status to reach a genuinely NEWER view —
+   not merely retrying the same one, which Task 32 already does) remains real, separate design
+   work, out of scope for this plan.
 
-4. **`ReceiveHigherSVC` adopts a higher view but never re-broadcasts its own `STARTVIEWCHANGE` —
-   so a single primary failure can wedge the cluster permanently if survivors' timers don't fire
-   near-simultaneously, which is the ordinary case for independent real timers, not an edge case.**
-   The shared root cause with point 3 above is broader than either gap's own specific missing
-   emission site (point 3's is `TimerSendSVC`'s own `rep_status[r] = "Normal"` gate blocking
-   re-arming; this point's is `ReceiveHigherSVC` never emitting anything at all): no replica in
-   this module EVER sends a `STARTVIEWCHANGE` once it has left `"Normal"` status, by any path. This
-   gap is reachable with only ONE dead replica, not two, which makes it strictly more consequential
-   on its own terms: `ReceiveHigherSVC`
-   (`VSR.tla:183-194`) seeds `rep_recv_svc[r]` with a singleton (just the sender it heard from) and
-   never sends a `STARTVIEWCHANGE` of its own — a real divergence from the original paper's own
-   §4.2 step 1, where a replica that notices the need for a view change *because it heard a higher
-   view* also sends `STARTVIEWCHANGE`. Consequence, composed with `SendDVC`'s own
-   `Cardinality(rep_recv_svc[r]) >= f` threshold (`VSR.tla:221`): only a replica whose OWN
-   `TimerSendSVC` fires ever produces a `STARTVIEWCHANGE` that anyone else can count; a replica
-   that only ever adopts passively contributes nothing to any other replica's own threshold.
+4. **`ReceiveHigherSVC` adopts a higher view but never re-broadcasts its own `STARTVIEWCHANGE` AT
+   THE MOMENT OF ADOPTING — which used to mean a single primary failure could wedge the cluster
+   permanently if survivors' timers didn't fire near-simultaneously; audit-remediation Task 32
+   substantially narrows this, though the underlying adoption-time gap is unchanged.** The shared
+   root cause with point 3 above is broader than either gap's own specific missing emission site
+   (point 3's is `TimerSendSVC`'s own `rep_status[r] = "Normal"` gate blocking re-arming; this
+   point's is `ReceiveHigherSVC` never emitting anything at all, at adoption time): before Task 32,
+   no replica in this module EVER sent a `STARTVIEWCHANGE` once it had left `"Normal"` status, by
+   any path. `ReceiveHigherSVC` (`VSR.tla:183-194`) seeds `rep_recv_svc[r]` with a singleton (just
+   the sender it heard from) and never sends a `STARTVIEWCHANGE` of its own — a real divergence
+   from the original paper's own §4.2 step 1, where a replica that notices the need for a view
+   change *because it heard a higher view* also sends `STARTVIEWCHANGE`. That specific fact about
+   `ReceiveHigherSVC` itself is UNCHANGED by Task 32: it still does not broadcast anything at the
+   moment it adopts a higher view.
 
    Concretely, in a 3-replica cluster (`f = 1`) with the primary dead: if only ONE surviving
    backup's timer fires, that backup broadcasts `STARTVIEWCHANGE`, and the OTHER backup (which
    happens to be `Primary` of the new view) adopts it via `ReceiveHigherSVC` — its own singleton
    `rep_recv_svc` already meets `f = 1`, so it immediately sends its own, self-addressed
    `DOVIEWCHANGE`. But the FIRST backup (the one whose timer actually fired) never receives a
-   matching `STARTVIEWCHANGE` back — the second backup never sent one — so its own
-   `rep_recv_svc` stays empty and it never sends a `DOVIEWCHANGE` at all. The new primary ends up
-   with exactly ONE valid `DOVIEWCHANGE` (its own), one short of `SendSV`'s own `>= f + 1 = 2`
-   threshold (`VSR.tla:269`) — permanently, the same way point 3's own wedge is permanent, since
-   `TimerSendSVC` is gated on `rep_status[r] = "Normal"` and both survivors are now
-   `"ViewChange"`. Reproduced live in a throwaway clone (3 replicas, primary stopped, only one
-   survivor's `check_timeout` called): both survivors stuck at `status = "ViewChange"` forever,
-   including the one that IS `Primary` of the new view and IS alive.
+   matching `STARTVIEWCHANGE` back at that point — the second backup didn't send one at ADOPTION
+   time — so its own `rep_recv_svc` stays empty and it does not send a `DOVIEWCHANGE` yet. The new
+   primary ends up with exactly ONE valid `DOVIEWCHANGE` (its own), one short of `SendSV`'s own
+   `>= f + 1 = 2` threshold (`VSR.tla:269`).
 
-   Safety is unaffected, for the same reason as point 3. Unlike point 3, this does not require an
-   adversarial two-failure construction — an ordinary deployment where `check_timeout` is driven
-   by independent real wall-clock timers per replica (this module's own intended driver shape, see
-   `check_timeout`'s own doc comment in `replica.mli`) will routinely have survivors' timers fire
-   at slightly different times, and whichever one fires first is, by this mechanism, not
-   guaranteed to be enough on its own — a correct driver must expect that completing a view
-   change can require as many as `f + 1` replicas' own timers to fire independently (worst case,
-   the dead-primary scenario this point demonstrates; a fully-live cluster with no crash needs
-   only `f`, since each of the `f + 1` non-firing replicas still independently accumulates enough
-   adopted `STARTVIEWCHANGE`s to send its own `DOVIEWCHANGE`) — not just one replica noticing,
-   with the rest merely overhearing — and design its timer policy accordingly. Not modeled or
-   checked
-   by `VSR.tla`/TLC at all, for the same reason as point 3; fixing it for real (adding the missing
-   re-broadcast to `ReceiveHigherSVC`, matching the original paper) is real, separate protocol
-   work, out of scope for this plan.
+   **Before Task 32**, this was permanent, for the same reason as point 3: `TimerSendSVC` was
+   gated on `rep_status[r] = "Normal"` and both survivors were now `"ViewChange"`, so nothing
+   either of them did from here on had any further effect. **After Task 32**, it is not: the second
+   backup (the one that IS `Primary` of the new view, holding exactly its own self-addressed
+   `DOVIEWCHANGE`, one short of quorum) is below `HasDvcQuorum`, so ITS OWN next `check_timeout`
+   call now retries its `STARTVIEWCHANGE` for the same view instead of doing nothing — reaching the
+   FIRST backup this time, which then crosses `SendDVC`'s own threshold from that retry alone and
+   sends the second, missing `DOVIEWCHANGE` to the new primary, completing the view change. This
+   follows directly from reading `try_forfeit_or_retry_view_change`'s own code in
+   `lib/vsr/replica.ml` (the same retry mechanism
+   `test/test_dst_scenarios.ml`'s `test_a_dropped_start_view_change_broadcast_is_retried_not_abandoned`
+   pins for a different scenario) — but this EXACT "one straggler backup, one further firing on the
+   OTHER backup, no independent original timeout" shape has not been given its own dedicated
+   regression test as of Task 32, so treat the mechanism as verified by inspection and this
+   specific worked example as reasoned-through rather than pinned.
+
+   Safety is unaffected, for the same reason as point 3, in both regimes. Unlike point 3, this does
+   not require an adversarial two-failure construction — an ordinary deployment where
+   `check_timeout` is driven by independent real wall-clock timers per replica (this module's own
+   intended driver shape, see `check_timeout`'s own doc comment in `replica.mli`) will routinely
+   have survivors' timers fire at slightly different times. Before Task 32, a correct driver had to
+   expect that completing a view change could require as many as `f + 1` replicas' own timers to
+   fire independently WHILE STILL `Normal` (worst case, the dead-primary scenario this point
+   demonstrates; a fully-live cluster with no crash needs only `f`). After Task 32, that is no
+   longer a hard requirement in the worked example above — a straggler's own vote can still arrive
+   via a RETRY from whichever replica it's missing from, on that replica's own later firing, not
+   only from an original, perfectly-timed independent one — though this has not been proven as a
+   general bound for every `f`/topology, only demonstrated for the `f = 1` case above. A timer
+   policy still should not assume "the first replica to notice is always enough on its own" without
+   also giving replicas a REAL chance to fire `check_timeout` again after adopting passively (i.e.
+   a genuinely periodic timer, not a one-shot). Not modeled or checked by `VSR.tla`/TLC at all, for
+   the same reason as point 3; fixing the remaining, unchanged half of this gap for real (adding
+   the missing re-broadcast to `ReceiveHigherSVC` itself, AT adoption time, matching the original
+   paper, so completion does not have to wait for a second timer firing at all) remains real,
+   separate protocol work, out of scope for this plan.
 
 **Known limitation of the shipped bound, disclosed rather than silently accepted:**
 `NoLogDivergence` is one of this scope's two headline safety invariants (the other is

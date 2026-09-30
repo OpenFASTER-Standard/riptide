@@ -259,13 +259,26 @@ let with_cluster ~replica_count ~svc_limit
    see the call sites below for why that matters: it is what guarantees several replicas'
    check_timeout calls are genuinely INDEPENDENT, each one deciding to start a view change without
    having heard anything from the others yet, rather than one adopting a view the other already
-   broadcast). Only the FIRST call can ever have an effect (check_timeout's own guard requires
-   [status = Normal], and the first successful call moves [status] to [View_change] -- see
-   replica.mli's own doc comment); every call after that is a real, guard-enforced no-op, not
-   merely "harmless because nothing happens to be listening". Calling it more than once here is
-   deliberate, not sloppy: it exercises that no-op guard directly, the same way a real caller would
-   -- a real wall-clock timer fires on its own schedule regardless of whether a view change is
-   already underway, and check_timeout's whole job is to make every firing beyond the first safe. *)
+   broadcast).
+
+   {b Audit-remediation Task 32 changed what happens after the first call.} Before that task, ONLY
+   the first call could ever have an effect (check_timeout's own guard requires [status = Normal],
+   and the first successful call moves [status] to [View_change] -- see replica.mli's own doc
+   comment); every call after that was a real, guard-enforced no-op that sent nothing at all. That
+   is no longer true: a replica already in [View_change] and still below [has_dvc_quorum] (which
+   covers every call site below at least at the moment this comment was last verified -- none of
+   them hand-builds a DVC quorum before calling this) now RETRIES its StartViewChange broadcast for
+   the SAME view on every such call instead of doing nothing, bounded by the same [svc_limit]
+   budget (see replica.ml's own [try_forfeit_or_retry_view_change] doc comment). Calling it more
+   than once here is still deliberate, not sloppy, and for the same underlying reason as before:
+   it exercises exactly what a real wall-clock timer would do, firing on its own schedule
+   regardless of whether a view change is already underway -- it is just that "safe" no longer
+   means "inert"; it means "does not start a second, spurious episode" (no extra [view_number]
+   bump, no [recv_svc]/[recv_dvc]/[sent_dvc] reset), which is a real and still-checked property,
+   not "sends nothing" as it used to be. See
+   [test/test_vsr_replica.ml]'s own
+   [test_check_timeout_below_quorum_retries_without_starting_a_new_episode] for where that
+   narrower invariant is actually pinned at the unit level. *)
 let fire_check_timeout_repeatedly r ~times =
   for _ = 1 to times do
     Replica.check_timeout r
@@ -334,10 +347,16 @@ let test_single_view_change_survives_primary_failure () =
 
       (* Both surviving backups independently decide their primary has gone silent and each fires
          its own timeout -- see this test's own doc comment above for exactly why both, not one,
-         are required for the view change to reach quorum at all. 3 calls each, not 1: exercises
-         check_timeout's own no-op-after-the-first guard directly (see
-         fire_check_timeout_repeatedly's own doc comment) rather than relying on incidentally never
-         calling it twice. *)
+         are required for the view change to reach quorum at all. 3 calls each, not 1: since
+         audit-remediation Task 32, this exercises check_timeout's below-quorum RETRY path
+         (see fire_check_timeout_repeatedly's own doc comment), not a no-op guard -- each backup's
+         2nd and 3rd calls genuinely re-broadcast a StartViewChange for the SAME view before
+         [settle] ever runs, so the OTHER backup receives duplicate copies of it. That is
+         deliberately exercised here too, not just tolerated: [ReceiveMatchingSVC]'s own [recv_svc]
+         update is a set (idempotent) and [SendDVC] is guarded by [sent_dvc], so a duplicate changes
+         nothing once the real effect has already landed -- this test's own assertions below (after
+         [settle]) confirm that duplicates converge to the exact same end state a single broadcast
+         each would, not merely that nothing crashes. *)
       fire_check_timeout_repeatedly backup2 ~times:3;
       fire_check_timeout_repeatedly backup3 ~times:3;
       settle ();
@@ -580,18 +599,37 @@ let test_two_sequential_view_changes () =
    (per test 1/2's own established mechanism) they correctly time out and complete a view change
    into view 2 -- but Primary(2) = 1 + ((2-1) mod 5) = 2, which is EXACTLY the backup killed first.
    The cluster is now permanently wedged: every survivor reaches [status = View_change] and NOTHING
-   in this module can move any of them past it, because check_timeout's own guard requires
-   [status = Normal] (VSR.tla:164, faithfully transcribed) -- a replica already in [View_change] has
-   no mechanism to try yet another, newer view on its own. Real VSR/VRR re-arms the view-change
-   timer while already in [View_change] specifically to handle this; this implementation (and the
-   spec it transcribes) does not.
+   in this module can ever move any of them past it -- but WHY not is more specific than it used to
+   be, since audit-remediation Task 32.
+
+   {b Before Task 32}: because [check_timeout]'s own guard required [status = Normal] (VSR.tla:164,
+   faithfully transcribed) for ANY effect at all once past the initial episode, full stop -- a
+   replica already in [View_change] had literally no mechanism to do anything further on its own.
+
+   {b After Task 32}: [check_timeout] DOES do something on every one of these survivors' further
+   calls now -- it retries the SAME view's StartViewChange broadcast (bounded by [svc_limit], see
+   replica.ml's own [try_forfeit_or_retry_view_change] doc comment) -- but that retry can never be
+   what moves a replica to a NEWER view. The only path to a newer view is the FORFEIT branch, and
+   forfeiting requires [has_dvc_quorum], which requires this replica to be PRIMARY of the view it is
+   stuck in -- and by this scenario's own construction (Primary(2) = 2, the backup killed FIRST,
+   asserted below as "no survivor considers itself primary") no survivor ever is. So the wedge
+   itself is UNCHANGED by Task 32: these three survivors now spend their retry budget re-announcing
+   view 2 to each other over and over, entirely harmlessly (idempotent on both ends -- see test 1's
+   own updated doc comment for why a duplicate SVC changes nothing), but never reach a state where
+   any of them COULD forfeit and try view 3. Real VSR/VRR re-arms the view-change timer to try a
+   NEWER view while already in [View_change] specifically to handle this; Task 32's fix retries the
+   SAME view instead, which is a genuine, smaller fix for a genuine, different bug (a replica whose
+   own broadcast was dropped but WOULD otherwise complete) -- not a fix for this one, and this test
+   is what proves that distinction rather than merely asserting it.
 
    This test proves BOTH halves of the disclosure: (a) the wedge is real and permanent (repeated
-   check_timeout calls, across several further rounds with real settling in between, change
-   NOTHING), and (b) safety is completely unaffected throughout (the value committed before either
-   crash remains committed and present on every survivor the whole time) -- exactly the "liveness-
-   only, never a safety violation" framing spec/tla/README.md's disclosure makes, now backed by a
-   real, running reproduction rather than prose alone. *)
+   check_timeout calls, across several further rounds with real settling in between, change NOTHING
+   OBSERVABLE -- view_number and status, specifically; see this test's own inline comment at the
+   round loop below for what DOES change, and why it still doesn't matter), and (b) safety is
+   completely unaffected throughout (the value committed before either crash remains committed and
+   present on every survivor the whole time) -- exactly the "liveness-only, never a safety
+   violation" framing spec/tla/README.md's disclosure makes, now backed by a real, running
+   reproduction rather than prose alone. *)
 let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
   with_cluster ~replica_count:5 ~svc_limit:10 (fun ~replicas ~stop ~settle ~isolate:_ ~reconnect:_ ->
       let replica_count = 5 in
@@ -636,8 +674,30 @@ let test_two_dead_primary_designates_wedge_the_cluster_permanently () =
 
       (* THE WEDGE ITSELF: repeated check_timeout calls, across several further rounds with real
          settling in between (so any latent message flow gets a genuine chance to run), change
-         NOTHING. This is what makes it a real regression test of the disclosed gap rather than a
-         single-snapshot assertion that could vacuously pass for an unrelated reason. *)
+         NOTHING OBSERVABLE -- view_number and status specifically, checked below. This is what
+         makes it a real regression test of the disclosed gap rather than a single-snapshot
+         assertion that could vacuously pass for an unrelated reason.
+
+         WHAT ACTUALLY HAPPENS UNDER THE HOOD, since audit-remediation Task 32 (worth being precise
+         about, since "changes nothing" is no longer true of every call the way it used to be):
+         each survivor enters this loop with svc_count = 2 (1 from its own initial Normal ->
+         View_change transition in the setup above, 1 more from that same setup's 2nd
+         [fire_check_timeout_repeatedly] call, which is NOW a genuine below-quorum RETRY rather
+         than the old no-op -- see this file's own [fire_check_timeout_repeatedly] doc comment).
+         Each of THIS loop's [times:3] calls that lands before svc_count reaches svc_limit = 10 is
+         ALSO a genuine retry (re-broadcasting StartViewChange for view 2, still harmlessly
+         idempotent on every receiver): round 1 spends 3 (survivor's svc_count 2 -> 5), round 2
+         spends 3 more (-> 8), round 3's first two calls exhaust the last 2 of the budget (-> 10),
+         and every call from round 3's 3rd call onward -- round 3's last call, and all of round 4 --
+         is finally blocked by [check_timeout]'s own top-level [svc_count >= svc_limit] guard, a
+         REAL no-op again, just for a different reason than before Task 32 (budget exhaustion, not
+         "View_change means nothing can happen"). None of this changes what this loop actually
+         asserts: [has_dvc_quorum] never holds for any survivor at any point (none of them is ever
+         Primary(2), the guard this test's own setup already confirmed), so not one of these
+         retries -- successful or budget-blocked -- ever has a chance to advance [view_number] or
+         [status]. svc_limit = 10 here is generous specifically so this loop's own 4 rounds x 3
+         calls (12) plus the setup's 2 comfortably demonstrate BOTH regimes (genuine retries, then
+         genuine budget exhaustion) within one test, rather than the budget question being moot. *)
       for round = 1 to 4 do
         List.iter (fun r -> fire_check_timeout_repeatedly r ~times:3) survivors;
         settle ();

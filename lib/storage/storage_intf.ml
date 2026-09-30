@@ -278,8 +278,10 @@ module type S = sig
         [persist_superblock], and only THEN broadcasts [StartViewChange].
       - [handle_start_view_change]'s ReceiveHigherSVC adopts the higher view, calls
         [persist_superblock], and only then reaches [try_send_dvc].
-      - [try_forfeit_view_change] (ForfeitViewChange) does the same before its own
-        [StartViewChange] broadcast.
+      - [try_forfeit_or_retry_view_change]'s own quorum-held (ForfeitViewChange) branch does the
+        same before its own [StartViewChange] broadcast. (Its below-quorum retry branch, added by
+        audit-remediation Task 32, moves none of these three fields at all -- see that function's
+        own doc comment -- so it is not one of the sites this list is about.)
       - [try_send_sv] (SendSV) writes the new log, raises [last_normal_view]/[commit_number],
         calls [persist_superblock], and only then broadcasts [StartView].
       - [handle_start_view] (ReceiveSV, the BACKUP side of a view change) is worse still: it raises
