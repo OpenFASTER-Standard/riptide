@@ -1168,11 +1168,19 @@
             "id": 19,
             "title": "[4.1] Per-merge_key serialization inside Materializer",
             "description": "Per-merge_key serialization inside Materializer",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Wrap Materializer.write's read-join-put in an in-process lock keyed by merge_key, closing the deterministic lost-update finding for the realistic one-Materializer-per-replica-process deployment shape.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "33359c4970a37d8ebe90a59d4f32493f4c600c60",
+                "8a1766e7721ac942d417651f17236839935061e6",
+                "a4292314ac54071bd5aad91e5c461eeb53af7ec1"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 20,
