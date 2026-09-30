@@ -1289,11 +1289,18 @@
             "id": 26,
             "title": "[6.1] A configurable cap on concurrent accepted connections",
             "description": "A configurable cap on concurrent accepted connections",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Tcp.create gains ?max_connections; the accept loop refuses any connection beyond the cap before any handshake is attempted.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "3f13d60eb9bf620a0875298480b6c12f68633e22",
+                "5323f3f2c0bbbef1b7053b44660fd2096029640e"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 27,
