@@ -194,6 +194,95 @@ let no_op_host () =
     log = (fun _ -> ());
   }
 
+(* Substring test, for asserting on a real error message's content rather than merely its
+   non-emptiness -- [Str] is already a dependency of this test executable (test/dune), and
+   test_module_reactor.ml uses this exact helper for the same purpose. *)
+let string_contains ~needle haystack =
+  try
+    ignore (Str.search_forward (Str.regexp_string needle) haystack 0);
+    true
+  with Not_found -> false
+
+(* ── Final fix wave, finding I7: Decision 5's own two named isolation properties, neither of which
+   had a real test ───────────────────────────────────────────────────────────────────────────────
+   The spec's Testing-strategy section names, for Decision 5: "a module that deliberately loops
+   forever or overruns its own memory is contained -- doesn't crash the host, doesn't touch another
+   module's or the core's memory, triggers fuel exhaustion or a trap as designed." Only the
+   loop-forever half was actually covered (by [test_a_runaway_module_is_contained_...]); the
+   memory-overrun half was covered only by three INSTANTIATE-time rejection tests (an over-large or
+   unbounded DECLARED maximum, an imported memory), all of which abort before any guest code runs,
+   and the cross-module claim was asserted nowhere at all. *)
+
+let test_a_guest_that_accesses_memory_out_of_bounds_traps_and_is_reported_as_an_error () =
+  let m =
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/out_of_bounds.wat")
+      ~host:(no_op_host ()) ~protocol:(permissive_protocol ())
+  in
+  match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
+  | Ok _ ->
+    Alcotest.fail
+      "a genuine out-of-bounds linear-memory access returned Ok -- the trap was not surfaced at all"
+  | Error e ->
+    (* Two separate things worth asserting, because "Error" alone would also be produced by the
+       wall-clock containment path, which is a DIFFERENT mechanism (this guest terminates
+       immediately -- it never runs long enough to time out) and would mean the trap itself went
+       unobserved. *)
+    (* The real message wasmtime v49 produces for this fixture, confirmed live:
+         error while executing at wasm backtrace: 0: 0x3c - <unknown>!<wasm function 0>
+         Caused by:
+           0: memory fault at wasm address 0x7ffffffc in linear memory of size 0x10000
+           1: wasm trap: out of bounds memory access
+       Both needles below come from that real text -- checked rather than pattern-guessed, and
+       checked as two separate assertions so a future runtime-version change that renames one of
+       them still says precisely which half stopped matching. *)
+    Alcotest.(check bool)
+      "the guest's own real WASM trap is what is reported (message names the out-of-bounds memory \
+       access)"
+      true
+      (let lower = String.lowercase_ascii e in
+       string_contains ~needle:"out of bounds" lower);
+    Alcotest.(check bool) "...reported as a WASM-level trap, not some other failure shape" true
+      (string_contains ~needle:"wasm trap" (String.lowercase_ascii e));
+    Alcotest.(check bool) "...and not the unrelated wall-clock containment path" false
+      (string_contains ~needle:"fuel exhausted" e)
+
+let test_two_separately_instantiated_modules_do_not_share_linear_memory () =
+  let module_bytes = read_file "fixtures/memory_sentinel.wat" in
+  let instantiate () =
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes ~host:(no_op_host ())
+      ~protocol:(permissive_protocol ())
+  in
+  let writer = instantiate () in
+  let reader = instantiate () in
+  (* The sentinel this fixture stores, little-endian, as the writer itself reads it back out --
+     asserted rather than assumed, so the reader's four zero bytes below are known to be real
+     isolation and not a fixture that silently wrote nothing at all. *)
+  let sentinel = "\x34\x12\xed\x5e" in
+  (match Loader.invoke writer ~entrypoint:"handle" ~arg:(Bytes.make 1 '\000') with
+  | Error e -> Alcotest.failf "the writer guest itself failed: %s" e
+  | Ok result ->
+    Alcotest.(check string) "the writer really did write its sentinel into its own linear memory"
+      sentinel (Bytes.to_string result));
+  (match Loader.invoke reader ~entrypoint:"handle" ~arg:(Bytes.make 1 '\001') with
+  | Error e -> Alcotest.failf "the reader guest itself failed: %s" e
+  | Ok result ->
+    Alcotest.(check string)
+      "a separately-instantiated module reading the SAME offset observes zero-initialized memory, \
+       not the other module's sentinel"
+      "\000\000\000\000" (Bytes.to_string result));
+  (* Same property one step further in, and free to check here: even the SAME [t], invoked again,
+     observes nothing its own previous invocation wrote. That is Decision 5's "one fresh instance
+     per invocation, no stale state between invocations" made observable -- here it holds for a
+     second, independent reason too, since every invocation's guest code runs in a forked child
+     whose writes land only in that child's own copy-on-write view of the memory. *)
+  match Loader.invoke writer ~entrypoint:"handle" ~arg:(Bytes.make 1 '\001') with
+  | Error e -> Alcotest.failf "the writer's second invocation itself failed: %s" e
+  | Ok result ->
+    Alcotest.(check string)
+      "even the same t's next invocation does not observe what its own previous invocation wrote"
+      "\000\000\000\000" (Bytes.to_string result)
+
+
 let test_instantiate_rejects_a_module_declaring_a_memory_maximum_over_the_cap () =
   Alcotest.check_raises
     "an over-large self-declared memory maximum is rejected at load time, not silently honored"
@@ -398,6 +487,13 @@ let tests =
     ( "Loader.instantiate rejects a module declaring no memory maximum at all",
       `Quick,
       test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all );
+    ( "Loader.invoke reports a guest's genuine out-of-bounds memory access as a trap, not a host \
+       crash",
+      `Quick,
+      test_a_guest_that_accesses_memory_out_of_bounds_traps_and_is_reported_as_an_error );
+    ( "two separately-instantiated modules do not share linear memory",
+      `Quick,
+      test_two_separately_instantiated_modules_do_not_share_linear_memory );
     ( "Loader.instantiate rejects a module that imports memory instead of declaring it locally",
       `Quick,
       test_instantiate_rejects_a_module_that_imports_memory_instead_of_declaring_it_locally );
