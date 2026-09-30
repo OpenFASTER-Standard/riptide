@@ -138,6 +138,13 @@ trail (every standalone repro, in order, with exact error text) behind each of t
 
 ## cosign (admission-gate signing) toolchain setup
 
+**`cosign` is a hard prerequisite for `dune test` as a whole, not just for the admission gate's own
+tests.** Without it on `PATH` (or at `/work/toolchain/bin/cosign`), `test_module_admission.ml`,
+`test_module_reactor.ml` and `test_module_end_to_end.ml` all fail during their own *setup*: each
+signs a real fixture with a freshly generated keypair and then verifies it through
+`Admission.verify`, because the reactor only ever loads a `verified_artifact` and this suite refuses
+to fake one. Install it first (below); a suite run on a box without it is not a meaningful result.
+
 `lib/module/admission.ml` (Task 5, subtask 4) shells out to a real, locally-installed
 [`cosign`](https://github.com/sigstore/cosign) binary to verify a WASM artifact's signature
 before it is ever admitted — never a placeholder/stubbed check. `cosign` is not baked into this

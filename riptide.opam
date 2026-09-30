@@ -5,6 +5,14 @@ depends: [
   "ocaml" {>= "5.0"}
   "dune" {>= "3.0"}
   "digestif"
+  # lib/module/loader.ml (Task 5, subtask 3) runs real, compiled WASM through this binding.
+  # IMPORTANT: a plain `opam install wasmtime` is NOT sufficient on its own -- the version this
+  # constraint names links a libwasmtime whose CPU-feature detection aborts the process on any
+  # modern CPU, and the binding itself has two GC-liveness bugs that only surface once real guest
+  # execution happens. Both are fixed by patches/wasmtime-0.0.3-cpuid-and-gc-safety.patch, which
+  # must be applied to the installed package before anything here builds against it; see this
+  # repo's README ("WASM toolchain setup") for the exact, verified sequence.
+  "wasmtime" {= "0.0.3"}
   "alcotest"
   "qcheck-core"
   "qcheck-alcotest"

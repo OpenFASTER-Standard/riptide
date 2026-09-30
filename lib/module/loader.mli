@@ -126,9 +126,11 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     [test_two_concurrent_invocations_of_the_same_module_do_not_share_protocol_state] in
     test_module_loader.ml).
 
-    Returns [Error msg] — never raises — for: a protocol violation (above), no such export, the
+    Returns [Error msg] for: a protocol violation (above), no such export, the
     named export isn't a function, the guest traps (including a genuine WASM trap, e.g. an
-    out-of-bounds memory access), or the
+    out-of-bounds memory access — see
+    [test_a_guest_that_accesses_memory_out_of_bounds_traps_and_is_reported_as_an_error] in
+    test_module_loader.ml), or the
     wall-clock containment deadline is exceeded (the closest real equivalent this loader has to
     "fuel exhausted", given no fuel API is available on the classic [wasm_c_api] surface this
     loader runs on — see [loader.ml]'s top comment). The call itself runs in a forked child
@@ -196,6 +198,23 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     round, and the fourth's own residual (the sub-instruction instant at [cleanup]'s own entry,
     before any guard of its own can exist) disclosed in full there rather than glossed. No exit
     path leaks a zombie process or a file descriptor.
+
+    {b The exact raise contract} (corrected in this plan's final fix wave, review finding M1 — the
+    blanket "never raises" this paragraph used to open with was false in one documented, deliberate,
+    already-tested case, which is worse than making no claim): [invoke] raises exactly two
+    exceptions, [Out_of_memory] and [Stack_overflow], and converts every other failure it can
+    observe into an [Error]. Both are re-raised on purpose rather than swallowed — they say the
+    PROCESS is in trouble, not that this one guest call failed, and OCaml convention is not to turn
+    either into an ordinary result. [loader.ml]'s own [step] re-raises them (having run [cleanup]
+    first, so no zombie or descriptor leaks on the way out), [cleanup] itself re-raises rather than
+    retrying them (retrying is exactly wrong for a process already out of resources, and this is the
+    only way [cleanup] can raise at all), and {!Riptide_module.Reactor}'s own dispatch mirrors the
+    same two for the same reason — pinned end to end by
+    [test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowing_them] in
+    test_module_reactor.ml, where a host closure raising [Stack_overflow] is asserted to propagate
+    all the way out. Note the deliberate asymmetry with {!instantiate}, which raises [Failure] for
+    its own setup-time rejections: failing to SET UP a guest is the caller's own problem to see
+    immediately, whereas failing DURING a guest call is data about the guest.
 
     **Known, disclosed, deliberately-not-engineered-around interaction**: this test suite's own
     external per-test watchdog (`test_riptide.ml`'s [Suite_timeout], a SIGALRM-driven safety net

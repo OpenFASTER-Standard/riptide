@@ -122,12 +122,27 @@ type host_functions = {
   log : string -> unit;
 }
 
-(* Which side of a possible fork a host-import closure is currently running on. [Direct] calls
-   the caller-supplied [host_functions] straight (the normal, non-contained path, and always
-   what the *parent* process uses). [Relay] is switched to only inside a just-forked *child*
-   (see [run_contained]) -- copy-on-write means mutating this ref in the child never touches the
-   parent's own copy, so the parent's host functions keep working normally, untouched by
-   whatever the child does with its own private copy of this same ref cell. *)
+(* Which side of the fork a given piece of this loader is running on, and therefore how a
+   host-function call reaches the real, caller-supplied [host_functions].
+
+   [Direct host] holds those real closures and is what a [t] is created with. [Relay] is switched
+   to only inside a just-forked *child* (see [run_contained]) -- copy-on-write means mutating this
+   ref in the child never touches the parent's own copy, so the parent keeps holding [Direct]
+   throughout, untouched by whatever the child does with its own private copy of this same cell.
+
+   The two arms are consumed by two different, non-overlapping pieces of code, and that split is an
+   invariant worth stating (review finding M2, which found the two mixed up):
+   - the PARENT only ever reads [Direct], via [supervise_child]'s own [host_of_sink], when servicing
+     a relayed call on the guest's behalf;
+   - a host-import CLOSURE ([make_host_extern] below) only ever reads [Relay], because guest code is
+     only ever executed by the forked child ({!invoke} -> [run_contained] is the sole caller of
+     [W.Wasmtime.func_call_list], and it always forks first).
+   Both directions are asserted rather than assumed -- [host_of_sink] and [relay_of_sink] each fail
+   loudly on the arm they must never see. A future non-forked/in-process execution tier (the obvious
+   candidate: an amortized, pooled dispatch path -- see Reactor's own disclosed "no per-dispatch
+   amortization" gap) is exactly what would make a host-import closure legitimately need [Direct],
+   and [relay_of_sink] is then the one place that has to grow a real second arm; that is a
+   deliberate future extension point, not a path anything takes today. *)
 type sink = Direct of host_functions | Relay of { req_w : Unix.file_descr; resp_r : Unix.file_descr }
 
 type t = {
@@ -392,6 +407,22 @@ module Pipe_protocol = struct
     tag, read_frame fd
 end
 
+(* The import-closure-side mirror of [supervise_child]'s own [host_of_sink]: a host-import closure
+   runs only ever in the forked child, so its sink is always [Relay] (see the [sink] type's own
+   comment for the full invariant and the one future change that would alter it). Asserting that,
+   rather than keeping an unreachable [Direct] arm that quietly calls the parent's real closures from
+   whichever process happens to be running, is review finding M2's resolution: the old dead arm made
+   it impossible for a reader to tell whether in-process execution was a supported mode. Reached at
+   all, this raises inside guest execution, where the child's own guard turns it into an ordinary
+   containment failure -- loud in the result, never a silent wrong-process side effect. *)
+let relay_of_sink (sink : sink ref) =
+  match !sink with
+  | Relay { req_w; resp_r } -> (req_w, resp_r)
+  | Direct _ ->
+    failwith
+      "Loader: a host-import closure ran with a Direct sink -- guest code is only ever executed by \
+       run_contained's forked child, which always switches to Relay first"
+
 let make_host_extern store (sink : sink ref) (memory_ref : W.Memory.t option ref) name =
   let need_memory () =
     match !memory_ref with
@@ -407,9 +438,8 @@ let make_host_extern store (sink : sink ref) (memory_ref : W.Memory.t option ref
            | [ Val.Int32 ptr; Val.Int32 len ] ->
              let memory = need_memory () in
              let s = W.Memory.to_string memory ~pos:ptr ~len in
-             (match !sink with
-             | Direct host -> host.log s
-             | Relay { req_w; _ } -> Pipe_protocol.write_msg req_w ~tag:'L' (Bytes.of_string s));
+             let req_w, _resp_r = relay_of_sink sink in
+             Pipe_protocol.write_msg req_w ~tag:'L' (Bytes.of_string s);
              []
            | _ -> failwith "Loader: \"log\" called with unexpected argument shape"))
   | "read_materialized" ->
@@ -425,14 +455,12 @@ let make_host_extern store (sink : sink ref) (memory_ref : W.Memory.t option ref
              let memory = need_memory () in
              let merge_key = W.Memory.to_string memory ~pos:key_ptr ~len:key_len in
              let value =
-               match !sink with
-               | Direct host -> host.read_materialized ~merge_key
-               | Relay { req_w; resp_r } ->
-                 Pipe_protocol.write_msg req_w ~tag:'R' (Bytes.of_string merge_key);
-                 let flag = Pipe_protocol.read_frame resp_r in
-                 if Bytes.length flag = 1 && Bytes.get flag 0 = '\001' then
-                   Some (Pipe_protocol.read_frame resp_r)
-                 else None
+               let req_w, resp_r = relay_of_sink sink in
+               Pipe_protocol.write_msg req_w ~tag:'R' (Bytes.of_string merge_key);
+               let flag = Pipe_protocol.read_frame resp_r in
+               if Bytes.length flag = 1 && Bytes.get flag 0 = '\001' then
+                 Some (Pipe_protocol.read_frame resp_r)
+               else None
              in
              (match value with
              | None -> [ Val.Int32 0 ]
@@ -451,12 +479,10 @@ let make_host_extern store (sink : sink ref) (memory_ref : W.Memory.t option ref
              let memory = need_memory () in
              let payload = read_guest_bytes memory ~ptr ~len in
              let ok =
-               match !sink with
-               | Direct host -> Result.is_ok (host.propose_write payload)
-               | Relay { req_w; resp_r } ->
-                 Pipe_protocol.write_msg req_w ~tag:'P' payload;
-                 let status = Pipe_protocol.read_frame resp_r in
-                 Bytes.length status = 1 && Bytes.get status 0 = '\000'
+               let req_w, resp_r = relay_of_sink sink in
+               Pipe_protocol.write_msg req_w ~tag:'P' payload;
+               let status = Pipe_protocol.read_frame resp_r in
+               Bytes.length status = 1 && Bytes.get status 0 = '\000'
              in
              [ Val.Int32 (if ok then 0 else 1) ]
            | _ -> failwith "Loader: \"propose_write\" called with unexpected argument shape"))
