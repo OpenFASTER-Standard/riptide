@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Proves, mechanically, that no write can reach the replicated log without passing Decision 7's
+universal authorization checkpoint.
+
+Usage: scripts/check-authorization-checkpoint          (checks lib/)
+       scripts/check-authorization-checkpoint PATH...  (checks only the given files/directories)
+
+WHY THIS EXISTS. The Layer 0/Layer 2 boundary design spec
+(`docs/superpowers/specs/2026-09-30-layer0-layer2-boundary-design.md`) names its own test strategy
+for Decision 7 -- the universal authorization checkpoint -- as "an exhaustive call-site audit
+(grep-based, in the style `scripts/check-citations` already established this session for a different
+invariant) plus fuzzing, proving no write can bypass the checkpoint under any code path." The
+fuzzing half shipped as `test/test_batch_commit_authorization_fuzz.ml`. This is the audit half,
+which the plan's own final whole-branch review (finding I6) found had never been built at all:
+the property was argued in prose and hand-verified by reviewers, which is exactly what this repo's
+own CLAUDE.md ("no spec without running code") says is not enough.
+
+WHAT IT ACTUALLY PROVES (and what it cannot). The checkpoint is a structural claim about ONE call
+site: `Riptide_vsr.Replica.propose` is the only way anything enters the replicated log, and the
+only caller of it in `lib/` is `Batch_commit.propose`, which evaluates `~authorize` over every
+write in the batch before reaching it. So the claim decomposes into four checks, all of them
+lexical -- this is a grep-class tool, not a theorem prover:
+
+  1. `lib/` contains exactly ONE call to `Replica.propose`, and it is in
+     `lib/batch_commit/batch_commit.ml`. (Module aliases -- `module R = Riptide_vsr.Replica` -- are
+     resolved, so an aliased call cannot hide from this. `open Riptide_vsr.Replica`, which would
+     make a bare `propose x` call unfindable by any lexical means, is rejected outright rather than
+     silently unaudited.)
+  2. That call is lexically inside `Batch_commit.propose`.
+  3. `Batch_commit.propose` evaluates `t.authorize` exactly once, before that call, over EVERY
+     element of `writes` (matched as a whole expression, so narrowing it to a subset of the batch --
+     the shape a "the first write is enough" refactor would produce -- fails here).
+  4. The call sits inside the `else` branch of `if denied then ...`, i.e. it is unreachable when any
+     write was denied.
+
+Plus one guard on the policy's own reachability: `Batch_commit.create` takes `~authorize` as a
+REQUIRED labeled argument, so no `Batch_commit.t` can exist with no policy attached.
+
+Comments and string literals are stripped before any of this is matched, so a doc comment that
+merely TALKS about `Replica.propose` (batch_commit.mli alone mentions it a dozen times) is never
+mistaken for a call, and a deleted-but-documented call cannot pass.
+
+DISCLOSED LIMITATIONS, stated rather than implied away:
+  - `test/` is deliberately NOT audited. Tests call `Replica.propose` directly on purpose (e.g.
+     test_dst_cluster.ml drives raw VSR proposals), which is legitimate: a test is not a path
+     production data flows through. The claim is about `lib/`.
+  - A future caller reaching the log through some mechanism that is not `Replica.propose` at all
+     (a second propose-like entry point added to `replica.ml`, direct storage writes) is outside
+     what this script can see. Check 1's "exactly one" is a tripwire for the common shape, not a
+     proof that `Replica.propose` remains the only door.
+  - Checks 3 and 4 are pinned to the current expression shapes, quoted below. An equivalent
+     rewrite (a `List.for_all`-phrased check, a `match` instead of `if`) fails here even though it
+     would be correct. That is deliberate for a security-relevant invariant: the failure is loud,
+     and updating this script is a conscious act with a reviewer looking at it, which is the point.
+
+Exit codes: 0 clean, 1 the invariant does not hold as written, 2 usage/environment error.
+"""
+import os
+import re
+import subprocess
+import sys
+
+DEFAULT_ROOTS = ("lib",)
+EXPECTED_CALL_SITE = "lib/batch_commit/batch_commit.ml"
+
+# Check 3: the checkpoint expression itself, whitespace-normalized. `writes` -- the whole batch,
+# unqualified -- is the load-bearing token here.
+AUTHORIZE_OVER_EVERY_WRITE = (
+    "let denied = List.exists (fun (w : write) -> match t.authorize w with "
+    "Deny _ -> true | Allow -> false) writes in"
+)
+# Check 4: the guard the propose call must sit behind.
+DENIAL_GUARD = "if denied then"
+# The create signature that keeps a policy from ever being optional.
+REQUIRED_AUTHORIZE_IN_CREATE = "let create ~replica ~authorize"
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def tracked_files():
+    r = git("ls-files")
+    if r.returncode != 0:
+        sys.exit("error: not a git repository (or git unavailable)")
+    return r.stdout.split()
+
+
+def strip_comments_and_strings(src):
+    """Blank out OCaml comments (nested) and string/char literals, preserving length and newlines.
+
+    Length preservation matters: every offset this script reports or compares is an offset into the
+    ORIGINAL file, so line numbers in error messages point where a reader expects.
+    """
+    out = list(src)
+    i, n, depth = 0, len(src), 0
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        two = src[i : i + 2]
+        if depth == 0 and two == '(*':
+            depth, start = 1, i
+            i += 2
+            while i < n and depth > 0:
+                if src[i : i + 2] == '(*':
+                    depth += 1
+                    i += 2
+                elif src[i : i + 2] == '*)':
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            blank(start, i)
+        elif src[i] == '"':
+            start = i
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                elif src[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            blank(start, i)
+        elif src[i] == "'" and i + 2 < n:
+            # A char literal ('a', '\n', '\001') -- as opposed to a type variable ('a in `'a list`)
+            # or a prime in an identifier, neither of which this pattern matches.
+            m = re.match(r"'(\\[0-9]{3}|\\.|[^'\\])'", src[i:])
+            if m:
+                blank(i, i + m.end())
+                i += m.end()
+            else:
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def line_of(src, idx):
+    return src[:idx].count("\n") + 1
+
+
+def replica_aliases(code):
+    """Module aliases for Riptide_vsr.Replica, so `module R = Riptide_vsr.Replica; R.propose` is
+    found too -- the obvious way a second call site would otherwise escape a bare grep."""
+    names = set()
+    for m in re.finditer(r"\bmodule\s+([A-Z][A-Za-z0-9_']*)\s*=\s*(?:Riptide_vsr\.)?Replica\b", code):
+        names.add(m.group(1))
+    return names
+
+
+def find_propose_calls(path, code):
+    """Every `<Replica-or-alias>.propose` occurrence in already-stripped `code`."""
+    names = {"Replica", "Riptide_vsr.Replica"} | replica_aliases(code)
+    hits = []
+    for name in names:
+        for m in re.finditer(re.escape(name) + r"\.propose\b", code):
+            # `Riptide_vsr.Replica.propose` would otherwise also match as `Replica.propose`; keep
+            # the longest qualification at each offset only.
+            hits.append((m.start(), m.end(), path))
+    hits.sort()
+    deduped = []
+    for start, end, p in hits:
+        if deduped and start < deduped[-1][1]:
+            # Overlapping match at the same call: keep whichever ends later (the fuller name).
+            if end > deduped[-1][1]:
+                deduped[-1] = (deduped[-1][0], end, p)
+            continue
+        deduped.append((start, end, p))
+    return deduped
+
+
+def enclosing_toplevel_let(code, idx):
+    """(name, start, end) of the top-level `let` definition containing `idx`, or None.
+
+    Top-level means "at column 0", which is this codebase's actual, uniform formatting for every
+    definition in `lib/` (ocamlformat-shaped); a nested `let` is always indented.
+    """
+    starts = [(m.start(), m.group(1)) for m in re.finditer(r"(?m)^let\s+(?:rec\s+)?([a-z_][A-Za-z0-9_']*)", code)]
+    prev = None
+    for start, name in starts:
+        if start > idx:
+            return (prev[1], prev[0], start) if prev else None
+        prev = (start, name)
+    return (prev[1], prev[0], len(code)) if prev else None
+
+
+def else_branch_extent(code, guard_idx):
+    """(start, end) of the `else` branch belonging to the `if` at `guard_idx`.
+
+    Tracks `begin`/`end` (and parenthesis) nesting from the `else` keyword onward, which is what
+    batch_commit.ml's own `if denied then ... else begin ... end` shape is written with.
+    """
+    else_m = re.compile(r"\belse\b").search(code, guard_idx)
+    if not else_m:
+        return None
+    i = else_m.end()
+    depth = 0
+    started = False
+    n = len(code)
+    while i < n:
+        if re.match(r"\bbegin\b", code[i:]):
+            depth += 1
+            started = True
+            i += len("begin")
+        elif re.match(r"\bend\b", code[i:]):
+            depth -= 1
+            i += len("end")
+            if started and depth == 0:
+                return (else_m.end(), i)
+        else:
+            i += 1
+    return None
+
+
+def main(argv):
+    roots = [a for a in argv if not a.startswith("--")] or list(DEFAULT_ROOTS)
+    files = [
+        f
+        for f in tracked_files()
+        if f.endswith(".ml") and any(f == r or f.startswith(r.rstrip("/") + "/") for r in roots)
+    ]
+    if not files:
+        print(f"error: no .ml files found under {roots}", file=sys.stderr)
+        return 2
+
+    problems = []
+    stripped = {}
+    calls = []
+    for f in files:
+        try:
+            src = open(f, encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        code = strip_comments_and_strings(src)
+        stripped[f] = code
+        for m in re.finditer(r"\bopen\s+Riptide_vsr\.Replica\b", code):
+            problems.append(
+                f"{f}:{line_of(code, m.start())}: `open Riptide_vsr.Replica` makes a bare "
+                "`propose ...` call impossible to audit lexically -- qualify the calls instead"
+            )
+        calls += find_propose_calls(f, code)
+
+    # Check 1: exactly one Replica.propose call in lib/, at the expected file.
+    if len(calls) != 1:
+        problems.append(
+            f"expected exactly 1 call to Replica.propose under {roots}, found {len(calls)}: "
+            + ", ".join(f"{p}:{line_of(stripped[p], s)}" for s, _e, p in calls)
+        )
+    elif calls[0][2] != EXPECTED_CALL_SITE:
+        problems.append(
+            f"the single Replica.propose call is in {calls[0][2]}, not the expected "
+            f"{EXPECTED_CALL_SITE} -- the authorization checkpoint lives in the latter"
+        )
+
+    if calls and calls[0][2] == EXPECTED_CALL_SITE:
+        code = stripped[EXPECTED_CALL_SITE]
+        call_idx = calls[0][0]
+        call_line = line_of(code, call_idx)
+
+        # Check 2: it is inside Batch_commit.propose itself.
+        enclosing = enclosing_toplevel_let(code, call_idx)
+        if enclosing is None or enclosing[0] != "propose":
+            problems.append(
+                f"{EXPECTED_CALL_SITE}:{call_line}: the Replica.propose call is inside "
+                f"`{enclosing[0] if enclosing else '<unknown>'}`, not `propose` -- the checkpoint "
+                "is documented as being on propose's own path"
+            )
+            fn_start, fn_end = 0, len(code)
+        else:
+            _name, fn_start, fn_end = enclosing
+        body = code[fn_start:fn_end]
+
+        def norm(s):
+            return re.sub(r"\s+", " ", s)
+
+        normalized_body = norm(body)
+
+        # Check 3: authorize is evaluated exactly once, before the call, over the whole batch.
+        authorize_hits = [m.start() + fn_start for m in re.finditer(r"\bt\.authorize\b", body)]
+        if len(authorize_hits) != 1:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: expected exactly 1 evaluation of `t.authorize` inside "
+                f"`propose`, found {len(authorize_hits)}"
+                + (
+                    " (lines " + ", ".join(str(line_of(code, h)) for h in authorize_hits) + ")"
+                    if authorize_hits
+                    else ""
+                )
+            )
+        elif authorize_hits[0] > call_idx:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: `t.authorize` is evaluated at line "
+                f"{line_of(code, authorize_hits[0])}, AFTER the Replica.propose call at line "
+                f"{call_line} -- a write could reach the log before the checkpoint ran"
+            )
+        if norm(AUTHORIZE_OVER_EVERY_WRITE) not in normalized_body:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: `propose` no longer contains the exact checkpoint "
+                "expression this audit pins, which evaluates ~authorize over EVERY write in the "
+                f"batch:\n    {AUTHORIZE_OVER_EVERY_WRITE}\n  (see this script's own docstring: an "
+                "equivalent rewrite fails here on purpose)"
+            )
+
+        # Check 4: the call is inside the else branch of `if denied then`.
+        guard = code.find(DENIAL_GUARD, fn_start, fn_end)
+        if guard == -1:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: `propose` no longer contains the `{DENIAL_GUARD}` guard "
+                "the Replica.propose call is supposed to sit behind"
+            )
+        else:
+            extent = else_branch_extent(code, guard)
+            if extent is None:
+                problems.append(
+                    f"{EXPECTED_CALL_SITE}:{line_of(code, guard)}: could not find a "
+                    "`begin ... end`-delimited else branch for the denial guard"
+                )
+            elif not (extent[0] <= call_idx < extent[1]):
+                problems.append(
+                    f"{EXPECTED_CALL_SITE}:{call_line}: the Replica.propose call is NOT inside the "
+                    f"else branch of `{DENIAL_GUARD}` (lines {line_of(code, extent[0])}-"
+                    f"{line_of(code, extent[1])}) -- a denied batch could still reach the log"
+                )
+
+        # Policy reachability: no Batch_commit.t can exist without an ~authorize.
+        if REQUIRED_AUTHORIZE_IN_CREATE not in normalized_body and REQUIRED_AUTHORIZE_IN_CREATE not in norm(code):
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: `{REQUIRED_AUTHORIZE_IN_CREATE}` not found -- ~authorize "
+                "must stay a REQUIRED argument, or a handle with no policy at all becomes "
+                "constructible"
+            )
+
+    for p in problems:
+        print(p, file=sys.stderr)
+    if problems:
+        print(
+            f"\n{len(problems)} authorization-checkpoint violation(s)",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "ok: Replica.propose has exactly 1 caller in "
+        + "/".join(roots)
+        + f" ({EXPECTED_CALL_SITE}:{line_of(stripped[EXPECTED_CALL_SITE], calls[0][0])}), it is "
+        "inside Batch_commit.propose, it evaluates ~authorize over every write in the batch first, "
+        f"and it sits behind the `{DENIAL_GUARD}` guard "
+        f"({len(files)} .ml files scanned)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

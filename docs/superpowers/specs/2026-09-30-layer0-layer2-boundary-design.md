@@ -215,7 +215,19 @@ document:
 - **Authorization checkpoint (Decision 7):** an exhaustive call-site audit (grep-based, in the
   style `scripts/check-citations` already established this session for a different invariant)
   plus fuzzing, proving no write can bypass the checkpoint under any code path — exactly the
-  task's own stated test strategy for this subtask.
+  task's own stated test strategy for this subtask. **Both halves are real and named, as of this
+  plan's final fix wave (review finding I6 — they were argued in prose and hand-verified by
+  reviewers before that, which this repo's own `CLAUDE.md` says is not enough):**
+  `scripts/check-authorization-checkpoint` is the audit (comments/strings stripped, module aliases
+  resolved, `open Riptide_vsr.Replica` in `lib/` rejected outright as unauditable; proves
+  `Replica.propose` has exactly one caller in `lib/`, inside `Batch_commit.propose`, behind a
+  single `~authorize` evaluation over every write in the batch, inside the denial guard's own
+  `else` branch — and that `~authorize` is still a required argument of `create`), and
+  `test/test_batch_commit_authorization_fuzz.ml` is the fuzzing (QCheck over randomly generated
+  sequences of `propose` calls — batch sizes including empty, `Allow`/`Deny` mixes within one
+  batch, `merge_key`/`?materialize` presence, retries of an already-used idempotency key — proving
+  no denied write reaches `committed_envelopes` or a materialize sink, that every batch which
+  should have committed did, and that denials are counted once per refused batch).
 
 ## Non-goals (explicitly out of scope for this task)
 

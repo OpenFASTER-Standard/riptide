@@ -479,6 +479,30 @@ val propose :
     call under the same [idempotency_key] with a permissive [~authorize] (or against a different
     handle) is a genuine first attempt, not a blocked retry.
 
+    {b How "no write can bypass this checkpoint" is actually proven}, rather than argued in this
+    comment (the design spec's own Decision 7 test strategy names both halves; neither existed until
+    this plan's final fix wave, finding I6):
+
+    - [scripts/check-authorization-checkpoint] -- the STRUCTURAL half. A grep-class audit (in the
+      style of [scripts/check-citations]) over all of [lib/], with comments and string literals
+      stripped first, proving: {!Riptide_vsr.Replica.propose} has exactly ONE caller in [lib/] and
+      it is this function; that call is lexically inside this function; [~authorize] is evaluated
+      here exactly once, before it, over EVERY element of [writes]; that call sits inside the
+      [else] branch of the resulting denial guard; and [~authorize] remains a REQUIRED argument of
+      {!create}, so no handle can exist with no policy. Module aliases of {!Riptide_vsr.Replica}
+      are resolved, and an [open Riptide_vsr.Replica] anywhere in [lib/] (which would make a bare
+      [propose] call unfindable by any lexical means) fails the audit rather than being silently
+      unaudited.
+    - [test/test_batch_commit_authorization_fuzz.ml] -- the BEHAVIOURAL half. QCheck properties
+      over randomly generated SEQUENCES of {!propose} calls against one shared replica (random
+      batch sizes including empty, random [Allow]/[Deny] mixes within one batch, random
+      [merge_key] presence, random [?materialize] presence, random retries of an already-used
+      idempotency key), asserting no denied write ever reaches {!committed_envelopes} or a
+      {!materialize_sink}, that every batch that SHOULD have committed did (so the property cannot
+      be satisfied by an implementation that commits nothing), and that
+      {!authorization_denials} counts exactly once per refused BATCH rather than once per denied
+      write.
+
     Checks first whether [idempotency_key] already appears among the batches in
     [Batch_commit.replica t]'s own log -- the WHOLE log as {!Riptide_vsr.Replica.entries} reports
     it, including the replicated-but-not-yet-committed tail, not merely the committed prefix --

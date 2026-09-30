@@ -89,6 +89,7 @@ let () =
          ("batch_commit", Test_batch_commit.tests);
          ("batch_commit_cluster", Test_batch_commit_cluster.tests);
          ("batch_commit_materialize", Test_batch_commit_materialize.tests);
+         ("batch_commit_authorization_fuzz", Test_batch_commit_authorization_fuzz.tests);
          ("dek", Test_dek.tests);
          ("redaction", Test_redaction.tests);
          ("pki", Test_pki.tests);
