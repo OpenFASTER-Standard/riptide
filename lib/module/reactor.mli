@@ -107,6 +107,66 @@ val subscribe :
     subscribed to the same or different keys (the fan-out shape this reactor exists for) remain
     attributable in the log stream, not merged into one undifferentiated "[reactor] ..." line.
 
+    {b Known, disclosed residual gap: dispatch is PER WRITE, not per merged-value CHANGE, and the
+    guest's [arg] is the write's own payload, not the merged value.} (Review finding I4; the design
+    spec's Decision 2 has been corrected to describe the real trigger condition, and the gap is named
+    there as deliberately deferred work.) The spec originally said a module "is invoked when that
+    key's {i merged} value changes." What actually happens is that
+    {!wrap_materialize_sink}'s [write] fires once for every write landing at a subscribed
+    [merge_key], and passes {b that write's own value} to the guest. Two consequences a subscribing
+    caller has to know: nothing compares the merged accumulator before and after, so a write that
+    merges to a value identical to the previous one still dispatches (a module needing
+    "only act on real change" must dedupe itself); and the [arg] a guest receives is NOT current
+    state. Live evidence rather than a hypothetical: [test/fixtures/counter.wat], the one real module
+    built against this boundary, ignores [arg] entirely and re-reads its own key through
+    [host.read_materialized] to obtain the merged value — that workaround exists because of this gap.
+    Closing it needs a diff against the accumulator's prior value at the sink's own call site, which
+    raises real questions (what "changed" means for an arbitrary lattice value; whether the sink needs
+    read-before-write access it does not have) that belong to a future task's design, not to this
+    mechanism as shipped.
+
+    {b Known, disclosed residual gap: [~protocol] is supplied by YOU, and nothing checks it against
+    the module.} (Review finding I5; the spec's Decision 4 has been corrected, and
+    {!Admission.verify} discloses the same gap from the verification side.) The spec originally
+    described the protocol as travelling with the module's own manifest, verified at admission. There
+    is no manifest: [~protocol] is whatever this caller passes, {!Admission.verify} never looks for a
+    protocol at all, and no check anywhere compares the one supplied here against what the module
+    actually does. So a protocol here is a claim the SUBSCRIBER makes about the module, enforced
+    faithfully against that claim — a protocol that permits more than the module should be allowed to
+    do is enforced exactly as faithfully as a correct one. Concretely: the real trust boundary today
+    is "whoever subscribes a module is trusted to describe its behavior honestly," which is weaker
+    than "the verified artifact says what it may do." Note also that enforcement is per ENTRYPOINT
+    call ({!Loader.invoke} steps the checker on the entrypoint name before entering the guest), not
+    per host-function call — the guest's own [read_materialized]/[propose_write]/[log] calls are not
+    individually checked, so a protocol cannot currently express a constraint like "no second
+    [propose_write] in one dispatch."
+
+    {b Known, disclosed residual gap: no per-dispatch amortization — every dispatch recompiles the
+    module from its source bytes.} (Task 6's own boundary-friction item 2, sharpened by review finding
+    M3 to say what actually happens rather than only "re-instantiates".) Each dispatch runs the full
+    cost: [module_bytes] (WAT text, in every fixture here) through [wat_to_wasm], a fresh WASM module
+    compile, a fresh instance, a fresh {!Protocol.checker}, and a real [fork] for containment
+    ({!Loader.invoke}). Nothing is cached or pooled between dispatches, per module, per key, or
+    process-wide — so a hot key fans out real compiles, not cheap invocations. Part of that is a
+    deliberate safety property, not waste (Decision 5's "one fresh instance per invocation, no stale
+    state between invocations", which any future cache has to preserve), and part is simply
+    unamortized: a compiled-artifact cache would keep the property while removing the recompile. That
+    is named, deferred performance work, not something the current shape pretends to have.
+
+    {b Known, disclosed residual gap: a module trap is logged to stderr only.} (Review finding M4.)
+    When a dispatched module traps, exhausts its wall-clock containment budget, or violates its
+    protocol, this reactor writes an unstructured [Printf.eprintf] line (tagged with the [merge_key]
+    and module path, see below) and moves on. The design spec's Error-handling section originally
+    promised a structured event through {!Riptide_vsr.Replica}'s [?on_event] hook; that was never
+    built, and was deliberately declined rather than bolted on here, because it is a Layer 0
+    interface change and not a local one: [replica_event] is a documented CLOSED variant covering
+    three concepts [replica.ml] itself classifies (a guest trap is not one), [replica.mli] exposes no
+    way for anything outside that module to fire an event at all, and this reactor deliberately holds
+    no {!Riptide_vsr.Replica.t} — it takes erased [~read]/[~propose] closures precisely so it has no
+    opinion on which replica a subscription is wired to. A deployment that needs machine-readable
+    module-failure signals today has to read this process's stderr; a future task owns deciding
+    whether such events belong on Layer 0's replica-event channel or on a reactor-owned one.
+
     {b Known, disclosed residual gap: [~propose] is fire-and-forget from this reactor's own
     perspective.} {!wrap_materialize_sink} calls [propose] and relays only the [Ok]/[Error] shape
     it returns back to the guest as a status byte -- it does not await, retry, or otherwise confirm

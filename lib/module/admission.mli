@@ -14,6 +14,33 @@
     there is no code path from an on-disk artifact to {!Loader.instantiate} that
     doesn't pass through {!verify} first.
 
+    {b Known, disclosed residual gap: this gate verifies a SIGNATURE. It does not verify
+    PROVENANCE.} (Review finding I3; the design spec's own Decision 6 has been corrected to match,
+    and names this as deliberately deferred follow-up work rather than something silently dropped.)
+    The spec originally promised provenance verification too — [cosign verify-attestation] against
+    SLSA/in-toto attestations — and commit [4193b20]'s own message claims "signature+provenance".
+    Neither is true of the code: {!verify} performs a content-digest check and exactly one
+    [cosign verify-blob] call, and an artifact with no attestation of any kind passes. So what a
+    {!verified_artifact} actually attests is "these bytes hash to the digest the caller expected, and
+    someone holding the expected key signed them" — NOT "this artifact was built by a trusted builder
+    from trusted source." Doing that for real needs a policy model this function's signature does not
+    yet have room for (which attestations are required; how missing vs. malformed vs.
+    untrusted-issuer differ), which is why it is named as a future sub-project instead of
+    half-implemented here.
+
+    {b Known, disclosed residual gap: a {!verified_artifact}'s [tier] is bound to what was verified;
+    its session-type protocol is not — nothing here even looks for one.} (Review finding I5.) The
+    spec's Decision 4 originally described a module declaring its own valid call sequence "alongside
+    its ABI manifest"; there is no manifest, and {!verify} inspects nothing about the artifact's
+    contents beyond its digest. The protocol a module runs under is supplied by whoever calls
+    {!Riptide_module.Reactor.subscribe}/{!Loader.instantiate} — see
+    {!Riptide_module.Reactor.subscribe}'s own disclosure of the same gap from the consuming side —
+    so a subscriber may supply any protocol at all, including one that permits calls the module's
+    real behavior should never have been allowed to make. [tier] is deliberately different: it is
+    carried on this record precisely so a downstream consumer never re-derives or re-trusts it. Any
+    future protocol binding needs the same treatment, plus a manifest format to bind, which is
+    exactly why it is deferred rather than approximated.
+
     **Bundle-file convention.** [cosign] itself is the source of truth for what "signed" means;
     this module does not invent its own signature format. For an artifact at path [p], the
     corresponding [cosign] verification material is expected at the sibling file [p ^ ".bundle"]

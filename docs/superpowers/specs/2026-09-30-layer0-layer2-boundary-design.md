@@ -52,11 +52,33 @@ append-only log — `Replica`'s `?on_event` hook, added by Task 34, observes thi
 materialized state (the lattice's merged output per `merge_key`, which can coalesce several
 commits into one visible change).
 
-**Chosen: materialized state changes.** A module subscribes to a `merge_key` and is invoked when
-that key's *merged* value changes — the same output the `Materializer` itself already produces.
-This is the natural read surface for business logic ("react to the current state of X"), and
-avoids pushing merge/coalescing logic into every module that needs current state, which reacting to
-raw commits would require.
+**Chosen: the materialized layer, not the raw commit log.** A module subscribes to a `merge_key` and
+is dispatched from the materialize path — the same path the `Materializer` itself is driven by —
+never from `Replica`'s own `?on_event` commit stream. This is the natural read surface for business
+logic ("react to the current state of X") and avoids pushing merge/coalescing logic into every
+module that needs current state, which reacting to raw commits would require.
+
+**What actually shipped, corrected (final fix wave, review finding I4 — this section previously
+claimed dispatch happens when the key's *merged* value *changes*, which is not what the code does,
+and a spec asserting behavior the code does not have is exactly the failure `CLAUDE.md`'s "no spec
+without running code" rule names, just in the other direction):** `Reactor.wrap_materialize_sink`
+dispatches **once per write** landing at a subscribed `merge_key`, and hands the guest **that write's
+own payload**, not the merged accumulator. Two concrete consequences, both real today:
+
+- **No change detection.** Nothing compares the merged value before and after; a write that merges
+  into a value identical to the previous one still dispatches. "Per-write" is the real trigger
+  condition, "per-change" is not.
+- **The `arg` a guest receives is not current state.** It is the single write that triggered this
+  dispatch. `test/fixtures/counter.wat` — the one real module built against this boundary — already
+  works around this: it ignores `arg` entirely and re-reads its own subscribed key through
+  `host.read_materialized` to get the merged value. That workaround is live evidence of the gap, not
+  a stylistic choice by that fixture.
+
+Closing this for real means diffing against the merged accumulator's prior value at the
+`materialize_sink` call site, which raises real design questions a future task owns rather than this
+one: what counts as "changed" for an arbitrary lattice value, and whether the sink needs
+read-before-write access it does not have today. Until then the honest statement of this decision is
+the one above, and `reactor.mli` discloses the same gap at the point of use.
 
 ## Decision 3 (subtask 1): a real, hand-rolled module ABI on core WASM — not the Component Model
 
@@ -100,14 +122,38 @@ maintained, real OCaml code generation), built on classical multiparty session t
 
 **Chosen: a hand-rolled finite-state-machine validator, not `nuscr`.** `nuscr` is sized for
 multiparty protocols (several roles negotiating a global protocol); task 5 only ever has two
-parties — one module, one host. Each module declares its own valid call sequence as an explicit
-state machine alongside its ABI manifest (e.g. "`init` before `handle`," "no concurrent
-`propose_write`"). The loader validates a module's declared automaton is well-formed before
-instantiation, and enforces it at every host-function call at runtime — checked twice, load time
-and call time, mirroring the "check, don't trust" convention `Sender_mismatch`/
-`Committed_prefix_mismatch` already establish elsewhere in this codebase. Session types here check
-sequencing safety only, never business invariants — those stay a Layer 2 concern, per the task's
-own description.
+parties — one module, one host. A protocol is an explicit state machine (e.g. "`init` before
+`handle`"), validated for well-formedness when it is constructed (`Protocol.create` rejects an
+initial state outside its own state set, transitions naming unknown states, and two transitions
+sharing one `(from_state, on_call)` pair — i.e. nondeterminism) and enforced at run time, mirroring
+the "check, don't trust" convention `Sender_mismatch`/`Committed_prefix_mismatch` already establish
+elsewhere in this codebase. Session types here check sequencing safety only, never business
+invariants — those stay a Layer 2 concern, per the task's own description.
+
+**What actually shipped, corrected (final fix wave, review finding I5):** two claims in the original
+wording of this decision did not survive contact with the code, and are restated here rather than
+left standing:
+
+- **The protocol is supplied by the subscribing caller, not carried by the module.** This section
+  originally said each module "declares its own valid call sequence ... alongside its ABI manifest."
+  There is no manifest. `Loader.instantiate` takes `~protocol:Protocol.t` as an argument, and
+  `Reactor.subscribe` passes through whatever its own caller hands it. Nothing ties a protocol to
+  the artifact that `Admission.verify` verified: a subscriber can supply any protocol at all, and no
+  check anywhere compares it against what the module actually does. The trust boundary is therefore
+  "the code that subscribes a module is trusted to describe that module's behavior honestly," which
+  is a genuinely weaker statement than this decision originally made, and is disclosed as such in
+  both `reactor.mli` and `admission.mli`.
+- **Enforcement is per *entrypoint call*, not per host-function call.** `Loader.invoke` steps the
+  checker on the entrypoint name (`handle`, `init`, …) before the guest is dispatched into at all;
+  the guest's own subsequent `host.read_materialized`/`host.propose_write`/`host.log` calls are
+  **not** individually checked against the protocol. So "no concurrent `propose_write`" is not a
+  constraint this mechanism can currently express, while "`init` before `handle`" is.
+
+Binding a protocol to a verified artifact needs a real manifest-format decision — what a module
+declares its own protocol *as*, and how admission verifies that declaration — which is a future
+task's design work, not a bolt-on. Extending enforcement down to individual host calls is a separate,
+independent question (the checker and the relay path both exist; what is missing is a decision about
+what the protocol alphabet should be).
 
 ## Decision 5 (subtask 3): uniform SFI isolation, built now; microVM tier designed, not built
 
@@ -139,17 +185,33 @@ under either tier.
 operations, in-toto, or SLSA (`opam search` returned zero matches for all five). Unlike Decision 3,
 this is a security-critical verification surface, not a project-owned convention.
 
-**Chosen: shell out to the real, official `cosign` binary** (signature verification via
-`cosign verify`, provenance verification via `cosign verify-attestation` against SLSA/in-toto
-attestations) as a subprocess, checking its exit code and parsed output — never hand-rolled
-cryptographic or attestation-verification logic in OCaml. "Don't roll your own crypto" applies
-here in a way it doesn't for Decision 3's ABI, which is inherently project-specific and safe to
-own directly. Modules are distributed as OCI artifacts addressed by content digest, never a
-mutable tag. A failing artifact — unsigned, tampered, or missing valid provenance — never enters
-the log and never reaches the loader. A module's isolation tier (Decision 5's `Sfi | Microvm`) is
+**Chosen: shell out to the real, official `cosign` binary** as a subprocess, checking its exit code
+and output — never hand-rolled cryptographic or attestation-verification logic in OCaml. "Don't roll
+your own crypto" applies here in a way it doesn't for Decision 3's ABI, which is inherently
+project-specific and safe to own directly. Modules are distributed as OCI artifacts addressed by
+content digest, never a mutable tag. A module's isolation tier (Decision 5's `Sfi | Microvm`) is
 recorded as part of admission — the gate is the one place that durably decides which tier a given
 module's artifact runs under, so Decision 5's loader has a single source of truth to read rather
 than a second, independent configuration surface.
+
+**What actually shipped: signature verification only. Provenance/attestation verification is
+deliberately deferred, not dropped (final fix wave, review finding I3).** The original wording of
+this decision promised both "signature verification via `cosign verify`" and "provenance
+verification via `cosign verify-attestation` against SLSA/in-toto attestations," and commit
+`4193b20`'s own message claims "signature+provenance." Neither the code nor any test does provenance
+verification at all: `Admission.verify` performs a SHA-256 content-digest check in OCaml and then
+exactly one `cosign verify-blob` call. There is no `verify-attestation` invocation anywhere, no
+attestation is required, and an artifact with no provenance attestation whatsoever passes admission
+today. The sentence "a failing artifact — unsigned, tampered, or missing valid provenance — never
+enters the log and never reaches the loader" was true of the first two and false of the third; it is
+removed rather than reworded, because the honest version is the paragraph you are reading.
+
+Implementing it for real is its own sub-project, not a bolt-on: it needs a policy model for *which*
+attestations are required (builder identity, source repository, build type), how a missing vs.
+malformed vs. untrusted-issuer attestation differ, and what the verification material's own
+distribution story is — all of which this project's "keep specs and plans small, decompose before
+building" discipline says gets its own brainstorm. `admission.mli` discloses the same gap at the
+point of use, alongside its existing TOCTOU disclosure.
 
 ## Decision 7 (subtask 5): a universal authorization checkpoint inside the existing write path
 
@@ -170,24 +232,44 @@ established, tested vocabulary for "this write did not happen, and here is preci
 
 ## Data flow (end to end)
 
-`Materializer` merges committed values for `merge_key K` → produces new materialized state → a new
-reactor dispatch loop, one per module subscribed to `K`, spins up a fresh sandboxed WASM instance
-(Decision 5) and invokes the module's `handle` entrypoint (Decision 3's ABI) with the new bytes →
-the module may call `propose_write` → the call is checked against the module's declared session
-type (Decision 4) → the real `Batch_commit.propose` runs → the new universal authorization
-checkpoint (Decision 7) decides → normal VSR quorum replication (unchanged, already hardened by
-Task 12) → committed → re-materialized → may re-trigger the same or other subscribed modules.
+A write carrying `merge_key K` commits → `Batch_commit`'s materialize step drives its
+`materialize_sink` with that write's own payload → the wrapping reactor sink first lets the inner
+sink (the real `Materializer`, which merges it into `K`'s accumulator) run, then dispatches once per
+module subscribed to `K` → each dispatch spins up a fresh sandboxed WASM instance (Decision 5) and
+invokes the module's `handle` entrypoint (Decision 3's ABI) **with that write's own payload bytes**
+(per Decision 2's correction above: per-write, not per-merged-change, and not the merged value) →
+the entrypoint call is checked against the caller-supplied session type (Decision 4's correction:
+per entrypoint, not per host call) → the module may call `propose_write` → the real
+`Batch_commit.propose` runs → the universal authorization checkpoint (Decision 7) decides → normal
+VSR quorum replication (unchanged, already hardened by Task 12) → committed → re-materialized → may
+re-trigger the same or other subscribed modules, bounded by `Reactor.max_dispatch_depth`.
 
 Before any of this: the module's own artifact passed the admission gate (Decision 6) at
 install/deploy time, not at every invocation.
 
 ## Error handling
 
-- A trapped or crashed module (out-of-bounds access, fuel exhausted) is caught at the host
-  boundary by wasmtime's own trap mechanism. It never crashes Layer 0; it is logged via a new
-  event variant on `?on_event` (Task 34's hook).
-- A session-type violation is a safe rejection, at load time or call time — the same
-  "guard failure ⇒ total no-op" convention `replica.ml` already uses throughout.
+- A trapped or crashed module (out-of-bounds access, fuel exhausted) is contained at the host
+  boundary and never crashes Layer 0: `Loader.invoke` returns `Error`, and the reactor logs it and
+  carries on with the next subscriber. **Corrected (final fix wave, review finding M4): that log is
+  an unstructured `Printf.eprintf` line on stderr, NOT a `?on_event` event variant.** This section
+  originally promised the latter; it was never built, and building it inside a fix wave was declined
+  deliberately rather than overlooked. Three things would have to change together, none of them
+  local: `Riptide_vsr.Replica`'s `replica_event` is documented as a deliberately CLOSED variant
+  covering exactly three concepts *that module itself* classifies or mutates, and a guest trap is
+  none of them; `replica.mli` exposes no way for anything outside `replica.ml` to fire an event at
+  all (`fire_event` is private, and every firing site is a real replica state transition with
+  documented call-convention guarantees a module trap does not fit); and `Reactor` holds no
+  `Replica.t` — by design, it takes erased `~read`/`~propose` closures precisely so it has no opinion
+  on which replica or handle a subscription is wired to. That combination is a Layer 0 interface
+  change, which this project's own `CLAUDE.md` ("small, aligned governance for Layer 0") puts outside
+  a fix wave's authority. The gap is disclosed at the point of use in `reactor.mli`; a future task
+  owns deciding whether module-lifecycle events belong on Layer 0's replica-event channel at all, or
+  on a separate reactor-owned one.
+- A session-type violation is a safe rejection: at protocol-construction time (`Protocol.create`
+  rejects a malformed automaton) and at call time (`Loader.invoke` rejects a call the checker's
+  current state has no transition for, before the guest is entered at all) — the same "guard failure
+  ⇒ total no-op" convention `replica.ml` already uses throughout.
 - An admission-gate failure means the artifact never loads; nothing about it enters any log.
 - An authorization denial makes `propose` return a refusal via the existing classified-refusal
   vocabulary, not a new one.
@@ -239,3 +321,27 @@ document:
   exists or a dedicated investment is justified by real usage.
 - Multi-language guest support beyond "anything that compiles to core WASM" — no PDK-style
   multi-SDK convenience layer is being built.
+
+**Named, deliberately-deferred follow-ups** (added by this plan's final fix wave — each one was
+promised somewhere above before the corrections, so each is recorded here as real deferred work with
+a named reason rather than left as a discrepancy between this document and the code; every one is also
+disclosed in the relevant `.mli`, so a caller meets it at the point of use, not only here):
+
+- **Provenance/attestation verification** (Decision 6, review finding I3) — needs a policy model for
+  which attestations are required and how each failure mode differs; signature verification is what
+  shipped.
+- **Dispatch on merged-value change, rather than per write** (Decision 2, review finding I4) — needs
+  a definition of "changed" for an arbitrary lattice value, and read-before-write access the sink does
+  not have.
+- **Binding a session-type protocol to the verified artifact** (Decision 4, review finding I5) —
+  needs a manifest format for a module to declare its own protocol, and admission-side verification
+  of that declaration. Extending enforcement from per-entrypoint to per-host-call is a separate
+  question of the same family.
+- **Surfacing module traps through a structured event channel** (Error handling, review finding M4) —
+  needs a Layer 0 interface decision (extend `replica_event`, or give the reactor its own event
+  channel) under this project's own Layer 0 governance rule; traps are stderr-logged today.
+- **Per-dispatch amortization of module compilation** (Decision 5, review finding M3 / Task 6's own
+  boundary-friction item 2) — every dispatch currently recompiles the module from its WAT/wasm source
+  and forks a fresh process; a compiled-artifact cache or instance pool is a real performance
+  sub-project, and `Decision 5`'s "one fresh instance per invocation" safety property must survive
+  whatever shape it takes.
