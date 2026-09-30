@@ -156,9 +156,13 @@ backoff/threshold mechanism at all.)
 harness conventions) where a follower's ring genuinely would have evicted an unmaterialized entry
 pre-fix, proven safe post-fix by checking the entry's content survives in the materializer even
 after the raw WAL slot is gone. A second scenario fault-injects materialization falling genuinely,
-permanently behind (e.g., a stuck/crashed materializer) and proves the loud-failure path fires
-within its configured threshold, rather than either silently losing data or wedging forever with no
-signal.
+permanently behind (e.g., a stuck/crashed materializer) and proves the REAL signal fires (see the
+correction above — there is no threshold/backoff mechanism to test): repeated append attempts
+against the entries this stalled materializer has not yet drained are refused as `Eviction_blocked`
+(one of `Replica.append_refusal`'s five classified shapes) every time, observable via
+`append_refusals`' own counter climbing without bound and, as of Task 34, via `?on_event` firing
+`Append_refused Eviction_blocked` synchronously for each refusal — rather than either silently
+losing data or wedging forever with no signal at all.
 
 ## Decision 3 (subtask 4.5): Deployment-required encryption via a `propose`-level flag
 
@@ -298,8 +302,10 @@ here is the same).
   is a separate cleanup decision, not required to close subtask 4.5.
 - **KEK or CA rotation** — both remain explicit non-goals carried over from the just-merged plan's
   own Decisions 5/6.
-- **A watermark observability dashboard** — Decision 2 delivers the loud-failure signal itself, not
-  any monitoring/alerting UI built on top of it.
+- **A watermark observability dashboard** — Decision 2 delivers the classified-refusal signal
+  itself (`append_refusals`' own counters, and Task 34's `?on_event`/`Append_refused` hook — see
+  the correction above; there is no separate "loud-failure path" beyond these), not any
+  monitoring/alerting UI built on top of it.
 - **A general `Kv_store_intf.S` namespacing combinator** — Decision 4 solves the actual
   misconfiguration failure mode found (exclusive ownership), not a more general "let multiple
   consumers safely share one directory" mechanism nobody currently needs.
