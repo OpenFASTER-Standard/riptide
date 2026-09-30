@@ -52,6 +52,42 @@ let test_a_runaway_module_is_contained_not_crashing_the_host () =
   | Ok _ -> Alcotest.fail "expected containment, not success"
   | Error e -> Alcotest.(check bool) "fuel exhaustion is reported, not a host crash" true (String.length e > 0)
 
+(* Final-fix-wave finding I2: the containment deadline must charge GUEST execution time only, never
+   time the PARENT spends inside a host closure the guest called out to. Those closures are
+   entirely caller-supplied code (Task 6's reactor wires a real [Batch_commit.propose] into
+   [propose_write], which can cascade into materialization and further nested module dispatches
+   before it returns), and the guest is blocked on the relay response for every microsecond of it --
+   executing nothing of its own. Charging that against its budget made a perfectly well-behaved
+   guest get SIGKILLed and reported "fuel exhausted" AFTER its own write had already been proposed
+   and committed by the very closure whose slowness caused the report.
+
+   [echo.wat] is exactly the right guest for this: one [host.log] call, then an immediate return.
+   With the log closure alone sleeping longer than the whole budget, a guest doing essentially zero
+   work of its own either completes ([Ok], the correct outcome) or gets reported as a runaway
+   ([Error], the bug) purely as a function of how host-closure time is accounted -- nothing else
+   about the call differs. *)
+let test_time_spent_in_a_host_closure_is_not_charged_against_the_guests_fuel_budget () =
+  let host =
+    {
+      Loader.read_materialized = (fun ~merge_key:_ -> None);
+      propose_write = (fun _ -> Ok ());
+      (* Deliberately longer than the ENTIRE budget, so pre-fix there is no remaining time left at
+         all the moment this returns -- not a marginal, timing-sensitive overrun. *)
+      log = (fun _ -> Unix.sleepf (Loader.fuel_budget_seconds +. 0.3));
+    }
+  in
+  let m =
+    Loader.instantiate ~tier:Loader.Sfi ~module_bytes:(read_file "fixtures/echo.wat") ~host
+      ~protocol:(permissive_protocol ())
+  in
+  match Loader.invoke m ~entrypoint:"handle" ~arg:Bytes.empty with
+  | Ok _ -> ()
+  | Error e ->
+    Alcotest.failf
+      "a guest that did nothing but call one (slow) host closure was reported as a containment \
+       failure -- host-closure time is being charged against the guest's own fuel budget: %s"
+      e
+
 let test_read_materialized_relays_a_known_value_back_to_the_guest () =
   let seen_keys = ref [] in
   let host =
@@ -341,6 +377,9 @@ let tests =
     ( "Loader.invoke contains a runaway module instead of crashing the host",
       `Quick,
       test_a_runaway_module_is_contained_not_crashing_the_host );
+    ( "Loader.invoke does not charge host-closure time against the guest's own fuel budget",
+      `Quick,
+      test_time_spent_in_a_host_closure_is_not_charged_against_the_guests_fuel_budget );
     ( "Loader.invoke relays a known read_materialized value back to the guest",
       `Quick,
       test_read_materialized_relays_a_known_value_back_to_the_guest );

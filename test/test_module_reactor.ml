@@ -317,6 +317,100 @@ let test_dispatch_swallows_an_ordinary_exception_and_logs_it_with_merge_key_and_
     true
     (string_contains ~needle:"boom" stderr_output)
 
+(* ── Final fix wave, findings I1 + I2 (tested together, deliberately) ─────────────────────────────
+   I1: reentrant dispatch was unbounded -- a module that proposes to its own subscribed key
+   retriggers itself, and every live level holds a forked child process, two pipe fds and a freshly
+   compiled WASM instance until the level below returns, so nothing stopped a self-proposing guest
+   from consuming processes and descriptors without limit.
+
+   I2 is in the same test on purpose: the two interact directly. Before I2's fix, time spent in a
+   nested cascade was charged against every OUTER guest's own fuel budget, so a deep chain collapsed
+   from the outside in with spurious "fuel exhausted" containment failures -- which is why this test
+   asserts not only that the depth bound stops the chain, but that NOTHING in the chain failed on
+   the way there. Those two assertions pull in opposite directions (the first needs deep nesting;
+   the second needs deep nesting to be harmless), which is exactly what makes running them together
+   worth more than running either alone.
+
+   The cascade here is driven by a ~propose closure that re-enters the very sink that dispatched it.
+   That is the same shape the real chain has -- test_module_end_to_end.ml drives the genuine
+   Batch_commit.propose -> commit -> materialize -> wrapped sink version for real -- with the
+   consensus/materialization machinery left out so this test can push the nesting several levels
+   PAST the bound (which a real chain, bounded at 4 by its own fixture, never reaches) without
+   standing up a 12-deep commit chain to do it. *)
+let test_reentrant_dispatch_is_bounded_by_max_dispatch_depth () =
+  let reactor = Reactor.create () in
+  let merge_key = "depth-chain-key" in
+  let inner_writes = ref 0 in
+  let inner_sink : Batch_commit.materialize_sink =
+    { write = (fun ~merge_key:_ _ -> incr inner_writes) }
+  in
+  let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
+  let dispatches = ref 0 in
+  let recurse = ref true in
+  (* Strictly above the bound, so the closure keeps trying to recurse for several more levels after
+     the reactor has already started refusing -- this test's own ceiling is a backstop against
+     hanging the suite if the bound is absent entirely, NOT the thing under test. Pre-fix this test
+     therefore fails with a real, finite, wrong number (that ceiling) rather than by hanging. *)
+  let own_ceiling = Reactor.max_dispatch_depth + 4 in
+  (* Real host-side work per level, sized off the two constants under test rather than hardcoded, so
+     the I2 half of this test is PROVABLY discriminating rather than incidentally so: with
+     [max_dispatch_depth] levels each spending this long inside its own relayed host call, the
+     OUTERMOST level accumulates 1.5x the entire fuel budget of nested time before its own child
+     ever reports back. If that time is (wrongly) charged to the guest, the outer levels are
+     SIGKILLed as runaways and the assertions below see real "fuel exhausted" failures; charged
+     correctly, none of them is affected at all. Without this delay the whole chain finishes well
+     inside one budget, and the I2 assertion -- verified live -- passes even against an
+     I2-regressed loader, which is exactly the kind of quietly-vacuous assertion this branch's own
+     review history has caught more than once. *)
+  let host_work_per_level =
+    Loader.fuel_budget_seconds /. float_of_int Reactor.max_dispatch_depth *. 1.5
+  in
+  let propose _ =
+    incr dispatches;
+    Unix.sleepf host_work_per_level;
+    if !recurse && !dispatches < own_ceiling then wrapped.write ~merge_key (v "retrigger");
+    Ok ()
+  in
+  let no_read ~merge_key:_ = None in
+  Reactor.subscribe reactor ~merge_key ~module_:(verified_propose_write ())
+    ~protocol:allow_handle_from_init ~read:no_read ~propose;
+  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key (v "start")) in
+  Alcotest.(check int)
+    "the reentrant chain stopped at exactly the documented depth bound, not at this test's own \
+     ceiling (and not never)"
+    Reactor.max_dispatch_depth !dispatches;
+  Alcotest.(check bool) "the refusal itself is logged, naming the limit it hit" true
+    (string_contains ~needle:"maximum reentrant dispatch depth" stderr_output);
+  Alcotest.(check bool) "...and naming the merge_key responsible for the chain" true
+    (string_contains ~needle:merge_key stderr_output);
+  (* I1 + I2 combined: every dispatch in the chain -- including the outermost, which stayed blocked
+     inside its own relayed host call for the entire duration of all 7 levels below it -- must have
+     completed cleanly. A spurious fuel timeout anywhere in that chain is precisely the bug I2
+     fixed, and deep nesting is precisely what provokes it. *)
+  Alcotest.(check bool)
+    "no dispatch in the chain was reported as a containment failure (in particular, no outer level \
+     was charged for the nested levels' time and SIGKILLed as a runaway)"
+    false
+    (string_contains ~needle:"module dispatch failed" stderr_output
+    || string_contains ~needle:"module dispatch raised" stderr_output
+    || string_contains ~needle:"fuel exhausted" stderr_output);
+  Alcotest.(check int)
+    "materialization itself was never what got skipped -- the inner sink ran once per write, \
+     refused dispatch included"
+    (Reactor.max_dispatch_depth + 1)
+    !inner_writes;
+  (* The depth counter is released on the way back out, not leaked: a fresh top-level write, after
+     the chain above has fully unwound, must dispatch normally again rather than finding the reactor
+     permanently wedged at its own limit. [recurse] off, so this second write is a single, plain
+     dispatch and the expected count is exact rather than "at least". *)
+  recurse := false;
+  ignore (capture_stderr (fun () -> wrapped.write ~merge_key (v "second-top-level-write")));
+  Alcotest.(check int)
+    "a top-level write after the chain unwound dispatches normally -- the depth counter was \
+     released on the way out, not leaked"
+    (Reactor.max_dispatch_depth + 1)
+    !dispatches
+
 let tests =
   [
     ("a materialized change on a subscribed key invokes the module", `Quick,
@@ -331,4 +425,7 @@ let tests =
       test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowing_them);
     ("dispatch swallows an ordinary exception and logs it with merge_key/module context", `Quick,
       test_dispatch_swallows_an_ordinary_exception_and_logs_it_with_merge_key_and_module_context);
+    ("reentrant dispatch is bounded by max_dispatch_depth, and nesting costs no outer level its \
+      own fuel budget", `Quick,
+      test_reentrant_dispatch_is_bounded_by_max_dispatch_depth);
   ]

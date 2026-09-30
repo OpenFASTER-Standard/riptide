@@ -698,7 +698,45 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
          set [cleaned_up], and this returns immediately without a second syscall. *)
       cleanup ())
   in
-  let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
+  (* MUTABLE, deliberately: it is extended by exactly the time the PARENT spends inside a host
+     closure, so only genuine GUEST execution time is ever charged against the budget -- see
+     [charge_to_host] below. *)
+  let deadline = ref (Unix.gettimeofday () +. fuel_budget_seconds) in
+  (* Final-fix-wave finding I2. The budget ([fuel_budget_seconds]) stands in for guest FUEL, i.e.
+     work the guest itself does; but this parent's own supervision loop spends real wall-clock time
+     running things that are not the guest at all. The 'L'/'R'/'P' arms below call entirely
+     caller-supplied host closures ([host_functions]'s own three fields), and in this plan's own
+     reactor (Task 6) a relayed [propose_write] genuinely drives a whole nested
+     [Batch_commit.propose] -- authorization checkpoint, VSR commit, materialization, and every
+     module dispatch that materialization itself retriggers -- before it returns. Throughout ALL of
+     that the guest is blocked on the relay response, having executed nothing of its own since its
+     call instruction.
+     Charging that time against the guest produced a real, concrete misbehavior, not a theoretical
+     unfairness: a well-behaved guest whose one host call happened to be slow (or merely deep) was
+     SIGKILLed and reported "fuel exhausted" -- AFTER the write it proposed had already been
+     authorized and committed by the very closure whose duration triggered the report. The caller
+     then sees a containment failure for a call that in fact succeeded.
+     So: stop the clock for the duration of every host-side call, by pushing the deadline out by
+     exactly the elapsed host time. [Fun.protect] rather than a plain sequence, so the credit is
+     applied even when the closure raises (in which case [step]'s own guard converts it to a
+     containment failure and cleans up -- the deadline no longer matters, but leaving it
+     inconsistent on one path and not another would be a trap for the next reader). The finally
+     itself cannot raise (one [gettimeofday], one [ref] assignment), so no [Finally_raised] shape
+     is reachable here.
+     What this deliberately does NOT do is bound host-closure time: a host closure that blocks
+     forever blocks this loop forever, exactly as it did before this fix. That is the caller's own
+     code, on the caller's own (parent) process -- not the untrusted guest this loader is built to
+     contain -- and giving it a deadline would mean this loader unilaterally deciding to abandon
+     mid-flight an operation the caller may well have already made durable (a committed
+     [Batch_commit.propose] is the concrete case). Disclosed as a real, bounded residual in
+     [loader.mli]'s own {!invoke} contract rather than silently traded for the bug above; the
+     reentrant-dispatch depth bound that keeps the nesting itself finite lives with the code that
+     creates it, in [Reactor.max_dispatch_depth]. *)
+  let charge_to_host : 'a. (unit -> 'a) -> 'a =
+   fun f ->
+    let started = Unix.gettimeofday () in
+    Fun.protect ~finally:(fun () -> deadline := !deadline +. (Unix.gettimeofday () -. started)) f
+  in
   (* One step of work: the fuel-deadline check, the [Unix.select] call, the [read_msg] that
      follows it, and dispatching whichever tag came back ('L'/'R'/'P' invoke the REAL host
      closures, which are entirely caller-supplied code this loader has no control over). Wrapped
@@ -710,7 +748,7 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
      comment above for the three real, live-reproduced gaps this closed, one per fix round. *)
   let step () : [ `Continue | `Done of (bytes, string) result ] =
     try
-      let remaining = deadline -. Unix.gettimeofday () in
+      let remaining = !deadline -. Unix.gettimeofday () in
       if remaining <= 0. then (
         cleanup ();
         `Done
@@ -726,22 +764,30 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
         | _ -> (
           let tag, payload = Pipe_protocol.read_msg req_r in
           match tag with
+          (* All three host-call arms run under [charge_to_host] (finding I2): the guest is blocked
+             on its relayed call from the instant it issued it until this parent has finished both
+             the closure AND the response write that unblocks it, so the whole arm -- not just the
+             closure call inside it -- is host time, not guest time. *)
           | 'L' ->
-            (host_of_sink ()).log (Bytes.to_string payload);
+            charge_to_host (fun () -> (host_of_sink ()).log (Bytes.to_string payload));
             `Continue
           | 'R' ->
-            let merge_key = Bytes.to_string payload in
-            (match (host_of_sink ()).read_materialized ~merge_key with
-            | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
-            | Some value ->
-              Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
-              Pipe_protocol.write_frame resp_w value);
+            charge_to_host (fun () ->
+                let merge_key = Bytes.to_string payload in
+                match (host_of_sink ()).read_materialized ~merge_key with
+                | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
+                | Some value ->
+                  Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
+                  Pipe_protocol.write_frame resp_w value);
             `Continue
           | 'P' ->
-            let status =
-              match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
-            in
-            Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
+            charge_to_host (fun () ->
+                let status =
+                  match (host_of_sink ()).propose_write payload with
+                  | Ok () -> '\000'
+                  | Error _ -> '\001'
+                in
+                Pipe_protocol.write_frame resp_w (Bytes.make 1 status));
             `Continue
           | 'D' ->
             cleanup ();

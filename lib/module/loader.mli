@@ -40,6 +40,25 @@ type t
 (** A single, live, already-instantiated guest module. Not reusable across separate logical
     invocations of a module — call {!instantiate} again for each one (Decision 5). *)
 
+val fuel_budget_seconds : float
+(** The wall-clock containment budget one {!invoke} call gives the guest, in seconds — this
+    loader's own stand-in for wasmtime's per-instruction fuel metering, which is entirely absent
+    from the classic [wasm_c_api] surface it runs on (see [loader.ml]'s top comment). Exposed
+    rather than kept private for two real reasons, not merely for tests: a caller that dispatches
+    guests reentrantly needs it to reason about its own bound (see
+    {!Riptide_module.Reactor.max_dispatch_depth}, whose own documented derivation cites this
+    value), and this loader's own regression test for "host-closure time is not guest time"
+    (below) has to know the budget it is deliberately exceeding.
+
+    {b What this budget does and does not measure.} It bounds GUEST execution time only. Time the
+    PARENT spends inside a host closure the guest called out to ([read_materialized]/
+    [propose_write]/[log], all entirely caller-supplied code — which may itself be arbitrarily
+    slow, and in this plan's own reactor genuinely IS: a relayed [propose_write] can drive a whole
+    nested {!Riptide_batch_commit.Batch_commit.propose}, materialization, and further module
+    dispatches before returning) is explicitly NOT charged against it: the guest is blocked
+    waiting for that response the entire time and is executing nothing of its own. See
+    {!invoke}'s own doc comment for the real bug this closed. *)
+
 val instantiate :
   tier:isolation_tier -> module_bytes:string -> host:host_functions -> protocol:Protocol.t -> t
 (** [module_bytes] is WAT text or a raw WASM binary (both accepted transparently — see
@@ -128,6 +147,31 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     bug this caused and fixed the first time this loader actually returned non-empty guest
     results). Each [invoke] call costs a real `fork`, non-trivial relative to an in-process call
     — a real, measurable cost Task 6's reactor should account for, not assume away.
+
+    {b The containment deadline charges GUEST time only} ({!fuel_budget_seconds}). Time this
+    parent process spends inside a host closure the guest called out to — and, transitively,
+    inside anything that closure itself drives — is credited back to the deadline rather than
+    counted against it, because the guest is blocked on the relay response for every microsecond
+    of it and is executing nothing of its own. This is not a fairness nicety: charging it produced
+    a real misbehavior (found by this plan's own final whole-branch review, finding I2), because
+    this plan's reactor wires a genuine {!Riptide_batch_commit.Batch_commit.propose} into
+    ["propose_write"] — authorization checkpoint, VSR commit, materialization, and every further
+    module dispatch that materialization retriggers, all inside one relayed host call. A
+    well-behaved guest was therefore SIGKILLed and reported "fuel exhausted" AFTER the write it
+    proposed had already been committed by the very closure whose duration triggered the report,
+    handing its caller a containment failure for a call that in fact succeeded.
+
+    {b Known, disclosed residual gap: a host closure's own duration is not bounded by anything
+    here.} A caller-supplied ["log"]/["read_materialized"]/["propose_write"] that blocks forever
+    blocks this supervision loop forever, and no deadline in this module interrupts it. That is
+    deliberate, not an oversight this fix left behind: those closures are the CALLER's own code
+    running in the PARENT process — not the untrusted guest this loader exists to contain — and
+    abandoning one mid-flight would mean unilaterally walking away from an operation the caller may
+    already have made durable (a committed {!Riptide_batch_commit.Batch_commit.propose} is exactly
+    that case). A caller that needs its own host-side timeout owns imposing it inside its own
+    closure. The related hazard this fix DOES close a bound on is unbounded reentrant nesting of
+    such calls, and it is bounded where it is created rather than here — see
+    {!Riptide_module.Reactor.max_dispatch_depth}.
 
     The forked child is always reaped and both of its parent-side pipe file descriptors always
     closed, on every exit path — including a child that dies via an uncaught OS signal (a real,

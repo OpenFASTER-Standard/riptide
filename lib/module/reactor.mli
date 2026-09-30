@@ -30,6 +30,40 @@ type t
 
 val create : unit -> t
 
+val max_dispatch_depth : int
+(** The enforced ceiling on how deeply {!wrap_materialize_sink}'s dispatch may nest inside itself
+    (currently 8). Public, not an internal detail, because it is a real, observable limit on what a
+    subscribed module can do: a module that proposes to its own subscribed key retriggers itself,
+    and this is the bound at which that chain stops.
+
+    {b Why a bound exists at all.} Reentrant dispatch is by design (see {!wrap_materialize_sink}) —
+    a dispatched module's [~propose] is wired to a real
+    {!Riptide_batch_commit.Batch_commit.propose}, which commits, materializes, and drives the very
+    sink that dispatched it. Each live level holds a forked child process, two pipe file
+    descriptors, and a freshly compiled WASM instance until the level below it returns, so an
+    unconditionally self-proposing guest previously consumed processes and descriptors without any
+    limit at all. Once this depth is already live, a further dispatch is REFUSED — logged with the
+    responsible [merge_key] and the limit, and treated exactly like a module that chose to do
+    nothing (see {!wrap_materialize_sink}: the inner sink's own [write] still ran first,
+    unconditionally, so materialization is never what gets skipped here) rather than raised, since
+    the code that would receive such an exception is the guest's own relayed host call, which has
+    no way to act on it.
+
+    {b Relation to {!Loader.fuel_budget_seconds}} (stated because it changed in the same fix wave
+    that added this): while nested host-closure time was still charged against each outer guest's
+    own fuel budget, deep nesting was crudely self-limiting — an outer guest was eventually
+    SIGKILLed as a "runaway" and the chain collapsed from the outside in. That was itself a bug
+    (a well-behaved guest reported as a containment failure after its write had already committed;
+    see {!Loader.invoke}'s own doc comment), and fixing it removed the accidental bound along with
+    it. This constant is now the only thing keeping the nesting finite.
+
+    {b Known, disclosed residual gap: this is a bound, not a scheduler.} A legitimately long
+    reaction chain deeper than this is refused, not deferred — the proper mechanism (queue a
+    retriggered dispatch and run it at depth 1 once the current one returns) needs a real design of
+    its own: ordering, fairness, durability across restarts, and what it would mean for the
+    sequential-dispatch contract {!wrap_materialize_sink} documents as load-bearing. That is a
+    future task's, not something this bound pretends to have solved. *)
+
 val subscribe :
   t ->
   merge_key:string ->
@@ -119,7 +153,14 @@ val wrap_materialize_sink :
     exception: both are re-raised rather than caught, matching [loader.ml]'s own [cleanup]
     precedent in this exact codebase -- they signal the process itself is in trouble, not a normal
     per-module failure to log and continue past. A change on a [merge_key] with no subscribers is
-    a total no-op beyond the inner [write] call -- no {!Loader.instantiate} is ever attempted. *)
+    a total no-op beyond the inner [write] call -- no {!Loader.instantiate} is ever attempted.
+
+    Dispatch may reenter this same [write] (a module's [~propose] is typically wired to a real
+    {!Riptide_batch_commit.Batch_commit.propose}, which commits, materializes, and drives this sink
+    again), and that nesting is bounded: once {!max_dispatch_depth} levels are already live, a
+    further dispatch is refused and logged rather than attempted. See {!max_dispatch_depth} for the
+    bound's own derivation and its disclosed limitation. The inner [write] above is never what gets
+    refused -- that call is unconditional at every depth. *)
 
 module For_testing : sig
   val log_call_count : unit -> int
