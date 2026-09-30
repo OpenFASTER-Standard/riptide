@@ -42,9 +42,15 @@ val instantiate : tier:isolation_tier -> module_bytes:string -> host:host_functi
     [tier = Microvm] @raise Failure "Loader.instantiate: Microvm tier is not yet implemented
     (Task 8's own job)" — a real, tested error, not silent acceptance of an unbuilt capability.
 
-    [tier = Sfi] applies wasmtime's own resource limits so a module cannot grow its linear memory
-    past what it itself declares (enforced by wasmtime's core WASM semantics on every guest
-    [memory.grow]) nor blow a generous, fixed guest call-stack bound (wasmtime's
+    [tier = Sfi] applies a REAL, host-enforced linear-memory page limit at instantiate time — not
+    merely the guest module's own self-declared maximum, which is under full guest control and
+    enforces nothing against an adversarial module on its own (wasmtime's ordinary [memory.grow]
+    honors a hostile guest's own multi-gigabyte self-declared maximum exactly as faithfully as a
+    well-behaved one's small one). [instantiate] parses the module's own binary memory section
+    directly (see [loader.ml]'s [check_memory_limit]) and @raise Failure if its declared maximum
+    exceeds a fixed cap (1024 pages / 64 MiB — see [loader.ml]'s [memory_pages_cap] for the one-
+    line justification), or if it declares no maximum at all (unbounded growth is itself a
+    violation, not a pass). It also blows a generous, fixed guest call-stack bound (wasmtime's
     [max_wasm_stack] engine config). It does **not** apply true instruction-level fuel metering —
     fuel is entirely absent from the classic [wasm_c_api] this loader runs on (see [loader.ml]'s
     top comment for the full story, including a hard environment bug — an outdated CPU-feature-
@@ -53,9 +59,9 @@ val instantiate : tier:isolation_tier -> module_bytes:string -> host:host_functi
     containment used instead.
 
     @raise Failure if the module fails to compile/instantiate (e.g. malformed WAT/wasm, an
-    import from an unsupported namespace or an unrecognized ["host"] function name, or a WASM
-    validation error) — these are genuine setup failures, distinct from {!invoke}'s per-call
-    [Error] result. *)
+    import from an unsupported namespace or an unrecognized ["host"] function name, a declared
+    memory maximum exceeding the cap or missing entirely, or a WASM validation error) — these
+    are genuine setup failures, distinct from {!invoke}'s per-call [Error] result. *)
 
 val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
 (** Calls the guest's exported function named [entrypoint] (resolved by name against the
@@ -82,4 +88,27 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     during the call) are visible from inside it (see [loader.ml]'s [run_contained] for the real
     bug this caused and fixed the first time this loader actually returned non-empty guest
     results). Each [invoke] call costs a real `fork`, non-trivial relative to an in-process call
-    — a real, measurable cost Task 6's reactor should account for, not assume away. *)
+    — a real, measurable cost Task 6's reactor should account for, not assume away.
+
+    The forked child is always reaped and both of its parent-side pipe file descriptors always
+    closed, on every exit path — including a child that dies via an uncaught OS signal (a real,
+    demonstrated possibility on this exact codebase: [loader.ml]'s top comment point 0 already
+    found `libwasmtime`'s own Rust internals capable of process-aborting panics) rather than
+    through its own clean reporting. No exit path leaks a zombie process or a file descriptor;
+    see [loader.ml]'s [supervise_child]. *)
+
+module For_testing : sig
+  val simulate_child_death_mid_message :
+    unit -> (bytes, string) result * int * Unix.file_descr * Unix.file_descr
+  (** Exists only for this task's own regression test proving the "no zombie/fd leak, ever"
+      guarantee documented on {!invoke} above holds even on the one path nothing in the public
+      ["host"]-import/guest-execution API alone can organically trigger: a contained call's
+      forked child dying (here, simulated by a bare child that just closes its pipe) before it
+      ever completes a message, the same shape an uncaught OS signal produces. Not part of the
+      guest-execution API — Task 4/6 must never call this. Returns the containment result
+      (always [Error], never raises), the dead child's own pid, and the parent's own two
+      pipe file descriptors, so the test can independently confirm both real reaping
+      ([Unix.kill pid 0] failing with [ESRCH], not merely succeeding on an unreaped zombie) and
+      real fd closure ([Unix.close] on either failing with [EBADF], not silently succeeding on
+      a still-open descriptor). *)
+end

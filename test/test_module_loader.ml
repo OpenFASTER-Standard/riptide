@@ -138,6 +138,59 @@ let test_propose_write_relays_the_hosts_denial_back_to_the_guest () =
     Alcotest.(check (list string)) "the host still received the exact rejected payload"
       [ "reject-me" ] !seen_payloads
 
+let no_op_host () =
+  {
+    Loader.read_materialized = (fun ~merge_key:_ -> None);
+    propose_write = (fun _ -> Ok ());
+    log = (fun _ -> ());
+  }
+
+let test_instantiate_rejects_a_module_declaring_a_memory_maximum_over_the_cap () =
+  Alcotest.check_raises
+    "an over-large self-declared memory maximum is rejected at load time, not silently honored"
+    (Failure
+       "Loader.instantiate: guest module's own declared memory maximum (65536 pages / 4294967296 \
+        bytes) exceeds this loader's cap (1024 pages / 67108864 bytes)") (fun () ->
+      ignore
+        (Loader.instantiate ~tier:Loader.Sfi
+           ~module_bytes:(read_file "fixtures/oversized_memory.wat") ~host:(no_op_host ())))
+
+let test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all () =
+  Alcotest.check_raises
+    "an unbounded (no declared maximum) memory is rejected too, not just an over-large bounded one"
+    (Failure
+       "Loader.instantiate: guest module declares its memory with no maximum at all (unbounded \
+        growth) -- a declared maximum of at most 1024 pages (67108864 bytes) is required") (fun () ->
+      ignore
+        (Loader.instantiate ~tier:Loader.Sfi
+           ~module_bytes:(read_file "fixtures/unbounded_memory.wat") ~host:(no_op_host ())))
+
+let test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message () =
+  let result, child_pid, req_r, resp_w = Loader.For_testing.simulate_child_death_mid_message () in
+  (match result with
+  | Ok _ ->
+    Alcotest.fail
+      "expected a containment-failure Error (invoke's own contract: never raises), not Ok, for a \
+       child that never completed its message"
+  | Error e ->
+    Alcotest.(check bool) "a real, non-empty error is returned instead of an uncaught exception"
+      true
+      (String.length e > 0));
+  (* A genuinely reaped process is fully gone: kill(pid, 0) fails with ESRCH. An unreaped
+     zombie is still visible to the process table and kill(pid, 0) on it still SUCCEEDS. *)
+  (match Unix.kill child_pid 0 with
+  | () -> Alcotest.fail "the forked child was left as a zombie -- not reaped"
+  | exception Unix.Unix_error (Unix.ESRCH, _, _) -> ()
+  | exception exn -> raise exn);
+  let confirm_closed name fd =
+    match Unix.close fd with
+    | () -> Alcotest.fail (Printf.sprintf "%s was leaked open, not closed" name)
+    | exception Unix.Unix_error (Unix.EBADF, _, _) -> ()
+    | exception exn -> raise exn
+  in
+  confirm_closed "req_r" req_r;
+  confirm_closed "resp_w" resp_w
+
 let test_microvm_tier_raises_a_clear_not_implemented_error () =
   Alcotest.check_raises "microvm tier is designed, not built"
     (Failure "Loader.instantiate: Microvm tier is not yet implemented (Task 8's own job)") (fun () ->
@@ -170,6 +223,15 @@ let tests =
     ( "Loader.invoke relays the host's propose_write denial back to the guest",
       `Quick,
       test_propose_write_relays_the_hosts_denial_back_to_the_guest );
+    ( "Loader.instantiate rejects a module declaring a memory maximum over the cap",
+      `Quick,
+      test_instantiate_rejects_a_module_declaring_a_memory_maximum_over_the_cap );
+    ( "Loader.instantiate rejects a module declaring no memory maximum at all",
+      `Quick,
+      test_instantiate_rejects_a_module_declaring_no_memory_maximum_at_all );
+    ( "run_contained reaps the child and closes both pipe fds even when it dies mid-message",
+      `Quick,
+      test_run_contained_reaps_and_closes_fds_even_when_the_child_dies_mid_message );
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );

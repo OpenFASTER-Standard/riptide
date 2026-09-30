@@ -175,6 +175,26 @@ module Wasm_binary = struct
     in
     loop 8 (* skip the 4-byte magic + 4-byte version header *)
 
+  (* The guest module's own declared linear-memory limits (section id 5 -- MVP wasm permits at
+     most one locally-declared memory, matching this loader's own "guest must export exactly one
+     memory named \"memory\"" ABI convention, so the first entry is the only one that matters).
+     [None] means the module declares no local memory at all (nothing for [instantiate]'s own cap
+     check below to act on -- a missing "memory" export is instead [invoke]'s problem, via
+     [find_memory]). [Some None] means a memory IS declared but with no maximum at all (flag byte
+     0x00): unbounded growth, which this loader treats as itself a violation, not a pass -- see
+     [instantiate]. [Some (Some max)] is the module's own declared maximum, in pages. *)
+  let declared_memory_max_pages wasm : int option option =
+    let result = ref None in
+    iter_sections wasm ~f:(fun id s pos ->
+        if id = 5 (* memory section *) then (
+          let count, pos = read_uleb32 s pos in
+          if count > 0 then (
+            let flag, pos = read_u8 s pos in
+            let _min, pos = read_uleb32 s pos in
+            if flag land 1 = 1 then result := Some (Some (fst (read_uleb32 s pos)))
+            else result := Some None)));
+    !result
+
   (* name -> position in the flat vector `wasm_instance_exports` returns. The WASM spec
      guarantees that vector is exactly the export section's own entries, in order -- one entry
      per export regardless of kind -- so this is a correct, complete map. *)
@@ -238,6 +258,16 @@ end
    fixture's real work (a single host call), far below "looks hung" to a human running
    `dune test`. *)
 let fuel_budget_seconds = 2.0
+
+(* The real linear-memory page limit the brief's own Step 3 text calls for ("a linear-memory
+   page limit set at instantiation"). One WASM page is 64 KiB; 1024 pages is 64 MiB -- generous
+   enough for any module this task's own fixtures or Task 6's first real module plausibly needs
+   to hold, while remaining a small, bounded fraction of host memory a single hostile or buggy
+   guest could ever claim (unlike the guest's own self-declared limit alone, which is under full
+   guest control and enforces nothing against an adversarial module -- see [check_memory_limit]
+   below and the code-review finding this closes). Revisit once Task 6's real module has an
+   actual, measured working-set size to size this against instead of a round, defensible guess. *)
+let memory_pages_cap = 1024
 
 let read_guest_bytes memory ~ptr ~len = Bytes.of_string (W.Memory.to_string memory ~pos:ptr ~len)
 
@@ -376,6 +406,34 @@ let find_memory export_positions exports =
   | None -> None
   | Some idx -> ( try Some (W.Extern.as_memory (List.nth exports idx)) with _ -> None)
 
+(* Real, instantiate-time enforcement of the brief's own "linear-memory page limit set at
+   instantiation" (Step 3) -- the guest module's own self-declared max in its own WAT/wasm binary
+   is under full guest control and enforces nothing against an adversarial module on its own;
+   wasmtime's ordinary [memory.grow] semantics will happily honor a hostile guest's own
+   multi-gigabyte self-declared maximum exactly as faithfully as a well-behaved one's small one.
+   This rejects instantiation outright -- before the module ever runs -- for a declared maximum
+   that exceeds [memory_pages_cap], or for a memory declared with no maximum at all (unbounded
+   growth is itself a violation, not merely an unusually large but bounded one). A module
+   declaring no local memory at all is unaffected here (nothing to cap); a missing "memory"
+   export is [invoke]'s own, separate concern via [find_memory]. *)
+let check_memory_limit wasm =
+  match Wasm_binary.declared_memory_max_pages wasm with
+  | None -> ()
+  | Some None ->
+    failwith
+      (Printf.sprintf
+         "Loader.instantiate: guest module declares its memory with no maximum at all \
+          (unbounded growth) -- a declared maximum of at most %d pages (%d bytes) is required"
+         memory_pages_cap
+         (memory_pages_cap * 65536))
+  | Some (Some declared_max) ->
+    if declared_max > memory_pages_cap then
+      failwith
+        (Printf.sprintf
+           "Loader.instantiate: guest module's own declared memory maximum (%d pages / %d bytes) \
+            exceeds this loader's cap (%d pages / %d bytes)"
+           declared_max (declared_max * 65536) memory_pages_cap (memory_pages_cap * 65536))
+
 let instantiate ~tier ~module_bytes ~host =
   match tier with
   | Microvm ->
@@ -389,6 +447,7 @@ let instantiate ~tier ~module_bytes ~host =
     let store = W.Store.create engine in
     let wasm_bytes = W.Wasmtime.wat_to_wasm ~wat:module_bytes in
     let wasm = W.Byte_vec.to_string wasm_bytes in
+    check_memory_limit wasm;
     let modl = W.Wasmtime.new_module store ~wasm:wasm_bytes in
     let memory_ref = ref None in
     let sink = ref (Direct host) in
@@ -400,11 +459,101 @@ let instantiate ~tier ~module_bytes ~host =
     memory_ref := memory;
     { instance; exports; export_positions; memory; sink }
 
+(* The parent-side half of containment: services host-function relay requests from the child on
+   [req_r]/[resp_w], and returns the child's own final result once it reports done -- via [tag]
+   'D' (success, [payload] is the guest's own result bytes) or 'E' (the child's own [try...with]
+   caught something and reported it as a clean failure). Every exit from this function's own loop
+   -- success, fuel-timeout, or anything else, INCLUDING a child that dies without ever completing
+   a message (an uncaught OS signal -- SIGSEGV/SIGABRT/SIGBUS from a Rust-side libwasmtime panic
+   during real guest execution is a real, not hypothetical, way this can happen on this exact
+   codebase, see this file's own top comment point 0 -- or protocol corruption) -- reaps the
+   child and closes both [req_r]/[resp_w] exactly once, via [cleanup], so {!invoke}'s own
+   documented "never raises" contract genuinely holds no matter how the child ends. A prior
+   version of this logic only reached that cleanup on 3 of 5 possible exit paths, silently
+   leaking a zombie process and two file descriptors -- and letting the uncaught-EOF exception
+   propagate straight out of [invoke] -- on the other 2 (an unrecognized pipe tag, or the child's
+   write end closing before a complete message arrived); see
+   `For_testing.simulate_child_death_mid_message`'s own regression test for a real, live proof
+   this no longer happens. *)
+let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, string) result =
+  let host_of_sink () =
+    match !sink with
+    | Direct host -> host
+    | Relay _ -> failwith "Loader: parent's own sink was unexpectedly switched to Relay"
+  in
+  let cleaned_up = ref false in
+  let cleanup () =
+    if not !cleaned_up then (
+      cleaned_up := true;
+      (* Harmless if the child already exited on its own (success/'E'/timeout already sent it a
+         SIGKILL): killing an already-dead pid just raises ESRCH, tolerated below. Sending it
+         unconditionally here, on every path, is exactly what makes this a single, uniform
+         cleanup instead of the per-path duplication the original code had (and got wrong). *)
+      (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
+      (try ignore (Unix.waitpid [] child_pid) with Unix.Unix_error _ -> ());
+      (try Unix.close req_r with Unix.Unix_error _ -> ());
+      (try Unix.close resp_w with Unix.Unix_error _ -> ()))
+  in
+  let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
+  let rec loop () =
+    let remaining = deadline -. Unix.gettimeofday () in
+    if remaining <= 0. then (
+      cleanup ();
+      Error
+        (Printf.sprintf
+           "Loader.invoke: fuel exhausted (wall-clock budget of %.1fs exceeded; the classic \
+            wasm_c_api this loader runs on has no fuel-metering API, see loader.ml's top \
+            comment -- the guest was SIGKILLed, not merely abandoned)"
+           fuel_budget_seconds))
+    else
+      match Unix.select [ req_r ] [] [] remaining with
+      | [], _, _ -> loop () (* spurious wakeup with time still left -- recompute and retry *)
+      | _ -> (
+        match Pipe_protocol.read_msg req_r with
+        | exception exn ->
+          cleanup ();
+          Error
+            (Printf.sprintf
+               "Loader.invoke: the contained guest's process ended before completing its call \
+                (%s) -- treated as a containment failure, not a crash of the host"
+               (Printexc.to_string exn))
+        | tag, payload -> (
+          match tag with
+          | 'L' ->
+            (host_of_sink ()).log (Bytes.to_string payload);
+            loop ()
+          | 'R' ->
+            let merge_key = Bytes.to_string payload in
+            (match (host_of_sink ()).read_materialized ~merge_key with
+            | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
+            | Some value ->
+              Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
+              Pipe_protocol.write_frame resp_w value);
+            loop ()
+          | 'P' ->
+            let status =
+              match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
+            in
+            Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
+            loop ()
+          | 'D' ->
+            cleanup ();
+            Ok payload
+          | 'E' ->
+            cleanup ();
+            Error (Bytes.to_string payload)
+          | other ->
+            cleanup ();
+            Error (Printf.sprintf "Loader.invoke: internal containment-pipe protocol error (unrecognized tag %C)" other)))
+  in
+  loop ()
+
 (* Real containment for the (possibly-infinite) guest call: forks a genuine OS process to make
    it, relays any host-function calls the child makes back to the parent's real [host_functions]
-   (via [t.sink], flipped to [Relay] only in the child -- see top comment), and SIGKILLs the
-   child if it hasn't finished within [fuel_budget_seconds]. Returns the guest's own result BYTES
-   on success, already read out of guest memory -- by the child itself, not the parent.
+   (via [t.sink], flipped to [Relay] only in the child -- see top comment), and (via
+   [supervise_child] above) SIGKILLs the child if it hasn't finished within [fuel_budget_seconds].
+   Returns the guest's own result BYTES on success, already read out of guest memory -- by the
+   child itself, not the parent.
 
    That last part is load-bearing, not a style choice: guest linear memory is exactly as subject
    to copy-on-write as everything else fork duplicates. A first version of this function had the
@@ -450,61 +599,39 @@ let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
   | child_pid ->
     Unix.close req_w;
     Unix.close resp_r;
-    let host_of_sink () =
-      match !(t.sink) with
-      | Direct host -> host
-      | Relay _ -> failwith "Loader: parent's own sink was unexpectedly switched to Relay"
-    in
-    let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
-    let finish result =
+    supervise_child ~child_pid ~req_r ~resp_w ~sink:t.sink ()
+
+(* Exposed only so this task's own regression test can prove {!invoke}'s "never raises, no
+   zombie/fd leak" contract holds even on the one path this loader cannot organically trigger
+   through the public guest-execution API alone: a child that dies via an uncaught OS signal (or
+   any other means that closes its pipe before a complete message is written) rather than
+   through its own [try...with]. Not part of the guest-execution API -- Task 4/6 should never
+   call this. *)
+module For_testing = struct
+  let simulate_child_death_mid_message () =
+    let req_r, req_w = Unix.pipe ~cloexec:false () in
+    let resp_r, resp_w = Unix.pipe ~cloexec:false () in
+    match Unix.fork () with
+    | 0 ->
+      (* Deliberately closes its write end without ever sending a complete message -- from the
+         parent's point of view this is indistinguishable from a signal-killed child: both leave
+         the pipe closed with no full 'D'/'E' message pending. *)
       Unix.close req_r;
       Unix.close resp_w;
-      result
-    in
-    let rec loop () =
-      let remaining = deadline -. Unix.gettimeofday () in
-      if remaining <= 0. then (
-        (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
-        ignore (Unix.waitpid [] child_pid);
-        finish
-          (Error
-             (Printf.sprintf
-                "Loader.invoke: fuel exhausted (wall-clock budget of %.1fs exceeded; the \
-                 classic wasm_c_api this loader runs on has no fuel-metering API, see \
-                 loader.ml's top comment -- the guest was SIGKILLed, not merely abandoned)"
-                fuel_budget_seconds)))
-      else
-        match Unix.select [ req_r ] [] [] remaining with
-        | [], _, _ -> loop () (* spurious wakeup with time still left -- recompute and retry *)
-        | _ -> (
-          let tag, payload = Pipe_protocol.read_msg req_r in
-          match tag with
-          | 'L' ->
-            (host_of_sink ()).log (Bytes.to_string payload);
-            loop ()
-          | 'R' ->
-            let merge_key = Bytes.to_string payload in
-            (match (host_of_sink ()).read_materialized ~merge_key with
-            | None -> Pipe_protocol.write_frame resp_w (Bytes.make 1 '\000')
-            | Some value ->
-              Pipe_protocol.write_frame resp_w (Bytes.make 1 '\001');
-              Pipe_protocol.write_frame resp_w value);
-            loop ()
-          | 'P' ->
-            let status =
-              match (host_of_sink ()).propose_write payload with Ok () -> '\000' | Error _ -> '\001'
-            in
-            Pipe_protocol.write_frame resp_w (Bytes.make 1 status);
-            loop ()
-          | 'D' ->
-            ignore (Unix.waitpid [] child_pid);
-            finish (Ok payload)
-          | 'E' ->
-            ignore (Unix.waitpid [] child_pid);
-            finish (Error (Bytes.to_string payload))
-          | other -> failwith (Printf.sprintf "Loader: unknown internal pipe tag %C" other))
-    in
-    loop ()
+      Unix.close resp_r;
+      Unix.close req_w;
+      Unix._exit 0
+    | child_pid ->
+      Unix.close req_w;
+      Unix.close resp_r;
+      let sink =
+        ref
+          (Direct
+             { read_materialized = (fun ~merge_key:_ -> None); propose_write = (fun _ -> Ok ()); log = ignore })
+      in
+      let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
+      result, child_pid, req_r, resp_w
+end
 
 let invoke t ~entrypoint ~arg =
   match Hashtbl.find_opt t.export_positions entrypoint with
