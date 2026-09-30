@@ -92,11 +92,18 @@ let with_cluster ~replica_count (body : replicas:Replica.t array -> stop:(int ->
                            [Invalid_argument] -- Finding 1 of the fix round split that out so it
                            no longer also catches [durable_append]'s unrelated backend-refusal
                            escape), so this loop absorbs it exactly like [Cluster.run]'s own
-                           dispatch loop does, to stay total. *)
+                           dispatch loop does, to stay total.
+
+                           Also absorbs [Replica.Committed_prefix_mismatch] (audit-remediation
+                           Task 33), by name, right alongside [Sender_mismatch] -- same rationale,
+                           raised when a [Start_view]/[Do_view_change]-driven log adoption would
+                           otherwise overwrite an already-committed op-number with disagreeing
+                           content. See replica.mli / lib/dst/cluster.ml's own dispatch loop. *)
                         let msg, sender = Sim_transport.receive handles.(i) in
                         (match Replica.handle_message replica ~sender msg with
                         | () -> ()
-                        | exception Replica.Sender_mismatch _ -> ());
+                        | exception Replica.Sender_mismatch _ -> ()
+                        | exception Replica.Committed_prefix_mismatch _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

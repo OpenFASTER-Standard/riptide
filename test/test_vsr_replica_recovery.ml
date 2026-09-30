@@ -1588,7 +1588,13 @@ let with_cluster_and_storage ~replica_count ~svc_limit
                            below pins that a genuine backend-contract-violation [Invalid_argument]
                            must NOT be caught anywhere it could be mistaken for a declined op; a
                            blanket catch here would have silently done exactly that for any such
-                           fault reached through a real cluster run) to stay total. *)
+                           fault reached through a real cluster run) to stay total.
+
+                           Also absorbs [Replica.Committed_prefix_mismatch] (audit-remediation
+                           Task 33), by name, right alongside [Sender_mismatch] -- same rationale,
+                           raised when a [Start_view]/[Do_view_change]-driven log adoption would
+                           otherwise overwrite an already-committed op-number with disagreeing
+                           content. See replica.mli / lib/dst/cluster.ml's own dispatch loop. *)
                         let msg, sender = Riptide_sim.Sim_transport.receive handles.(i) in
                         (* [replicas.(i)], read FRESH on every message rather than captured at fork
                            time (Task 13 fix round) -- see this harness's own doc comment: [restart]
@@ -1596,7 +1602,8 @@ let with_cluster_and_storage ~replica_count ~svc_limit
                            keep feeding the dead replica forever. *)
                         (match Replica.handle_message replicas.(i) ~sender msg with
                         | () -> ()
-                        | exception Replica.Sender_mismatch _ -> ());
+                        | exception Replica.Sender_mismatch _ -> ()
+                        | exception Replica.Committed_prefix_mismatch _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())
@@ -2241,41 +2248,86 @@ let run_superblock_rebuild_over_claim_trace ~value_source ~expect_replacement =
         (Replica.is_primary replicas.(0));
       Alcotest.(check bool) "the view change completed on it" true
         (Replica.status replicas.(0) = Replica.Normal);
-      Alcotest.(check bool) "and on the other survivor" true
-        (Replica.status replicas.(1) = Replica.Normal);
       let live = [ replicas.(0); replicas.(1) ] in
       let holds x r = List.exists (fun y -> encoded y = encoded x) (Replica.entries r) in
       let durably_holds ~op_number x i =
         Riptide_storage.Fault_injecting_storage.wal_read storages.(i) ~op_number = Some (encoded x)
       in
       if expect_replacement then begin
-        (* THE NEGATIVE CONTROL. It ASSERTS the replacement, so it stops proving anything the moment
-           the hazard stops being real. *)
+        (* THE NEGATIVE CONTROL, UPDATED BY TASK 33 (audit-remediation) -- read this note before the
+           assertions below, because what this arm now demonstrates changed, even though WHY it is
+           still here (the retracted procedure is still wrong to use) has not.
+
+           Before Task 33, [adopt_durable_log] compared only LENGTH against [commit_number], so this
+           exact over-claimed-[last_normal_view] hazard let replica 1's abandoned-view log silently
+           REPLACE the survivors' real committed ops 2/3 cluster-wide -- this section's own long
+           header comment above is that trace, and until Task 33 this branch asserted exactly that
+           replacement (see this file's own git history for the pre-Task-33 version of this block).
+           Task 33 adds a CONTENT check to that very guard, and this hazard is the first place that
+           check does real, independent work OUTSIDE a hand-forged message: replica 1's own StartView
+           here is entirely genuine, correctly attributed, and really is sent by the real
+           [Primary(4)] -- Group 1/Task 3's sender- and role-authentication checks have nothing to
+           say against it at all -- and it is refused anyway, on CONTENT alone, by whichever replica
+           already holds different content at that op-number.
+
+           The retracted operational advice ("read the values off a live peer") is STILL retracted
+           and STILL wrong to follow -- nothing here walks that back, and
+           [Storage_intf.S.superblock_rebuild_from_wal]'s own doc comment is unchanged. What changed
+           is the CONSEQUENCE of following it anyway: silent, cluster-wide data corruption became a
+           safe refusal plus a liveness cost (the honest survivor gets stuck in View_change rather
+           than adopting a completed, wrong view) -- exactly the "stop, don't destroy" trade this
+           whole task exists to make.
+
+           THE MECHANISM, concretely: replica 1 (the coordinator) completes [SendSV] ON ITSELF
+           without any conflict at all -- the winning DVC is its own (it ties replica 2 on
+           [last_normal_view] and wins the [n] tie-break with its longer, abandoned-view log), so
+           every slot [adopt_durable_log] compares is being compared against ITSELF, trivially equal
+           regardless of what the over-claimed [commit_number] says. Replica 1 alone ends up believing
+           view 4 is settled, with its own 5-entry abandoned-view log wholesale -- this is real
+           self-corruption, and Task 33 does not and cannot prevent a replica from adopting its OWN
+           log content over its OWN prior claims (there is nothing to compare against that disagrees).
+           But the moment that poisoned [StartView] reaches replica 2 -- which still holds the REAL
+           op 2 / op 3 durably, unlike replica 1 -- [handle_start_view]'s new content check catches
+           the disagreement at op 2 and raises {!Riptide_vsr.Replica.Committed_prefix_mismatch},
+           caught by [with_cluster_and_storage]'s own dispatch loop (mirroring
+           [lib/dst/cluster.ml]'s real one) as a total no-op: the message is dropped, replica 2's own
+           log/commit_number/status are untouched, and it simply never leaves [View_change]. *)
         Alcotest.(check int)
-          "THE POINT: replica 1's DVC WON selection with its 5-entry abandoned-view log" 5
+          "THE COORDINATOR still completes on ITSELF: its own log's re-adoption trivially matches \
+           its own content, whatever the over-claimed commit_number says" 5
           (Replica.op_number replicas.(0));
-        Alcotest.(check int) "so did the other survivor adopt it" 5 (Replica.op_number replicas.(1));
+        Alcotest.(check bool)
+          "and the honest survivor never adopted replica 1's poisoned StartView: it is still stuck \
+           in View_change (a liveness cost, not a safety one -- Committed_prefix_mismatch, caught \
+           and dropped by the dispatch loop)"
+          true
+          (Replica.status replicas.(1) = Replica.View_change);
         Alcotest.(check int)
-          "the cluster's REAL committed op 2 is in NEITHER live replica's log any more" 0
-          (List.length (List.filter (holds real2) live));
-        Alcotest.(check int) "nor its real committed op 3" 0
-          (List.length (List.filter (holds real3) live));
-        (* Not merely lost -- REPLACED, at the same op-numbers, by values from an abandoned view. *)
-        Alcotest.(check bool) "op 2 now holds replica 1's stale view-1 value on BOTH live replicas" true
-          (durably_holds ~op_number:2 stale.(0) 0 && durably_holds ~op_number:2 stale.(0) 1);
-        Alcotest.(check bool) "and op 3 likewise" true
-          (durably_holds ~op_number:3 stale.(1) 0 && durably_holds ~op_number:3 stale.(1) 1);
-        (* The sharpest form of it: the replacements are not merely present, they are reported
-           COMMITTED -- so a client that was told ops 2 and 3 succeeded would now read back different
-           values at those op-numbers, with the cluster asserting they are committed. *)
-        Alcotest.(check int) "and the commit_number still covers them" 3
-          (Replica.commit_number replicas.(0));
-        Alcotest.(check bool) "so the STALE values are the ones reported committed, on both" true
-          (List.for_all (fun r -> Replica.is_committed r stale.(0) && Replica.is_committed r stale.(1)) live);
-        Alcotest.(check bool) "while the real committed values are reported committed nowhere" true
-          (List.for_all (fun r -> (not (Replica.is_committed r real2)) && not (Replica.is_committed r real3)) live)
+          "the honest survivor's own real log is UNTOUCHED -- still exactly its own 3 entries" 3
+          (Replica.op_number replicas.(1));
+        Alcotest.(check int) "the cluster's REAL committed op 2 survives on the honest survivor" 1
+          (List.length (List.filter (holds real2) [ replicas.(1) ]));
+        Alcotest.(check int) "and its real committed op 3" 1
+          (List.length (List.filter (holds real3) [ replicas.(1) ]));
+        Alcotest.(check bool) "durably too -- nothing on the honest survivor's own disk was ever \
+                               truncated or rewritten" true
+          (durably_holds ~op_number:2 real2 1 && durably_holds ~op_number:3 real3 1);
+        Alcotest.(check bool) "and still reported committed there, exactly as a client was told" true
+          (Replica.is_committed replicas.(1) real2 && Replica.is_committed replicas.(1) real3);
+        (* The stale values DO land, durably and "committed", on the coordinator that adopted its
+           own wrong log -- that self-corruption is real and Task 33 does not claim to prevent it
+           (see the mechanism note above) -- but they are no longer cluster-wide, unlike the
+           pre-Task-33 trace this section's own header documents, where BOTH live replicas ended up
+           reporting the stale values committed. *)
+        Alcotest.(check bool) "the stale values ARE committed on the self-corrupted coordinator" true
+          (Replica.is_committed replicas.(0) stale.(0) && Replica.is_committed replicas.(0) stale.(1));
+        Alcotest.(check bool)
+          "...but NOT on the honest survivor, which never accepted them" true
+          ((not (Replica.is_committed replicas.(1) stale.(0))) && not (Replica.is_committed replicas.(1) stale.(1)))
       end
       else begin
+        Alcotest.(check bool) "and on the other survivor" true
+          (Replica.status replicas.(1) = Replica.Normal);
         (* THE FIXED ARM. The honest, LOWER [last_normal_view] loses selection to the survivors'
            genuinely higher one -- which is exactly what it should do -- so the cluster keeps its real
            committed data, and replica 1's never-committed ops 4..5 are correctly truncated. *)
@@ -2309,8 +2361,20 @@ let run_superblock_rebuild_over_claim_trace ~value_source ~expect_replacement =
           (Replica.is_committed replicas.(1) real2 && Replica.is_committed replicas.(1) real3)
       end)
 
-(* THE NEGATIVE CONTROL: the retracted procedure, applied exactly as it was written. *)
-let test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data () =
+(* THE NEGATIVE CONTROL: the retracted procedure, applied exactly as it was written.
+
+   RENAMED BY TASK 33 (audit-remediation), same scenario: before Task 33 this test's name said
+   "..._replaces_committed_data", because that is what really happened -- the honest survivor
+   silently adopted the coordinator's stale, abandoned-view log. Task 33 adds a content check to
+   [adopt_durable_log] that now refuses that adoption on the honest survivor (it already holds
+   DIFFERENT, readable content at the disputed op-numbers), confining the corruption to the
+   mis-repaired replica alone -- see [run_superblock_rebuild_over_claim_trace]'s own [expect_replacement]
+   branch for the full, updated trace and its own disclosure of exactly how far this narrowing goes
+   (it is NOT a general fix -- a replica with no readable copy to compare against still adopts the
+   wrong log silently). The scenario, the unsafe rebuild values, and the [~expect_replacement:true]
+   argument are all UNCHANGED; only the observable OUTCOME the shared function now asserts, and this
+   test's own name, changed to keep describing it accurately. *)
+let test_a_rebuild_copying_a_live_peers_current_values_is_now_refused_not_replaced () =
   run_superblock_rebuild_over_claim_trace ~value_source:Copied_from_a_live_peers_current_state
     ~expect_replacement:true
 
@@ -2318,9 +2382,12 @@ let test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data (
    under-claim trace's own narrowed arm
    ([test_a_rebuild_with_only_last_normal_view_wrong_still_destroys_it]) already applies: the arm above
    over-claims all THREE values at once, so on its own it does not establish WHICH of them the
-   replacement hangs on. This arm supplies the TRUE [commit_number] ([1] -- replica 1's own, asserted
-   live in the scenario) alongside the SAME over-claimed [view_number]/[last_normal_view] pair
-   ([3], [3]), and reproduces the replacement outcome UNCHANGED, assertion for assertion.
+   original replacement hazard hung on. This arm supplies the TRUE [commit_number] ([1] -- replica 1's
+   own, asserted live in the scenario) alongside the SAME over-claimed [view_number]/[last_normal_view]
+   pair ([3], [3]), and reproduces the SAME outcome as the arm above, UNCHANGED, assertion for
+   assertion -- pre-Task-33 that outcome was cluster-wide replacement; post-Task-33 (this rename) it is
+   the coordinator self-corrupting while the honest survivor refuses and stays in [View_change], exactly
+   like the un-narrowed arm.
 
    WHAT THAT DISPROVES, concretely. [storage_intf.ml]'s per-field list used to claim that an
    over-claimed [commit_number] "is how the second trace's stale ops 2 and 3 end up marked committed
@@ -2339,7 +2406,7 @@ let test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data (
    [commit_number]. The [commit_number]-too-high hazard is still real in its own right -- it bites in a
    quorum where THIS replica's [k] IS the maximum -- it is simply not the mechanism of this trace, and
    the doc no longer says it is. *)
-let test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_still_replaces_committed_data
+let test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_is_also_refused_not_replaced
     () =
   run_superblock_rebuild_over_claim_trace
     ~value_source:Over_claimed_views_with_this_replicas_true_commit_number ~expect_replacement:true
@@ -2424,14 +2491,17 @@ let tests =
        committed op",
       `Quick,
       test_a_rebuild_with_correct_values_preserves_that_same_committed_op );
-    ( "Task 13 re-review (finding 1, NEGATIVE CONTROL, the OTHER direction): copying a live peer's \
-       CURRENT values into the rebuild silently REPLACES the cluster's committed data",
+    ( "Task 13 re-review (finding 1, NEGATIVE CONTROL, the OTHER direction) / Task 33 (audit-remediation, \
+       renamed): copying a live peer's CURRENT values into the rebuild self-corrupts the mis-repaired \
+       replica, but Committed_prefix_mismatch now refuses it on the honest survivor instead of REPLACING \
+       the cluster's committed data",
       `Quick,
-      test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data );
-    ( "Task 13 round-3 (finding 2, NEGATIVE CONTROL narrowed): over-claiming only the VIEW pair, with \
-       the TRUE commit_number, replaces committed data just the same",
+      test_a_rebuild_copying_a_live_peers_current_values_is_now_refused_not_replaced );
+    ( "Task 13 round-3 (finding 2, NEGATIVE CONTROL narrowed) / Task 33 (audit-remediation, renamed): \
+       over-claiming only the VIEW pair, with the TRUE commit_number, is refused on the honest survivor \
+       just the same",
       `Quick,
-      test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_still_replaces_committed_data );
+      test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_is_also_refused_not_replaced );
     ( "Task 13 re-review (finding 1): the SAME trace with the crashed replica's OWN true prior state \
        preserves that committed data",
       `Quick,

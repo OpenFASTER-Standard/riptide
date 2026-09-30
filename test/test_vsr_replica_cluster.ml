@@ -153,11 +153,19 @@ let with_cluster ?(replica_count = default_replica_count)
                      this loop absorbs it, matching Cluster.run's own dispatch loop, to stay
                      total. [test_cluster_dispatch_drops_a_sender_mismatched_delivery] below is
                      what actually drives a genuine mismatch through this exact loop, via [net]
-                     directly rather than any replica's own [Sim_transport.send]. *)
+                     directly rather than any replica's own [Sim_transport.send].
+
+                     Also absorbs [Replica.Committed_prefix_mismatch] (audit-remediation Task 33),
+                     by name, right alongside [Sender_mismatch] -- the same "stay total against a
+                     genuinely distinct, exceptional condition" rationale, raised when a
+                     [Start_view]/[Do_view_change]-driven log adoption would otherwise overwrite an
+                     already-committed op-number with disagreeing content. See replica.mli /
+                     lib/dst/cluster.ml's own dispatch loop for the full rationale. *)
                   let msg, sender = Sim_transport.receive handles.(i) in
                   (match Replica.handle_message replica ~sender msg with
                   | () -> ()
-                  | exception Replica.Sender_mismatch _ -> ());
+                  | exception Replica.Sender_mismatch _ -> ()
+                  | exception Replica.Committed_prefix_mismatch _ -> ());
                   dispatch_loop ()
                 in
                 dispatch_loop ()))

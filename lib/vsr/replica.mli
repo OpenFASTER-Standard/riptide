@@ -719,6 +719,30 @@ exception Sender_mismatch of string
     genuine backend-contract violation — this distinct exception is what lets a caller catch
     exactly the sender-mismatch case and let everything else propagate unchanged. *)
 
+exception Committed_prefix_mismatch of string
+(** Raised by {!adopt_durable_log} — reached from {!handle_message}'s [Start_view] dispatch and
+    from the internal, [Do_view_change]-driven [SendSV] action (see {!handle_message}'s own doc
+    comment) — when an incoming log's content at some op-number [o] in [1, commit_number] disagrees
+    with what THIS replica already durably holds and regards as committed at that same [o]. {b
+    Audit-remediation Task 33}: {!adopt_durable_log}'s own prefix-matching walk used to just STOP at
+    the first content mismatch and let the caller's truncate-then-reappend silently overwrite
+    everything from there on, including already-committed op-numbers — a same-length, differently
+    forged log passes every existing LENGTH-based guard ({!truncate_wal}'s own
+    [resulting_length < committed] check, the Review-Focus fix) without ever having its CONTENT
+    compared against what is already committed. This closes that gap: the whole adoption is refused,
+    not just truncated to the point of disagreement, so nothing already committed is put at risk by
+    a partial rewrite either. See [replica.ml]'s own comment at {!adopt_durable_log} for the exact
+    check, including why it deliberately reads [commit_number] as it stands at that function's own
+    entry rather than either caller's own [~committed] argument.
+
+    {b A NEW, DISTINCT exception, not a reuse of {!Sender_mismatch} or a bare [Invalid_argument]} —
+    the same discipline {!Sender_mismatch}'s own doc comment above already states for the identical
+    reason: a caller's dispatch loop that absorbs one exception to stay total against adversarial
+    input must never, by sharing a type, also absorb an unrelated condition it was never meant to
+    swallow. Every real dispatch loop that catches {!Sender_mismatch} by name in this codebase must
+    catch this exception by name too — see {!Riptide_dst.Cluster}'s dispatch loop for the primary
+    example and its own comment for why. *)
+
 val handle_message : t -> sender:int -> string -> unit
 (** [handle_message t ~sender bytes] decodes [bytes] via {!Riptide_vsr.Message.decode} and
     dispatches.
@@ -753,6 +777,15 @@ val handle_message : t -> sender:int -> string -> unit
     adversarial input (e.g. {!Riptide_dst.Cluster}'s fault-injecting simulation) catches
     {!Sender_mismatch} around this call, the same way it already absorbs
     {!Riptide_vsr.Message.Malformed_message} for an undecodable payload.
+
+    {b {!Sender_mismatch} is not this function's only disclosed exception} (audit-remediation
+    Task 33): the [Start_view] dispatch described below can also raise {!Committed_prefix_mismatch}
+    — see that exception's own doc comment for exactly when, and [replica.ml]'s own comment at
+    {!adopt_durable_log} (the shared function both [Start_view]'s dispatch and the internal
+    [Do_view_change]-driven [SendSV] action funnel through) for the full mechanism. A caller that
+    already catches {!Sender_mismatch} to stay total against adversarial input must catch this one
+    too, by name, the same way — see the two exceptions' own doc comments for why they are
+    deliberately kept distinct rather than merged into one.
 
     The per-message-type dispatch itself, once the sender check above has passed:
 

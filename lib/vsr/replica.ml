@@ -882,7 +882,66 @@ let durable_append t ~op_number (v : Value.value) =
    conservative direction -- the not-yet-rewritten slots read back as CORRUPT (in range, not
    returnable), never as ABSENT, so a replica interrupted mid-adoption cannot nack an op it might
    still have been holding. *)
+
+(* Task 33 (audit-remediation): [prefix_ok] just below finds the longest prefix that is
+   content-identical to what durable storage already holds, but on a MISMATCH it simply STOPS
+   there and lets [truncate_wal]/[append_rest] silently overwrite everything from that point on --
+   including op-numbers within this replica's own, ALREADY-COMMITTED range. [truncate_wal]'s own
+   [resulting_length < committed] guard (the Review Focus fix, this function's own [~committed] doc
+   comment above) only ever compares LENGTHS, never CONTENT -- a forged log of the SAME LENGTH as
+   the real one, differing only in an already-committed slot's content, sails straight through it
+   untouched. That is a real gap, not a hypothetical one: VSR's own core safety property is
+   [NoLogDivergence] (`spec/tla/VSR.tla`) -- committed entries never disappear OR CHANGE -- and
+   nothing before this check ever compared incoming content against what THIS replica already
+   regards as committed.
+
+   [committed_at_entry] is [t.commit_number] AS IT STANDS AT THIS FUNCTION'S OWN ENTRY, deliberately
+   NOT the caller-supplied [~committed] argument: [~committed] routinely moves this replica's commit
+   point FORWARD (e.g. [try_send_sv]'s own [new_k], a DVC quorum's [HighestCommitNumber] -- ordinary,
+   correct progress, not a violation), and content this call is itself about to newly commit for the
+   FIRST time has no prior value here to conflict with. Only content this replica already regarded
+   as committed BEFORE this call began is protected.
+
+   If [values] itself is SHORTER than [committed_at_entry], there is nothing left to compare against
+   once the list runs out -- a pure LENGTH mismatch, not a content one, so this loop raises nothing
+   for it: [handle_start_view] already refuses that shape outright before ever reaching here (its own
+   [n < t.commit_number] guard, checked against this same [t.commit_number]). [try_send_sv] does
+   NOT guard this shape -- the comment at its own [advance_commit_number t new_k] call site
+   discloses, by name, that the adopted log's length can legitimately fall below the coordinator's
+   own prior [commit_number] when [HighestCommitNumber] over the winning DVC quorum is lower than
+   what the coordinator itself already had, and that this is knowingly left unguarded rather than
+   fixed here (fixing it would fight the deliberately-unconditional [new_k] assignment). This loop
+   must not turn that already-disclosed, already-accepted hazard into a NEW raise -- and it has
+   nothing to compare content against in that case regardless, since [values] is what is short, not
+   any individual entry within it.
+
+   Raises a NEW, DISTINCT exception rather than reusing {!Sender_mismatch} (defined further below in
+   this file) or a bare [Invalid_argument]: audit-remediation Task 3's own Finding 1 (see
+   {!Sender_mismatch}'s own doc comment) already lived this exact mistake once, for a different pair
+   of conditions -- {!durable_append}'s unclassified backend-refusal escape used to share
+   [Invalid_argument] with what is now {!Sender_mismatch}, and a caller absorbing one to stay total
+   would, with a single shared exception type, also silently absorb the other. Reusing either
+   existing exception here would reintroduce the identical hazard for a third, unrelated condition. *)
+exception Committed_prefix_mismatch of string
+
 let adopt_durable_log t (values : Value.value list) ~committed =
+  let committed_at_entry = t.commit_number in
+  let rec check_committed_prefix o = function
+    | _ when o > committed_at_entry -> ()
+    | [] -> ()
+    | v :: rest ->
+      (match slot_state t ~op_number:o with
+      | Present stored when not (value_equal stored v) ->
+        raise
+          (Committed_prefix_mismatch
+             (Printf.sprintf
+                "adopt_durable_log: op %d is committed locally (commit_number = %d) with content differing from \
+                 the incoming log -- refusing the whole adoption rather than overwrite committed content"
+                o committed_at_entry))
+      | Present _ | Corrupt | Absent -> ());
+      check_committed_prefix (o + 1) rest
+  in
+  check_committed_prefix 1 values;
   let target_length = List.length values in
   let prefix_ok =
     let rec loop o = function
@@ -995,11 +1054,20 @@ let adopt_durable_log t (values : Value.value list) ~committed =
    view transitions, and an OVER-claimed [last_normal_view] makes this replica WIN [WinningDVC]'s
    selection (tie on [last_normal_view], then longest log) with a STALE log, so [FillValue] rebuilds
    already-committed op-numbers from this replica's superseded values while [HighestCommitNumber]
-   independently carries the real commit-number forward -- the cluster silently adopts DIFFERENT
-   values for operations clients were already told had succeeded. Pinned by
-   [test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data] and its fixed
-   counterpart. There is no known safe GENERAL procedure for sourcing these values externally; the
-   only safe triple is this replica's OWN true prior state.
+   independently carries the real commit-number forward -- the cluster used to silently adopt
+   DIFFERENT values for operations clients were already told had succeeded. Pinned by
+   [test_a_rebuild_copying_a_live_peers_current_values_is_now_refused_not_replaced] and its fixed
+   counterpart. {b Audit-remediation Task 33 narrows, but does not close, this specific hazard}: a
+   receiving replica that already durably holds DIFFERENT, readable content at the disputed
+   op-number now refuses the resulting [StartView] wholesale (raising
+   {!Committed_prefix_mismatch}) instead of silently adopting it, so the corruption stays confined
+   to the mis-repaired replica itself rather than spreading to every live replica -- but a receiving
+   replica whose own copy of that op-number is absent or corrupt still has nothing to compare
+   against and silently adopts the wrong content, exactly as before. See
+   {!Riptide_storage.Storage_intf.S.superblock_rebuild_from_wal}'s own doc comment for the full,
+   updated disclosure of exactly how far this narrowing goes. There is still no known safe GENERAL
+   procedure for sourcing these values externally; the only safe triple is this replica's OWN true
+   prior state.
 
    AND ROUND 3 (finding 1) RETRACTED THE ONE EXAMPLE OF SUCH A SOURCE THIS COMMENT USED TO OFFER: an
    external monitor of this replica's own traffic does NOT qualify, because DURABILITY PRECEDES

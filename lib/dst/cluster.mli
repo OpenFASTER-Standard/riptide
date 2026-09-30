@@ -234,6 +234,15 @@ val run :
     from one adversarial or buggy peer must never be allowed to take down an otherwise-healthy
     replica's whole dispatch loop, in a simulated cluster any more than in a real one.
 
+    {b Audit-remediation Task 33 adds a second, equally narrow catch}: this loop also absorbs
+    {!Riptide_vsr.Replica.Committed_prefix_mismatch} by name, right alongside
+    {!Riptide_vsr.Replica.Sender_mismatch} — raised when a [Start_view] (or the internal [SendSV]
+    action a [Do_view_change] can drive) would otherwise overwrite an already-committed op-number
+    with disagreeing content. Same rationale:
+    a genuinely distinct, exceptional condition that must not vanish into ordinary staleness, and
+    must not be caught by a blanket [Invalid_argument] that would also re-absorb
+    [Replica.durable_append]'s unrelated backend-contract-violation escape.
+
     {b [replicas.(i)] is replica [i + 1]}, matching every existing cluster-test harness in this
     repo ([with_cluster], [with_cluster_and_storage]). {b Every replica's [view_number] is pinned
     to [1] before [body] runs} (via [Replica.for_test_set_view_number], same as

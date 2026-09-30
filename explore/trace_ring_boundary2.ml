@@ -100,8 +100,13 @@ let () =
                       Task 3), not the blanket [Invalid_argument] -- see replica.mli /
                       lib/dst/cluster.ml's own dispatch loop for why: [Invalid_argument] is also
                       what [durable_append] re-raises for an unclassified backend refusal, which
-                      must propagate here rather than be swallowed. *)
-                   | exception Riptide_vsr.Replica.Sender_mismatch _ -> ());
+                      must propagate here rather than be swallowed.
+
+                      Also catches [Riptide_vsr.Replica.Committed_prefix_mismatch]
+                      (audit-remediation Task 33), by name, for the identical reason -- see
+                      replica.mli / lib/dst/cluster.ml's own dispatch loop for the full rationale. *)
+                   | exception Riptide_vsr.Replica.Sender_mismatch _ -> ()
+                   | exception Riptide_vsr.Replica.Committed_prefix_mismatch _ -> ());
                    decr inflight;
                    loop ()
                  in

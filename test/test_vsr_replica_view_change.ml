@@ -231,11 +231,18 @@ let with_cluster ~replica_count ~svc_limit
                            why the loop still absorbs [Replica.Sender_mismatch] (Finding 1 of the
                            fix round: NOT the blanket [Invalid_argument] -- that also matches
                            [durable_append]'s own unrelated backend-contract-violation escape,
-                           which must propagate rather than be swallowed here) to stay total. *)
+                           which must propagate rather than be swallowed here) to stay total.
+
+                           Also absorbs [Replica.Committed_prefix_mismatch] (audit-remediation
+                           Task 33), by name, right alongside [Sender_mismatch] -- same rationale,
+                           raised when a [Start_view]/[Do_view_change]-driven log adoption would
+                           otherwise overwrite an already-committed op-number with disagreeing
+                           content. See replica.mli / lib/dst/cluster.ml's own dispatch loop. *)
                         let msg, sender = Sim_transport.receive handles.(i) in
                         (match Replica.handle_message replica ~sender msg with
                         | () -> ()
-                        | exception Replica.Sender_mismatch _ -> ());
+                        | exception Replica.Sender_mismatch _ -> ()
+                        | exception Replica.Committed_prefix_mismatch _ -> ());
                         dispatch_loop ()
                       in
                       dispatch_loop ())

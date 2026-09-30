@@ -568,11 +568,25 @@ let with_cluster ~seed ~replica_count ~svc_limit ~net_fault_config ~storage_faul
                      propagating failure. Catching the distinct [Sender_mismatch] instead fixes
                      this: only a genuine sender-mismatch is absorbed here, and a backend contract
                      violation now propagates out of this dispatch loop exactly as it did before
-                     Task 3 ever added a sender field to check. *)
+                     Task 3 ever added a sender field to check.
+
+                     TASK 33 (audit-remediation): [handle_message]'s [Start_view] dispatch (and the
+                     internal, [Do_view_change]-driven [SendSV] action it shares [adopt_durable_log]
+                     with) can now also raise [Riptide_vsr.Replica.Committed_prefix_mismatch] -- a
+                     forged, same-length StartView/DoViewChange log that disagrees in CONTENT with
+                     an already-committed op-number, which [flip_one_byte]'s corruption fault can in
+                     principle produce (a bit-flip inside an already-decoded, checksum-verified log
+                     entry the message's own outer checksum never covers a second time once past
+                     decode). Exactly the same reasoning as [Sender_mismatch] just above applies:
+                     this is a genuinely different, distinct signal from ordinary protocol staleness,
+                     so it is caught by name, right next to [Sender_mismatch], rather than folded
+                     into a blanket catch that would also re-absorb [durable_append]'s own unrelated
+                     backend-contract-violation escape. *)
                   if alive.(i) then begin
                     match Riptide_vsr.Replica.handle_message replicas.(i) ~sender msg with
                     | () -> ()
                     | exception Riptide_vsr.Replica.Sender_mismatch _ -> ()
+                    | exception Riptide_vsr.Replica.Committed_prefix_mismatch _ -> ()
                   end;
                   decr inflight;
                   dispatch_loop ()

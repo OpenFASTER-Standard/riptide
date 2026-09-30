@@ -1554,6 +1554,94 @@ let test_send_sv_resets_svc_count () =
   Alcotest.(check bool) "and it really did start a new view-change episode" true
     (Replica.status t = Replica.View_change)
 
+(* ---- Task 33 (audit-remediation): content-check the committed prefix on Start_view/DoViewChange-
+   driven SendSV, not just its length ----
+
+   Both real callers of [adopt_durable_log] -- [handle_start_view] (ReceiveSV) directly below, and
+   the internal, [Do_view_change]-driven [try_send_sv] (SendSV) tested further below -- share ONE
+   function to adopt an incoming log wholesale. Before this task, that function's own
+   prefix-matching walk stopped at the FIRST content mismatch and let the caller's
+   truncate-then-reappend silently overwrite everything from there on, including op-numbers within
+   this replica's own [commit_number]: a forged log of the SAME LENGTH as the real one, differing
+   only in an already-committed op's content, passed every existing guard (every one of them
+   compares LENGTHS, never CONTENT) and was adopted wholesale, discarding a value this replica had
+   already told a client was committed -- a direct violation of VSR's own [NoLogDivergence].
+   {!Replica.Committed_prefix_mismatch} closes that gap; see replica.mli's own doc comment on that
+   exception, and replica.ml's own comment at [adopt_durable_log], for the exact check. *)
+
+let expect_committed_prefix_mismatch name expected_message (f : unit -> unit) =
+  Alcotest.check_raises name (Replica.Committed_prefix_mismatch expected_message) f
+
+let test_start_view_refuses_a_committed_prefix_content_mismatch () =
+  let send, sent = capturing_send () in
+  let t = create_at_view_1 ~my_id:2 ~replica_count:3 ~send in
+  (* Real Prepare traffic from the real primary (replica 1) establishes a genuine, durably
+     committed op 1 -- exactly [test_backup_prepare_advances_commit_number_from_k]'s own setup. *)
+  Replica.handle_message t ~sender:1 (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0; source = 1 }));
+  Replica.handle_message t ~sender:1 (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1; source = 1 }));
+  Alcotest.(check int) "commit_number is genuinely 1 before the forged StartView arrives" 1 (Replica.commit_number t);
+  let sent_before = sent () in
+  (* A well-formed, correctly-attributed StartView (source = 1 = Primary(1), sender = 1 -- no
+     attribution or role forgery at all, unlike this file's own Sender_mismatch/Finding-3 tests
+     above) for the SAME view this replica is already in, carrying a log of the SAME LENGTH (n=2)
+     as this replica's own -- but op 1's own content ("forged", not "a") disagrees with what this
+     replica already durably committed there. Every existing LENGTH-based guard passes: n=2 equals
+     the log's own length, k=1 is in [0,2], and n=2 is NOT below commit_number=1. *)
+  let sv = sv_msg ~source:1 ~v:1 ~log:[ v "forged"; v "b" ] ~n:2 ~k:1 in
+  expect_committed_prefix_mismatch "a same-length, content-mismatched committed prefix is refused wholesale"
+    "adopt_durable_log: op 1 is committed locally (commit_number = 1) with content differing from the incoming \
+     log -- refusing the whole adoption rather than overwrite committed content" (fun () ->
+      Replica.handle_message t ~sender:1 sv);
+  Alcotest.(check bool) "status unchanged (still Normal)" true (Replica.status t = Replica.Normal);
+  Alcotest.(check int) "view_number unchanged" 1 (Replica.view_number t);
+  Alcotest.(check int) "op_number unchanged" 2 (Replica.op_number t);
+  Alcotest.(check int) "commit_number unchanged -- the already-committed value survives intact" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "the log is NOT overwritten: op 1 is still the real, committed value" true
+    (Replica.entries t = [ v "a"; v "b" ]);
+  Alcotest.(check bool) "the durable copy of op 1 is likewise untouched" true
+    (Replica.for_test_wal_read t ~op_number:1 = Some (v "a"));
+  Alcotest.(check bool) "no messages sent by the refused adoption" true (sent () = sent_before)
+
+let test_do_view_change_driven_send_sv_refuses_a_committed_prefix_content_mismatch () =
+  let send, sent = capturing_send () in
+  let t = Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:5 ~svc_limit:3 ~send () in
+  (* Real Prepare traffic (Primary(0) = 5 at replica_count = 5) establishes a genuine, durably
+     committed op 1 -- the same setup
+     [test_send_sv_commit_number_assignment_is_unconditional_not_monotonic] uses above. *)
+  Replica.handle_message t ~sender:5 (Message.encode (Message.Prepare { view = 0; n = 1; v = v "a"; k = 0; source = 5 }));
+  Replica.handle_message t ~sender:5 (Message.encode (Message.Prepare { view = 0; n = 2; v = v "b"; k = 1; source = 5 }));
+  Alcotest.(check int) "commit_number is genuinely 1 before the view change" 1 (Replica.commit_number t);
+  let sent_before_view_change = List.length (sent ()) in
+  (* Force a view-change episode THIS replica -- Primary(6) = 1 at replica_count = 5 -- will itself
+     complete as the new primary, via a real f+1 = 3 DoViewChange quorum below. *)
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:6 ~last_normal_view:0;
+  (* Three individually well-formed DVCs (n = 1 matches the single-entry log's own length, k = 1 is
+     in [0,1], last_normal_view = 1 < v = 6), all claiming op 1's content is "forged", not "a" --
+     WinningDVC picks among exactly this set (last_normal_view/n tie-broken or not, it does not
+     matter here: all three are identical), so whichever wins carries the forged op 1. *)
+  Replica.handle_message t ~sender:2 (dvc_msg ~v:6 ~log:[ v "forged" ] ~last_normal_view:1 ~n:1 ~k:1 ~i:2);
+  Replica.handle_message t ~sender:3 (dvc_msg ~v:6 ~log:[ v "forged" ] ~last_normal_view:1 ~n:1 ~k:1 ~i:3);
+  Alcotest.(check int) "two DVCs are below the f+1 = 3 threshold: nothing sent yet" sent_before_view_change
+    (List.length (sent ()));
+  (* The THIRD DVC completes the quorum and fires SendSV -- which now must refuse wholesale, rather
+     than adopt a winning log that disagrees with op 1's own already-committed content. *)
+  expect_committed_prefix_mismatch "SendSV refuses a same-length, content-mismatched committed prefix"
+    "adopt_durable_log: op 1 is committed locally (commit_number = 1) with content differing from the incoming \
+     log -- refusing the whole adoption rather than overwrite committed content" (fun () ->
+      Replica.handle_message t ~sender:4 (dvc_msg ~v:6 ~log:[ v "forged" ] ~last_normal_view:1 ~n:1 ~k:1 ~i:4));
+  Alcotest.(check bool) "status unchanged: still View_change -- the view change did NOT complete" true
+    (Replica.status t = Replica.View_change);
+  Alcotest.(check int) "view_number unchanged" 6 (Replica.view_number t);
+  Alcotest.(check int) "commit_number unchanged -- the already-committed value survives intact" 1
+    (Replica.commit_number t);
+  Alcotest.(check bool) "the log is NOT overwritten: op 1 is still the real, committed value" true
+    (Replica.entries t = [ v "a"; v "b" ]);
+  Alcotest.(check bool) "the durable copy of op 1 is likewise untouched" true
+    (Replica.for_test_wal_read t ~op_number:1 = Some (v "a"));
+  Alcotest.(check int) "no StartView was ever broadcast by the refused adoption" sent_before_view_change
+    (List.length (sent ()))
+
 (* ---- ReceiveSV (VSR.tla:292-305) ---- *)
 
 let test_receive_sv_adopts_log_view_and_returns_to_normal () =
@@ -2146,6 +2234,15 @@ let tests =
       `Quick,
       test_send_sv_refuses_when_highest_commit_exceeds_the_winning_log );
     ("Task 3: SendSV resets svc_count on completing a view change", `Quick, test_send_sv_resets_svc_count);
+    (* Task 33 (audit-remediation): content-check the committed prefix, not just its length *)
+    ( "Task 33: ReceiveSV refuses a same-length, content-mismatched committed prefix wholesale \
+       (Committed_prefix_mismatch)",
+      `Quick,
+      test_start_view_refuses_a_committed_prefix_content_mismatch );
+    ( "Task 33: a DoViewChange-driven SendSV refuses a same-length, content-mismatched committed \
+       prefix wholesale (Committed_prefix_mismatch)",
+      `Quick,
+      test_do_view_change_driven_send_sv_refuses_a_committed_prefix_content_mismatch );
     (* Task 3: ReceiveSV *)
     ( "Task 3: ReceiveSV adopts log/op_number/view wholesale and returns to Normal",
       `Quick,

@@ -174,11 +174,14 @@ module type S = sig
         selection falls to the longer log -- replica 2's -- so the committed op survives, is
         re-replicated, and the cluster continues correctly.
 
-      TOO HIGH (over-claiming) -- {b the CLUSTER's already-committed data is silently REPLACED by
-      this replica's stale values}, which is strictly worse than the truncation above: the cluster
-      does not lose an acknowledged operation, it adopts a DIFFERENT one in its place and reports it
+      TOO HIGH (over-claiming) -- {b this replica's own state ends up replaced by its own stale
+      values, and -- before audit-remediation Task 33 -- that spread unconditionally to the whole
+      cluster}; Task 33 narrows, but does not close, that second half -- see the disclosure right
+      after the trace below for exactly how far. This remains strictly worse in kind than the
+      truncation above wherever it still reaches another replica uncontested: the cluster does not
+      lose an acknowledged operation, it adopts a DIFFERENT one in its place and reports it
       committed. This is exactly what copying a live peer's current values produces
-      ([test_a_rebuild_copying_a_live_peers_current_values_replaces_committed_data] and its fixed
+      ([test_a_rebuild_copying_a_live_peers_current_values_is_now_refused_not_replaced] and its fixed
       counterpart [test_a_rebuild_with_this_replicas_own_true_prior_state_preserves_committed_data]
       -- again one scenario function, two integer triples):
       - Replica 1, primary of view 1, durably appends ops 1..5. Op 1 is committed cluster-wide; ops
@@ -200,29 +203,68 @@ module type S = sig
         while [HighestCommitNumber] (a separate maximum, VSR.tla:257-260) independently carries
         [k = 3] forward -- {b from the SURVIVOR's own honest [k], not from anything the repaired
         replica supplied}; see the [commit_number] bullet in the per-field list below, and the
-        narrowed arm it cites, for why that distinction is load-bearing rather than pedantic. The [StartView] then installs that log on every LIVE replica (replica 3,
-        whose own last act started this view change, is permanently gone by then -- tolerating the
-        loss of one replica out of 2f+1 is exactly what VSR is for, so an unreachable machine's disk
-        is not a copy the protocol can ever use). Two committed, client-acknowledged operations have
-        been replaced by different values at the same op-numbers, and are reported committed.
+        narrowed arm it cites, for why that distinction is load-bearing rather than pedantic.
+        Replica 1 durably adopts that wholesale log ONTO ITSELF with no conflict at all: every slot
+        {!Riptide_vsr.Replica}'s own [adopt_durable_log] compares here is being compared against
+        replica 1's OWN prior content, trivially equal to itself.
+        {b Before audit-remediation Task 33}, the [StartView] this produces then installed that same
+        log on every OTHER live replica too (replica 3, whose own last act started this view change,
+        is permanently gone by then -- tolerating the loss of one replica out of 2f+1 is exactly what
+        VSR is for, so an unreachable machine's disk is not a copy the protocol can ever use), so two
+        committed, client-acknowledged operations ended up replaced by different values at the same
+        op-numbers, CLUSTER-WIDE, and reported committed everywhere live.
+        {b As of Task 33, this no longer reaches a replica that already holds DIFFERENT, readable
+        content at the disputed op-number}: {!Riptide_vsr.Replica.adopt_durable_log} now compares the
+        incoming log's own content, not just its length, against every op-number up to the
+        RECEIVING replica's own [commit_number], and refuses the whole adoption -- raising
+        {!Riptide_vsr.Replica.Committed_prefix_mismatch}, caught and dropped as a total no-op by
+        every real dispatch loop -- the instant it disagrees. In this exact trace, replica 2 still
+        durably holds its own REAL ops 2 and 3, so it now refuses replica 1's [StartView] outright
+        and simply never leaves [View_change]: the replacement stays confined to replica 1 itself,
+        now the cluster's lone dissenter rather than a majority. See
+        [test/test_vsr_replica_recovery.ml]'s own [run_superblock_rebuild_over_claim_trace] for the
+        running, updated evidence.
+      - {b Task 33 is a NARROWING, not a closure, of this specific hazard -- do not read it as
+        "over-claiming is now safe".} The new content check can only refuse an adoption at an
+        op-number where the RECEIVING replica itself already holds different, READABLE (durably
+        [Present], per {!Riptide_vsr.Replica}'s own [slot_state]) content --
+        {!Riptide_vsr.Replica.Committed_prefix_mismatch}'s own doc comment states this same scope. A
+        receiving replica whose own copy of that op-number is [Absent] or [Corrupt] has nothing to
+        compare against and silently adopts whatever content the winning log carries, reproducing
+        the ORIGINAL hazard exactly. So the general conclusion below -- there is no safe way to
+        source these three values externally, and the only fix that closes this hazard for real is
+        VSR's own Recovery sub-protocol or a durable superblock history -- is UNCHANGED by Task 33;
+        what changed is only that one common, concrete manifestation of it (an honest peer surviving
+        alongside the mis-repaired replica, with its own readable copy of the disputed content) now
+        fails safe instead of failing catastrophically.
       - Rebuilt instead with replica 1's OWN true prior state ([view_number = 1],
         [last_normal_view = 1], [commit_number = 1]), its DVC honestly reports the LOWER
         [last_normal_view], loses selection to the survivors' [last_normal_view = 3], and the
         cluster keeps its real committed ops 2 and 3 -- while replica 1's uncommitted ops 4..5 are
         correctly truncated.
 
-      Nothing in this function's checks, or in {!Riptide_vsr.Replica}'s own
-      [handle_do_view_change] validation, can catch the over-claiming case:
-      [handle_do_view_change] validates a DVC's [entries]/[nacks]/[n]/[k]/[i]/[v] and bounds
-      [last_normal_view] below the view it announces, but it cannot verify that
-      [last_normal_view] is TRUE -- no receiver has any independent evidence of another replica's
-      own view history. That is the whole problem, not an unimplemented check.
+      Nothing in this function's OWN checks, or in {!Riptide_vsr.Replica}'s own
+      [handle_do_view_change] field validation, can catch the over-claiming case AT REPAIR TIME OR
+      AT DVC-RECEIPT TIME: [handle_do_view_change] validates a DVC's [entries]/[nacks]/[n]/[k]/[i]/[v]
+      and bounds [last_normal_view] below the view it announces, but it cannot verify that
+      [last_normal_view] is TRUE -- no receiver has any independent evidence of another replica's own
+      view history. That is the whole problem at THIS layer, not an unimplemented check here.
+      {b Audit-remediation Task 33 adds a check at a LATER point in the same replica} --
+      {!Riptide_vsr.Replica.adopt_durable_log}, reached once a winning log has already been selected
+      -- that compares the winning log's CONTENT (not [last_normal_view] itself) against what the
+      RECEIVING replica already durably holds, and refuses on disagreement. That is a real,
+      independent check, and it does catch the over-claiming case in the common shape described
+      above -- but only where the receiving replica has readable content to compare against; see the
+      trace's own disclosure a few paragraphs up for exactly how far it goes and does not go.
 
       Per-field, in both directions, so none of the three is optional or "probably fine at 0":
       - [last_normal_view] too LOW loses view-change log selection to a replica holding a shorter
-        log (first trace). Too HIGH wins selection it has no right to and overwrites the winner's
-        committed entries with its own stale ones (second trace). It is the primary sort key other
-        replicas rank this one by, so it is wrong in BOTH directions, never "conservative".
+        log (first trace). Too HIGH wins selection it has no right to and overwrites the winner's OWN
+        copy of its committed entries with its own stale ones (second trace) -- and, as of Task 33,
+        attempts the same against every OTHER replica's copy too, succeeding only where that replica
+        has no readable content of its own to refuse with (see the trace's own disclosure above). It
+        is the primary sort key other replicas rank this one by, so it is wrong in BOTH directions,
+        never "conservative".
       - [commit_number] too LOW removes this replica's own protection against truncating a prefix it
         knows to be committed ([truncate_wal]'s [~committed] guard), so a later view change can
         discard it locally. Too HIGH makes this replica assert, through its own DVC's [k] and into
@@ -237,11 +279,13 @@ module type S = sig
         the SURVIVING peer's own honest [k = 3] is equal-or-higher, so it is the peer's [k], not the
         repaired replica's, that ends up carrying the commit-number forward there, regardless of what
         the repaired replica supplies. Pinned by the narrowed arm
-        [test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_still_replaces_committed_data]:
+        [test_a_rebuild_over_claiming_only_the_views_with_the_true_commit_number_is_also_refused_not_replaced]:
         supplying the TRUE [commit_number] ([1]) alongside the SAME over-claimed
-        [view_number]/[last_normal_view] pair ([3], [3]) reproduces the replacement outcome UNCHANGED,
-        assertion for assertion. So the over-claimed field the second trace actually hangs on is
-        [last_normal_view] -- which is what wins log selection -- and not [commit_number].
+        [view_number]/[last_normal_view] pair ([3], [3]) reproduces the SAME outcome as the un-narrowed
+        arm, UNCHANGED, assertion for assertion (pre-Task-33: cluster-wide replacement; post-Task-33:
+        the coordinator self-corrupts while the honest survivor refuses and stays in [View_change]).
+        So the over-claimed field the second trace actually hangs on is [last_normal_view] -- which is
+        what wins log selection -- and not [commit_number].
       - [view_number] too LOW makes the replica accept as current a view the cluster has already
         abandoned. Too HIGH makes it reject the real current primary's traffic and refuse every
         [StartView] from the view actually in progress. Note also (review finding M9) that
@@ -294,8 +338,11 @@ module type S = sig
       a LOWER BOUND on the true durable triple, never the triple. And the fifth site means it is not
       even reliably a lower bound: a wire-observing monitor cannot tell from any message whether THIS
       replica adopted a given view, because adopting one emits nothing. If it infers adoption from
-      the [StartView] it saw go by, it can be too HIGH (the over-claiming direction, which REPLACES
-      the cluster's committed data); if it conservatively assumes non-adoption, it is too low again.
+      the [StartView] it saw go by, it can be too HIGH (the over-claiming direction, which can
+      replace another replica's committed data wherever that replica has no readable copy of its own
+      to refuse with -- see the second trace's own disclosure above for exactly how far
+      audit-remediation Task 33 narrows this); if it conservatively assumes non-adoption, it is too
+      low again.
       It can therefore err in either catastrophic direction, and from outside there is no way to tell
       which.
 
