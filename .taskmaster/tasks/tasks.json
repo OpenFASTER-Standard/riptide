@@ -1306,11 +1306,18 @@
             "id": 27,
             "title": "[6.2] EMFILE on accept is not counted toward the fatal error budget",
             "description": "EMFILE on accept is not counted toward the fatal error budget",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Exclude EMFILE from accept_max_consecutive_errors's counter; log and back off briefly instead of eventually re-raising fatally and killing the listener process.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "d2a1f5f31b22e6e5e9019752463a37d0c114e1c9",
+                "d0c8a4ad22fc014c082b970d6e7f7950f707e225"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 28,
