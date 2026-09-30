@@ -70,43 +70,95 @@ let sha256_hex_of_file path =
     Ok Digestif.SHA256.(to_hex (digest_string contents))
   with Sys_error msg -> Error (Printf.sprintf "admission: cannot read artifact: %s" msg)
 
-(* Runs [cosign_path] with [args], via [Unix.open_process_args_full] (never a shell -- no [sh -c]
+(* Runs [cosign_path] with [args] via [Unix.create_process] (never a shell -- no [sh -c]
    involved, so there is no shell-quoting hazard for any argument, including a caller-supplied
-   path). Returns the real stdout on a genuine exit-0; [Error _] on every other real outcome:
-   the binary missing/unexecutable at [cosign_path] (surfaces as [Unix.Unix_error], confirmed
-   live: `Unix.open_process_args_full "/nonexistent/cosign" ...` raises
-   `Unix_error(ENOENT, "create_process", ...)` synchronously in the caller, before any process
-   exists to leak -- there is nothing to reap or close on this path), a nonzero exit, or the
-   child dying to a signal. Every successful spawn is fully reaped and both its pipe-backed
-   channels are always closed via [Unix.close_process_full], on every exit path (including a
-   nonzero exit) -- confirmed live via a `ps -eo pid,ppid,stat,cmd | awk '$3 ~ /Z/'` sweep
-   showing no zombies after a full test run exercising both the missing-binary and the
-   nonzero-exit paths. *)
+   path), with the child's stdout AND stderr both pointed at the SAME pipe write-end (a single
+   merged stream), and its stdin pointed at [/dev/null].
+
+   Fix round 1 (review finding #2): this used to read cosign's stdout and stderr from two
+   SEPARATE pipes, sequentially (stdout fully, then stderr fully). That is a real deadlock hazard
+   -- if combined output ever exceeded the OS pipe buffer (~64KB, historically) before the
+   undrained pipe was read, the child would block writing to the full pipe forever, and this
+   function would be blocked reading the OTHER (empty) pipe forever, with no timeout anywhere.
+   Real `cosign` output is small today so this never triggered in practice, but it's the same
+   subprocess-hygiene hazard class Task 3 (immediately before this one) found real, multi-round
+   bugs in for [loader.ml]'s own forked-child containment. Fixed by removing the hazard entirely
+   rather than working around it with a concurrent-read/[Unix.select] mechanism: merging stdout
+   and stderr into one pipe means there is only ever one fd to read, so there is no "other pipe"
+   to leave undrained. This function only ever uses the merged output for (a) the exit-0 success
+   value, which no caller inspects (see [verify] below -- [_stdout] is intentionally unused), and
+   (b) an error-message string on non-exit-0, where interleaved stdout+stderr content is exactly
+   as useful for a human/log reader as two separately-labeled streams would have been -- nothing
+   in this module parses cosign's output as structured data.
+
+   [/dev/null] as the child's stdin (rather than, say, an immediately-closed pipe) guarantees a
+   spawned `cosign` can never block on a stdin read even if a future call shape ever needed one;
+   today's [cosign verify-blob] invocations (both the [~key] and keyless forms) never read stdin
+   at all.
+
+   Returns the real merged output on a genuine exit-0; [Error _] on every other real outcome: the
+   binary missing/unexecutable at [cosign_path] (a real [Unix.Unix_error], confirmed live:
+   `Unix.create_process "/nonexistent/cosign" ...` raises `Unix_error(ENOENT, "create_process",
+   ...)` synchronously in the caller, before any process exists to leak -- nothing was ever
+   forked on this path, so there is nothing to reap or close beyond the pipe/devnull fds this
+   function itself opened), a nonzero exit, or the child dying to a signal. Every fd this
+   function opens (the pipe's two ends, [/dev/null]) is closed on every exit path, and every
+   successfully spawned child is reaped via [Unix.waitpid] -- confirmed live via a `ps -eo
+   pid,ppid,stat,cmd | awk '$3 ~ /Z/'` sweep showing no zombies after a full test run exercising
+   both the missing-binary and the nonzero-exit paths. The pipe is created with [~cloexec:true]
+   (and [/dev/null] opened with [O_CLOEXEC]) specifically so the ORIGINAL, higher-numbered fds
+   this function holds never leak into the child at all: [Unix.create_process]'s internal
+   [dup2] onto fds 0/1/2 always produces non-cloexec copies regardless of the source fd's own
+   flag (standard POSIX [dup2] semantics), so marking the sources cloexec here only closes the
+   *extra*, otherwise-unnecessary duplicate references a naive implementation would otherwise
+   leave open in the child. *)
 let run_cosign cosign_path args =
   match
     try
-      Ok
-        (Unix.open_process_args_full cosign_path
-           (Array.of_list (cosign_path :: args))
-           (Unix.environment ()))
+      let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+      let output_read, output_write = Unix.pipe ~cloexec:true () in
+      Ok (devnull, output_read, output_write)
     with Unix.Unix_error (err, fn, arg) ->
-      Error (Printf.sprintf "admission: cannot run cosign at %S (%s: %s %s)" cosign_path fn
-               (Unix.error_message err) arg)
+      Error
+        (Printf.sprintf "admission: cannot prepare cosign subprocess (%s: %s %s)" fn
+           (Unix.error_message err) arg)
   with
   | Error _ as e -> e
-  | Ok (cosign_stdout, cosign_stdin, cosign_stderr) ->
-      close_out cosign_stdin;
-      let stdout_content = In_channel.input_all cosign_stdout in
-      let stderr_content = In_channel.input_all cosign_stderr in
-      (match Unix.close_process_full (cosign_stdout, cosign_stdin, cosign_stderr) with
-      | Unix.WEXITED 0 -> Ok stdout_content
-      | Unix.WEXITED code ->
+  | Ok (devnull, output_read, output_write) -> (
+      let spawn_result =
+        try
+          Ok
+            (Unix.create_process cosign_path
+               (Array.of_list (cosign_path :: args))
+               devnull output_write output_write)
+        with Unix.Unix_error (err, fn, arg) ->
           Error
-            (Printf.sprintf "admission: cosign exited %d: %s" code (String.trim stderr_content))
-      | Unix.WSIGNALED signal ->
-          Error (Printf.sprintf "admission: cosign killed by signal %d" signal)
-      | Unix.WSTOPPED signal ->
-          Error (Printf.sprintf "admission: cosign stopped by signal %d" signal))
+            (Printf.sprintf "admission: cannot run cosign at %S (%s: %s %s)" cosign_path fn
+               (Unix.error_message err) arg)
+      in
+      match spawn_result with
+      | Error _ as e ->
+          Unix.close devnull;
+          Unix.close output_read;
+          Unix.close output_write;
+          e
+      | Ok pid ->
+          Unix.close devnull;
+          Unix.close output_write;
+          let output_ic = Unix.in_channel_of_descr output_read in
+          let output_content = In_channel.input_all output_ic in
+          close_in output_ic (* also closes the underlying output_read fd *);
+          let _, status = Unix.waitpid [] pid in
+          (match status with
+          | Unix.WEXITED 0 -> Ok output_content
+          | Unix.WEXITED code ->
+              Error
+                (Printf.sprintf "admission: cosign exited %d: %s" code
+                   (String.trim output_content))
+          | Unix.WSIGNALED signal ->
+              Error (Printf.sprintf "admission: cosign killed by signal %d" signal)
+          | Unix.WSTOPPED signal ->
+              Error (Printf.sprintf "admission: cosign stopped by signal %d" signal)))
 
 let cosign_verify_args ~key ~artifact_path =
   let bundle = bundle_path_for artifact_path in

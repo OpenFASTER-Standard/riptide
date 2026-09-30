@@ -51,19 +51,42 @@ val verify :
       out to at all for this call (see [test_verify_rejects_on_digest_mismatch_without_ever_invoking_cosign]
       in [test_module_admission.ml] for a real, non-mocked proof of this: a fake, marker-writing
       substitute [cosign] is never actually invoked when the digest is wrong).
-    + **Signature check (real [cosign], shelled out via [Unix.open_process_args_full]).** If
-      [~key] is supplied, this is a real local-keypair [cosign verify-blob --key ...] call
-      against [artifact_path]'s [.bundle] sibling file (see this file's top comment for the
-      exact convention). If [~key] is omitted, [verify] attempts [cosign]'s keyless/Fulcio
-      verification path instead ([cosign verify-blob --bundle ...] with no [--key]) — this repo's
-      own test suite deliberately does not exercise that path with real assertions (no live
-      Sigstore/Fulcio/Rekor network dependency in tests, matching this task's own disclosed
-      open question), but the code path is real and will genuinely invoke [cosign], not a stub;
-      wiring a real OIDC identity/issuer for a live keyless deployment is a deployment-time
-      configuration concern, not something this function's signature needs to widen for.
+    + **Signature check (real [cosign], shelled out via [Unix.create_process], stdout+stderr
+      merged into a single pipe — see [admission.ml]'s own [run_cosign] doc comment for why a
+      merged single stream, not two separately-read ones, is a deliberate fix for a real
+      pipe-deadlock hazard class, not an incidental simplification).** If [~key] is supplied,
+      this is a real local-keypair [cosign verify-blob --key ...] call against [artifact_path]'s
+      [.bundle] sibling file (see this file's top comment for the exact convention). If [~key] is
+      omitted, [verify] attempts [cosign]'s keyless/Fulcio verification path instead
+      ([cosign verify-blob --bundle ...] with no [--key]) — this repo's own test suite
+      deliberately does not exercise that path with real assertions (no live Sigstore/Fulcio/
+      Rekor network dependency in tests, matching this task's own disclosed open question), but
+      the code path is real and will genuinely invoke [cosign], not a stub; wiring a real OIDC
+      identity/issuer for a live keyless deployment is a deployment-time configuration concern,
+      not something this function's signature needs to widen for.
 
     A nonzero [cosign] exit code, [cosign_path] not resolving to an executable file at all (the
     [Unix.ENOENT]-shaped failure), or any other real subprocess failure, all return [Error _] —
     never [Ok] and never a raised exception; this gate fails closed on every real failure mode it
     can produce, matching {!Loader}'s own "guard failure ⇒ total no-op"
-    convention. *)
+    convention.
+
+    **Known, disclosed, deliberately-not-engineered-around residual gap (TOCTOU).** The
+    content-digest check above and [cosign]'s own read of [artifact_path] (inside the signature
+    check) are two SEPARATE opens of the same path — [sha256_hex_of_file] reads it once, in
+    OCaml, and then, if that passes, a freshly-spawned [cosign] process reads it again, entirely
+    independently, by path. There is a real window between those two reads in which
+    [artifact_path]'s on-disk contents could change (e.g. a concurrent writer, a symlink
+    retarget), and nothing in this function detects or prevents that: a "verified" result only
+    ever proves the digest check and the [cosign] check each separately passed against
+    *whatever bytes were at that path at the moment each of them individually ran*, not that both
+    checks saw the identical byte sequence. This is inherent to the "shell out to an external
+    tool that re-reads the artifact by path" design this task's own brief specifies — closing it
+    for real would need a materially different design (e.g. handing [cosign] an already-open file
+    descriptor rather than a path, which its own CLI surface does not support; or copying the
+    artifact to a fresh, exclusively-held path before either read), which is out of this task's
+    scope, not merely undone here. Disclosed explicitly, per this codebase's own convention (see
+    e.g. {!Loader.invoke}'s doc comment, "Known, disclosed, deliberately-not-engineered-around
+    interaction"), rather than left as a silent gap behind the "never fails open" claim above —
+    that claim is true of every check this function actually performs, it is not a claim that the
+    two checks are atomic with each other. *)

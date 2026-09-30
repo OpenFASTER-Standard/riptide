@@ -33,6 +33,12 @@ let sha256_hex path =
   close_in ic;
   Digestif.SHA256.(to_hex (digest_string contents))
 
+let string_contains ~needle haystack =
+  try
+    ignore (Str.search_forward (Str.regexp_string needle) haystack 0);
+    true
+  with Not_found -> false
+
 (* Test-setup-only helper: shells out to the real cosign binary to generate a real keypair /
    really sign a real file, so this task's own "accepts a real signed artifact"/"rejects a
    tampered artifact" tests exercise real cosign end to end, not a mock. Not the code under test
@@ -75,7 +81,22 @@ let isolation_tier_testable =
     ( = )
 
 let test_verify_rejects_when_cosign_is_not_on_path () =
-  (* ?key:None is explicit, not merely omitted: Admission.verify's own type -- ?key:string sitting
+  (* Fix round 1 (review finding #1): the brief's own literal pseudocode for this test used
+     ~digest:"sha256:deadbeef" ~artifact_path:"/tmp/whatever" -- a path that doesn't exist. Since
+     Admission.verify's content-digest check (correctly ordered first, before cosign is ever
+     invoked -- see admission.mli) short-circuits on a nonexistent/unreadable artifact, that
+     version of this test never actually reached the cosign-invocation step at all: it returned
+     Error for "cannot read artifact", not for anything cosign-related, so it wasn't really
+     testing the missing-binary path it's named for (confirmed live by reproducing that exact
+     call standalone: the real error was "admission: cannot read artifact: /tmp/whatever: No
+     such file or directory"). Fixed by using a REAL artifact file whose digest genuinely
+     matches ~digest, so the digest check passes and the call actually reaches the (still
+     genuinely missing) cosign binary -- isolating "cosign binary missing" from "digest
+     mismatch" as two distinct, separately-tested failure modes (the digest-mismatch shape is
+     its own dedicated test below,
+     test_verify_rejects_on_digest_mismatch_without_ever_invoking_cosign).
+
+     ?key:None is explicit, not merely omitted: Admission.verify's own type -- ?key:string sitting
      between two required labeled arguments, with no trailing positional argument -- is exactly
      the shape the brief's own type signature specifies (Task 5's own pseudocode), but that shape
      means OCaml's optional-argument erasure does not kick in from ordinary application alone;
@@ -83,12 +104,20 @@ let test_verify_rejects_when_cosign_is_not_on_path () =
      leaves a residual `?key:string -> ...` function type rather than erasing to the concrete
      result type, which then fails to pattern-match against `Ok`/`Error` at all. Passing
      `?key:None` explicitly resolves it cleanly. *)
+  let dir = make_temp_dir "admission_test" in
+  let artifact = Filename.concat dir "module.wasm" in
+  write_file artifact "fake wasm bytes";
   match
-    Admission.verify ~cosign_path:"/nonexistent/cosign" ?key:None ~digest:"sha256:deadbeef"
-      ~tier:Loader.Sfi ~artifact_path:"/tmp/whatever"
+    Admission.verify ~cosign_path:"/nonexistent/cosign" ?key:None ~digest:(sha256_hex artifact)
+      ~tier:Loader.Sfi ~artifact_path:artifact
   with
   | Ok _ -> Alcotest.fail "expected a closed-fail rejection"
-  | Error _ -> ()
+  | Error msg ->
+      (* Not just Error _ -- assert the rejection actually names the missing binary, so a future
+         regression that changes WHICH check fires first (e.g. an accidental reordering) would
+         be caught here instead of silently passing on a different Error for the wrong reason. *)
+      Alcotest.(check bool) "error mentions the missing cosign binary" true
+        (string_contains ~needle:"nonexistent/cosign" msg)
 
 let test_verify_accepts_a_real_locally_signed_artifact () =
   (* Test setup: generate a real cosign keypair (cosign generate-key-pair, in a tmp dir),
