@@ -1,2 +1,3 @@
 (library
- (name riptide_module))
+ (name riptide_module)
+ (libraries wasmtime unix))
