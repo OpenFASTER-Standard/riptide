@@ -245,22 +245,42 @@ let open_file_handle ~sw path =
 (* Closes [h]'s current (O_DIRECT) fd and reopens the same file with [O_DSYNC] alone --
    permanent for the rest of this handle's lifetime, mirroring Task 1's own ruling for the
    filesystems where [O_DIRECT] genuinely doesn't work (e.g. tmpfs rejects it outright). Only
-   ever called after a real [Eio.Io] failure while [h.direct_capable] was still [true]; see
-   this file's top comment for why this is believed to be a dead path on this box's own
-   mounts (ext4, overlayfs) rather than the routine case it was for Task 1. *)
+   ever called after a real [Eio.Io] [EINVAL] failure while [h.direct_capable] was still [true];
+   see this file's top comment for why this is believed to be a dead path on this box's own
+   mounts (ext4, overlayfs) rather than the routine case it was for Task 1.
+
+   {b Task 19, Bug 2 (audit-remediation, use-after-close on a failed reopen):} [h.direct_capable]
+   is set to [false] BEFORE attempting the reopen, not after it succeeds. If the reopen itself
+   raises (e.g. [EMFILE], too many open files), [h.fd] is already closed at that point -- the
+   previous version left [h.direct_capable] at [true] in exactly that case (the assignment below
+   it never ran), so a LATER call into this handle would see [direct_capable = true], try to use
+   the already-closed [h.fd], get another [Eio.Io], and re-enter this function again -- potentially
+   looping through repeated close/reopen attempts on a handle that is already broken, far from the
+   real root cause. Setting the flag first means a failed reopen leaves the handle in a state every
+   later caller can see immediately (via the propagated exception, and via [direct_capable] already
+   reading [false]) without being fooled into thinking O_DIRECT is still active on a closed fd. *)
 let downgrade_to_dsync_only ~sw (h : file_handle) =
   if h.direct_capable then begin
     ignore (Eio_unix.Fd.close h.fd);
+    h.direct_capable <- false;
     h.fd <-
       Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_dsync_only
-        ~perm:0o600 ~resolve:Uring.Resolve.empty h.path;
-    h.direct_capable <- false
+        ~perm:0o600 ~resolve:Uring.Resolve.empty h.path
   end
 
+(* {b Task 19, Bug 1 (audit-remediation, O_DIRECT misdetection):} narrowed from a blanket
+   [Eio.Io _ when h.direct_capable] to specifically [EINVAL] -- the one errno shape this file's own
+   top comment ("O_DIRECT: second attempt, this time it works") documents as the real,
+   O_DIRECT-unsupported failure (e.g. tmpfs rejecting O_DIRECT outright, or the pre-Task-2
+   intermittent EINVAL from misaligned buffers). A different errno -- [ENOSPC], [EIO], [ENOMEM]: a
+   real storage fault with nothing to do with O_DIRECT support -- must propagate instead of
+   permanently and irreversibly downgrading this handle; it is {!Riptide_vsr.Replica}'s own
+   [durable_append] that classifies those shapes as [storage_fault] (Task 12), via the same narrow
+   [Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (errno, _, _)), _)] matching style used there. *)
 let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   let rec go () =
     try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ]
-    with Eio.Io _ when h.direct_capable ->
+    with Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EINVAL, _, _)), _) when h.direct_capable ->
       downgrade_to_dsync_only ~sw h;
       go ()
   in
@@ -306,7 +326,8 @@ let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
       let rec go () =
         match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
         | exception End_of_file -> None
-        | exception Eio.Io _ when h.direct_capable ->
+        | exception
+            Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EINVAL, _, _)), _) when h.direct_capable ->
           downgrade_to_dsync_only ~sw h;
           go ()
         | n -> if n = len then Some (Cstruct.to_string ~len:want buf) else None

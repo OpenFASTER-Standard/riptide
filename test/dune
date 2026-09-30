@@ -5,4 +5,13 @@
    golden_fixtures
    alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix
    mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt tls tls-eio)
- (deps ../spec/golden/vectors.txt ../lib/storage/file_kv_store.ml))
+ (deps ../spec/golden/vectors.txt ../lib/storage/file_kv_store.ml ../lib/storage/file_storage.ml
+   file_storage_o_direct_probe.exe))
+
+; Task 19 (Bug 1): a standalone helper process [test_file_storage.ml]'s own
+; [test_an_unrelated_write_error_does_not_permanently_strip_o_direct] forks+execs under a
+; [ulimit -f]-lowering shell -- see that helper's own top comment for why this has to be a real,
+; separate OS process rather than anything done inside the main [test_riptide] binary itself.
+(executable
+ (name file_storage_o_direct_probe)
+ (libraries riptide_storage eio eio.unix eio_linux eio_main uring optint unix))

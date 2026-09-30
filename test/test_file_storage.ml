@@ -1082,6 +1082,213 @@ let test_storage_operations_do_not_depend_on_tmpdir () =
              without a usable TMPDIR"
             (Some "x") (File_storage.wal_read t ~op_number:1)))
 
+(* -- Task 19: audit-remediation "minor bundle" -- O_DIRECT misdetection, use-after-close on a
+   failed reopen, startup-cost doc (that last one is [file_storage.mli]-only, not tested here).
+
+   Both fixes below live in [perform_write]/[perform_read]/[downgrade_to_dsync_only] -- see that
+   file's own top comment ("O_DIRECT: second attempt, this time it works") for why this fallback
+   dance exists at all, and the code's own comment directly above [downgrade_to_dsync_only] for
+   the [EINVAL] shape it exists to catch.
+
+   {b Why Bug 1 gets a REAL dynamic reproduction but Bug 2 does not, despite both being asked for.}
+   Bug 1 (the catch is too broad) has an externally observable consequence on THIS module
+   specifically, because [t.ring] is one [file_handle] held open and reused for [t]'s entire
+   lifetime -- an unrelated write fault that wrongly downgrades it has a lasting, checkable effect
+   (the ring's fd loses O_DIRECT for good). [File_storage_o_direct_probe] exploits that:
+   [RLIMIT_FSIZE], lowered via a real [ulimit -f] in a forked+exec'd shell (there is no [Unix]
+   binding for [setrlimit] in this installation, and lowering the WHOLE test suite's own limit
+   would risk breaking unrelated tests that legitimately write larger files), makes a real,
+   non-[EINVAL] [Eio.Io] ([EFBIG]) fire on the ring's DATA write while its HEADER write (a much
+   smaller offset) still fits -- a real storage-adjacent fault with nothing to do with O_DIRECT
+   support. The probe reads the ring fd's actual [O_DIRECT] bit straight from the kernel via
+   [/proc/self/fdinfo] before and after, which is real, dynamic, OS-level evidence.
+
+   Bug 2 (use-after-close on a failed reopen) has no comparable angle: reaching
+   [downgrade_to_dsync_only] at all -- even to test the reopen-failure branch specifically --
+   requires a GENUINE [EINVAL] on write/read, which is the one failure this module's own top
+   comment already documents as unreproducible on this box's own mounts (ext4, overlayfs both
+   confirmed to support aligned O_DIRECT I/O with zero failures across 5000 real operations; this
+   task's own investigation additionally confirmed this container's tmpfs -- kernel 6.12 -- also
+   accepts aligned O_DIRECT writes, and that mounting anything smaller/stricter to force a real
+   [ENOSPC]/[EINVAL] is blocked in this sandbox: plain [mount] and [unshare --mount] both fail with
+   EPERM, and [CapEff] confirms [CAP_SYS_ADMIN] is absent even though the process is UID 0). Since
+   the ENTRY condition itself cannot be constructed, no reopen-failure mechanism on top of it
+   (EMFILE, ENOENT, EISDIR) would make the resulting test any more real -- the missing piece is
+   always the same one. [test_downgrade_marks_direct_incapable_before_attempting_the_reopen] below
+   is therefore a source-level guard instead, following the same precedent (and the same honest
+   disclosure of why) as [test_file_kv_store.ml]'s own
+   [test_durable_write_and_delete_fsync_the_shard_directory_not_dir_path]: it fails loudly if the
+   ordering fix is ever reverted, which is the actual regression to prevent, even though it cannot
+   observe the reopen-failure consequence dynamically. *)
+
+let file_storage_source_path = "../lib/storage/file_storage.ml"
+
+let read_source_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () -> really_input_string ic (in_channel_length ic))
+
+let source_contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i = (i + nl <= hl) && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+let source_index_of ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec go i =
+    if i + nl > hl then None else if String.sub haystack i nl = needle then Some i else go (i + 1)
+  in
+  go 0
+
+(* The body of a top-level [let <name> ...] binding: everything from that binding up to the next
+   line starting in column 0 -- same technique, and same reasoning, as
+   [test_file_kv_store.ml]'s own [top_level_binding_body]. *)
+let top_level_binding_body source name =
+  let lines = String.split_on_char '\n' source in
+  let starts_binding line = String.length line > 4 && String.sub line 0 4 = "let " in
+  let rec find = function
+    | [] -> Alcotest.failf "no top-level binding %S found in %s" name file_storage_source_path
+    | line :: rest ->
+      if
+        starts_binding line
+        && String.length line >= 4 + String.length name
+        && String.sub line 4 (String.length name) = name
+      then
+        let rec take acc = function
+          | [] -> List.rev acc
+          | l :: tl -> if l <> "" && l.[0] <> ' ' && l.[0] <> ')' then List.rev acc else take (l :: acc) tl
+        in
+        String.concat "\n" (line :: take [] rest)
+      else find rest
+  in
+  find lines
+
+(* Task 19, Bug 1 -- real, dynamic reproduction. See this section's own top comment for the full
+   design rationale (why a forked+exec'd, [ulimit -f]-wrapped subprocess, and how [EFBIG] on the
+   ring's DATA write while its HEADER write still fits is engineered). [ring_capacity] is fixed at
+   8 inside the probe itself (matching this file's own [ring_capacity] constant), so
+   [header_region_size = 8 * 4096 = 32768] and the data write lands at offset 32768 -- 40 blocks
+   ([ulimit -f 40] = 20480 bytes) sits strictly between the header write's own end (4096 bytes) and
+   that data offset, so the header write fits and the data write cannot. *)
+let file_storage_o_direct_probe_path = "./file_storage_o_direct_probe.exe"
+
+let run_o_direct_probe ~probe_path ~ulimit_f_blocks dir =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
+  let read_fd, write_fd = Unix.pipe () in
+  match Unix.fork () with
+  | 0 ->
+    (try
+       Unix.close read_fd;
+       Unix.dup2 write_fd Unix.stdout;
+       Unix.close write_fd;
+       Unix.execv "/bin/sh"
+         [| "/bin/sh"; "-c";
+            Printf.sprintf "ulimit -f %d && exec %s %s" ulimit_f_blocks (Filename.quote probe_path)
+              (Filename.quote dir)
+         |]
+     with _ -> Unix._exit 127)
+  | child_pid ->
+    Unix.close write_fd;
+    Fun.protect
+      ~finally:(fun () ->
+        (try Unix.close read_fd with Unix.Unix_error _ -> ());
+        ignore (Unix.waitpid [] child_pid))
+      (fun () ->
+        let buf = Buffer.create 512 in
+        let chunk = Bytes.create 4096 in
+        let rec loop () =
+          let n = Unix.read read_fd chunk 0 4096 in
+          if n > 0 then begin
+            Buffer.add_subbytes buf chunk 0 n;
+            loop ()
+          end
+        in
+        (try loop () with Unix.Unix_error _ -> ());
+        Buffer.contents buf)
+
+let find_probe_line ~prefix output =
+  String.split_on_char '\n' output
+  |> List.find_opt (fun line ->
+         String.length line >= String.length prefix && String.sub line 0 (String.length prefix) = prefix)
+
+let test_an_unrelated_write_error_does_not_permanently_strip_o_direct () =
+  with_tmp_dir (fun dir ->
+      let output =
+        run_o_direct_probe ~probe_path:file_storage_o_direct_probe_path ~ulimit_f_blocks:40 dir
+      in
+      (match find_probe_line ~prefix:"BEFORE_DIRECT=" output with
+      | Some line ->
+        Alcotest.(check string) "O_DIRECT is active on the ring fd before the fault"
+          "BEFORE_DIRECT=true" line
+      | None -> Alcotest.failf "probe produced no BEFORE_DIRECT line; full output:\n%s" output);
+      (match find_probe_line ~prefix:"APPEND_RAISED=" output with
+      | Some line ->
+        Alcotest.(check bool)
+          "the injected fault really is the EFBIG this test relies on, not something else" true
+          (source_contains ~needle:"File too large" line)
+      | None ->
+        Alcotest.failf
+          "probe's wal_append did not raise at all -- the RLIMIT_FSIZE fault injection did not \
+           fire; full output:\n\
+           %s"
+          output);
+      match find_probe_line ~prefix:"AFTER_DIRECT=" output with
+      | Some line ->
+        Alcotest.(check string)
+          "an unrelated (EFBIG) write failure must not permanently strip O_DIRECT (Task 19 Bug 1)"
+          "AFTER_DIRECT=true" line
+      | None -> Alcotest.failf "probe produced no AFTER_DIRECT line; full output:\n%s" output)
+
+(* Task 19, Bug 1 -- source-level guard, complementing the dynamic reproduction above. The dynamic
+   test above only proves a NON-[EINVAL] fault ([EFBIG]) does not trigger the downgrade; it cannot
+   also prove a genuine [EINVAL] STILL does (that path is unreproducible on this box -- see this
+   section's own top comment), so this pins the positive half directly against the source: the
+   guard must actually name [EINVAL], and the old, unconditional "catch anything" shape must be
+   gone. *)
+let test_o_direct_downgrade_guard_matches_only_einval () =
+  let source = read_source_file file_storage_source_path in
+  List.iter
+    (fun name ->
+      let body = top_level_binding_body source name in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "%s's downgrade guard narrows to EINVAL specifically -- a different errno (ENOSPC/EIO/\
+            ENOMEM/etc) is a real storage fault, not \"O_DIRECT unsupported\", and must propagate \
+            rather than trigger a permanent downgrade"
+           name)
+        true
+        (source_contains ~needle:"Unix.EINVAL" body);
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "%s no longer has the old, unconditional \"Eio.Io _ when h.direct_capable\" \
+            catch-anything guard"
+           name)
+        false
+        (source_contains ~needle:"Eio.Io _ when h.direct_capable" body))
+    [ "perform_write"; "perform_read" ]
+
+(* Task 19, Bug 2 -- source-level guard. See this section's own top comment for why a dynamic
+   reproduction is not possible on this box (reaching this function at all requires a genuine
+   [EINVAL], which is unreproducible here). Fails loudly if [h.direct_capable <- false] is ever
+   moved back to after the reopen attempt -- the actual regression this closes: a failed reopen
+   (e.g. [EMFILE]) would otherwise leave [h.fd] closed while [h.direct_capable] still reads [true],
+   so a later caller re-enters this function and retries against an already-closed fd. *)
+let test_downgrade_marks_direct_incapable_before_attempting_the_reopen () =
+  let source = read_source_file file_storage_source_path in
+  let body = top_level_binding_body source "downgrade_to_dsync_only" in
+  match
+    (source_index_of ~needle:"h.direct_capable <- false" body, source_index_of ~needle:"openat2" body)
+  with
+  | Some assign_at, Some open_at ->
+    Alcotest.(check bool)
+      "h.direct_capable is set to false BEFORE attempting the reopen, not after it succeeds" true
+      (assign_at < open_at)
+  | _ ->
+    Alcotest.fail
+      "expected both \"h.direct_capable <- false\" and an openat2 call in \
+       downgrade_to_dsync_only's body"
+
 let tests =
   [
     ( "Task 14: create rejects ring_capacity <= 0",
@@ -1183,4 +1390,13 @@ let tests =
     ( "Task 17: File_storage.create/wal_append do not depend on TMPDIR",
       `Quick,
       test_storage_operations_do_not_depend_on_tmpdir );
+    ( "Task 19 Bug 1: an unrelated (EFBIG) write error does not permanently strip O_DIRECT",
+      `Quick,
+      test_an_unrelated_write_error_does_not_permanently_strip_o_direct );
+    ( "Task 19 Bug 1: the downgrade guard matches only EINVAL, not any Eio.Io",
+      `Quick,
+      test_o_direct_downgrade_guard_matches_only_einval );
+    ( "Task 19 Bug 2: downgrade marks direct_capable false before attempting the reopen",
+      `Quick,
+      test_downgrade_marks_direct_incapable_before_attempting_the_reopen );
   ]

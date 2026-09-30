@@ -226,21 +226,32 @@ let open_file_handle_read ~sw path =
 (* Transcribed from [file_storage.ml]'s [downgrade_to_dsync_only]: permanent for the
    rest of this handle's lifetime once a real [O_DIRECT] failure is hit. Never triggered for a
    read handle ([direct_capable] is always [false] there), so it's only ever reached from a
-   write handle's [perform_write]/[perform_read] retry. *)
+   write handle's [perform_write]/[perform_read] retry.
+
+   {b Task 19, Bug 2 (audit-remediation, use-after-close on a failed reopen) -- transcribed from
+   [file_storage.ml]'s own fix.} [h.direct_capable] is set to [false] BEFORE attempting the reopen,
+   not after it succeeds: a failed reopen (e.g. [EMFILE]) otherwise leaves [h.fd] closed while
+   [h.direct_capable] still reads [true], so a later caller would retry against the already-closed
+   fd instead of seeing the handle is broken. See [file_storage.ml]'s own comment on its copy of
+   this function for the full reasoning. *)
 let downgrade_to_dsync_only ~sw (h : file_handle) =
   if h.direct_capable then begin
     ignore (Eio_unix.Fd.close h.fd);
+    h.direct_capable <- false;
     h.fd <-
       Eio_linux.Low_level.openat2 ~sw ~seekable:true ~access:`RW ~flags:open_flags_write_fallback
-        ~perm:0o600 ~resolve:Uring.Resolve.empty h.path;
-    h.direct_capable <- false
+        ~perm:0o600 ~resolve:Uring.Resolve.empty h.path
   end
 
-(* Transcribed from [file_storage.ml] ([perform_write]). *)
+(* Transcribed from [file_storage.ml] ([perform_write]), including that file's own Task 19 Bug 1
+   fix: narrowed from a blanket [Eio.Io _ when h.direct_capable] to specifically [EINVAL] -- the
+   real O_DIRECT-unsupported errno shape -- so an unrelated real storage fault (ENOSPC/EIO/ENOMEM)
+   propagates instead of permanently downgrading this handle. See [file_storage.ml]'s own comment
+   on its copy of this function for the full reasoning. *)
 let perform_write ~sw (h : file_handle) ~offset (buf : Cstruct.t) =
   let rec go () =
     try Eio_linux.Low_level.writev ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ]
-    with Eio.Io _ when h.direct_capable ->
+    with Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EINVAL, _, _)), _) when h.direct_capable ->
       downgrade_to_dsync_only ~sw h;
       go ()
   in
@@ -275,7 +286,8 @@ let perform_read ~pool ~sw (h : file_handle) ~offset ~len ~want =
       let rec go () =
         match Eio_linux.Low_level.readv ~file_offset:(Optint.Int63.of_int offset) h.fd [ buf ] with
         | exception End_of_file -> None
-        | exception Eio.Io _ when h.direct_capable ->
+        | exception
+            Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EINVAL, _, _)), _) when h.direct_capable ->
           downgrade_to_dsync_only ~sw h;
           go ()
         | n -> if n = len then Some (Cstruct.to_string ~len:want buf) else None

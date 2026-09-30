@@ -45,6 +45,19 @@ val create :
     reopening the same directory after a process restart picks up exactly where the previous
     process left off, including across ring wraparound.
 
+    {b This recovery scan is O([ring_capacity]), not O(the number of entries actually written)} --
+    it always reads every one of [ring_capacity]'s slots (a real, aligned [O_DIRECT] header read
+    each, and a matching data read for any slot whose header looks occupied), never fewer, since
+    nothing durable on disk records how many slots are actually live short of reading each one.
+    Audit-remediation Task 19 measured this at roughly {b 53 µs/slot} on this box's own mounts, so
+    [create]'s (and, after a crash, [Riptide_vsr.Replica.restart]'s) one-time cost scales linearly
+    with [ring_capacity] alone, independent of how full the ring actually is: a modest
+    [ring_capacity] of 10,000 costs on the order of 530 ms before [create] returns; a
+    [ring_capacity] of 1,000,000 (sized, say, for a workload that never wants to evict) costs on
+    the order of 53 seconds -- a real, one-time startup/restart cost worth weighing directly
+    against how large a caller actually needs this ring to be, not just against the eviction
+    behaviour the "REQUIRED, with no default" note above already covers.
+
     [File_storage]-specific limitation, not part of the abstract {!Storage_intf.S} contract:
     [wal_append] raises [Invalid_argument] for any entry larger than one aligned data slot
     (currently 4096 bytes), since each slot holds exactly one entry's data, zero-padded to the

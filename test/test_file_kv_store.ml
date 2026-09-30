@@ -934,6 +934,64 @@ let test_sweep_still_finds_stale_temp_files_inside_shard_subdirectories () =
       Alcotest.(check (option string)) "an unrelated real key put after the sweep still works"
         (Some "still-here") (File_kv_store.get t ~key:"unrelated-key"))
 
+(* -- Task 19: audit-remediation "minor bundle" -- O_DIRECT misdetection and use-after-close on a
+   failed reopen (Bug 3, the [ring_capacity] startup-cost doc note, is [file_storage.mli]-only).
+   This module's [perform_write]/[perform_read]/[downgrade_to_dsync_only] were transcribed from
+   [file_storage.ml]'s originals (see this file's own top comment), so both bugs need their own,
+   separate fix and their own, separate regression coverage here -- fixing one file's copy does not
+   fix the other's.
+
+   {b Both tests below are source-level guards, not dynamic reproductions}, for a reason specific
+   to THIS module (unlike [file_storage.ml]'s own Bug 1 test, which IS a real dynamic
+   reproduction -- see that file's [test_an_unrelated_write_error_does_not_permanently_strip_o_direct]
+   for the full technique). [File_storage]'s ring handle is one [file_handle] held open and reused
+   for [t]'s entire lifetime, so a wrong downgrade has a lasting, externally observable effect.
+   [File_kv_store.put]/[get] instead open a BRAND NEW [file_handle] for every single call (see
+   [durable_write]'s [open_file_handle_write] and [durable_read]'s [open_file_handle_read]) and
+   always close it again before returning, success or exception (via [Fun.protect]) -- so there is
+   no [t]-scoped state for a wrong downgrade to corrupt across calls, and by the time any caller
+   (including a test) regains control, the handle whose [direct_capable] flag is in question is
+   already gone. Reaching [downgrade_to_dsync_only] at all would in any case require a genuine
+   [EINVAL] on write/read, which [file_storage.ml]'s own top comment already documents as
+   unreproducible on this box's own mounts -- see that file's Bug-1/Bug-2 section comment for the
+   full investigation (RLIMIT_FSIZE via a real [ulimit -f] gives a real, non-EINVAL EFBIG, which is
+   exactly why THAT test can be dynamic while genuinely triggering [EINVAL] itself cannot). *)
+
+let test_o_direct_downgrade_guard_matches_only_einval () =
+  let source = read_file file_kv_store_source_path in
+  List.iter
+    (fun name ->
+      let body = top_level_binding_body source name in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "%s's downgrade guard narrows to EINVAL specifically -- a different errno (ENOSPC/EIO/\
+            ENOMEM/etc) is a real storage fault, not \"O_DIRECT unsupported\", and must propagate \
+            rather than trigger a permanent downgrade"
+           name)
+        true
+        (contains ~needle:"Unix.EINVAL" body);
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "%s no longer has the old, unconditional \"Eio.Io _ when h.direct_capable\" \
+            catch-anything guard"
+           name)
+        false
+        (contains ~needle:"Eio.Io _ when h.direct_capable" body))
+    [ "perform_write"; "perform_read" ]
+
+let test_downgrade_marks_direct_incapable_before_attempting_the_reopen () =
+  let source = read_file file_kv_store_source_path in
+  let body = top_level_binding_body source "downgrade_to_dsync_only" in
+  match (index_of ~needle:"h.direct_capable <- false" body, index_of ~needle:"openat2" body) with
+  | Some assign_at, Some open_at ->
+    Alcotest.(check bool)
+      "h.direct_capable is set to false BEFORE attempting the reopen, not after it succeeds" true
+      (assign_at < open_at)
+  | _ ->
+    Alcotest.fail
+      "expected both \"h.direct_capable <- false\" and an openat2 call in \
+       downgrade_to_dsync_only's body"
+
 let tests =
   [
     ( "Task 10: repeated I/O does not grow the process's kernel map count",
@@ -1003,4 +1061,10 @@ let tests =
     ( "Task 18 (Ruling B): sweep_stale_temp_files still finds debris inside shard subdirectories",
       `Quick,
       test_sweep_still_finds_stale_temp_files_inside_shard_subdirectories );
+    ( "Task 19 Bug 1: the downgrade guard matches only EINVAL, not any Eio.Io",
+      `Quick,
+      test_o_direct_downgrade_guard_matches_only_einval );
+    ( "Task 19 Bug 2: downgrade marks direct_capable false before attempting the reopen",
+      `Quick,
+      test_downgrade_marks_direct_incapable_before_attempting_the_reopen );
   ]
