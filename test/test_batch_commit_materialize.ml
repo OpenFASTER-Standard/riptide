@@ -557,6 +557,98 @@ let test_write_at_op_number_has_merge_key_false_out_of_bounds () =
   Alcotest.(check bool) "an op-number past the end of the log is false" false
     (Batch_commit.write_at_op_number_has_merge_key replica ~op_number:2)
 
+(* ---- Task 21 (audit-remediation): a poisoned write must not abort materialization of every
+   OTHER write in its own batch (propose) or every LATER batch (materialize_up_to's replay) --
+   see .superpowers/sdd/2026-09-29-audit-remediation/task-21-brief.md.
+
+   Reproduces Materializer.write's own documented (materializer.mli's WARNING) failure shape
+   directly and simply: a single oversized payload, whose LWW-record encoding alone already
+   exceeds File_kv_store's 4096-byte max_value_size, raises Invalid_argument on the very FIRST
+   write to its merge_key -- no need for test_lattice_materialize_crypto_scenarios.ml's own
+   400-iteration accumulation approach, since one write here already overflows. *)
+let oversized_value_str = String.make 4200 'x'
+
+let poison_write ~merge_key =
+  {
+    Batch_commit.actor = "actor-1";
+    causation = fake_event_id (merge_key ^ "-poison-c");
+    correlation = fake_event_id (merge_key ^ "-poison-r");
+    payload =
+      lww_to_value
+        { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String oversized_value_str);
+          timestamp = 1L
+        };
+    merge_key = Some merge_key;
+  }
+
+let small_write ~merge_key ~value_str =
+  {
+    Batch_commit.actor = "actor-1";
+    causation = fake_event_id (merge_key ^ "-small-c");
+    correlation = fake_event_id (merge_key ^ "-small-r");
+    payload =
+      lww_to_value
+        { Last_write_wins.value = Riptide.Value.Scalar (Riptide.Value.String value_str); timestamp = 1L };
+    merge_key = Some merge_key;
+  }
+
+(* Tolerates today's pre-fix behaviour (Materializer.write's Invalid_argument propagating straight
+   out of propose/materialize_up_to) without asserting on it either way -- this test's whole point
+   is what happens to the OTHER write/batch afterwards, not whether the call itself raises.
+   Post-fix, neither loop ever raises for this documented failure shape at all, so this becomes a
+   no-op try around a call that always returns normally. *)
+let tolerating_the_known_overflow_exception f = try f () with Invalid_argument _ -> ()
+
+let test_one_oversized_write_in_a_batch_does_not_block_sibling_materialization () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      let failures_before = Batch_commit.materialize_write_failures () in
+      (* poison-mk deliberately listed FIRST: pre-fix, [List.iter] aborts on the first raise, so
+         placing the poisoned write ahead of the sibling in the very same batch is exactly the
+         shape that proves the sibling was never even attempted before this fix. *)
+      tolerating_the_known_overflow_exception (fun () ->
+          Batch_commit.propose replica ~idempotency_key:"k-mixed-batch" ~materialize:sink
+            [ poison_write ~merge_key:"poison-mk"; small_write ~merge_key:"sibling-mk" ~value_str:"sibling-value" ]);
+      let sibling = M.read materializer ~merge_key:"sibling-mk" in
+      Alcotest.(check bool) "the sibling key materialized despite the other write's overflow" true
+        (sibling <> Last_write_wins.bottom);
+      Alcotest.(check bool) "the poisoned write was counted as a materialize failure, not silently \
+                             dropped uncounted"
+        true
+        (Batch_commit.materialize_write_failures () > failures_before))
+
+let test_restart_replay_does_not_permanently_stop_after_one_poisoned_key () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun kv_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      (* No ~materialize sink on either propose call -- nothing is materialized synchronously.
+         Everything below is drained by materialize_up_to alone, against a brand-new (empty)
+         materializer, simulating a fresh replica restart re-materializing from the committed log
+         with no watermark state of its own. *)
+      propose_one_write replica ~idempotency_key:"k-poison" ~merge_key:(Some "poison-mk") ~timestamp:1
+        ~value_str:oversized_value_str;
+      propose_one_write replica ~idempotency_key:"k-late" ~merge_key:(Some "late-mk") ~timestamp:2
+        ~value_str:"late-value";
+      Alcotest.(check int) "both batches committed" 2 (Replica.commit_number replica);
+      let materializer = make_materializer kv_dir env sw in
+      let sink = make_sink materializer in
+      let failures_before = Batch_commit.materialize_write_failures () in
+      tolerating_the_known_overflow_exception (fun () ->
+          Batch_commit.materialize_up_to replica ~materialize:sink
+            ~through_commit_number:(Replica.commit_number replica));
+      let late = M.read materializer ~merge_key:"late-mk" in
+      Alcotest.(check bool) "a later, unrelated key materialized despite the earlier poison" true
+        (late <> Last_write_wins.bottom);
+      Alcotest.(check bool) "the poisoned write was counted as a materialize failure, not silently \
+                             dropped uncounted"
+        true
+        (Batch_commit.materialize_write_failures () > failures_before))
+
 let tests =
   [
     ( "a write's own merge_key survives WAL ring eviction that genuinely destroys the raw entry",
@@ -584,4 +676,10 @@ let tests =
       `Quick, test_write_at_op_number_has_merge_key_true_and_false_within_bounds );
     ( "write_at_op_number_has_merge_key is false for any out-of-bounds op-number",
       `Quick, test_write_at_op_number_has_merge_key_false_out_of_bounds );
+    ( "one oversized write in a batch does not block materialization of a sibling write in the \
+       same batch (Task 21)",
+      `Quick, test_one_oversized_write_in_a_batch_does_not_block_sibling_materialization );
+    ( "materialize_up_to's restart replay does not permanently stop after one poisoned key -- a \
+       later batch still materializes (Task 21)",
+      `Quick, test_restart_replay_does_not_permanently_stop_after_one_poisoned_key );
   ]

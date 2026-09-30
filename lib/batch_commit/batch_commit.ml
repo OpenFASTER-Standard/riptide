@@ -155,6 +155,47 @@ let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : boo
 type materialize_sink = { write : merge_key:string -> Value.value -> unit }
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
+(* ---- per-write materialize failure counting (task-master audit-remediation Task 21) ----
+
+   {!Riptide_materialize.Materializer.write} can raise [Invalid_argument] when the joined
+   accumulator's encoded size exceeds the KV backend's own [max_value_size] -- see that function's
+   own WARNING in materializer.mli for the full, deliberately-unfixed account (unbounded
+   accumulator growth vs. a bounded KV value size; NOT relitigated here). Before this counter and
+   {!materialize_write_catching} existed, that exception propagated straight out of whichever loop
+   invoked [write] -- [propose]'s own single-batch fold, or [materialize_up_to]'s replay walk --
+   aborting every OTHER write still queued in that loop, not just the one that actually overflowed.
+
+   This counter lives HERE, in Batch_commit, deliberately not as a field on
+   {!Riptide_vsr.Replica.t} the way [append_refusals] lives there (see that function's own doc
+   comment in replica.mli for the shape this one intentionally mirrors): a materializer write
+   failure is a downstream KV-value-size limit on the MATERIALIZATION side, nothing to do with
+   consensus durability, and [Batch_commit] sits ABOVE [Replica] and consumes it -- coupling the
+   lower module to a fact about the layer built on top of it would be exactly backwards. It is a
+   single, process-lifetime counter rather than one per [Replica.t] because [Batch_commit] itself
+   holds no per-replica state of its own to attach one to: every other function in this module is a
+   pure projection of a [Replica.t] argument, and there is no [Batch_commit.t]. Like
+   [append_refusals], it never resets: the useful reading is a delta between two samples taken
+   around a call of interest, not an absolute value read in isolation. *)
+let materialize_write_failures_count = ref 0
+
+let materialize_write_failures () = !materialize_write_failures_count
+
+(* Catches ONLY [Invalid_argument] -- {!Riptide_materialize.Materializer.write}'s own documented
+   single failure shape -- and nothing else, matching this codebase's own established discipline
+   for narrow, documented-shape catches elsewhere: see {!Riptide_vsr.Replica.durable_append}'s own
+   [Storage_fault] classification in lib/vsr/replica.ml for the STYLE precedent (catch exactly the
+   documented shape, count it, and let anything else propagate as a genuine contract violation
+   rather than laundering it into "safe to skip"). An unrecognized exception shape out of [write]
+   is a backend contract violation and must still crash loudly, not be absorbed here.
+
+   Shared by BOTH [propose]'s materialize step and [materialize_up_to]'s replay loop, so the two
+   loops cannot drift into different catch behaviour -- exactly the "one shared helper" this task
+   requires rather than duplicating the same try/with twice. *)
+let materialize_write_catching (sink : materialize_sink) ~(merge_key : string) (payload : Value.value) : unit =
+  match sink.write ~merge_key payload with
+  | () -> ()
+  | exception Invalid_argument _ -> incr materialize_write_failures_count
+
 (* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
    step: walks the committed prefix up to [through_commit_number] (not just the one batch
    claiming a particular idempotency_key), materializing every write carrying a [merge_key] along
@@ -193,7 +234,7 @@ let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_si
               (fun (w : write) ->
                 match w.merge_key with
                 | None -> ()
-                | Some k -> materialize.write ~merge_key:k w.payload)
+                | Some k -> materialize_write_catching materialize ~merge_key:k w.payload)
               writes
           end)
     entries
@@ -378,7 +419,9 @@ let propose (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) ?(require_en
     | Some committed_writes ->
       List.iter
         (fun (w : write) ->
-          match w.merge_key with None -> () | Some merge_key -> sink.write ~merge_key w.payload)
+          match w.merge_key with
+          | None -> ()
+          | Some merge_key -> materialize_write_catching sink ~merge_key w.payload)
         committed_writes)
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =

@@ -1849,11 +1849,23 @@ let test_a_replica_can_materialize_its_own_commit_stream_without_the_writes () =
    What actually happens, measured here rather than reasoned about, and it is worse than a loud
    failure: the batch has ALREADY COMMITTED by the time the fold runs (that ordering is deliberate
    and correct -- materializing an uncommitted write would publish state the cluster has not agreed
-   on), so the exception surfaces out of [Batch_commit.propose] with the write durably in the
-   replicated log and permanently absent from the accumulator. The accumulator is left at its last
-   good value, so a SMALLER later write to the same merge_key succeeds and the store goes right on
-   working -- the divergence does not announce itself again. Retrying the failed key does not help
-   either: post-fix, materialization re-reads it from the committed bytes and hits the same cap.
+   on), so the write ends up durably in the replicated log and permanently absent from the
+   accumulator. The accumulator is left at its last good value, so a SMALLER later write to the
+   same merge_key succeeds and the store goes right on working -- the divergence does not announce
+   itself again. Retrying the failed key does not help either: materialization re-reads it from the
+   committed bytes and hits the same cap.
+
+   {b Updated by task-master audit-remediation Task 21}, which changed HOW this surfaces without
+   touching whether it happens: before Task 21, {!Riptide_materialize.Materializer.write}'s
+   [Invalid_argument] propagated straight out of [Batch_commit.propose] uncaught, so this test could
+   detect the exact failing element by catching it. Task 21 made that specific propagation the bug
+   (it was also aborting every OTHER, unrelated write queued in the same propose call or replay
+   walk -- see batch_commit.mli's own [materialize_write_failures]), so [propose] now catches this
+   documented shape itself, counts it, and returns normally. This test now detects the same stall
+   by watching the materialized set's own size stop growing instead of catching an exception, and
+   confirms the dedicated counter observed it -- everything else this test pins (the write commits
+   anyway, the accumulator is left one element short, a later smaller write still succeeds) is
+   unchanged, because Task 21 never touched this underlying, still-open limitation.
 
    Pinned, not fixed, and deliberately so, following exactly the precedent test_dst_scenarios.ml
    sets for the ring-capacity limitation it found: a running reproduction that will fail loudly if
@@ -1877,16 +1889,24 @@ let test_an_accumulator_outgrowing_its_kv_backend_diverges_from_the_log () =
       [ write_of ~merge_key:"mk" (G_set.to_value (G_set.of_list [ Printf.sprintf "element-%04d" n ])) ]
   in
   let failed_at = ref 0 in
-  (* The [Invalid_argument] escapes the whole loop, so there is no in-loop guard to write: the
-     [for] simply stops where the cap is hit. *)
-  (try
-     for n = 1 to 400 do
-       propose n
-     done
-   with Invalid_argument msg ->
-     failed_at := List.length (G_set.elements (M.read materializer ~merge_key:"mk")) + 1;
-     Alcotest.(check bool) "the failure names the backend's value-size limit" true
-       (contains ~needle:"exceeds this store's max value size" msg));
+  let failures_before = Batch_commit.materialize_write_failures () in
+  (* Post-Task-21, [propose] no longer raises for this documented failure shape -- it catches,
+     counts, and returns normally (see the doc comment above) -- so there is no exception left to
+     stop this loop for us. Detect the same stall explicitly instead: the materialized set's own
+     size stops growing at exactly the element that overflows the KV backend's cap, and the loop
+     stops itself there, matching the OLD exception-driven loop's own stopping point exactly (n = 1
+     .. failed_at, inclusive, is proposed -- never further). *)
+  let n = ref 1 in
+  while !failed_at = 0 && !n <= 400 do
+    let before_count = List.length (G_set.elements (M.read materializer ~merge_key:"mk")) in
+    propose !n;
+    let after_count = List.length (G_set.elements (M.read materializer ~merge_key:"mk")) in
+    if after_count = before_count then failed_at := !n;
+    incr n
+  done;
+  Alcotest.(check bool)
+    "the dedicated materialize-write-failure counter observed at least this stall" true
+    (Batch_commit.materialize_write_failures () > failures_before);
   Alcotest.(check bool)
     "the fold really does hit File_kv_store's 4096-byte value cap (measured: at the 195th element)"
     true

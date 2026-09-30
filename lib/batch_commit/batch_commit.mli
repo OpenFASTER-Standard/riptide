@@ -152,6 +152,32 @@ type encryption_sink = {
     every existing call site. Making encryption unconditional is a live option for a later task,
     once a real caller exists to define what happens to plaintext-reading paths. *)
 
+val materialize_write_failures : unit -> int
+(** [materialize_write_failures ()] is how many individual writes {!propose}'s own materialize step
+    and {!materialize_up_to}'s replay walk have, TOGETHER, had refused by
+    {!Riptide_materialize.Materializer.write} over this process's lifetime -- i.e. how many times
+    [write] raised [Invalid_argument] because the joined accumulator's encoded size exceeded the KV
+    backend's own bound (see {!Riptide_materialize.Materializer.write}'s own WARNING for the full,
+    deliberately-unfixed account of why that can happen; this counter does not change when or
+    whether it happens, only whether a caller can OBSERVE that it did).
+
+    Shaped like {!Riptide_vsr.Replica.append_refusals} on purpose -- {b a monotonic,
+    process-lifetime count that never resets}, so the useful reading is a delta between two samples
+    taken around a call of interest, not an absolute value read in isolation. Unlike
+    [append_refusals], this is a single counter rather than one per [(string * int)] reason and not
+    scoped to any one {!Riptide_vsr.Replica.t}: [Batch_commit] holds no per-replica state of its own
+    (every other function here is a pure projection of a [Riptide_vsr.Replica.t] argument), and a
+    materializer write failure is a fact about the materialization layer, not about any specific
+    replica's consensus/durability state -- deliberately NOT added to
+    {!Riptide_vsr.Replica.append_refusals} itself, which would couple that lower, more foundational
+    module to a failure mode entirely of this higher one's own making.
+
+    Before this counter existed (task-master audit-remediation Task 21), a write's
+    [Invalid_argument] propagated straight out of whichever loop called it, silently aborting every
+    OTHER write still queued in that same loop -- see {!propose} and {!materialize_up_to}'s own doc
+    comments for the corrected account of what happens to a write like this now (counted here, and
+    skipped, rather than aborting anything past it). *)
+
 val materialize_up_to :
   Riptide_vsr.Replica.t -> materialize:materialize_sink -> through_commit_number:int -> unit
 (** [materialize_up_to t ~materialize ~through_commit_number] walks [t]'s committed log from its
@@ -330,9 +356,22 @@ val propose :
     pre-fix and post-fix, in [test/test_lattice_materialize_crypto_scenarios.ml].
 
     Two consequences worth stating explicitly:
-    - The accumulator is a function of the committed log alone -- the one input every replica
-      agrees on -- so any replica holding a committed batch can materialize it, and replicas that
-      have materialized the same committed batches hold the same accumulator, whatever order or
+    - {b The accumulator is a function of the committed log plus each key's own size-bound write
+      history}, not of the committed log alone (task-master audit-remediation Task 21 narrowed this
+      claim: see {!materialize_write_failures} for why). Both this function and
+      {!materialize_up_to} now catch a per-write [Invalid_argument] out of
+      {!Riptide_materialize.Materializer.write} (its own KV backend's value-size bound exceeded --
+      see that function's own WARNING), count it via {!materialize_write_failures}, and move on to
+      the next write rather than aborting -- so a write can be silently and PERMANENTLY skipped,
+      exactly like {!Riptide_materialize.Materializer.write}'s own already-documented "a later,
+      smaller write to the same key still succeeds, and the gap never surfaces again" behaviour.
+      This is still every real replica's accumulator, not a source of divergence: whether a given
+      write is skipped this way is a deterministic function of that write's own payload and the
+      backend's fixed size bound, never of timing, call order, or which replica evaluates it, so any
+      two replicas that have seen the same committed writes reach the same size-cap outcome for each
+      one and therefore the same accumulator -- any replica holding a committed batch can still
+      materialize it, and replicas that have materialized the same committed batches (with the same
+      per-write size-cap outcomes, which is guaranteed) hold the same accumulator, whatever order or
       how many times each did so (join is commutative, associative and idempotent).
     - Materializing therefore does not need the writes in hand at all: calling this function with
       an EMPTY [writes] list materializes whatever is committed under [idempotency_key] and
