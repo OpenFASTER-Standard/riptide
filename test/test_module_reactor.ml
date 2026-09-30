@@ -208,6 +208,115 @@ let test_one_subscribed_modules_denial_does_not_affect_a_sibling_module_on_the_s
   Alcotest.(check int) "the Deny-wired module's write did not reach the log at all" 0
     (List.length (Batch_commit.committed_envelopes deny_replica))
 
+(* ── Fix round 2: regression coverage for the fix-round-1 behavioral changes ─────────────────────
+   The exception-scoping re-raise and the merge_key/module log-attribution format were both
+   shipped as prose (this file's own comments) plus doc comments plus manual verification only --
+   this repo's own CLAUDE.md "No spec without running code" rule means that isn't good enough on
+   its own: nothing in the suite would previously have caught a future regression (e.g. someone
+   "simplifying" dispatch's catch-all back to a blanket `with exn -> ...`, or dropping the context
+   interpolation from a log call). The two tests below pin both, the same way loader.ml's own
+   `cleanup` fault-injection tests (`Loader.For_testing`) already pin its own, analogous
+   exception-scoping behavior in this exact codebase. *)
+
+let string_contains ~needle haystack =
+  try
+    ignore (Str.search_forward (Str.regexp_string needle) haystack 0);
+    true
+  with Not_found -> false
+
+(* Redirects the real fd 2 (not just the OCaml `stderr` channel's buffer) to a temp file for the
+   duration of [f], then restores it -- so this captures the REAL emitted log content (this
+   process's actual `Printf.eprintf` output, exactly what an operator watching this box's own log
+   stream would see), not a mocked stand-in for it. Every `Printf.eprintf` call in reactor.ml
+   already ends its own format string with `%!` (auto-flushing), so no extra flush is strictly
+   required around [f] itself, but one is included anyway for safety/clarity. *)
+let capture_stderr f =
+  flush stderr;
+  let saved_stderr = Unix.dup Unix.stderr in
+  let tmp_path = Filename.temp_file "reactor_test_stderr" "" in
+  let tmp_fd = Unix.openfile tmp_path [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+  Unix.dup2 tmp_fd Unix.stderr;
+  Unix.close tmp_fd;
+  Fun.protect
+    ~finally:(fun () ->
+      flush stderr;
+      Unix.dup2 saved_stderr Unix.stderr;
+      Unix.close saved_stderr)
+    (fun () ->
+      f ();
+      flush stderr);
+  let content = read_file tmp_path in
+  Sys.remove tmp_path;
+  content
+
+(* Pins the exception-scoping fix (fix round 1, Finding 1): [Out_of_memory]/[Stack_overflow] must
+   propagate OUT of wrap_materialize_sink's own [write], never be caught and logged like an
+   ordinary dispatch failure -- matching loader.ml's own [cleanup] precedent
+   (`with | (Out_of_memory | Stack_overflow) as exn -> raise exn | _ -> ...`) in this exact
+   codebase. [raise Stack_overflow] here is an entirely ordinary use of a predefined exception
+   constructor -- OCaml does not require the call stack to actually be exhausted to raise it, so
+   this test is fast and deterministic, not a stress test.
+
+   The closure that raises is [~propose] (reachable via `fixtures/propose_write.wat`'s own
+   "handle", which calls `host.propose_write` unconditionally, per Task 3). That closure actually
+   executes on the PARENT side of Loader.invoke's own fork-based containment (inside
+   `supervise_child`'s `step`, servicing the guest's relayed 'P' message -- see loader.ml's own
+   top comment) -- loader.ml's OWN `step` already re-raises Out_of_memory/Stack_overflow rather
+   than converting them to an [Error], so this exception reaches `Loader.invoke`'s own call site
+   (and therefore this reactor's `dispatch`) as a genuine raised exception, not a wrapped
+   [Error] -- which is exactly the path this test needs to exercise dispatch's own re-raise. *)
+let test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowing_them () =
+  let reactor = Reactor.create () in
+  let no_read ~merge_key:_ = None in
+  Reactor.subscribe reactor ~merge_key:"k" ~module_:(verified_propose_write ())
+    ~protocol:allow_handle_from_init ~read:no_read ~propose:(fun _ -> raise Stack_overflow);
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
+  Alcotest.check_raises
+    "Stack_overflow propagates out of wrap_materialize_sink's write rather than being caught and \
+     logged like an ordinary dispatch failure"
+    Stack_overflow
+    (fun () -> wrapped.write ~merge_key:"k" (v "trigger"))
+
+(* Pins BOTH the swallow-and-log behavior (an ordinary exception must NOT propagate) and the
+   log-attribution format (fix round 1, Finding 2): the real, actually-emitted log line for this
+   dispatch must name the responsible merge_key and module. A distinct, real merge_key
+   ("distinct-merge-key-xyz", chosen to be implausible as an accidental substring match anywhere
+   else in the emitted text) and the module's own real, freshly-generated `local_path` are both
+   checked for, so this assertion is genuinely checking the right content, not something that
+   would pass by coincidence (e.g. against a hardcoded/fixed string).
+
+   Loader.invoke's own [step] absorbs an ordinary (non-Out_of_memory/Stack_overflow) exception
+   raised from a host closure into an [Error _] result itself (see loader.ml's own generic
+   catch-all) rather than letting it escape as a raised exception -- so this specific scenario
+   exercises dispatch's `Error msg -> ... "module dispatch failed" ...` branch, not its outer
+   `with exn -> ... "module dispatch raised" ...` branch (which fires only for a failure
+   originating outside Loader.invoke's own containment, e.g. Loader.instantiate itself raising).
+   Both branches share the exact same `context` construction, so this still directly verifies the
+   log-attribution format fix; it just isn't the specific catch-all line the fix's own diff
+   touched. *)
+let test_dispatch_swallows_an_ordinary_exception_and_logs_it_with_merge_key_and_module_context () =
+  let reactor = Reactor.create () in
+  let no_read ~merge_key:_ = None in
+  let propose_module = verified_propose_write () in
+  let merge_key = "distinct-merge-key-xyz" in
+  Reactor.subscribe reactor ~merge_key ~module_:propose_module ~protocol:allow_handle_from_init
+    ~read:no_read ~propose:(fun _ -> failwith "boom");
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
+  (* capture_stderr's own call to [f] running to completion at all -- rather than an exception
+     escaping through it and failing this test via Alcotest's own uncaught-exception handling --
+     is itself the proof that wrap_materialize_sink's write did not raise for an ordinary
+     exception; there is no separate "did not raise" assertion form to call in addition to that. *)
+  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key (v "trigger")) in
+  Alcotest.(check bool) "the emitted log line identifies the merge_key responsible" true
+    (string_contains ~needle:merge_key stderr_output);
+  Alcotest.(check bool) "the emitted log line identifies the module responsible" true
+    (string_contains ~needle:propose_module.Admission.local_path stderr_output);
+  Alcotest.(check bool) "the underlying failure's own message is still present in the log line"
+    true
+    (string_contains ~needle:"boom" stderr_output)
+
 let tests =
   [
     ("a materialized change on a subscribed key invokes the module", `Quick,
@@ -218,4 +327,8 @@ let tests =
       test_a_module_that_calls_propose_write_zero_times_is_not_an_error);
     ("one subscribed module's denial does not affect a sibling module on the same key", `Quick,
       test_one_subscribed_modules_denial_does_not_affect_a_sibling_module_on_the_same_key);
+    ("dispatch re-raises Out_of_memory/Stack_overflow rather than swallowing them", `Quick,
+      test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowing_them);
+    ("dispatch swallows an ordinary exception and logs it with merge_key/module context", `Quick,
+      test_dispatch_swallows_an_ordinary_exception_and_logs_it_with_merge_key_and_module_context);
   ]
