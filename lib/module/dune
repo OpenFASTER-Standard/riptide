@@ -1,3 +1,10 @@
 (library
  (name riptide_module)
- (libraries wasmtime unix digestif))
+ ; riptide (Task 6, subtask 6.5): Reactor.wrap_materialize_sink's own ~arg encoding reuses this
+ ; codebase's existing canonical Value.value <-> bytes convention (Riptide.Value.canonical_encode)
+ ; rather than inventing a second one -- see reactor.mli's own doc comment. Confirmed acyclic:
+ ; riptide has no dependency on riptide_module in either direction.
+ ; riptide_batch_commit (Task 6, subtask 6.1): Reactor.wrap_materialize_sink wraps/returns
+ ; Riptide_batch_commit.Batch_commit.materialize_sink directly. Confirmed acyclic: riptide_batch_commit
+ ; depends only on riptide/riptide_vsr/riptide_materialize, none of which depend on riptide_module.
+ (libraries wasmtime unix digestif riptide riptide_batch_commit))
