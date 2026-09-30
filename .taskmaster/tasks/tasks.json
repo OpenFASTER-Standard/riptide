@@ -1371,11 +1371,17 @@
             "id": 31,
             "title": "[7.3] Content-check the committed prefix, not just its length",
             "description": "Content-check the committed prefix, not just its length",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "truncate_wal and handle_start_view's guards additionally check that the incoming log's entries covering [1, local commit_number] match the locally held committed entries' content hashes exactly, refusing wholesale on mismatch.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "8c50e0ae25467c8c3774002dedf3b203b946aed8",
+                "be6d429fa084e3b844f4b4a6866d240f5de7c114"
+              ]
+            }
           },
           {
             "id": 32,
