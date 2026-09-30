@@ -1220,11 +1220,17 @@
             "id": 22,
             "title": "[4.4] Promote Lattice_conformance to an installable library",
             "description": "Promote Lattice_conformance to an installable library",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Move test/lattice_conformance.ml into a real library so a caller implementing their own Lattice_intf.S can actually run the law-checking property tests lattice_intf.ml's own doc already points them to.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "c38fcd15961d8286674cbe5be6a51dae975fd384"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 23,
