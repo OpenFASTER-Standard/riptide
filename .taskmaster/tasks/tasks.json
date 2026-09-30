@@ -1186,11 +1186,17 @@
             "id": 20,
             "title": "[4.2] Per-write materialization failure no longer aborts the whole batch or replay",
             "description": "Per-write materialization failure no longer aborts the whole batch or replay",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Batch_commit.propose's write loop and materialize_up_to's replay loop both catch and count a raising write instead of aborting all subsequent writes -- fixes the restart-divergence and batch-atomicity findings via one shared fix.",
             "testStrategy": "Real, running tests per docs/superpowers/specs/2026-09-29-audit-remediation-design.md's own decision -- see that document for the exact reproduction/regression test each decision requires.",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "b949d13c51e762e901b2cac2ec88599381bc7feb"
+              ],
+              "prs": []
+            }
           },
           {
             "id": 21,
