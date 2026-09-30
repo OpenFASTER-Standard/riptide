@@ -1013,7 +1013,7 @@ let test_accept_loop_caps_concurrent_connections () =
    stderr are redirected to a plain file, not a pipe drained to EOF: a pipe would risk blocking the
    child on a full buffer while this test is still busy flooding connections and has not read
    anything yet, and [Eio.traceln] (see [Eio.Debug], confirmed live by reading
-   [core/debug.ml]'s own [default_traceln]) already flushes stderr after every line, so a plain
+   [core/debug.ml]'s own [default_traceln]) already flushes stderr after every message, so a plain
    file gives byte-exact, immediately-visible output without needing a background reader. *)
 let tcp_emfile_probe_path = "./tcp_emfile_probe.exe"
 
