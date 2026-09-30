@@ -1642,6 +1642,77 @@ let test_do_view_change_driven_send_sv_refuses_a_committed_prefix_content_mismat
   Alcotest.(check int) "no StartView was ever broadcast by the refused adoption" sent_before_view_change
     (List.length (sent ()))
 
+(* ---- Task 33 review finding (Minor, fixed per this repo's own CLAUDE.md "no spec without running
+   code" rule): the disclosed residual scope of the committed-prefix content check, pinned live ----
+
+   [replica.mli]'s own doc comment on {!Replica.Committed_prefix_mismatch}, [replica.ml]'s comment at
+   [adopt_durable_log] (the [check_committed_prefix] loop's own [Present stored when not (...)]
+   match arm), and [lib/storage/storage_intf.ml]'s own [superblock_rebuild_from_wal] doc comment
+   (its "Task 33 is a NARROWING, not a closure" disclosure) all state the SAME scope: the check only
+   fires when [slot_state] reads [Present stored] locally and disagrees with the incoming value. A
+   receiving replica whose own copy of the disputed op-number is [Corrupt] (or [Absent]) has NOTHING
+   to compare against -- [check_committed_prefix]'s match arm is [Present _ | Corrupt | Absent -> ()]
+   for every case that isn't a genuine [Present]-vs-[Present] disagreement -- so it silently adopts
+   whatever the incoming log claims there, exactly as before Task 33 existed at all.
+
+   Until this test, that was accurate but pinned by manual code trace only, not by running code --
+   this test is what the review asked for.
+
+   ONLY [Corrupt] is used, not [Absent], because [Absent] cannot actually arise for [o <=
+   commit_number] in the first place: {!Replica.commit_number}'s own doc comment states
+   [commit_number t <= op_number t] holds for EVERY reachable state, and [slot_state]'s own [None]
+   branch classifies anything at or below [max t.op_number (wal_highest_op_number ())] as [Corrupt],
+   never [Absent] (see that function's own comment) -- so an op within the committed range that this
+   replica has any durable trace of at all reads back [Present] or [Corrupt], never [Absent]. This
+   is exactly the "whichever is easier to construct, you don't need both" case the review itself
+   anticipated. *)
+let test_committed_prefix_check_does_not_cover_a_locally_absent_or_corrupt_slot () =
+  let send, _sent = capturing_send () in
+  (* [Fault_injecting_storage] over [Memory_storage], not {!Replica.volatile_storage}: this test
+     needs a REAL, deterministic storage fault ([for_test_corrupt_entry]), which [volatile_storage]'s
+     plain in-memory backend has no mechanism to produce at all. [replication_quorum:2] makes
+     [faults_max = replication_quorum - 1 = 1] -- exactly enough for the one corrupted slot below,
+     matching [with_cluster_and_storage]'s own derivation at replica_count = 3 in
+     test_vsr_replica_recovery.ml. No probabilistic [?fault_config] override: only the deterministic
+     [for_test_corrupt_entry] call below ever corrupts anything here. *)
+  let backend =
+    Riptide_storage.Fault_injecting_storage.create ~prng:(Riptide_sim.Prng.create 1) ~replication_quorum:2
+      ~underlying:(module Riptide_storage.Memory_storage)
+      (Riptide_storage.Memory_storage.create ())
+  in
+  let storage = Replica.storage_of_module (module Riptide_storage.Fault_injecting_storage) backend in
+  let t = Replica.create ~my_id:2 ~replica_count:3 ~svc_limit:3 ~send ~storage () in
+  Replica.for_test_set_view_number t 1;
+  (* The exact same real-Prepare setup as
+     [test_start_view_refuses_a_committed_prefix_content_mismatch] above: op 1's REAL content ("a")
+     becomes genuinely, durably committed. *)
+  Replica.handle_message t ~sender:1 (Message.encode (Message.Prepare { view = 1; n = 1; v = v "a"; k = 0; source = 1 }));
+  Replica.handle_message t ~sender:1 (Message.encode (Message.Prepare { view = 1; n = 2; v = v "b"; k = 1; source = 1 }));
+  Alcotest.(check int) "commit_number is genuinely 1 before the corruption" 1 (Replica.commit_number t);
+  (* A REAL, deterministic storage fault on op 1's own durable copy -- one byte flipped and written
+     back through the wrapped backend (see {!Riptide_storage.Fault_injecting_storage.for_test_corrupt_entry}'s
+     own doc comment), not a hand-waved "imagine it's corrupt". *)
+  Riptide_storage.Fault_injecting_storage.for_test_corrupt_entry backend ~op_number:1;
+  Alcotest.(check bool)
+    "precondition: op 1 is no longer readable locally (Corrupt, not Present) -- this is the state \
+     the disclosed gap is about"
+    true
+    (Replica.for_test_wal_read t ~op_number:1 = None);
+  (* The SAME shape of forged StartView [test_start_view_refuses_a_committed_prefix_content_mismatch]
+     uses above -- identical source/view/length/k -- differing only in that THIS replica no longer
+     has a readable copy of op 1 to refuse with. *)
+  let sv = sv_msg ~source:1 ~v:1 ~log:[ v "forged"; v "b" ] ~n:2 ~k:1 in
+  (* THE POINT: no exception. [check_committed_prefix] walks past op 1 silently (its own [Corrupt]
+     arm is a no-op, not a raise), so the whole adoption proceeds -- exactly the disclosed, still-open
+     half of this hazard, not a broader or narrower gap than documented. *)
+  Replica.handle_message t ~sender:1 sv;
+  Alcotest.(check bool) "the forged content WAS adopted at op 1 -- the disclosed gap is real, in memory" true
+    (Replica.entries t = [ v "forged"; v "b" ]);
+  Alcotest.(check bool) "...and durably, not merely in-memory: op 1's durable copy is now the forged value" true
+    (Replica.for_test_wal_read t ~op_number:1 = Some (v "forged"));
+  Alcotest.(check int) "commit_number itself is untouched by this adoption (k = 1, same as before)" 1
+    (Replica.commit_number t)
+
 (* ---- ReceiveSV (VSR.tla:292-305) ---- *)
 
 let test_receive_sv_adopts_log_view_and_returns_to_normal () =
@@ -2243,6 +2314,10 @@ let tests =
        prefix wholesale (Committed_prefix_mismatch)",
       `Quick,
       test_do_view_change_driven_send_sv_refuses_a_committed_prefix_content_mismatch );
+    ( "Task 33 review finding (Minor): the content check does NOT cover a locally Corrupt (or \
+       Absent) slot -- the disclosed residual gap, pinned live",
+      `Quick,
+      test_committed_prefix_check_does_not_cover_a_locally_absent_or_corrupt_slot );
     (* Task 3: ReceiveSV *)
     ( "Task 3: ReceiveSV adopts log/op_number/view wholesale and returns to Normal",
       `Quick,
