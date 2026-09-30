@@ -296,7 +296,29 @@ let signals_to_mask_during_cleanup =
     Sys.sigurg;
     Sys.sigxcpu;
     Sys.sigxfsz;
+    (* Neither unblockable nor a synchronous fault, so both genuinely belong in the list above
+       under its own stated rule -- omitted from the first version of it purely by oversight,
+       which made that "every asynchronous signal OCaml names a constant for" claim false as
+       written (caught by code review, round 4). Harmless as an omission today (nothing anywhere
+       in this repo installs an OCaml handler for either, so neither can currently produce an
+       OCaml-level exception mid-[cleanup] at all), but a list whose documented invariant is
+       "exhaustive" has to actually be exhaustive -- otherwise the next reader reasonably infers
+       an exclusion was deliberate and looks for the reason. [Sys.sigcont] in particular IS
+       blockable (unlike its [Sys.sigstop] counterpart), and [Sys.sigabrt] is only "synchronous"
+       when self-raised via [abort]; both are freely deliverable from another process via
+       [kill]. *)
+    Sys.sigabrt;
+    Sys.sigcont;
   ]
+
+(* Non-zero ONLY for the duration of [For_testing.simulate_signal_in_cleanups_pre_mask_window],
+   and consumed (reset to zero) by the very first [cleanup] attempt that reads it, so exactly one
+   attempt is widened -- see that function, and [cleanup]'s own doc comment (round 4), for what
+   that reproduces and why a ONE-SHOT widening is the right shape for it (widening every attempt
+   against a repeating signal would simply never converge, which proves nothing about the retry
+   loop and everything about the injection). Zero on every production path, where the entire cost
+   is one float comparison per [cleanup] attempt. *)
+let pre_mask_window_widening_for_testing = ref 0.
 
 (* The real linear-memory page limit the brief's own Step 3 text calls for ("a linear-memory
    page limit set at instantiation"). One WASM page is 64 KiB; 1024 pages is 64 MiB -- generous
@@ -540,11 +562,61 @@ let instantiate ~tier ~module_bytes ~host =
    genuinely unexpected (non-signal) failure mid-sequence leaves a clean, fully-idempotent state
    to retry from rather than a permanently-stuck "done" flag.
 
-   All three rounds' regressions are pinned by `For_testing.simulate_child_death_mid_message`
-   (round 1), `simulate_an_exception_mid_step` (round 2), and
+   Round 4 stopped narrowing and closed the CLASS. Round 3's masked attempt has a window of its
+   own, strictly narrower than the one it closed but exactly the same shape: the instant between
+   [cleanup] entering its own [try] and [Unix.sigprocmask SIG_BLOCK] actually taking hold. A
+   signal landing THERE raised an exception that round 3's own outer catch-all swallowed -- so
+   [cleaned_up] stayed [false], NONE of kill/waitpid/close/close had run, and, unlike rounds 1-3,
+   nothing raised anywhere either: a permanent zombie plus 2 leaked fds sitting behind a
+   perfectly normal-looking [Ok]/[Error], with no escaped exception to notice it by (which is how
+   each of the first three was actually caught). Reproduced live by the code review the same way
+   round 3's was -- widening that specific window with a temporary 50ms delay, ~10x this suite's
+   own real 5ms SIGALRM interval, since unwidened it is nanoseconds wide and has no realistic
+   production signal source at all (the fuel timeout is deadline+[select]-timeout based, not
+   signal-based, and the only signal user anywhere in this codebase is the test suite's own
+   watchdog) -- then confirmed the zombie and the still-open fds directly.
+
+   The fix is deliberately NOT a fourth, narrower guard, because there is no reason to believe a
+   fourth would be the last: every step of the sequence is already idempotent by design (re-kill
+   hits ESRCH, re-wait hits ECHILD, re-close hits EBADF, all tolerated), and round 3 already made
+   [cleaned_up := true] conditional on the whole sequence actually completing -- so the sequence
+   is safe to simply RETRY, and "retry until [cleaned_up] is actually [true]" removes the notion
+   of a window to find at all. Whatever instant a signal lands in, the only thing it can do is
+   cost one wasted iteration: the loop re-enters and masks again, rather than silently giving up.
+   Real signal delivery cannot be infinitely dense (an infinitely dense signal stream is a
+   process that makes no progress at ALL, cleanup or otherwise), so an attempt eventually runs
+   start-to-finish under the mask. Two supporting details, both load-bearing:
+   - The mask is now restored from a value read by a PURE QUERY ([SIG_BLOCK] with an empty set
+     changes nothing and returns the mask in effect), taken BEFORE [Fun.protect] is installed,
+     with the actual [SIG_BLOCK] moved INSIDE it. Round 3 had this the other way round, which hid
+     a second, quieter bug in the very same window: an exception between [SIG_BLOCK] returning and
+     [Fun.protect] being installed left every asynchronous signal blocked in the process FOREVER
+     (the restore was never armed, and the swallowed-then-retried-later mask read would then
+     capture the already-blocked set as "previous"). A failed pure query, by contrast, changes no
+     state at all -- so the retry loop genuinely starts each iteration from the caller's own mask.
+   - [Out_of_memory]/[Stack_overflow] are still re-raised immediately and are never retried:
+     looping on a process that is already out of resources is the one case where retrying is
+     actively wrong, and OCaml convention is not to swallow either one regardless.
+   The loop is a tail call, so even a pathologically signal-dense run costs no stack.
+
+   All four rounds' regressions are pinned by `For_testing.simulate_child_death_mid_message`
+   (round 1), `simulate_an_exception_mid_step` (round 2),
    `simulate_repeated_signals_during_cleanup` (round 3: a real, repeatedly-firing OS signal
    throughout an entire contained call, the same live-signal rigor the review's own
-   reproduction used, without needing a permanent debug hook in production code). *)
+   reproduction used, without needing a permanent debug hook in production code), and
+   `simulate_signal_in_cleanups_pre_mask_window` (round 4: the same real signal, landing in the
+   specific pre-mask instant above, via a one-shot widening of exactly that window).
+
+   One residual, disclosed rather than papered over (this file's own norm -- see the 1ms/5ms
+   note on round 3's test): the OCaml runtime delivers a pending signal at its next polling
+   point, and a function's own entry is such a point, so an exception can still be raised at
+   [cleanup]'s entry BEFORE its own [try] is established -- no language construct can cover the
+   instant before a handler is installed. That case changes no state whatsoever ([cleaned_up] is
+   still [false], nothing has run), and every [cleanup] call site in this function is inside
+   [step]'s single guard, whose handlers call [cleanup] again -- so it costs a retry from one
+   level up, not a leak. Only two such deliveries back-to-back, in that same sub-instruction
+   window, could escape [step] itself, and that escapes LOUDLY as an exception rather than
+   silently as the leak this round closes. *)
 let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, string) result =
   let host_of_sink () =
     match !sink with
@@ -552,54 +624,66 @@ let supervise_child ~child_pid ~req_r ~resp_w ~(sink : sink ref) () : (bytes, st
     | Relay _ -> failwith "Loader: parent's own sink was unexpectedly switched to Relay"
   in
   let cleaned_up = ref false in
-  let cleanup () =
-    if not !cleaned_up then
-      (* The whole thing is wrapped in one more try/with, deliberately even OUTSIDE the masked
-         section below: masking prevents a SECOND signal from interrupting the kill/waitpid/
-         close/close sequence ITSELF, but a signal already pending when [Unix.sigprocmask]
-         restores the mask in [~finally] can still be delivered (and its handler raise) right as
-         -- or immediately after -- that restore call returns, i.e. at [cleanup]'s own exit point,
-         past the protected section but still inside [cleanup]'s own call frame. Without this
-         outer guard that exception would propagate to WHATEVER called [cleanup] -- including
-         call sites that aren't themselves inside [step]'s own try (there are none left after
-         folding the deadline check in below, but relying on that structurally rather than
-         guaranteeing it locally is exactly the kind of narrowing that made rounds 1 and 2 each
-         need a further round). Guaranteeing [cleanup] itself never raises (bar the two
-         exceptions below) makes the guarantee true by construction, not by every caller
-         happening to already be inside a try. *)
-      try
-        (* Mask every asynchronous signal for the duration of the actual work below, so a SECOND
-           signal-driven exception (another watchdog tick, or anything else with an OCaml-level
-           raising handler) can't land mid-sequence and leave it half-done -- see this
-           function's own doc comment (round 3) for the live reproduction this closes.
-           [SIG_BLOCK] returns the mask that was in effect before, which is restored via
-           [SIG_SETMASK] in [~finally] regardless of how the protected body ends, so this never
-           leaves the process with a signal mask the CALLER didn't already choose. *)
-        let previous_mask = Unix.sigprocmask Unix.SIG_BLOCK signals_to_mask_during_cleanup in
-        Fun.protect
-          ~finally:(fun () -> ignore (Unix.sigprocmask Unix.SIG_SETMASK previous_mask))
-          (fun () ->
-            (* Harmless if the child already exited on its own (success/'E'/timeout already sent
-               it a SIGKILL): killing an already-dead pid just raises ESRCH, tolerated below.
-               Sending it unconditionally here, on every path, is exactly what makes this a
-               single, uniform cleanup instead of the per-path duplication the original code had
-               (and got wrong). *)
-            (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
-            (try ignore (Unix.waitpid [] child_pid) with Unix.Unix_error _ -> ());
-            (try Unix.close req_r with Unix.Unix_error _ -> ());
-            (try Unix.close resp_w with Unix.Unix_error _ -> ());
-            (* Set only once the full sequence above has actually run to completion -- not
-               before -- so a genuinely unexpected failure partway through (masking closes off
-               the signal-driven case specifically, but this is cheap, unconditional defense in
-               depth against anything else) leaves a retry starting fresh rather than a
-               permanently-stuck "done" flag skipping whatever hadn't run yet. Every step above
-               is itself idempotent (re-killing/re-waiting/re-closing an already-handled
-               resource just hits its own tolerated error), so a full retry from scratch is
-               always safe. *)
-            cleaned_up := true)
-      with
-      | (Out_of_memory | Stack_overflow) as exn -> raise exn
-      | _ -> ()
+  let rec cleanup () =
+    if not !cleaned_up then (
+      (* ONE attempt. Every exception except the two below is swallowed here and then simply
+         retried by the tail call at the bottom of this branch -- see this function's own doc
+         comment (round 4) for why retrying, rather than adding a fourth narrower guard, is what
+         actually closes this class: the attempt below is fully idempotent, and it sets
+         [cleaned_up] only if it ran start to finish, so a signal landing in ANY instant of it
+         (including the instant before its own mask takes hold, which no guard placed inside it
+         can cover) costs one wasted iteration instead of silently abandoning a half-done
+         kill/waitpid/close/close. Swallowing here also keeps [cleanup] itself non-raising for
+         its callers, which is what lets [step] treat it as unconditionally safe on every one of
+         its exit paths. *)
+      (try
+         (* Testing-only, one-shot, zero on every production path: widens the pre-mask window
+            below so a real, repeatedly-firing signal can reliably be made to land in it. Reset
+            BEFORE the delay, not after, so it is consumed exactly once even though the delay is
+            expected to be interrupted by that very signal. *)
+         if !pre_mask_window_widening_for_testing > 0. then (
+           let delay = !pre_mask_window_widening_for_testing in
+           pre_mask_window_widening_for_testing := 0.;
+           Unix.sleepf delay);
+         (* A PURE QUERY of the mask currently in effect ([SIG_BLOCK] with an empty set blocks
+            nothing), taken before [Fun.protect] is installed precisely BECAUSE it changes no
+            state: if this is the call an async signal interrupts, the process's mask is exactly
+            as the caller left it and the retry above starts cleanly. The real [SIG_BLOCK] then
+            happens INSIDE the protected body, so the window between "signals are now blocked"
+            and "the restore is armed" does not exist at all -- round 3 had these two the other
+            way round and could leave every async signal blocked in this process permanently.
+            Everything below therefore runs with every asynchronous signal deferred (not lost),
+            and the caller's own mask is always restored, however the body ends. *)
+         let previous_mask = Unix.sigprocmask Unix.SIG_BLOCK [] in
+         Fun.protect
+           ~finally:(fun () -> ignore (Unix.sigprocmask Unix.SIG_SETMASK previous_mask))
+           (fun () ->
+             ignore (Unix.sigprocmask Unix.SIG_BLOCK signals_to_mask_during_cleanup);
+             (* Harmless if the child already exited on its own (success/'E'/timeout already sent
+                it a SIGKILL): killing an already-dead pid just raises ESRCH, tolerated below.
+                Sending it unconditionally here, on every path, is exactly what makes this a
+                single, uniform cleanup instead of the per-path duplication the original code had
+                (and got wrong). *)
+             (try Unix.kill child_pid Sys.sigkill with Unix.Unix_error _ -> ());
+             (try ignore (Unix.waitpid [] child_pid) with Unix.Unix_error _ -> ());
+             (try Unix.close req_r with Unix.Unix_error _ -> ());
+             (try Unix.close resp_w with Unix.Unix_error _ -> ());
+             (* Set only once the full sequence above has actually run to completion -- not
+                before -- which is exactly what makes the retry above sound: every step is
+                itself idempotent (re-killing/re-waiting/re-closing an already-handled resource
+                just hits its own tolerated error), so a full retry from scratch is always safe,
+                and an attempt that did NOT finish leaves nothing claiming it did. *)
+             cleaned_up := true)
+       with
+       | (Out_of_memory | Stack_overflow) as exn ->
+         (* Never retried and never swallowed: retrying anything is the wrong move for a process
+            already out of memory or stack, and OCaml convention is to let both propagate. This
+            is the ONLY way [cleanup] can raise. *)
+         raise exn
+       | _ -> ());
+      (* Idempotent by construction: on the overwhelmingly common path the attempt above already
+         set [cleaned_up], and this returns immediately without a second syscall. *)
+      cleanup ())
   in
   let deadline = Unix.gettimeofday () +. fuel_budget_seconds in
   (* One step of work: the fuel-deadline check, the [Unix.select] call, the [read_msg] that
@@ -751,8 +835,12 @@ let run_contained t func ~memory ~arg_ptr ~arg_len : (bytes, string) result =
    contained call, proving [cleanup] itself is safe against a SECOND signal landing mid-sequence
    (what the review's second live reproduction, widening the kill-to-waitpid window with a
    temporary sleep, looked like -- reproduced here without needing that same kind of permanent
-   debug hook in production code). Not part of the guest-execution API -- Task 4/6 should never
-   call any of these. *)
+   debug hook in production code); and [simulate_signal_in_cleanups_pre_mask_window] (round 4's
+   fix) -- the same real signal, aimed at the one instant round 3's masking could not itself
+   cover (after [cleanup] has entered its guard, before its [sigprocmask] has taken hold), via a
+   one-shot widening of exactly that window, proving the retry loop recovers from it instead of
+   silently abandoning a half-done cleanup. Not part of the guest-execution API -- Task 4/6 should
+   never call any of these. *)
 module For_testing = struct
   let simulate_child_death_mid_message () =
     let req_r, req_w = Unix.pipe ~cloexec:false () in
@@ -870,6 +958,54 @@ module For_testing = struct
       in
       Fun.protect
         ~finally:(fun () ->
+          ignore (Unix.setitimer Unix.ITIMER_REAL previous_itimer);
+          Sys.set_signal Sys.sigalrm previous_handler)
+        (fun () ->
+          let result = supervise_child ~child_pid ~req_r ~resp_w ~sink () in
+          result, child_pid, req_r, resp_w)
+
+  let simulate_signal_in_cleanups_pre_mask_window () =
+    let req_r, req_w = Unix.pipe ~cloexec:false () in
+    let resp_r, resp_w = Unix.pipe ~cloexec:false () in
+    match Unix.fork () with
+    | 0 ->
+      (* Same shape as [simulate_child_death_mid_message]'s child: closes its write end without
+         ever sending a complete message, which drives the parent straight into [step]'s
+         exception path and from there into [cleanup] -- the function under test here. *)
+      Unix.close req_r;
+      Unix.close resp_w;
+      Unix.close resp_r;
+      Unix.close req_w;
+      Unix._exit 0
+    | child_pid ->
+      Unix.close req_w;
+      Unix.close resp_r;
+      let sink =
+        ref
+          (Direct
+             { read_materialized = (fun ~merge_key:_ -> None); propose_write = (fun _ -> Ok ()); log = ignore })
+      in
+      (* Real [SIGALRM] again, for the same reason round 3's test uses it (a faithful live
+         reproduction of the review's own finding, with this same binary's own watchdog signal,
+         rather than a synthetic stand-in), at the same 5ms interval (see the long note on that
+         choice above -- 1ms reliably tripped a separate, unrelated ctypes-finalizer crash). *)
+      let previous_handler =
+        Sys.signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise Injected_signal_for_testing))
+      in
+      let previous_itimer =
+        Unix.setitimer Unix.ITIMER_REAL { Unix.it_interval = 0.005; it_value = 0.005 }
+      in
+      (* The whole point of this test: 50ms of widening (10x the signal interval above, so the
+         very first [cleanup] attempt is certain to be interrupted, not merely likely) injected
+         into the ONE instant round 3's masking could not cover -- after [cleanup] has entered its
+         own guard, before its [sigprocmask] has taken hold. One-shot, so the retry that follows
+         runs unwidened and is expected to complete normally; with the retry loop removed, this
+         same injection instead leaves a zombie child and two leaked fds behind a normal-looking
+         result, which is exactly the failure round 4 closes (verified by reverting the loop). *)
+      pre_mask_window_widening_for_testing := 0.05;
+      Fun.protect
+        ~finally:(fun () ->
+          pre_mask_window_widening_for_testing := 0.;
           ignore (Unix.setitimer Unix.ITIMER_REAL previous_itimer);
           Sys.set_signal Sys.sigalrm previous_handler)
         (fun () ->

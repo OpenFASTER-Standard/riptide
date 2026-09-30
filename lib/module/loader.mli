@@ -101,12 +101,18 @@ val invoke : t -> entrypoint:string -> arg:bytes -> (bytes, string) result
     [Unix.sigprocmask] around the actual kill/waitpid/close/close sequence, with [cleanup]
     guaranteed by construction to never propagate anything out of it besides [Out_of_memory]/
     [Stack_overflow], which are deliberately let through rather than silently converted, per
-    OCaml convention). This took three real fix rounds to actually hold for every path, not
-    one or two — each prior round's own regression test passed while a further gap the review
-    kept finding stood; see [loader.ml]'s [supervise_child], [step], and [cleanup] for the full
-    history, all three confirmed via a live, real-signal reproduction (a real, permanently-armed
-    SIGALRM in this same test suite, not a synthetic stand-in) at each round. No exit path leaks
-    a zombie process or a file descriptor.
+    OCaml convention); AND a signal landing in the one instant that masking cannot itself cover,
+    before the mask takes hold, which the cleanup sequence survives by being retried until it has
+    genuinely run start-to-finish rather than by yet another, narrower guard (its every step —
+    kill, waitpid, close, close — is idempotent by design, so retrying is always safe, and it
+    claims completion only after actually completing). This took four real fix rounds to actually
+    hold for every path, not one or two — each prior round's own regression test passed while a
+    further gap the review kept finding stood; see [loader.ml]'s [supervise_child], [step], and
+    [cleanup] for the full history, all four confirmed via a live, real-signal reproduction (a
+    real, permanently-armed SIGALRM in this same test suite, not a synthetic stand-in) at each
+    round, and the fourth's own residual (the sub-instruction instant at [cleanup]'s own entry,
+    before any guard of its own can exist) disclosed in full there rather than glossed. No exit
+    path leaks a zombie process or a file descriptor.
 
     **Known, disclosed, deliberately-not-engineered-around interaction**: this test suite's own
     external per-test watchdog (`test_riptide.ml`'s [Suite_timeout], a SIGALRM-driven safety net
@@ -156,6 +162,21 @@ module For_testing : sig
       entire contained call, then restores the exact previous handler/itimer state regardless of
       outcome so it doesn't disturb that watchdog for whatever test runs next. Not part of the
       guest-execution API — Task 4/6 must never call this. Same return shape and same two
+      independent checks ([Unix.kill pid 0] / [Unix.close]) as {!simulate_child_death_mid_message}
+      above. *)
+
+  val simulate_signal_in_cleanups_pre_mask_window :
+    unit -> (bytes, string) result * int * Unix.file_descr * Unix.file_descr
+  (** Exists only for this task's own regression test proving the same guarantee holds against
+      the one instant masking the cleanup sequence could not itself cover (round 4): a real
+      asynchronous signal landing after [cleanup] has entered its own guard but before its
+      [Unix.sigprocmask] has taken hold, which previously left kill/waitpid/close/close entirely
+      un-run behind a normal-looking result with no exception raised anywhere — the only one of
+      this loader's four reentrancy rounds that was silent rather than loud. Arms the same real,
+      repeatedly-firing [SIGALRM] as {!simulate_repeated_signals_during_cleanup} and additionally
+      widens that specific window once, so the signal is certain to land in it; restores the exact
+      previous handler/itimer state (and clears the widening) regardless of outcome. Not part of
+      the guest-execution API — Task 4/6 must never call this. Same return shape and same two
       independent checks ([Unix.kill pid 0] / [Unix.close]) as {!simulate_child_death_mid_message}
       above. *)
 end

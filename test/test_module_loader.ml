@@ -226,6 +226,29 @@ let test_cleanup_reaps_and_closes_fds_even_under_repeated_signals_mid_cleanup ()
          "a real, rapidly repeated SIGALRM firing throughout an entire contained call, including \
           during cleanup's own kill/waitpid/close/close sequence"
 
+let test_cleanup_reaps_and_closes_fds_even_when_a_signal_lands_in_its_pre_mask_window () =
+  (* [SIG_BLOCK] with an empty set is a pure query of the mask currently in effect. Sampling it
+     either side of the call guards the second, quieter half of this same window: cleanup blocks
+     every asynchronous signal for the duration of its own sequence, and an interruption between
+     "blocked" and "the restore is armed" would leave them blocked in this process permanently --
+     which no later test would attribute to this one. This is a guard, not a live reproduction:
+     that specific window is a single instruction wide by construction now (the block happens
+     inside the [Fun.protect] that restores it), so it cannot be widened the way the pre-mask
+     window below can. *)
+  let mask_before_the_call = List.sort compare (Unix.sigprocmask Unix.SIG_BLOCK []) in
+  let outcome = Loader.For_testing.simulate_signal_in_cleanups_pre_mask_window () in
+  let mask_after_the_call = List.sort compare (Unix.sigprocmask Unix.SIG_BLOCK []) in
+  Alcotest.(check (list int))
+    "cleanup restored the caller's own signal mask exactly, despite being interrupted mid-attempt"
+    mask_before_the_call mask_after_the_call;
+  outcome
+  |> assert_contained_failure_with_no_leaks
+       ~scenario:
+         "a real SIGALRM landing in the one instant cleanup's own signal masking cannot cover -- \
+          after cleanup has entered its guard, before its sigprocmask has taken hold -- which \
+          without the retry loop leaves the whole kill/waitpid/close/close sequence un-run \
+          behind a normal-looking result, with no exception raised anywhere to notice it by"
+
 let test_microvm_tier_raises_a_clear_not_implemented_error () =
   Alcotest.check_raises "microvm tier is designed, not built"
     (Failure "Loader.instantiate: Microvm tier is not yet implemented (Task 8's own job)") (fun () ->
@@ -277,6 +300,10 @@ let tests =
     ( "cleanup reaps the child and closes both pipe fds even under repeated signals mid-cleanup",
       `Quick,
       test_cleanup_reaps_and_closes_fds_even_under_repeated_signals_mid_cleanup );
+    ( "cleanup reaps the child and closes both pipe fds even when a signal lands in its pre-mask \
+       window",
+      `Quick,
+      test_cleanup_reaps_and_closes_fds_even_when_a_signal_lands_in_its_pre_mask_window );
     ( "Loader.instantiate raises a clear not-implemented error for the Microvm tier",
       `Quick,
       test_microvm_tier_raises_a_clear_not_implemented_error );
