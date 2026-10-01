@@ -101,16 +101,25 @@ let sign_with_fresh_keypair ~dir artifact =
     ~cwd:dir;
   Filename.concat dir "cosign.pub"
 
+(* Returns the temp dir alongside the verified artifact (not just the artifact) so a caller can
+   clean it up once it's no longer needed -- see Reactor.subscribe's own doc comment: module_'s
+   bytes are read ONCE, at subscribe time, never re-read from disk on any later dispatch, so this
+   directory's lifetime only needs to span "until subscribe returns", not the whole test. Fixed
+   here (Minor finding, fix round 1): this directory was previously never removed at all --
+   confirmed live, 6 leftover /tmp/ledger_e2e_test* dirs after 2 full suite runs. *)
 let verified_module fixture_relpath tier =
   let dir = make_temp_dir "ledger_e2e_test" in
   let artifact = Filename.concat dir (Filename.basename fixture_relpath) in
   write_file artifact (read_file fixture_relpath);
   let key = sign_with_fresh_keypair ~dir artifact in
-  match
-    Admission.verify ~cosign_path ~key ~digest:(sha256_hex artifact) ~tier ~artifact_path:artifact
-  with
-  | Ok verified -> verified
-  | Error e -> Alcotest.failf "test setup: Admission.verify failed: %s" e
+  let verified =
+    match
+      Admission.verify ~cosign_path ~key ~digest:(sha256_hex artifact) ~tier ~artifact_path:artifact
+    with
+    | Ok verified -> verified
+    | Error e -> Alcotest.failf "test setup: Admission.verify failed: %s" e
+  in
+  (verified, dir)
 
 let verified_ledger () = verified_module "fixtures/ledger.wat" Loader.Sfi
 
@@ -288,9 +297,20 @@ let with_ledger_env (f : env_handles -> unit) =
             Batch_commit.propose handle ~idempotency_key ~materialize:wrapped_sink legs;
             Ok ())
       in
-      Reactor.subscribe reactor ~merge_key:Schema.requests_merge_key ~module_:(verified_ledger ())
-        ~protocol:allow_handle_from_init ~read:read_for_module ~propose:propose_for_module;
-      f { handle; replica; materializer; wrapped_sink })
+      let verified_artifact, verification_dir = verified_ledger () in
+      (* Same Fun.protect ~finally idiom as with_tmp_dir above, applied to the admission-
+         verification temp directory: runs the subscribe call and the whole test body under it, so
+         cleanup happens whether the body returns normally or raises (e.g. a failed Alcotest
+         assertion). module_'s bytes are already resident in memory by the time subscribe returns
+         (see verified_module's own comment above), so removing the directory here never races
+         anything this test still needs. *)
+      Fun.protect
+        ~finally:(fun () ->
+          ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote verification_dir))))
+        (fun () ->
+          Reactor.subscribe reactor ~merge_key:Schema.requests_merge_key ~module_:verified_artifact
+            ~protocol:allow_handle_from_init ~read:read_for_module ~propose:propose_for_module;
+          f { handle; replica; materializer; wrapped_sink }))
 
 (* This task's own documented test-setup convention (per task-3-brief.md step 6 and the design
    spec's own non-goals: no "mint"/account-opening flow exists in this focused-core scope) --
