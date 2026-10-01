@@ -5,12 +5,37 @@
    established this session for a different invariant) plus fuzzing, proving no write can bypass the
    checkpoint under any code path." Neither half had been built. The audit half is
    `scripts/check-authorization-checkpoint`, which proves the STRUCTURAL claim (exactly one
-   Replica.propose caller in lib/, inside Batch_commit.propose, behind an ~authorize evaluation over
-   every write in the batch). This file is the BEHAVIOURAL half: for randomly generated sequences of
-   propose calls -- random batch sizes, random Allow/Deny mixes within a batch, random merge_key
-   presence, random ~materialize presence, random retries of an already-used idempotency key -- no
-   write a policy denied ever appears in the replicated log, and none ever reaches a materialize
-   sink either.
+   Replica.propose caller in lib/, inside Batch_commit.propose, behind an evaluation of BOTH
+   authorization hooks over the batch). This file is the BEHAVIOURAL half: for randomly generated
+   sequences of propose calls -- random batch sizes, random Allow/Deny mixes within a batch, random
+   merge_key presence, random ~materialize presence, random retries of an already-used idempotency
+   key -- no write any policy refused ever appears in the replicated log, and none ever reaches a
+   materialize sink either.
+
+   {b Both hooks, not just ~authorize} (final whole-branch review, IMP-3). The checkpoint comprises
+   two hooks, and batch_commit.mli names THIS file as the behavioural proof that "no write can bypass
+   this checkpoint" -- but through the layer2-boundary-revision branch this file had zero
+   authorize_batch coverage: the structural half (scripts/check-authorization-checkpoint) was extended
+   for the new hook and the behavioural half was only mechanically updated for a signature change. It
+   now generates a genuine batch-level axis, independent of the per-write one, and checks the
+   emergent behaviours that only exist because there are two hooks:
+
+   - a batch whose every write the per-write hook ALLOWS is still refused in full when the batch-level
+     hook denies it, and not one of its writes reaches the log or the sink;
+   - the two hooks compose as a disjunction (either denying refuses the whole batch), mirroring
+     batch_commit.ml's own [||];
+   - authorization_denials still increments exactly ONCE per refused batch -- not once per denying
+     hook, and not once per denied write -- including for a batch only the batch-level hook refused,
+     and including for one both hooks refuse at the same time;
+   - the batch-level hook inherits the per-write hook's own exemptions by construction, because it is
+     evaluated under the same guard: it is never consulted for the empty-writes drain idiom, nor for a
+     retry of a key already in the log. The generator produces both shapes, so a regression that moved
+     authorize_batch outside that guard would show up as a denial count the model did not predict.
+
+   The batch-level policy used here is a real cross-write property no single write can self-certify --
+   "at most one write in this batch may be marked X" -- deliberately the same SHAPE as the first real
+   one in this codebase (Riptide_ledger.Authorize.authorize_batch's "a batch carrying transfer legs
+   must carry exactly two"), without importing the ledger's own semantics into a Layer 0 test.
 
    Why fuzzing adds something the audit doesn't: the audit proves the checkpoint is on the only path
    to the log, but says nothing about the checkpoint's own semantics under composition. The real
@@ -43,7 +68,13 @@ let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
 
 (* ── The generated program ─────────────────────────────────────────────────────────────────────── *)
 
-type generated_write = { allowed : bool; merge_key : string option }
+type generated_write = {
+  allowed : bool;
+  (* Orthogonal to [allowed], on purpose: a write can be batch-significant AND individually denied,
+     which is how the "both hooks refuse the same batch, counted once" case gets generated. *)
+  batch_significant : bool;
+  merge_key : string option;
+}
 
 type generated_step = {
   writes : generated_write list;
@@ -57,10 +88,15 @@ type generated_step = {
 let write_gen =
   let open QCheck2.Gen in
   let* allowed = oneof_weighted [ (2, return true); (1, return false) ] in
+  (* The batch-level axis (IMP-3). 1-in-3, which gives a 4-write batch roughly a 40% chance of
+     carrying the two X writes the batch policy refuses on -- dense enough to exercise the batch hook
+     hard, sparse enough that plenty of batches still commit and keep the non-vacuity check below
+     meaningful. *)
+  let* batch_significant = oneof_weighted [ (2, return false); (1, return true) ] in
   (* Two keys only, shared across the whole program, so generated writes genuinely collide on a
      merge_key rather than each getting a private one. *)
   let* merge_key = oneof_weighted [ (1, return None); (1, oneof_list [ Some "mk1"; Some "mk2" ]) ] in
-  return { allowed; merge_key }
+  return { allowed; batch_significant; merge_key }
 
 let step_gen =
   let open QCheck2.Gen in
@@ -82,6 +118,7 @@ let print_program program =
               (List.map
                  (fun w ->
                    (if w.allowed then "A" else "D")
+                   ^ (if w.batch_significant then "X" else "")
                    ^ match w.merge_key with None -> "" | Some k -> "@" ^ k)
                  step.writes))
            (if step.reuse_earlier_key then " reuse-key" else "")
@@ -90,30 +127,70 @@ let print_program program =
 
 (* ── Running one generated program against real machinery ──────────────────────────────────────── *)
 
-(* The policy under test, derived from the write's own payload so it is a genuine per-write decision
-   (not a per-batch or per-call one): every generated write's payload is a unique marker string
-   whose first character is 'A' (allow) or 'D' (deny). That also makes the property's own check
-   direct -- a marker found in the committed log names the exact step and write it came from. *)
+(* Every generated write's payload is a unique marker string whose first two characters carry the two
+   policies' inputs: char 0 is 'A' (allow) or 'D' (deny) for the PER-WRITE hook, char 1 is 'X' or '-'
+   for the BATCH-LEVEL hook. Encoding both in the payload is what keeps each policy a genuine function
+   of what it is handed rather than of call order or of state the test holds on the side, and it makes
+   the property's own checks direct -- a marker found in the committed log names the exact step and
+   write it came from. *)
+let marker ~step_index ~write_index ~allowed ~batch_significant =
+  Printf.sprintf "%c%c:step%d-write%d"
+    (if allowed then 'A' else 'D')
+    (if batch_significant then 'X' else '-')
+    step_index write_index
+
+let is_denied_marker s = String.length s > 0 && s.[0] = 'D'
+let is_batch_significant_marker s = String.length s > 1 && s.[1] = 'X'
+
+(* The per-write hook: a genuine per-write decision (not a per-batch or per-call one) -- it sees one
+   write and nothing else. *)
 let authorize (w : Batch_commit.write) =
   match w.payload with
-  | Value.Scalar (Value.String s) when String.length s > 0 && s.[0] = 'D' ->
+  | Value.Scalar (Value.String s) when is_denied_marker s ->
     Batch_commit.Deny "fuzz policy denies every write marked D"
   | _ -> Batch_commit.Allow
 
-let marker ~step_index ~write_index ~allowed =
-  Printf.sprintf "%c:step%d-write%d" (if allowed then 'A' else 'D') step_index write_index
+(* The batch-level hook (IMP-3): a genuine CROSS-write decision -- "at most one write in this batch
+   may be marked X" -- which is structurally impossible for [authorize] above to reach, since no single
+   write can tell whether a sibling is also marked X. Deliberately the same shape as the first real
+   batch policy in this codebase (the ledger's "a batch carrying transfer legs must carry exactly
+   two"). *)
+let authorize_batch (writes : Batch_commit.write list) =
+  let x_count =
+    List.length
+      (List.filter
+         (fun (w : Batch_commit.write) ->
+           match w.payload with
+           | Value.Scalar (Value.String s) -> is_batch_significant_marker s
+           | _ -> false)
+         writes)
+  in
+  if x_count > 1 then
+    Batch_commit.Deny "fuzz batch policy denies a batch carrying more than one write marked X"
+  else Batch_commit.Allow
 
-let is_denied_marker s = String.length s > 0 && s.[0] = 'D'
+(* The model's own copy of the two hooks' verdicts for one generated step, combined exactly the way
+   batch_commit.ml combines them: a disjunction, either one refusing the WHOLE batch. *)
+let model_write_denied (writes : generated_write list) =
+  List.exists (fun (gw : generated_write) -> not gw.allowed) writes
+
+let model_batch_denied (writes : generated_write list) =
+  List.length (List.filter (fun (gw : generated_write) -> gw.batch_significant) writes) > 1
+
+let model_denied writes = model_write_denied writes || model_batch_denied writes
 
 (* Runs the whole program against ONE shared replica and ONE handle, and returns what actually
-   happened plus the markers a correct implementation MUST have committed. That second list is what
-   keeps this property from being satisfiable by an implementation that simply never commits
-   anything: the model below mirrors batch_commit.ml's real rules exactly -- a batch is proposed only
-   when it has writes, its key is not already in the log, and no write in it was denied; a denied
-   batch never claims its key, so a later step may still use it. *)
+   happened, plus the markers a correct implementation MUST have committed, plus the markers it must
+   NOT have. The must-have list is what keeps this property from being satisfiable by an
+   implementation that simply never commits anything; the must-NOT-have list is what makes
+   whole-batch refusal by the BATCH-level hook checkable at all, since such a batch can consist
+   entirely of writes the per-write hook allowed and so has no 'D' marker to look for (IMP-3). The
+   model mirrors batch_commit.ml's real rules exactly -- a batch is proposed only when it has writes,
+   its key is not already in the log, and NEITHER hook denied it; a denied batch never claims its
+   key, so a later step may still use it. *)
 let run_program program =
   let replica = create_solo () in
-  let handle = Batch_commit.create ~replica ~authorize () in
+  let handle = Batch_commit.create ~replica ~authorize ~authorize_batch () in
   let materialized = ref [] in
   let sink : Batch_commit.materialize_sink =
     { write =
@@ -124,6 +201,7 @@ let run_program program =
   let keys_used = ref [] in
   let keys_in_log = Hashtbl.create 8 in
   let must_be_committed = ref [] in
+  let must_not_be_committed = ref [] in
   List.iteri
     (fun step_index step ->
       let key =
@@ -132,10 +210,16 @@ let run_program program =
         | _ -> Printf.sprintf "fuzz-key-%d" step_index
       in
       if not (List.mem key !keys_used) then keys_used := key :: !keys_used;
-      let writes =
+      let markers_of_step () =
         List.mapi
           (fun write_index (gw : generated_write) ->
-            let m = marker ~step_index ~write_index ~allowed:gw.allowed in
+            marker ~step_index ~write_index ~allowed:gw.allowed
+              ~batch_significant:gw.batch_significant)
+          step.writes
+      in
+      let writes =
+        List.map2
+          (fun m (gw : generated_write) ->
             {
               Batch_commit.actor = "fuzz";
               causation = fake_event_id m;
@@ -143,7 +227,7 @@ let run_program program =
               payload = Value.Scalar (Value.String m);
               merge_key = gw.merge_key;
             })
-          step.writes
+          (markers_of_step ()) step.writes
       in
       (* propose raises invalid_arg for the one shape that could have no effect at all (no writes AND
          no sink) -- that guard is its own tested behavior, not this property's subject, so the
@@ -151,17 +235,14 @@ let run_program program =
       let materialize = if step.with_materialize || writes = [] then Some sink else None in
       Batch_commit.propose handle ~idempotency_key:key ?materialize writes;
       if writes <> [] && not (Hashtbl.mem keys_in_log key) then
-        if List.for_all (fun (gw : generated_write) -> gw.allowed) step.writes then begin
+        if model_denied step.writes then
+          must_not_be_committed := markers_of_step () @ !must_not_be_committed
+        else begin
           Hashtbl.add keys_in_log key ();
-          must_be_committed :=
-            List.mapi
-              (fun write_index (gw : generated_write) ->
-                marker ~step_index ~write_index ~allowed:gw.allowed)
-              step.writes
-            @ !must_be_committed
+          must_be_committed := markers_of_step () @ !must_be_committed
         end)
     program;
-  (replica, !materialized, !must_be_committed)
+  (replica, !materialized, !must_be_committed, !must_not_be_committed)
 
 let committed_markers replica =
   List.filter_map
@@ -176,10 +257,10 @@ let committed_markers replica =
 let no_denied_write_ever_reaches_the_log =
   QCheck2.Test.make
     ~name:
-      "no write a policy denied ever reaches committed_envelopes or a materialize sink, under any \
-       generated sequence of propose calls"
+      "no write either authorization hook refused ever reaches committed_envelopes or a materialize \
+       sink, under any generated sequence of propose calls"
     ~count:200 ~print:print_program program_gen (fun program ->
-      let replica, materialized, must_be_committed = run_program program in
+      let replica, materialized, must_be_committed, must_not_be_committed = run_program program in
       let committed = committed_markers replica in
       (match List.filter is_denied_marker committed with
       | [] -> ()
@@ -200,9 +281,30 @@ let no_denied_write_ever_reaches_the_log =
       | leaked ->
         QCheck2.Test.fail_reportf "a DENIED write reached a materialize sink: %s@.program: %s"
           (String.concat ", " leaked) (print_program program));
+      (* The whole-batch half, and the only one that can catch a BATCH-level refusal that leaked
+         (IMP-3): a batch the batch hook refused can consist entirely of writes the per-write hook
+         allowed, so it carries no 'D' marker for the two checks above to find. Every write of every
+         refused batch -- refused by either hook -- must be absent from both the log and the sink. *)
+      let committed_from_refused = List.filter (fun m -> List.mem m committed) must_not_be_committed in
+      (match committed_from_refused with
+      | [] -> ()
+      | leaked ->
+        QCheck2.Test.fail_reportf
+          "a write from a REFUSED batch reached the replicated log: %s@.program: %s@.committed: %s"
+          (String.concat ", " leaked) (print_program program) (String.concat ", " committed));
+      let materialized_markers =
+        List.filter_map
+          (fun v -> match v with Value.Scalar (Value.String s) -> Some s | _ -> None)
+          materialized
+      in
+      (match List.filter (fun m -> List.mem m materialized_markers) must_not_be_committed with
+      | [] -> ()
+      | leaked ->
+        QCheck2.Test.fail_reportf "a write from a REFUSED batch reached a materialize sink: %s@.program: %s"
+          (String.concat ", " leaked) (print_program program));
       (* The non-vacuity half, in the same property rather than a separate test: every batch that
          SHOULD have committed did. Without this, an implementation that denied everything (or
-         proposed nothing at all) would pass the two checks above. *)
+         proposed nothing at all) would pass the checks above. *)
       (match List.filter (fun m -> not (List.mem m committed)) must_be_committed with
       | [] -> ()
       | missing ->
@@ -216,13 +318,19 @@ let no_denied_write_ever_reaches_the_log =
    would have refused -- proving denials are neither silently dropped nor double-counted (e.g. once
    per denied WRITE rather than once per denied BATCH, which is what the counter's own doc comment
    promises). Shares run_program's own model, run against a fresh delta each time, since
-   authorization_denials is a process-lifetime monotonic counter. *)
+   authorization_denials is a process-lifetime monotonic counter.
+
+   Extended by IMP-3 to cover the batch-level hook, which adds two counting cases the per-write hook
+   alone could not produce: a batch ONLY the batch hook refuses must still count exactly 1, and a
+   batch BOTH hooks refuse must also count exactly 1 -- once per refused batch, never once per denying
+   hook. The generator produces both routinely, since [allowed] and [batch_significant] are
+   independent. *)
 let denials_are_counted_once_per_refused_batch =
   QCheck2.Test.make
     ~name:"authorization_denials increments exactly once per whole batch the checkpoint refused"
     ~count:100 ~print:print_program program_gen (fun program ->
       let denials_before = Batch_commit.authorization_denials () in
-      let _replica, _materialized, _must_be_committed = run_program program in
+      let _replica, _materialized, _must_be_committed, _must_not_be_committed = run_program program in
       let observed = Batch_commit.authorization_denials () - denials_before in
       (* Re-derive the expected count with the same rules the implementation uses: a batch is
          evaluated (and so can be denied) only when it has writes and its key is not already in the
@@ -239,9 +347,7 @@ let denials_are_counted_once_per_refused_batch =
           in
           if not (List.mem key !keys_used) then keys_used := key :: !keys_used;
           if step.writes <> [] && not (Hashtbl.mem keys_in_log key) then
-            if List.for_all (fun (gw : generated_write) -> gw.allowed) step.writes then
-              Hashtbl.add keys_in_log key ()
-            else incr expected)
+            if model_denied step.writes then incr expected else Hashtbl.add keys_in_log key ())
         program;
       if observed <> !expected then
         QCheck2.Test.fail_reportf
