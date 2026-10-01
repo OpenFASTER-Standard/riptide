@@ -718,10 +718,44 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
                been called). This is "between a request materializing and its corresponding
                propose_write landing", chosen deliberately rather than merely "sometime": the gap
                between propose_write being CALLED (legs appended, uncommitted) and its effect
-               actually LANDING (legs committed and folded into balances). A backup, never the
-               primary, is crashed -- crashing the primary would introduce a view change, which is
-               real but genuinely out of this task's scope (see this task's own brief). *)
-            let backup_idx = 1 in
+               actually LANDING (legs committed and folded into balances).
+
+               A replica that is NOT the current primary is crashed -- crashing the primary would
+               introduce a view change, which is real but genuinely out of this task's scope (see
+               this task's own brief) -- but WHICH index that is cannot be hard-coded. By request
+               20, this run's own continuous network-fault injection has already driven the
+               cluster through several real view changes on its own (confirmed live: view 5, not
+               view 1, by this point), so "index 1" is no longer reliably a backup -- a fixed
+               index is exactly the kind of claim that looks safe by construction and silently
+               stops being true once the scenario it describes evolves. [find_live_non_primary]
+               queries [Replica.is_primary] across the actually-live replicas AT THIS MOMENT and
+               picks one that genuinely is not currently primary; the assertion right after it is
+               what makes "never the primary" a verified fact about this specific run rather than
+               an assumption baked into a constant. *)
+            let find_live_non_primary () =
+              let found = ref None in
+              Array.iteri
+                (fun i r ->
+                  if !found = None && (not env.is_down.(i)) && not (Replica.is_primary r) then
+                    found := Some i)
+                env.replicas;
+              !found
+            in
+            let backup_idx =
+              match find_live_non_primary () with
+              | Some i -> i
+              | None ->
+                Alcotest.fail
+                  "test setup: every live replica is currently primary (of its own view) -- no \
+                   genuine non-primary replica is available to crash at this point"
+            in
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "replica %d (chosen to crash) is genuinely NOT the current primary at the moment \
+                  of the crash"
+                 backup_idx)
+              false
+              (Replica.is_primary env.replicas.(backup_idx));
             (* The operator's own out-of-band knowledge for the repair below -- this backup's OWN
                real prior durable view/commit state, read off it BEFORE crashing it (never from a
                live peer; see Riptide_dst.Cluster.superblock_repair's own doc comment for why that
@@ -804,8 +838,9 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
 
       (* Catch up every LIVE replica -- not just whichever one [best_live_replica] already
          favors -- to the same committed LEDGER-MODULE state, before the cross-replica agreement
-         check below reads them directly. The repaired backup (index 1) rejoins via normal,
-         strictly sequential replication in this VSR subset (no bulk state-transfer --
+         check below reads them directly. The repaired replica (whichever index
+         [find_live_non_primary] picked above) rejoins via normal, strictly sequential
+         replication in this VSR subset (no bulk state-transfer --
          replica.mli's own disclosed scope boundary, cited in [with_ledger_dst_env]'s own top
          comment), so it can keep lagging the rest of the cluster for a while even after the
          cluster AS A WHOLE has stopped needing anything further from it (every balance and every
@@ -928,8 +963,9 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
         requests;
 
       (* ── Optional (d): cross-replica agreement, across all three replicas -- the crashed-and-
-         repaired backup (index 1) included, since the repair above (not merely the crash) is
-         this test's own deliberate choice (see its own doc comment). Proves VSR replication
+         repaired replica (whichever index was genuinely non-primary at crash time) included,
+         since the repair above (not merely the crash) is this test's own deliberate choice (see
+         its own doc comment). Proves VSR replication
          itself -- not just this test's own single-replica bookkeeping -- preserved every
          invariant-bearing entry cluster-wide, including on the replica that was actually
          crashed. *)
@@ -974,6 +1010,7 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
 let tests =
   [
     ( "a realistic request mix commits correctly through real VSR replication, injected network \
-       faults, and a backup crash timed between a request materializing and its legs landing",
+       faults, and a verified-non-primary replica crash timed between a request materializing \
+       and its legs landing",
       `Slow, test_the_ledger_invariant_holds_under_injected_failures );
   ]
