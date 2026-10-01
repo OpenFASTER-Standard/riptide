@@ -172,13 +172,6 @@ type env_handles = {
   replica : Replica.t;
   materializer : M.t;
   wrapped_sink : Batch_commit.materialize_sink;
-  watermark_store : File_kv_store.t;
-      (* The DURABLE per-(idempotency_key, position) materialization watermark this deployment hands
-         to Batch_commit (at [create] time, so every [propose] call through [handle] consults it) and
-         to every [materialize_up_to] catch-up walk below. It is the entire reason this file no longer
-         pins a balance-doubling restart bug: the ledger's own accumulator keeps no already-applied
-         table of its own any more, so this store IS the dedup. Held in the env because
-         [materialize_up_to] takes it per call rather than from the handle. *)
   accumulator : Accumulator.t;
       (* The accumulator this env STARTED with. Still the live one unless [restart] below has been
          called. Note what an [Accumulator.t] is now: two observability counters and nothing else --
@@ -360,7 +353,6 @@ let with_ledger_env (f : env_handles -> unit) =
               replica;
               materializer;
               wrapped_sink;
-              watermark_store;
               accumulator;
               committed;
               dispatch;

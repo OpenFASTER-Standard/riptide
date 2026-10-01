@@ -241,7 +241,8 @@ let propose_batch replicas is_down ~idempotency_key ?materialize writes =
 
 (* Where this file's own stand-in materialization watermark sits relative to
    [Reactor.wrap_materialize_sink] (Task 4's own review, Critical 1 -- see [with_ledger_dst_env]'s own
-   wiring comment for the mechanism, and [test_a_view_change_discarded_legs_batch_recovers_...] for
+   wiring comment for the mechanism, and
+   [test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers] for
    the A/B that makes the difference an asserted fact rather than a claim).
 
    [Inside_reactor] is the real, production-shaped composition and the default every scenario uses.
@@ -326,7 +327,7 @@ let with_ledger_dst_env ~seed ~replica_count ~net_fault_config
      as the one recovery path for a legs batch a storm-driven view change discarded before it
      committed. [Outside_reactor] composes the identical gate the other way round purely so that
      claim is a measured A/B rather than an argument; see
-     [test_a_view_change_discarded_legs_batch_recovers_only_with_the_watermark_inside_the_reactor]. *)
+     [test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers]. *)
   let applied : (string, unit) Hashtbl.t = Hashtbl.create 256 in
   let deduplicate (inner : Batch_commit.materialize_sink) : Batch_commit.materialize_sink =
     {
@@ -770,6 +771,21 @@ let cluster_state env =
     (col (fun _ r -> string_of_int (List.length (Replica.entries r))))
     (Batch_commit.authorization_denials ())
 
+(* Whether the cluster vector above shows a quorum of replicas in [Normal] status in the current
+   view -- the one fact that tells apart the two wedge shapes [sweep_seeds]'s own comment
+   documents: fewer than a quorum in [Normal] is the out-of-scope VSR view-change liveness gap;
+   a full quorum in [Normal] (seeds 22/24's own shape) is instead the ledger-level liveness
+   signature this fix round's regression test exists to catch. Down replicas never count as
+   [Normal] here, matching [cluster_state]'s own "down" rendering for them. *)
+let quorum_in_normal env =
+  let n = Array.length env.replicas in
+  let normal_count = ref 0 in
+  Array.iteri
+    (fun i r ->
+      if (not env.is_down.(i)) && Replica.status r = Replica.Normal then incr normal_count)
+    env.replicas;
+  !normal_count >= ((n - 1) / 2) + 1
+
 (* The DURABLE decision on record for a request, read off the most advanced live replica -- exactly
    the query Accumulator itself makes, through the same function, so this observes the real
    mechanism rather than a test-local reimplementation of it. [None] means no decision has committed
@@ -805,13 +821,20 @@ let drive_legs env ~idempotency_key ~transfer_key ~expected_delta (req : Schema.
       ~converged:(fun () -> decided () && legs () >= expected_delta)
   in
   if not ok then
+    let diagnosis =
+      if quorum_in_normal env then
+        "a FULL QUORUM OF REPLICAS IN `normal' IN THE CURRENT VIEW here means this is NOT the \
+         out-of-scope VSR view-change liveness gap this file documents -- it is the \
+         ledger-level liveness signature this fix round's own regression test demonstrates"
+      else
+        "FEWER THAN A QUORUM OF REPLICAS IN `normal' IN THE CURRENT VIEW here means the \
+         out-of-scope VSR view-change liveness gap this file documents, not a ledger defect; \
+         see this file's own sweep_seeds comment"
+    in
     Alcotest.failf
       "transfer %s: its own outcome did not converge after %d rounds (decision committed: %b; have \
-       %d of this transfer's own legs committed, want %d; cluster %s -- FEWER THAN A QUORUM OF \
-       REPLICAS IN `normal' IN THE CURRENT VIEW here means the out-of-scope VSR view-change \
-       liveness gap this file documents, not a ledger defect; see this file's own sweep_seeds \
-       comment)"
-      transfer_key max_rounds (decided ()) (legs ()) expected_delta (cluster_state env)
+       %d of this transfer's own legs committed, want %d; cluster %s -- %s)"
+      transfer_key max_rounds (decided ()) (legs ()) expected_delta (cluster_state env) diagnosis
 
 let drive_seed env ~account ~amount =
   let ok =
@@ -1459,23 +1482,34 @@ let test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_
       probe_seed
   | exception e ->
     let msg = Printexc.to_string e in
-    (* Asserted on the failure's SHAPE, not merely on the fact that one happened: a convergence stall
-       is the documented symptom (a decision/legs batch that no longer has anything to re-propose
-       it), and anything else -- a decode error, an authorization denial, a crash in the harness --
-       would mean this test is passing for a reason that has nothing to do with the Critical. *)
+    (* Asserted on the failure's SHAPE, not merely on the fact that one happened: a convergence
+       stall is the documented symptom (a decision/legs batch that no longer has anything to
+       re-propose it), and anything else -- a decode error, an authorization denial, a crash in
+       the harness -- would mean this test is passing for a reason that has nothing to do with
+       the Critical. That alone is not quite enough, though: [drive_legs]'s own failure message
+       (see [quorum_in_normal]) emits "did not converge" identically whether the real cause is
+       THIS bug or the unrelated, pre-existing VSR view-change wedge [sweep_seeds]'s own comment
+       documents -- so the assertion also pins the specific vector this bug produces (seed 22's
+       own documented shape: a FULL QUORUM of replicas in [Normal] status, not fewer than one),
+       so a future change can't make this pass for the wrong reason by stalling via the VSR gap
+       instead. *)
+    let contains ~needle =
+      let rec go i =
+        i + String.length needle <= String.length msg
+        && (String.sub msg i (String.length needle) = needle || go (i + 1))
+      in
+      go 0
+    in
     Alcotest.(check bool)
       (Printf.sprintf
-         "seed %d stalls with the watermark OUTSIDE the reactor wrapper, and stalls as a CONVERGENCE \
-          failure (the documented symptom of a discarded batch nothing re-proposes), not as some \
-          unrelated error. Actual failure: %s"
+         "seed %d stalls with the watermark OUTSIDE the reactor wrapper, and stalls as a \
+          CONVERGENCE failure (the documented symptom of a discarded batch nothing re-proposes) \
+          with a FULL QUORUM of replicas in `normal' status (this bug's own documented vector, \
+          not the unrelated VSR view-change gap, which would show fewer than a quorum in \
+          `normal' instead). Actual failure: %s"
          probe_seed msg)
       true
-      (let needle = "did not converge" in
-       let rec contains i =
-         i + String.length needle <= String.length msg
-         && (String.sub msg i (String.length needle) = needle || contains (i + 1))
-       in
-       contains 0)
+      (contains ~needle:"did not converge" && contains ~needle:"FULL QUORUM OF REPLICAS IN `normal'")
 
 let tests =
   List.map

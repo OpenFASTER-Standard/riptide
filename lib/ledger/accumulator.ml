@@ -74,8 +74,9 @@ let handle_guest_decision t ~actor ~(committed : committed) ~propose (decision_b
          RECORDED request read back out of the log, never from this dispatch's own bytes -- so a
          batch a view change discarded before it committed can still recover, which is the only
          recovery path that exists for one. Idempotent: Batch_commit.propose skips a batch already
-         in the log, and its own durable watermark will not re-apply a write it has already handed
-         to the sink. For a declined one, nothing is proposed, ever: that is finding C1's fix. *)
+         in the log (propose-side), and the caller's own sink is wrapped in Batch_commit.deduplicate,
+         whose watermark will not re-apply a write it has already handed to the sink
+         (materialize-side). For a declined one, nothing is proposed, ever: that is finding C1's fix. *)
       if already_accepted then
         propose ~idempotency_key (Legs.batch_of_decision ~actor ~accepted:true recorded));
     Ok ()
