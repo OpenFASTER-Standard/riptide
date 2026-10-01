@@ -401,6 +401,88 @@ let test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization () 
       Alcotest.(check int64) "the would-be recipient never received anything" 0L
         (balance_of env 800L))
 
+(* C1 again, from the other direction: not "the idiom the reviewer happened to use is now handled"
+   but "no route to re-materialization can resurrect a declined transfer". The fix would be
+   worthless if it were shaped around one caller -- the whole point of the finding is that
+   re-materialization arrives through several unrelated, individually-documented paths, each of
+   which a caller is entitled to use without knowing a ledger is downstream. All three supported
+   ones are exercised here against the same declined request, in sequence, on one cluster:
+
+     1. the empty-writes drain idiom      (batch_commit.mli's documented "is it committed? then
+                                           materialize it" probe)
+     2. a full re-propose of the original request content, same idempotency_key (the only kind of
+                                           retry this fire-and-forget layer permits a client)
+     3. Batch_commit.materialize_up_to    (a replay walk from the start of the log, which takes a
+                                           bare Replica.t and has no Batch_commit.t -- and
+                                           therefore no ~authorize -- in scope at all)
+
+   Each one genuinely re-dispatches the guest against a balance that is now ample, so each one is a
+   real attempt at the original bug rather than a no-op dressed up as a test: prevented_flips rises
+   by one per idiom, which is asserted, so a route that silently stopped reaching the guest would
+   fail here rather than pass quietly. *)
+let test_a_declined_decision_survives_every_rematerialization_idiom () =
+  with_ledger_env (fun env ->
+      seed_account env 720L 40L;
+      seed_account env 721L 5000L;
+      let declined =
+        Schema.{ request_id = 30L; from_account = 720L; to_account = 820L; amount = 900L }
+      in
+      propose_request env ~idempotency_key:"req-30" declined;
+      Alcotest.(check int) "request 30 was declined" 0 (List.length (module_leg_envelopes env));
+      (* Lift 720 far past the declined amount, through ordinary accepted traffic. *)
+      propose_request env ~idempotency_key:"req-31"
+        Schema.{ request_id = 31L; from_account = 721L; to_account = 720L; amount = 5000L };
+      Alcotest.(check int64) "the sender is now richly funded" 5040L (balance_of env 720L);
+      let legs_after_funding = List.length (module_leg_envelopes env) in
+      (* [>= 1] rather than [= 1] because the third idiom legitimately produces more: it replays the
+         WHOLE log, so it re-dispatches every request in it, not only the declined one. That extra
+         flip is the same rule protecting an ACCEPTED decision in the other direction -- re-dispatched
+         against a balance its own transfer has since drained, request 31's guest decides DECLINE,
+         and the recorded accept stands. Worth having in the assertion rather than tuned away: the
+         rule is "the first decision is final", not "declines are sticky". What pins this down to a
+         real re-dispatch is that the delta is nonzero at all -- a route that silently stopped
+         reaching the guest would show zero and fail here. *)
+      let check_idiom name run =
+        let flips_before = Accumulator.prevented_flips env.accumulator in
+        run ();
+        Alcotest.(check bool)
+          (Printf.sprintf "%s: really did re-dispatch the guest, which really did decide \
+                           differently, and was overridden" name)
+          true
+          (Accumulator.prevented_flips env.accumulator - flips_before >= 1);
+        Alcotest.(check int)
+          (Printf.sprintf "%s: still no leg for the declined request" name)
+          legs_after_funding
+          (List.length (module_leg_envelopes env));
+        Alcotest.(check bool)
+          (Printf.sprintf "%s: the recorded decision is still DECLINED" name)
+          true
+          (Accumulator.decision env.accumulator ~request_id:30L = Some false);
+        Alcotest.(check int64)
+          (Printf.sprintf "%s: the sender's balance is untouched" name)
+          5040L (balance_of env 720L);
+        Alcotest.(check int64)
+          (Printf.sprintf "%s: the would-be recipient still has nothing" name)
+          0L (balance_of env 820L)
+      in
+      check_idiom "empty-writes drain" (fun () ->
+          Batch_commit.propose env.handle ~idempotency_key:"req-30" ~materialize:env.wrapped_sink []);
+      check_idiom "full re-propose under the same idempotency_key" (fun () ->
+          propose_request env ~idempotency_key:"req-30" declined);
+      check_idiom "materialize_up_to over the whole log" (fun () ->
+          Batch_commit.materialize_up_to env.replica ~materialize:env.wrapped_sink
+            ~through_commit_number:(Replica.commit_number env.replica));
+      (* The other direction, stated explicitly rather than left implied by the leg count: the
+         whole-log replay above re-dispatched the ACCEPTED request 31 too, against a balance its own
+         transfer had already drained, so that dispatch decided DECLINE. Its recorded accept had to
+         stand -- a transfer that legitimately happened must not be retroactively withdrawn by a
+         catch-up walk any more than a declined one may be resurrected by it. *)
+      Alcotest.(check bool) "the accepted request's decision also stood, unchanged, across the replay"
+        true
+        (Accumulator.decision env.accumulator ~request_id:31L = Some true);
+      Alcotest.(check int64) "and its recipient kept every unit it was credited" 5040L
+        (balance_of env 720L))
+
 (* ── Final whole-branch review, finding I4 (Important): the accumulator's dedup key must not
    collide across two genuinely different legs ───────────────────────────────────────────────────
    Live-reproduced by the reviewer and again here: this file's own documented seeding convention
@@ -435,6 +517,8 @@ let tests =
       `Quick, test_the_same_request_id_proposed_twice_does_not_double_apply );
     ( "a declined request cannot be accepted by a later re-materialization",
       `Quick, test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization );
+    ( "a declined decision survives every re-materialization idiom",
+      `Quick, test_a_declined_decision_survives_every_rematerialization_idiom );
     ( "a request_id of zero does not collide with the seeding convention",
       `Quick, test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention );
   ]
