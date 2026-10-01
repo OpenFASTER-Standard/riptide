@@ -21,7 +21,15 @@
     failure: one module's trap, protocol violation, or {!Loader.instantiate}/{!Loader.invoke}
     failure is caught and logged internally, and never prevents a sibling module subscribed to the
     same key (or triggered by the same underlying commit) from running, and never raises out of
-    {!wrap_materialize_sink}'s own [write] at all. *)
+    {!wrap_materialize_sink}'s own [write] at all.
+
+    {b Frozen as of task-master Task 7}: the Layer 0/Layer 2 boundary this module forms one half
+    of (with {!Riptide_batch_commit.Batch_commit} the other) is no longer provisional -- Task 7
+    closed the friction catalog the double-entry ledger (the real module this boundary was built
+    to be pressure-tested against) surfaced. See
+    docs/superpowers/specs/2026-10-01-layer2-boundary-revision-design.md's own "Boundary frozen"
+    section for the closed catalog and what changed to close each item; further changes to this
+    interface carry the same re-verification discipline as the rest of Layer 0. *)
 
 type t
 (** A reactor's own subscription table -- entirely in memory, not durable across process restarts;

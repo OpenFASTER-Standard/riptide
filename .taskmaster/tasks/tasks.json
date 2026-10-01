@@ -682,7 +682,7 @@
         "id": "7",
         "title": "Revise the Layer 0/Layer 2 boundary based on real usage",
         "description": "Redesign whatever Task 6 exposed as wrong or awkward in the boundary, following the ThirdPartyResources-to-CustomResourceDefinition pattern: fast, driven by real usage, not accumulated imagined requirements.",
-        "status": "pending",
+        "status": "done",
         "priority": "medium",
         "dependencies": [
           "6"
@@ -694,33 +694,67 @@
             "id": 1,
             "title": "Catalog every friction point Task 6 surfaced",
             "description": "A concrete list, grounded in what actually broke or was awkward while building a real module - not speculative future requirements. Task 6 (the Layer 2 double-entry ledger, lib/ledger/) surfaced six, each now disclosed at the interface it concerns rather than only in a workspace note - the first five in commit 5b5e63d650ed4d7b9633dbae57921fe622865420, the sixth added in fix-wave round 2 after a scoped re-review live-reproduced a restart consequence that every earlier disclosure had understated: (1) batch_commit.mli stated that re-materializing an already-folded write is a no-op because the underlying join is idempotent - affirmatively FALSE for any accumulating (non-lattice-join) materialize_sink, and the direct cause of two real ledger bugs including that plan's own Critical finding; decide whether to narrow materialize_sink to lattice joins or to pass write identity through. (2) Batch_commit.create's ~authorize is write -> decision, evaluated per write with no sibling visibility, so no cross-write invariant (e.g. 'these two legs balance and are both in this batch') can be enforced at the checkpoint at all; consider a batch-aware form. (3) materialize_sink's write callback receives only ~merge_key and the payload - never the committing write's actor, idempotency_key or batch position - forcing any sink that must dedup replays onto content-based keys, which silently collapsed two distinct ledger legs and destroyed money. (4) reactor.mli: a ~propose closure holding a fixed Batch_commit.t silently no-ops forever once a view change moves the primary, since propose through a non-primary is a silent no-op; and the closure's (unit, string) result type cannot express 'no primary right now, retry'. (5) reactor.mli: a guest's proposed write can be discarded by a view change after ~propose already returned Ok, with no re-proposal anywhere; recovery works only via re-dispatch, which makes 'a dispatched guest must be idempotent under re-dispatch' a real but previously unstated obligation on module authors. (6) The host-side state a Layer 2 module must keep to satisfy (1) and (3) has nowhere durable to live, and the boundary offers no way to notice: the ledger's Accumulator.t holds both its decision table and its already-applied-legs table purely in memory, because neither a materialize_sink nor a reactor ~propose closure is given any durable place to record 'this request was already decided' or 'this committed write was already applied'. Consequence, live-reproduced and strictly worse than the narrower 'a declined request might be re-decided' that the first version of this catalog entry recorded: a restart followed by nothing more exotic than the documented Batch_commit.materialize_up_to catch-up walk re-applies EVERY leg in the log to balances that already contain them, silently doubling every account balance (1500 units across two accounts became 3000), while the committed log itself stays perfectly correct. Pinned as current accepted behaviour by test_restart_without_durable_dedup_state_doubles_balances in test/test_ledger_end_to_end.ml and disclosed at Accumulator.t; closing it is this task's own scope, needing both a decision write shape in the log and either a durable materialization watermark or (3)'s batch identity, not a per-module workaround.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": [
+                "5b5e63d650ed4d7b9633dbae57921fe622865420",
+                "fe5246c5337efa3854933683c048ec1af74c7dd3"
+              ],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Deliverable: a written record, not a code change.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "updatedAt": "2026-10-01T21:17:50.861Z"
           },
           {
             "id": 2,
             "title": "Redesign the specific broken pieces of the boundary",
             "description": "Scoped fixes only - do not use this as an opportunity to add speculative generality for domains that don't exist yet.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": [
+                "6078bec71c748dda86d35c4bf37d37ef6a1b148a",
+                "15268a917d1b467fafa776bf363e4bfbaf4ed751",
+                "df739d9b009ec878d9ed9b7602ce28d300fa12eb",
+                "df7611d9f9d46eed10416e719489c4712bb94e87",
+                "7c5a9b63b3215968414cb1ac13b9ae483e6471f5",
+                "b4217a3ac390af857e7566c7b2dba9bfbc9aaa74",
+                "e7bde449099d1aa146e8daa426a24ca9483cb2e2",
+                "919111068c033e7ea5d92841f38ac53b489fba0f",
+                "4afc21183a09b42e13460c8936819e0fd2090db3"
+              ],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Test: re-run Task 6's module against the revised boundary with no regression.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "updatedAt": "2026-10-01T21:18:00.217Z"
           },
           {
             "id": 3,
             "title": "Freeze the boundary and document the freeze",
             "description": "Once 7.2 is verified, this boundary now gets the same 'changes require re-verification' discipline as the rest of Layer 0.",
-            "status": "pending",
+            "status": "done",
+            "evidence": {
+              "commits": [
+                "862eb7f1c259c87b29ca0c1d67cbe0e3ec999bd1",
+                "5189c86068802295097c9624771b9424e4d82674",
+                "aa2ea920fc720ab282dff4b1c2f5f09c2f6893ec",
+                "8a13382839f8911b8f145ec82ef66b8fe30af605"
+              ],
+              "prs": []
+            },
             "dependencies": [],
             "details": "Deliverable: a versioned, documented boundary spec, treated as stable going forward.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "updatedAt": "2026-10-01T21:18:03.066Z"
           }
-        ]
+        ],
+        "updatedAt": "2026-10-01T21:18:03.066Z"
       },
       {
         "id": "8",
@@ -1507,9 +1541,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-10-01T13:59:56.061Z",
+      "lastModified": "2026-10-01T21:18:03.066Z",
       "taskCount": 12,
-      "completedCount": 7,
+      "completedCount": 8,
       "tags": [
         "master"
       ]

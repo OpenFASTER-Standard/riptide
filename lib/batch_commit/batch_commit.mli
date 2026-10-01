@@ -7,7 +7,14 @@
 
     Deliberately does NOT touch {!Riptide_vsr.Replica}, {!Riptide.Envelope}, or {!Riptide.Log} --
     a batch is just a {!Riptide.Value.value}, encoded/decoded entirely inside this module, so
-    {!Riptide_vsr.Replica.propose} and {!Riptide_vsr.Replica.entries} need no changes at all. *)
+    {!Riptide_vsr.Replica.propose} and {!Riptide_vsr.Replica.entries} need no changes at all.
+
+    {b Frozen as of task-master Task 7}: the Layer 0/Layer 2 boundary this module forms one half
+    of (with {!Riptide_module}'s {!Riptide_module.Reactor} the other) is no longer provisional --
+    Task 7 closed the friction catalog a real Layer 2 module (the double-entry ledger) surfaced
+    against it. See docs/superpowers/specs/2026-10-01-layer2-boundary-revision-design.md's own
+    "Boundary frozen" section for the closed catalog and what changed to close each item; further
+    changes to this interface carry the same re-verification discipline as the rest of Layer 0. *)
 
 type write = {
   actor : Riptide.Envelope.actor_id;

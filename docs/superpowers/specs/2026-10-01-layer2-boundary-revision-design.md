@@ -329,3 +329,41 @@ newly-frozen interface files, full suite green, all 3 repo gates clean.
   checking this one replica's own local view/status, not routing a proposal to a different machine.
   Real client-side primary discovery across a cluster is Task 9's own concern.
 - **Broader hardening against adversarial conditions** — task-master Task 12's own, separate scope.
+
+## Boundary frozen (Task 7.3)
+
+As of this task, all six items catalogued in the Context section above are closed:
+
+1. Re-materialization is no longer silently unsafe for accumulating sinks — closed by Decision 1's
+   durable watermark, shipped as `Batch_commit.deduplicate` (6078bec; re-landed at the composable-
+   wrapper layer, not the originally-specified internal-gate layer, by `b4217a3` after Task 4's own
+   review found the internal-gate shape permanently stalled guest re-dispatch recovery — see
+   Decision 1's own revision note above).
+2. Cross-write invariants are enforceable at the checkpoint — closed by Decision 4's
+   `?authorize_batch` hook (`15268a9`).
+3. `materialize_sink.write` carries full write identity (`idempotency_key`, `position`, `actor`,
+   `causation`, `correlation`), not just `merge_key` and payload — closed by Decision 2 (`df7611d`).
+4. A `~propose` closure can observe primary-liveness before calling `propose`, instead of silently
+   no-opping through a stale handle — closed by Decision 5's `Batch_commit.is_primary` (`15268a9`,
+   doc-corrected by `df739d9`).
+5. A dispatched guest's obligation to be idempotent under re-dispatch is now documented and
+   demonstrated (not just assumed) — closed by Decision 5's documented closure pattern, retrofitted
+   onto the ledger's own test harness (`7c5a9b6`) and exercised directly by a DST scenario
+   reproducing the original view-change-drop bug (`9191110`).
+6. Host-side state needed to satisfy (1) and (3) now has a durable home — the boundary-owned
+   watermark (Decision 1) plus the committed-log query that replaced the ledger's in-memory decision
+   mirror (Decision 3, `7c5a9b6`), closing the restart-doubling bug pinned by this plan's own Task 6
+   brief. The watermark/reactor-dispatch interaction this closure itself regressed was caught by
+   Task 4's own review and fixed before this task started (`b4217a3`, cleanup in `e7bde44`); a
+   second, independent coverage gap (the `authorize_batch` actor-mismatch clause having no running-
+   code coverage) was caught by Task 5's own review and closed the same way (`4afc211`). Both are
+   fully closed, re-reviewed, and already landed on this branch — see this plan's own
+   `.superpowers/sdd/2026-10-01-layer2-boundary-revision/progress.md` ledger for the full narrative;
+   nothing about either is reopened by this freeze.
+
+This interface — `lib/batch_commit/batch_commit.mli` and `lib/module/reactor.mli` — now carries the
+same "changes require re-verification" discipline as the rest of Layer 0, per this repo's own
+`CLAUDE.md` ("Small, aligned governance for Layer 0"): no further revision to either file happens
+without a real implementation pressure-testing it first, the same discipline that produced this very
+freeze. The boundary defined by Tasks 1-5 above, as revised by this document, is no longer
+provisional.
