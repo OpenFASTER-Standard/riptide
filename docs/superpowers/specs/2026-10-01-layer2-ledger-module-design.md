@@ -313,6 +313,29 @@ for the first time with a real domain and a real policy, instead of a toy counte
   decision to the replicated log as its own write shape — a real schema extension, and a question
   about what a module may durably record that belongs with the boundary revision (task-master Task
   7). Disclosed at `Accumulator.t`.
+
+  **Correction (fix-wave round 2, item 1): the paragraph above understated the restart gap, and the
+  real one is a great deal worse than "a decision could be re-decided".** `Accumulator.t` holds
+  *two* in-memory tables, not one — the decision table, and `applied_legs`, the guard that stops a
+  committed leg being folded into a balance twice. Both die with the process. So a restart followed
+  by nothing more exotic than the documented `materialize_up_to` catch-up walk — which is exactly
+  what a restarting node is expected to do, with no stale decline and no re-decided request needed
+  anywhere — re-applies **every leg in the log** to balances that already contain them, silently
+  **doubling every account's balance**. Live-reproduced: 1500 units across two accounts became
+  3000. The committed log stays perfectly correct throughout; only the materialized balances
+  diverge from it, which is the same silent shape as finding I4 and the reason "the log is fine" is
+  never sufficient evidence for this module.
+
+  This is disclosed, not fixed, and is deliberately pinned as current behaviour by
+  `test_restart_without_durable_dedup_state_doubles_balances` in
+  `test/test_ledger_end_to_end.ml` (a test that asserts the *bad* outcome on purpose, so a future
+  incidental change here cannot alter the semantics unnoticed; read its own comment before
+  touching it). Closing it needs both halves made durable: the decision committed to the log as
+  its own write shape, and materialization given either a durable watermark or — the better
+  framing — a `materialize_sink` that receives its write's own batch identity, so "already
+  applied" is answerable from the log rather than from memory. That second half is already
+  recorded as boundary friction (3) in task-master subtask 7.1, and this restart consequence is
+  recorded there too; both are Task 7's, not this module's.
 - **A single malformed or adversarial transfer leg** (non-positive amount, same account on both
   sides, a negative account id, a merge_key naming a different account than the leg claims, a
   payload `actor` disagreeing with its write's): caught by the self-certifying `authorize` check

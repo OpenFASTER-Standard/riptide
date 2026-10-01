@@ -162,6 +162,22 @@ type env_handles = {
   materializer : M.t;
   wrapped_sink : Batch_commit.materialize_sink;
   accumulator : Accumulator.t;
+      (* The accumulator this env STARTED with. Still the live one unless [restart] below has been
+         called, which only one test does. *)
+  restart : unit -> Accumulator.t * Batch_commit.materialize_sink;
+      (* Simulate a process restart over the SAME durable state: a brand-new Accumulator.t (empty
+         decision table, empty applied-legs table) and a fresh materialize_sink over it, while the
+         replica's log, the Materializer's KV directory and the module subscription all survive
+         untouched -- which is exactly what survives a real restart and what does not (see
+         accumulator.mli's own disclosure on Accumulator.t). The returned pair becomes the live
+         one: the reactor's own ~propose closure follows the swap, so a guest dispatched after a
+         restart decides against the restarted instance, not the retired one.
+
+         Re-using the SAME Reactor.t (rather than re-subscribing a fresh one) is faithful rather
+         than a shortcut: Reactor.subscribe reads the module's bytes once and instantiates a fresh
+         Loader.t/Protocol.checker per dispatch, so the guest holds no state across dispatches for
+         a restart to lose. What a restart loses is precisely the host-side tables, which is what
+         this swaps. *)
 }
 
 let with_ledger_env (f : env_handles -> unit) =
@@ -209,20 +225,32 @@ let with_ledger_env (f : env_handles -> unit) =
         if v = Last_write_wins.bottom then None
         else Schema.transfer_request_of_value v.Last_write_wins.value
       in
-      let inner_sink =
-        Accumulator.materialize_sink accumulator ~read_balance ~write_balance ~store_request
-      in
       let reactor = Reactor.create () in
-      let wrapped_sink = Reactor.wrap_materialize_sink reactor inner_sink in
+      let sink_over acc =
+        Reactor.wrap_materialize_sink reactor
+          (Accumulator.materialize_sink acc ~read_balance ~write_balance ~store_request)
+      in
+      let wrapped_sink = sink_over accumulator in
+      (* The currently-live (accumulator, sink) pair, held in one ref so [restart] can swap BOTH
+         at once and the ~propose closure below follows the swap rather than capturing the retired
+         instance. Every test but the restart-doubling pin leaves this at its initial value. *)
+      let live = ref (accumulator, wrapped_sink) in
       let read_for_module = Accumulator.read_for_guest ~read_request ~read_balance in
       (* host.propose_write's own half, now a single library call: the guest hands back 33 bytes (a
          decision tag plus the request), and Accumulator.handle_guest_decision is what decides --
          once and for all, per request_id -- whether that becomes a pair of committed legs. *)
       let propose_for_module (bytes : bytes) : (unit, string) result =
-        Accumulator.handle_guest_decision accumulator ~actor:"ledger-module"
+        let acc, sink = !live in
+        Accumulator.handle_guest_decision acc ~actor:"ledger-module"
           ~propose:(fun ~idempotency_key writes ->
-            Batch_commit.propose handle ~idempotency_key ~materialize:wrapped_sink writes)
+            Batch_commit.propose handle ~idempotency_key ~materialize:sink writes)
           bytes
+      in
+      let restart () =
+        let acc = Accumulator.create () in
+        let sink = sink_over acc in
+        live := (acc, sink);
+        (acc, sink)
       in
       let verified_artifact, verification_dir = verified_ledger () in
       (* Same Fun.protect ~finally idiom as with_tmp_dir above, applied to the admission-
@@ -237,24 +265,33 @@ let with_ledger_env (f : env_handles -> unit) =
         (fun () ->
           Reactor.subscribe reactor ~merge_key:Schema.requests_merge_key ~module_:verified_artifact
             ~protocol:allow_handle_from_init ~read:read_for_module ~propose:propose_for_module;
-          f { handle; replica; materializer; wrapped_sink; accumulator }))
+          f { handle; replica; materializer; wrapped_sink; accumulator; restart }))
 
 (* This task's own documented test-setup convention (per task-3-brief.md step 6 and the design
    spec's own non-goals: no "mint"/account-opening flow exists in this focused-core scope) --
    seeding a starting balance proposes a transfer_leg-shaped write DIRECTLY to the account's own
    merge_key, bypassing the request/module flow entirely. other_account = 0L is simply an
    unused/placeholder counterparty for this synthetic, test-only leg -- never itself seeded or
-   asserted on. *)
-let seed_account ?key env account amount =
-  let idempotency_key =
-    match key with Some k -> k | None -> Printf.sprintf "seed-%Ld" account
-  in
+   asserted on.
+
+   [?role] defaults to [Credit], i.e. "this account starts with [amount]". [Debit] is the one thing
+   this convention can express that no request flow can: driving an account NEGATIVE, which is
+   what the signed-funds-check regression test below needs and cannot get any other way (a
+   transfer out of an account the guest judges unaffordable is declined, by design). Both roles go
+   through the real Authorize.authorize unchanged -- a well-formed single leg is Allowed whatever
+   its role, per authorize.mli's own finding-I6 disclosure.
+
+   The idempotency key includes the role, so Credit- and Debit-seeding the same account are two
+   distinct batches rather than the second silently colliding with the first already in the log. *)
+let seed_account ?(role = Schema.Credit) env account amount =
+  let role_tag = match role with Schema.Debit -> "debit" | Schema.Credit -> "credit" in
+  let idempotency_key = Printf.sprintf "seed-%s-%Ld" role_tag account in
   let event_id = fake_event_id idempotency_key in
   let leg =
     Schema.
       {
         transfer_id = 0L;
-        role = Credit;
+        role;
         actor = "test-seed";
         this_account = account;
         other_account = 0L;
@@ -323,7 +360,15 @@ let test_insufficient_funds_is_a_clean_no_op () =
       Alcotest.(check int)
         "the module's handle genuinely ran exactly once, observed via its host.log call" 1
         (log_calls_after - log_calls_before);
-      Alcotest.(check int) "no leg was committed -- a clean no-op, no propose_write call at all" 0
+      (* The message here used to claim "a clean no-op, no propose_write call at all", which stopped
+         being true with finding C1's fix and is corrected (fix-wave round 2, re-review finding M3):
+         the guest ALWAYS calls propose_write now, on both outcomes. What makes a decline a no-op is
+         what the host does with it -- a decision tag of 0 records the decline and constructs no
+         legs -- not the guest staying silent, which is precisely the shape that was the bug. *)
+      Alcotest.(check int)
+        "no leg was committed: propose_write was called, carrying decision tag 0, and the host \
+         built no legs from it"
+        0
         (List.length (module_leg_envelopes env));
       Alcotest.(check int64) "the would-be-debited account's balance is unchanged" 50L
         (balance_of env 300L))
@@ -508,6 +553,150 @@ let test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention () =
       Alcotest.(check int64) "value is conserved across the two accounts" 800L
         (Int64.add (balance_of env 910L) (balance_of env 911L)))
 
+(* ── Fix-wave round 2, re-review finding I1-coverage (Important): the funds check must be SIGNED ──
+   Fix round 1 changed ledger.wat's sufficient-funds comparison from [i64.gt_u] to [i64.gt_s]
+   (finding I1) and wrote a long comment explaining why -- but nothing anywhere exercised the
+   difference. The re-reviewer sabotaged the fix back to [i64.gt_u] and all 629 tests still passed,
+   which means the fix was load-bearing only in the comment. This test is what makes it load-bearing
+   in the suite; it was confirmed RED against an [i64.gt_u] copy of the fixture before being kept.
+
+   The mechanism, precisely: Wire.encode_balance/decode_balance round-trip a NEGATIVE balance
+   faithfully (and are tested doing so), so an overdrawn account's balance really does arrive in the
+   guest as a negative i64. Read with [i64.gt_u], -200 compares as 1.8e19 -- richer than any
+   conceivable transfer -- so [amount > balance] is false for every amount and the guest approves
+   every further withdrawal from an account already in the red, driving it arbitrarily deeper.
+
+   Getting an account negative in the first place needs the seeding convention's [~role:Debit]
+   (see seed_account): no request flow can produce this state, because a transfer the guest judges
+   unaffordable is exactly what gets declined. That is a direct, individually well-formed leg going
+   through the real Authorize.authorize, not a hand-poked balance -- the same white-box technique
+   this file's own account seeding already relies on, which authorize.mli documents as Allowed by
+   design (finding I6). *)
+let test_an_overdrawn_account_cannot_withdraw_further_because_the_funds_check_is_signed () =
+  with_ledger_env (fun env ->
+      seed_account ~role:Schema.Debit env 950L 200L;
+      Alcotest.(check int64)
+        "the account is genuinely overdrawn -- a negative balance, round-tripped through the real \
+         materializer"
+        (-200L) (balance_of env 950L);
+      (* 50 is far less than 200, so an UNSIGNED read of -200 (1.8e19) approves this and a SIGNED
+         read (50 > -200) declines it. That gap is the entire test. *)
+      propose_request env ~idempotency_key:"req-40"
+        Schema.{ request_id = 40L; from_account = 950L; to_account = 951L; amount = 50L };
+      Alcotest.(check int) "the module's handle genuinely ran for this request" 1
+        (List.length
+           (List.filter
+              (fun (e : Envelope.envelope) -> e.actor = "client")
+              (Batch_commit.committed_envelopes env.replica)));
+      Alcotest.(check bool)
+        "the host recorded a DECLINE: the guest's signed comparison refused an overdrawn account"
+        true
+        (Accumulator.decision env.accumulator ~request_id:40L = Some false);
+      Alcotest.(check int) "no leg was committed for it" 0
+        (List.length (module_leg_envelopes env));
+      Alcotest.(check int64) "the overdrawn account was not driven deeper into the red" (-200L)
+        (balance_of env 950L);
+      Alcotest.(check int64) "and the would-be recipient received nothing" 0L (balance_of env 951L))
+
+(* ── Fix-wave round 2, item 1: a KNOWN-LIMITATION PIN, deliberately asserting the BAD behaviour ──
+   READ THIS BEFORE "FIXING" THIS TEST. It asserts that balances DOUBLE. That is not an oversight
+   and the assertion is not backwards: restart durability for this module's host-side tables is
+   real, scoped, not-yet-done work (task-master Task 7's boundary revision -- a durable
+   committed-log/watermark design, see accumulator.mli's own disclosure on Accumulator.t), and this
+   test exists so that the current, accepted-as-known behaviour cannot be changed silently. If a
+   future change makes the walk below idempotent across a restart, this test SHOULD fail -- and the
+   right response is to rewrite it into the positive assertion along with the disclosures it cites,
+   not to delete it or tune the numbers.
+
+   What it pins, and why it is worth pinning rather than merely writing down: the re-reviewer of fix
+   round 1 live-reproduced a blast radius strictly larger than anything disclosed anywhere. The
+   disclosures all described the DECISION table being volatile ("a declined request might be
+   re-decided"). But [applied_legs] -- the guard that stops an already-folded leg being added to a
+   balance a second time -- is equally in-memory, and nothing said so. So a restart followed by
+   nothing more exotic than the documented [materialize_up_to] catch-up walk re-applies EVERY leg in
+   the log to balances that already contain them. Not a declined request resurfacing: every account
+   in the ledger silently doubles.
+
+   The contrast is the substance of the test, which is why the same walk runs twice:
+     1. BEFORE the restart, in-process: identical walk, identical log, balances unchanged. The
+        in-memory guard works exactly as documented, and [repeat_dispatches] rising by one proves
+        the walk really did re-dispatch the guest rather than quietly skipping it.
+     2. AFTER the restart: same walk, same log, every balance doubled.
+   So the doubling is attributable to the lost in-memory state specifically, not to the catch-up
+   walk being wrong -- which is also why this is Task 7's to fix rather than a bug in
+   materialize_up_to.
+
+   Note what stays CORRECT throughout, and is asserted: the committed log. Exactly four leg
+   envelopes exist before and after, the two seeds plus the transfer's pair -- no entry is added,
+   duplicated or lost by any of this. Only the materialized balances diverge from it, which is the
+   same shape as finding I4 and the reason "the log is fine" is never sufficient evidence here. *)
+let test_restart_without_durable_dedup_state_doubles_balances () =
+  with_ledger_env (fun env ->
+      seed_account env 960L 1000L;
+      seed_account env 961L 500L;
+      propose_request env ~idempotency_key:"req-50"
+        Schema.{ request_id = 50L; from_account = 960L; to_account = 961L; amount = 300L };
+      Alcotest.(check int64) "the transfer applied: sender debited once" 700L (balance_of env 960L);
+      Alcotest.(check int64) "the transfer applied: recipient credited once" 800L
+        (balance_of env 961L);
+      Alcotest.(check int64) "1500 units exist across the two accounts" 1500L
+        (Int64.add (balance_of env 960L) (balance_of env 961L));
+      let committed_legs_before = List.length (Batch_commit.committed_envelopes env.replica) in
+      let walk sink =
+        Batch_commit.materialize_up_to env.replica ~materialize:sink
+          ~through_commit_number:(Replica.commit_number env.replica)
+      in
+      (* 1. The same walk, in the same process. This is the documented, working case. *)
+      let repeats_before = Accumulator.repeat_dispatches env.accumulator in
+      let flips_before = Accumulator.prevented_flips env.accumulator in
+      walk env.wrapped_sink;
+      Alcotest.(check int)
+        "in-process: the walk really did re-dispatch the guest for the already-decided request" 1
+        (Accumulator.repeat_dispatches env.accumulator - repeats_before);
+      Alcotest.(check int)
+        "in-process: and it agreed with the recorded accept, so nothing had to be overridden" 0
+        (Accumulator.prevented_flips env.accumulator - flips_before);
+      Alcotest.(check int64) "in-process: the sender's balance is unchanged by the walk" 700L
+        (balance_of env 960L);
+      Alcotest.(check int64) "in-process: the recipient's balance is unchanged by the walk" 800L
+        (balance_of env 961L);
+      (* 2. THE SIMULATED RESTART. Same durable materializer, same log, same subscription; a fresh
+            Accumulator.t, which is all a restart actually resets. *)
+      let restarted, restarted_sink = env.restart () in
+      Alcotest.(check bool)
+        "the retired instance still remembers deciding request 50 -- the loss below is the \
+         restart's, not a failure to record"
+        true
+        (Accumulator.decision env.accumulator ~request_id:50L = Some true);
+      Alcotest.(check bool)
+        "the restarted instance remembers nothing about request 50: the decision table is volatile"
+        true
+        (Accumulator.decision restarted ~request_id:50L = None);
+      walk restarted_sink;
+      Alcotest.(check int)
+        "the restarted instance decided request 50 afresh, as a FIRST decision -- it had no record \
+         to treat the dispatch as a repeat of"
+        0
+        (Accumulator.repeat_dispatches restarted);
+      Alcotest.(check bool) "and that fresh decision was an accept" true
+        (Accumulator.decision restarted ~request_id:50L = Some true);
+      (* The known limitation itself: applied_legs was volatile too, so every leg in the log was
+         folded into a balance that already contained it. *)
+      Alcotest.(check int64) "KNOWN LIMITATION: the sender's balance DOUBLED (1000-300 applied twice)"
+        1400L (balance_of env 960L);
+      Alcotest.(check int64)
+        "KNOWN LIMITATION: the recipient's balance DOUBLED (500+300 applied twice)" 1600L
+        (balance_of env 961L);
+      Alcotest.(check int64) "KNOWN LIMITATION: 1500 units became 3000 out of nothing" 3000L
+        (Int64.add (balance_of env 960L) (balance_of env 961L));
+      (* The log never went wrong, which is exactly what makes this silent. *)
+      Alcotest.(check int)
+        "the committed log is untouched by all of this -- nothing appended, nothing lost"
+        committed_legs_before
+        (List.length (Batch_commit.committed_envelopes env.replica));
+      Alcotest.(check int) "still exactly the transfer's own two module-authored legs" 2
+        (List.length (module_leg_envelopes env)))
+
 let tests =
   [
     ( "a request with sufficient funds commits both legs and updates both balances",
@@ -521,4 +710,8 @@ let tests =
       `Quick, test_a_declined_decision_survives_every_rematerialization_idiom );
     ( "a request_id of zero does not collide with the seeding convention",
       `Quick, test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention );
+    ( "an overdrawn account cannot withdraw further because the funds check is signed",
+      `Quick, test_an_overdrawn_account_cannot_withdraw_further_because_the_funds_check_is_signed );
+    ( "KNOWN LIMITATION pin: a restart without durable dedup state doubles every balance",
+      `Quick, test_restart_without_durable_dedup_state_doubles_balances );
   ]

@@ -31,19 +31,43 @@ type t
     between the propose side and the materialize side of the same ledger is required, not merely
     convenient.
 
-    {b In-memory, and NOT durable across a process restart.} Stated plainly because it bounds
-    exactly how much of finding C1 this closes: within one process's lifetime a decision can never
-    flip, which is what makes the bug unreachable via every idiom that actually triggered it (the
-    empty-writes drain, {!Riptide_batch_commit.Batch_commit.propose}'s own
-    unconditional-on-retry materialize step, {!Riptide_batch_commit.Batch_commit.materialize_up_to}
-    -- all of which re-dispatch an already-committed request inside a running process). A restart
-    starts with an empty table, so a request whose DECLINE was recorded only here, and whose
-    "ledger.requests" write is then re-materialized after the restart against a since-grown
-    balance, could still be decided afresh. Making the decision durable rather than merely
-    process-stable means committing it to the replicated log as its own write shape -- a real
-    extension of this module's schema, and a decision about what a module may durably record that
-    belongs with the Layer 0/Layer 2 boundary revision (task-master Task 7), not smuggled in
-    here. *)
+    {b BOTH tables are in-memory, and NEITHER is durable across a process restart. The
+    consequence is worse than a stale decision: a restart followed by any catch-up
+    materialization silently DOUBLES every account balance in the ledger.} Corrected and stated at
+    full strength here (fix-wave round 2, item 1) -- the earlier wording described only the
+    decision table's half of this and called the residual gap "a declined request might be
+    re-decided", which understated a Critical as a nuisance.
+
+    What is actually true, precisely:
+
+    - {b Within one process's lifetime, everything documented below holds.} A decision can never
+      flip and a committed leg can never be applied twice, which is what makes finding C1
+      unreachable via every idiom that actually triggered it (the empty-writes drain,
+      {!Riptide_batch_commit.Batch_commit.propose}'s own unconditional-on-retry materialize step,
+      {!Riptide_batch_commit.Batch_commit.materialize_up_to} -- all of which re-dispatch an
+      already-committed request, and re-hand already-applied legs to the sink, inside a running
+      process).
+    - {b Across a restart, the already-applied-legs table is lost too}, not just the decision
+      table. So it takes no exotic act at all -- no stale decline, no re-decided request, just the
+      documented {!Riptide_batch_commit.Batch_commit.materialize_up_to} catch-up walk a restarting
+      node is expected to perform -- for every leg already folded into a balance to be folded into
+      it a second time. Every account's balance doubles. Live-reproduced (1500 units across two
+      accounts became 3000) and now pinned, as current accepted behaviour, by
+      [test_restart_without_durable_dedup_state_doubles_balances] in
+      [test/test_ledger_end_to_end.ml] -- read that test's own comment before changing anything
+      here, since it deliberately asserts the bad behaviour so that it cannot change silently.
+    - {b The committed log stays correct throughout.} Nothing is appended, duplicated or lost by
+      any of the above; it is only the materialized balances that stop agreeing with the log. That
+      is what makes this silent, and it is the same failure shape as finding I4.
+
+    Closing it means making both tables durable rather than merely process-stable: committing a
+    decision to the replicated log as its own write shape, and giving materialization a durable
+    watermark (or giving a {!Riptide_batch_commit.Batch_commit.materialize_sink} its write's own
+    batch identity, so "already applied" can be answered from the log instead of from memory --
+    see {!materialize_sink}'s own disclosure of the same missing identity). Both are real schema /
+    Layer 0 signature questions about what a module may durably record, and both belong with the
+    Layer 0/Layer 2 boundary revision (task-master Task 7, whose subtask 7.1 friction catalog
+    records this), not smuggled in here. *)
 
 val create : unit -> t
 
@@ -197,6 +221,12 @@ val materialize_sink :
     rather than proposing the same content twice and expecting both to land. Closing this properly
     needs the sink to receive its write's own batch identity, which is a Layer 0 signature change
     and so task-master Task 7's call, not this module's.
+
+    {b Known, disclosed residual gap: this already-applied table is in-memory, so a restart plus
+    ANY catch-up materialization re-applies every leg in the log and doubles every balance.} The
+    same missing batch identity is why -- given it, "has this write already been applied" could be
+    answered durably from the log rather than from a table that dies with the process. See {!t}'s
+    own disclosure for the full blast radius and for the test that pins the current behaviour.
 
     {b Known, disclosed residual gap: no overflow guard on balance arithmetic} (final whole-branch
     review, finding M6, where the ruling was explicitly to document rather than code this). The
