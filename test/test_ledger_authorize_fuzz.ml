@@ -195,8 +195,26 @@ let print_leg (g : generated_leg) =
     (match g.role with Schema.Debit -> "Debit" | Schema.Credit -> "Credit")
     g.payload_actor
 
+(* ── Property 1: authorize-level ───────────────────────────────────────────────────────────────
+   {b CLOSED by Task 7, in the sense that the handle below is no longer the real deployment's shape}
+   (final whole-branch review, Minor -- every sibling file got such an annotation and this property
+   did not, leaving its well-formed half reading as a statement about the real system). The handle
+   here is created with [~authorize] ONLY, no [?authorize_batch], and that is deliberate: the property
+   is about what the PER-WRITE hook can and cannot judge on its own, which is exactly what
+   [Authorize.authorize] is responsible for and exactly what a reader of that function needs pinned.
+
+   The consequence to be explicit about is on the well-formed half, which asserts that a lone,
+   well-formed leg DOES reach the committed log. That is true of this [~authorize]-only handle, and it
+   is NOT true of the real deployment any more: [Authorize.authorize_batch] denies any batch carrying
+   a number of transfer legs other than zero or two, so a lone leg -- however well-formed -- is refused
+   there. Both statements are wanted. This one pins the per-write hook's own semantics (and therefore
+   that "well-formed in isolation" is a real, separable notion); [test_authorize_batch_pairing_fuzz]
+   below pins the batch hook's, on a handle that has both. *)
 let test_no_malformed_leg_ever_reaches_the_log =
-  QCheck2.Test.make ~name:"authorize: no malformed single leg write ever reaches the committed log"
+  QCheck2.Test.make
+    ~name:
+      "authorize alone (no authorize_batch): no malformed single leg write ever reaches the \
+       committed log, and a well-formed one does"
     ~count:200 ~print:print_leg leg_gen (fun g ->
       let replica = create_solo () in
       let handle = Riptide_batch_commit.Batch_commit.create ~replica ~authorize:Authorize.authorize () in
@@ -227,8 +245,13 @@ let test_no_malformed_leg_ever_reaches_the_log =
         true
       end
       else begin
+        (* True of this ~authorize-ONLY handle, which is the point -- see this property's own header
+           comment for why it is deliberately NOT true of the real deployment, where
+           Authorize.authorize_batch refuses a batch carrying exactly one leg. *)
         if not appeared then
-          QCheck2.Test.fail_reportf "a well-formed leg did NOT reach the committed log: %s" (print_leg g);
+          QCheck2.Test.fail_reportf
+            "a well-formed leg did NOT reach the committed log of an ~authorize-only handle: %s"
+            (print_leg g);
         true
       end)
 
@@ -652,7 +675,12 @@ let tests =
       `Quick,
       test_a_self_transfer_request_produces_legs_authorize_denies );
     ("a non-positive-amount leg is denied", `Quick, test_a_non_positive_amount_leg_is_denied);
-    ( "a direct unpaired leg write still passes authorize's own per-write checks alone",
+    (* Final whole-branch review, Minor: this registered name used to say the write "still passes
+       authorize's own per-write checks alone" -- the exact inverse of what the test asserts, which is
+       that it is DENIED, and denied by a per-write check (its merge_key not naming its own
+       this_account) rather than by the absence of a sibling leg. *)
+    ( "a directly-constructed unpaired leg write is still DENIED by authorize's own per-write checks \
+       alone",
       `Quick,
       test_a_direct_unpaired_leg_write_is_denied_not_just_a_module_originated_one );
   ]

@@ -2,10 +2,14 @@
    0/Layer 2 boundary (Tasks 1-6) composes together for real, per this repo's own CLAUDE.md
    "Expect the first extension mechanism to need real revision" -- Task 6 already pressure-tested
    the boundary with one real module (the reactor dispatch loop itself, test_module_reactor.ml)
-   and disclosed three friction points (see task-7-brief.md and this file's own bottom comment for
-   which of them this test actually tripped over, if any). This task's own job, per its brief, is
-   ONLY to wire Tasks 1-6's already-real interfaces together -- no new library code unless this
-   test reveals a genuine compositional gap.
+   and disclosed friction points that lib/module/reactor.mli's own "Known, disclosed residual gap"
+   and "CLOSED by task-master Task 7" paragraphs now enumerate in full -- that interface is the
+   durable record of which of them survived and which Task 7 closed. (Final whole-branch review,
+   Minor: this used to cite a task-7-brief.md and "this file's own bottom comment", neither of which
+   exists -- the brief lived in an untracked .superpowers/ workspace that does not survive a clone,
+   and this file has no bottom comment at all.) This test's own job is ONLY to wire Tasks 1-6's
+   already-real interfaces together -- no new library code unless this test reveals a genuine
+   compositional gap.
 
    Full chain this test drives, all real, none stubbed (design spec's own "Data flow end to end"):
    a real Batch_commit.t (authorize = allow_all) over a real, solo (replica_count = 1, f = 0)

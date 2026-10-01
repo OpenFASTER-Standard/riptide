@@ -2,10 +2,11 @@
    real end-to-end proof that Tasks 1-2's own ledger schema/wire/legs/authorize code (Schema,
    Wire, Legs, Authorize -- already shipped, see lib/ledger/) composes against the real Layer 2
    boundary (Admission/Loader/Protocol/Reactor/Batch_commit) exactly the way
-   test_module_end_to_end.ml already proved counter.wat does -- with a real domain, a real policy
-   (Authorize.authorize, NOT Batch_commit.allow_all: the first task in this whole plan to use it
-   end to end), and a real admission-verified guest (fixtures/ledger.wat) deciding real business
-   logic (sufficient funds) instead of an arbitrary counter increment.
+   test_module_end_to_end.ml already proved counter.wat does -- with a real domain, real policy on
+   BOTH of Batch_commit's authorization axes (Authorize.authorize AND Authorize.authorize_batch, not
+   Batch_commit.allow_all: the first task in this whole plan to use the real policy end to end), and
+   a real admission-verified guest (fixtures/ledger.wat) deciding real business logic (sufficient
+   funds) instead of an arbitrary counter increment.
 
    ── Where this module's host half actually lives ────────────────────────────────────────────────
    Schema/Wire/Legs/Authorize give a wire encoding, leg construction, and a per-write
@@ -23,10 +24,12 @@
    whether money moves is not test scaffolding.
 
    What is left in this file is what genuinely belongs to a test: the real stack wired together
-   (real solo replica, real Batch_commit.t with ~authorize:Authorize.authorize -- the first use of
-   the real policy end to end in this whole plan -- real Materializer, real admission-verified
-   ledger.wat, Reactor.subscribe), plus four small closures naming this test's own choice of lattice
-   (Last_write_wins) and KV backend (File_kv_store). *)
+   (real solo replica, real Batch_commit.t with ~authorize:Authorize.authorize AND
+   ~authorize_batch:Authorize.authorize_batch -- the first use of the real policy end to end in this
+   whole plan, on both hooks; final whole-branch review, Minor: this header enumerated only
+   ~authorize while the body has wired both since Task 7 -- real Materializer, real
+   admission-verified ledger.wat, Reactor.subscribe), plus four small closures naming this test's own
+   choice of lattice (Last_write_wins) and KV backend (File_kv_store). *)
 open Riptide
 open Riptide_ledger
 open Riptide_module
@@ -776,7 +779,13 @@ let test_a_declined_decision_survives_every_rematerialization_idiom () =
    enough to keep exercising it rather than trusting that a new mechanism cannot fail on the same
    input for a new reason. (The injectivity of the replacement key is tested directly, at the unit
    level, by [test_batch_commit_materialize.ml]'s own
-   [test_watermark_does_not_collide_across_different_idempotency_keys_same_position].) *)
+   [test_watermark_key_is_injective_where_a_naive_concatenation_collides] and
+   [test_watermark_does_not_collide_on_a_naive_concatenation_collision] -- which use inputs that
+   genuinely collide under a separator-free concatenation, and assert that they do before asserting
+   the real derivation separates them. This citation used to point at
+   [test_watermark_does_not_collide_across_different_idempotency_keys_same_position], which was then
+   the only such test and could not fail for the reason it claimed; final whole-branch review,
+   IMP-5. That test still exists as the weaker baseline it actually is.) *)
 let test_value_is_conserved_for_a_request_id_of_zero () =
   with_ledger_env (fun env ->
       seed_account env 910L 500L;

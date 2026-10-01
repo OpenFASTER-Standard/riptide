@@ -20,8 +20,11 @@ site: `Riptide_vsr.Replica.propose` is the only way anything enters the replicat
 only caller of it in `lib/` is `Batch_commit.propose`, which evaluates `~authorize` over every
 write in the batch, AND `~authorize_batch` (task-master Task 7, the Layer 0/Layer 2 boundary
 revision -- a second, optional, whole-batch-at-once hook added alongside `~authorize`) once over
-the whole batch, before reaching it. So the claim decomposes into five checks, all of them
-lexical -- this is a grep-class tool, not a theorem prover:
+the whole batch, before reaching it. So the claim decomposes into the four numbered checks below,
+all of them lexical -- this is a grep-class tool, not a theorem prover. (Check 3 carries TWO halves
+since Task 7 added the second hook; the code below labels them `Check 3` and `Check 3, continued`
+rather than making the second one a fifth check, and this line said "five checks" while only four
+were ever numbered -- final whole-branch review, Minor.)
 
   1. `lib/` contains exactly ONE call to `Replica.propose`, and it is in
      `lib/batch_commit/batch_commit.ml`. (Module aliases -- `module R = Riptide_vsr.Replica` -- are

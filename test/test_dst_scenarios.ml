@@ -1350,9 +1350,15 @@ let test_settle_loop_redrains_a_delivery_that_becomes_available_during_yield () 
    and 8 above).
 
    WHAT THE DESIGN CLAIMS, and it is a claim worth testing precisely because it is a claim about
-   something NOT existing. The watermark a ring-eviction consumer keeps
-   ({!Riptide_batch_commit.Batch_commit.materialize_up_to}'s own doc: "the caller owns any watermark
-   it wants to keep") is pure in-memory state, and this plan's Decision 2 says a restarted consumer
+   something NOT existing. The watermark a ring-eviction consumer keeps -- the "is this op-number at
+   or below the current materialization watermark" half of Task 6's own [?may_evict] predicate, which
+   {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key}'s doc comment explicitly assigns to
+   that consumer rather than to [Batch_commit] (final whole-branch review, Minor: this comment used to
+   quote a [materialize_up_to] doc sentence, "the caller owns any watermark it wants to keep", that no
+   longer exists in [lib/] -- the surviving statement of the same division of labour is the one cited
+   here, and it is a different mechanism entirely from
+   {!Riptide_batch_commit.Batch_commit.deduplicate}'s own per-write watermark) -- is pure in-memory
+   state, and this plan's Decision 2 says a restarted consumer
    needs no persisted copy of it: it re-primes itself by reading the replica's own recovered
    {!Riptide_vsr.Replica.commit_number} and re-running [materialize_up_to] once at construction.
    That is sound only if re-materializing an already-materialized range is genuinely inert, which is

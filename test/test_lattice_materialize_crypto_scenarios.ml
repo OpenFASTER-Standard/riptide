@@ -1120,8 +1120,8 @@ let with_watermark_cluster ~env ~sw ~wiring f =
                   match !(slots.(i)) with
                   | None -> () (* unreachable: the hook is never invoked retroactively at create *)
                   | Some r ->
-                    Batch_commit.materialize_up_to r ~materialize:sinks.(i) ~through_commit_number:new_commit
-                     ;
+                    Batch_commit.materialize_up_to r ~materialize:sinks.(i)
+                      ~through_commit_number:new_commit;
                     watermarks.(i) := new_commit)
         in
         let r =
