@@ -11,7 +11,7 @@
    fixtures/read_materialized.wat fixtures/propose_write.wat fixtures/oversized_memory.wat
    fixtures/unbounded_memory.wat fixtures/memory_import.wat fixtures/protocol_violator.wat
    fixtures/counter.wat fixtures/out_of_bounds.wat fixtures/memory_sentinel.wat
-   fixtures/log_then_spin.wat))
+   fixtures/log_then_spin.wat fixtures/ledger.wat))
 
 ; Task 19 (Bug 1): a standalone helper process [test_file_storage.ml]'s own
 ; [test_an_unrelated_write_error_does_not_permanently_strip_o_direct] forks+execs under a
