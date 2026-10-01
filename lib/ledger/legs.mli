@@ -7,6 +7,18 @@
     decoded request. There is no other way to produce a {!Schema.transfer_leg} write anywhere in
     this module's own trusted code. *)
 
+val event_id_of_request : Schema.transfer_request -> Riptide.Envelope.event_id
+(** [event_id_of_request r] is the {!Riptide.Envelope.event_id} every leg of [r]'s own batch uses
+    as BOTH its [causation] and its [correlation] -- the content hash of
+    {!Schema.transfer_idempotency_key} of [r]'s [request_id], and nothing else. Deterministic from
+    the request alone, deliberately: a re-proposal of an already-accepted transfer (see
+    {!Accumulator.handle_guest_decision}) is then byte-identical to the original batch rather than
+    merely equivalent to it.
+
+    Public because it is the one place that derivation lives, and because {!decision_of_bytes}
+    applies it ITSELF rather than taking [~causation]/[~correlation] from its caller -- a caller
+    holding only the guest's raw bytes has not yet seen the [request_id] the derivation needs. *)
+
 val legs_of_request :
   actor:Riptide.Envelope.actor_id ->
   causation:Riptide.Envelope.event_id ->
@@ -37,26 +49,33 @@ val legs_of_request :
 
 val decision_of_bytes :
   actor:Riptide.Envelope.actor_id ->
-  causation:Riptide.Envelope.event_id ->
-  correlation:Riptide.Envelope.event_id ->
   bytes ->
   (bool * Schema.transfer_request * Riptide_batch_commit.Batch_commit.write list, string) result
-(** [decision_of_bytes ~actor ~causation ~correlation b] is {!Wire.decode_decision} applied to
-    [b], then {!legs_of_request} applied to the decoded request -- [Error] (with a
+(** [decision_of_bytes ~actor b] is {!Wire.decode_decision} applied to [b], then
+    {!legs_of_request} applied to the decoded request -- [Error] (with a
     human-readable reason) if [b] is not a well-formed {!Wire.decision_bytes}-byte decision
     payload, and [Ok (accepted, request, legs)] otherwise, where [legs] is always exactly the two
     well-paired legs {!legs_of_request} would have produced for [request], REGARDLESS of
-    [accepted].
+    [accepted], with [causation = correlation = ]{!event_id_of_request} of that request.
 
     Building the legs even for a declined decision is deliberate: it keeps this function a pure,
     total decode-and-construct step with one behaviour to fuzz, and leaves the decision about
     whether those legs are ever proposed where it belongs -- in
-    {!Accumulator.handle_guest_decision}, the only caller, which proposes them only for a
-    first-time accept.
+    {!Accumulator.handle_guest_decision}, this function's only production caller, which proposes
+    them only for a first-time accept.
 
     {b This is the guest-facing trust boundary}: the host's [propose_write] closure calls this
     (via {!Accumulator.handle_guest_decision}) on the raw bytes a WASM guest supplies, so it is
     this function -- not anything inside the guest -- that is what actually guarantees "both legs
     of a transfer are a genuine, matched pair". It decodes those bytes exactly ONCE and hands the
     decoded request back to its caller alongside the legs, so no caller needs to decode them a
-    second time (final whole-branch review, finding M9). *)
+    second time (final whole-branch review, finding M9).
+
+    That sentence used to be false, and the fix was to make it true rather than to soften it
+    (fix-wave round 2, re-review finding I3): fix round 1 renamed this function from
+    [legs_of_bytes] and documented it as the trust boundary, but left
+    {!Accumulator.handle_guest_decision} calling {!Wire.decode_decision} and {!legs_of_request}
+    inline instead of rewiring it here -- so the one function the fuzz test in
+    [test/test_ledger_authorize_fuzz.ml] hammers with adversarial bytes was not on the path any
+    production write actually took. It is now the only decode of those bytes anywhere in this
+    module's host half. *)

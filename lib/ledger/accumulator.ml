@@ -1,5 +1,3 @@
-open Riptide
-
 type t = {
   (* request_id -> the first decision ever recorded for it, plus the request that decision was
      made about. Both halves matter: the bool is what can never flip, and the request is what a
@@ -35,43 +33,43 @@ let leg_key (leg : Schema.transfer_leg) : string =
   (* Every field of the leg, with the actor included -- Authorize.authorize guarantees the actor
      recorded in the payload is the real author of the committing write, so this genuinely
      separates (say) a module-authored leg from a test harness's own seeding leg even when both
-     carry transfer_id = 0. String.escaped on the actor so an actor containing the separator
-     cannot forge another actor's key. *)
+     carry transfer_id = 0.
+
+     Why this is injective despite "|" being a perfectly legal character in an actor id
+     (fix-wave round 2, re-review finding M2 -- the comment here previously credited
+     String.escaped, which does NOT escape "|" and so was simply a false explanation of a key
+     that nonetheless works): every segment except the actor is a fixed-arity rendering of an
+     int64 or of one of the two role tags, and NONE of those renderings can contain "|". So any
+     two legs whose keys are equal must split into the same number of "|"-separated segments, with
+     the SAME five non-actor segments at the same positions -- the first segment and the last four
+     -- which forces the remaining middle span, i.e. the actor, to match too. A "|" inside an
+     actor id can only ever add segments in the middle, never move a numeric field across a
+     delimiter boundary, because there are always exactly five numeric/tag segments pinned to the
+     two ends. String.escaped is kept purely so a key is printable/diffable when debugging. *)
   Printf.sprintf "%Ld|%s|%s|%Ld|%Ld|%Ld" leg.transfer_id (role_tag leg.role)
     (String.escaped leg.actor) leg.this_account leg.other_account leg.amount
 
-(* Deterministic from the idempotency key alone, so a re-proposal of the same transfer produces a
-   byte-identical batch rather than a merely equivalent one. *)
-let event_id_of_key (idempotency_key : string) : Envelope.event_id =
-  Value.content_hash (Value.Scalar (Value.String idempotency_key))
-
 let propose_legs ~actor ~propose (r : Schema.transfer_request) =
   let idempotency_key = Schema.transfer_idempotency_key r.request_id in
-  let event_id = event_id_of_key idempotency_key in
+  let event_id = Legs.event_id_of_request r in
   let legs = Legs.legs_of_request ~actor ~causation:event_id ~correlation:event_id r in
   propose ~idempotency_key legs
 
 let handle_guest_decision t ~actor ~propose (decision_bytes : bytes) : (unit, string) result =
-  let idempotency_key_of r = Schema.transfer_idempotency_key r.Schema.request_id in
-  let event_id r = event_id_of_key (idempotency_key_of r) in
-  (* Decoded exactly once, here; nothing downstream re-decodes these bytes (finding M9). The
-     causation/correlation handed to decision_of_bytes are the ones the legs would be proposed
-     under, so an accepted first decision can propose what it was handed directly. *)
-  match Wire.decode_decision decision_bytes with
-  | None ->
-    Error
-      (Printf.sprintf
-         "ledger propose closure: %d bytes do not decode as a well-formed %d-byte decision \
-          payload (tag byte must be 0 or 1)"
-         (Bytes.length decision_bytes) Wire.decision_bytes)
-  | Some (accepted, r) -> (
+  (* Decoded exactly once, by Legs.decision_of_bytes -- the guest-facing trust boundary the fuzz
+     test hammers -- and nothing here or downstream re-decodes these bytes (finding M9, and
+     fix-wave round 2's re-review finding I3, which caught that this call had been left as
+     duplicated inline decode logic while legs.mli already claimed to be on this path). The legs
+     handed back are already built under exactly the causation/correlation an accepted first
+     decision proposes them with, so that branch can propose what it was handed directly. *)
+  match Legs.decision_of_bytes ~actor decision_bytes with
+  | Error e -> Error e
+  | Ok (accepted, r, legs) -> (
     match Hashtbl.find_opt t.decided_requests r.request_id with
     | None ->
       Hashtbl.replace t.decided_requests r.request_id (accepted, r);
-      if accepted then (
-        let key = idempotency_key_of r in
-        let eid = event_id r in
-        propose ~idempotency_key:key (Legs.legs_of_request ~actor ~causation:eid ~correlation:eid r));
+      if accepted then
+        propose ~idempotency_key:(Schema.transfer_idempotency_key r.request_id) legs;
       Ok ()
     | Some (already_accepted, recorded) ->
       t.repeat_dispatches <- t.repeat_dispatches + 1;

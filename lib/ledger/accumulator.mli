@@ -74,6 +74,12 @@ val handle_guest_decision :
     otherwise, whatever the decision turns out to be -- a declined transfer is a normal outcome,
     not an error.
 
+    The decode-and-construct half is {!Legs.decision_of_bytes} -- called here, and the only place
+    a guest's raw bytes are ever decoded in this module's host half, which is what makes that
+    function's "this is the guest-facing trust boundary" claim (and the fuzz test standing behind
+    it) true of the real production path rather than of a test-only one. It was NOT called here
+    through fix round 1, which is a defect round 2 closed; see that function's own doc comment.
+
     {b The first decision ever recorded for a [request_id] is final, and that is the whole point
     of this function} (final whole-branch review, finding C1 -- a Critical). Concretely:
 

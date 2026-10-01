@@ -10,7 +10,7 @@
       directly, bypassing Legs entirely. This is the "cannot be violated by any sequence of
       valid-looking module operations" bar Decision 1 says the checkpoint alone is responsible for.
    2. Construction-level (what the checkpoint alone CANNOT enforce, and must instead be guaranteed
-      by construction): Legs.legs_of_bytes, fed arbitrary/adversarial bytes, must always produce
+      by construction): Legs.decision_of_bytes, fed arbitrary/adversarial bytes, must always produce
       either an Error or exactly two legs that are a genuine, balancing pair -- same transfer_id,
       opposite signed deltas, distinct accounts, each this_account/other_account the mirror of the
       other's. Fuzzing the construction code directly (not just inspecting it) is what Decision 1's
@@ -208,12 +208,12 @@ let test_no_malformed_leg_ever_reaches_the_log =
       end)
 
 (* ── Property 2: construction-level ────────────────────────────────────────────────────────────
-   Arbitrary/adversarial bytes fed into Legs.legs_of_bytes must always produce either Error, or
+   Arbitrary/adversarial bytes fed into Legs.decision_of_bytes must always produce either Error, or
    exactly two legs forming a genuine, balancing pair. The generator mixes real, well-formed
    32-byte encoded requests (via Wire.encode_request) with adversarial byte strings: wrong
    lengths (too short, too long, zero-length), and 32-byte-but-content-garbage strings (random
    bytes that happen to decode as SOME request, including ones with negative/zero amounts or
-   from_account = to_account, which legs_of_bytes must still turn into a well-paired, if
+   from_account = to_account, which decision_of_bytes must still turn into a well-paired, if
    business-nonsensical, pair of legs -- "balancing pair" here means role/account/amount
    consistency between the two legs, not that the business transfer itself makes sense; that
    distinction is exactly Decision 1's "authorize cannot and does not check business sense"). *)
@@ -266,13 +266,12 @@ let print_bytes (b : bytes) =
 
 let signed_delta (l : Schema.transfer_leg) = match l.role with Schema.Debit -> Int64.neg l.amount | Schema.Credit -> l.amount
 
-let test_legs_of_bytes_always_produces_nothing_or_a_balanced_pair =
+let test_decision_of_bytes_always_produces_nothing_or_a_balanced_pair =
   QCheck2.Test.make
     ~name:"Legs.decision_of_bytes: adversarial bytes always produce Error or a balanced pair"
     ~count:200 ~print:print_bytes bytes_gen (fun b ->
       let actor = "fuzz" in
-      let event_id = fake_event_id (print_bytes b) in
-      match Legs.decision_of_bytes ~actor ~causation:event_id ~correlation:event_id b with
+      match Legs.decision_of_bytes ~actor b with
       | Error _ -> true
       | Ok (_accepted, request, writes) -> (
         (* The request handed back alongside the legs must be the one the legs were actually built
@@ -290,7 +289,7 @@ let test_legs_of_bytes_always_produces_nothing_or_a_balanced_pair =
           | _ -> ())
         | [] -> ());
         if List.length writes <> 2 then
-          QCheck2.Test.fail_reportf "legs_of_bytes produced %d writes, not 2, for input %s"
+          QCheck2.Test.fail_reportf "decision_of_bytes produced %d writes, not 2, for input %s"
             (List.length writes) (print_bytes b);
         match List.map (fun (w : Riptide_batch_commit.Batch_commit.write) -> Schema.transfer_leg_of_value w.payload) writes with
         | [ Some l1; Some l2 ] ->
@@ -376,7 +375,7 @@ let test_a_direct_unpaired_leg_write_is_denied_not_just_a_module_originated_one 
      closure) through a real Batch_commit.t wired to the real Authorize.authorize. "Looks
      individually valid" on a casual read: positive amount, two distinct named accounts -- the
      one thing wrong with it is subtle, a merge_key that does NOT actually name this_account (a
-     mismatch Legs.legs_of_request/legs_of_bytes can never produce by construction, so this shape
+     mismatch Legs.legs_of_request/decision_of_bytes can never produce by construction, so this shape
      can only arise from a direct, non-module-originated write -- precisely the "any sequence of
      operations," not just ones Legs itself would ever generate, that Review Focus requires).
      Asserts it is NOT silently accepted into the committed log just because its amount/accounts
@@ -422,7 +421,7 @@ let test_a_direct_unpaired_leg_write_is_denied_not_just_a_module_originated_one 
 let tests =
   [
     QCheck_alcotest.to_alcotest test_no_malformed_leg_ever_reaches_the_log;
-    QCheck_alcotest.to_alcotest test_legs_of_bytes_always_produces_nothing_or_a_balanced_pair;
+    QCheck_alcotest.to_alcotest test_decision_of_bytes_always_produces_nothing_or_a_balanced_pair;
     ( "a self-transfer request produces legs authorize denies",
       `Quick,
       test_a_self_transfer_request_produces_legs_authorize_denies );
