@@ -113,17 +113,28 @@ let sign_with_fresh_keypair ~dir artifact =
 
 let verified_module fixture_relpath tier =
   let dir = make_temp_dir "ledger_dst_load_test" in
-  let artifact = Filename.concat dir (Filename.basename fixture_relpath) in
-  write_file artifact (read_file fixture_relpath);
-  let key = sign_with_fresh_keypair ~dir artifact in
-  let verified =
+  (* Everything from here to the [(verified, dir)] below can raise -- a missing/unreadable fixture,
+     a cosign failure, a verification failure -- and until it returns, no caller is holding [dir] to
+     clean up. Fix-wave round 2: round 1's fix made the SUCCESS path remove this directory (the
+     caller does, once subscribe has read the module's bytes), but a setup failure still orphaned
+     it; confirmed live, running this binary from a cwd where "fixtures/ledger.wat" does not resolve
+     left one /tmp/ledger_dst_load_test* dir behind per test. On the success path this re-raises nothing
+     and removes nothing -- ownership passes to the caller exactly as before. *)
+  let sign_and_verify () =
+    let artifact = Filename.concat dir (Filename.basename fixture_relpath) in
+    write_file artifact (read_file fixture_relpath);
+    let key = sign_with_fresh_keypair ~dir artifact in
     match
       Admission.verify ~cosign_path ~key ~digest:(sha256_hex artifact) ~tier ~artifact_path:artifact
     with
     | Ok verified -> verified
     | Error e -> Alcotest.failf "test setup: Admission.verify failed: %s" e
   in
-  (verified, dir)
+  match sign_and_verify () with
+  | verified -> (verified, dir)
+  | exception e ->
+    ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir)));
+    raise e
 
 (* Signed ONCE, at the top of the whole test, not per-request -- see this task's own brief. *)
 let verified_ledger () = verified_module "fixtures/ledger.wat" Loader.Sfi
