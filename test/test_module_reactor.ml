@@ -157,7 +157,6 @@ let create_solo () =
   let send ~to_:_ (_ : string) = () in
   Replica.create ~storage:(Replica.volatile_storage ()) ~my_id:1 ~replica_count:1 ~svc_limit:3 ~send ()
 
-
 let test_one_subscribed_modules_denial_does_not_affect_a_sibling_module_on_the_same_key () =
   (* Two modules subscribed to the SAME merge_key, each wired (via its own ~propose closure) to a
      DIFFERENT Batch_commit.t handle -- one handle's ~authorize always Denies, the other's always

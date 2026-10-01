@@ -330,13 +330,15 @@ type materialize_sink = {
 
     {b Which arguments a real sink actually reads, stated accurately} (final whole-branch review,
     Minor -- this comment used to cite "the ledger's actor-matching authorization check" as a sink's
-    own business logic needing [~actor], and that is wrong on both counts). No sink in this repo reads
-    [~actor] at all: [Riptide_ledger.Accumulator.materialize_sink] binds it as [~actor:_], and the
-    actor-matching check lives in [Riptide_ledger.Authorize.authorize] -- a per-WRITE authorization
-    hook evaluated before the commit, which already receives the whole {!write} and never needed this
-    callback to carry anything. [~actor]/[~causation]/[~correlation] are passed here because a sink is
+    own business logic needing [~actor], and that is wrong on both counts). No BUSINESS-LOGIC sink in
+    this repo reads [~actor] for its own accumulation/application logic: [Riptide_ledger.Accumulator.materialize_sink]
+    binds it as [~actor:_], and the actor-matching check lives in [Riptide_ledger.Authorize.authorize] -- a per-WRITE
+    authorization hook evaluated before the commit, which already receives the whole {!write} and never needed this
+    callback to carry anything. Test observer sinks (wrapping and delegating layers, deduplication guards, etc.) that
+    merely record or assert on [~actor] for testing purposes do bind and read it, but that is distinct from the
+    checkpoint's own enforcement logic. [~actor]/[~causation]/[~correlation] are passed here because a sink is
     an arbitrary caller-composed closure and withholding a committing write's own identity from it is
-    what forced the content-keyed workaround above, not because any current sink consumes them.
+    what forced the content-keyed workaround above, not because any current business-logic sink consumes them.
 
     {b And this does NOT make a payload's own [actor] field redundant.} The ledger keeps one, and
     keeps the authorization-checkpoint agreement check that makes it trustworthy, for a different
@@ -668,15 +670,17 @@ val propose :
     supersedes). When that guard is reached, [Batch_commit.t]'s own [~authorize] (supplied once,
     at {!create} time) is evaluated against EVERY write in [writes], and [Batch_commit.t]'s own
     [~authorize_batch] (Task 7, the Layer 0/Layer 2 boundary revision -- see {!create}'s own doc
-    comment) is evaluated once, against the WHOLE [writes] list, under this exact same guard -- not
-    a second, separately-gated check. If any write's [authorize w] returns [Deny reason], OR
-    [authorize_batch writes] itself returns [Deny reason], this function increments
-    {!authorization_denials} EXACTLY ONCE and proposes nothing for this call -- the materialize step
-    below still runs, exactly as it does for a batch that was simply never proposed at all, and finds
-    nothing committed under [idempotency_key] either way, so this is not a special case needing its
-    own check. A batch is one atomic, indivisible unit, so a single denied write (or a single
-    [authorize_batch] denial) refuses the WHOLE batch, not just itself -- there is no partial-batch
-    commit path anywhere in this module, and authorization does not create one.
+    comment) is evaluated once per batch against the WHOLE [writes] list, under this exact same guard --
+    not a second, separately-gated check. If any write's [authorize w] returns [Deny reason], OR if
+    [authorize_batch writes] returns [Deny reason], this function increments
+    {!authorization_denials} EXACTLY ONCE and proposes nothing for this call. The checkpoint is evaluated
+    in short-circuit order: if an early write fails per-write authorization, the batch is refused without
+    consulting [?authorize_batch] at all, which is correct because a single denied write refuses the
+    whole batch regardless -- the materialize step below still runs, exactly as it does for a batch that
+    was simply never proposed at all, and finds nothing committed under [idempotency_key] either way, so
+    this is not a special case needing its own check. A batch is one atomic, indivisible unit, so a single
+    denied write (or a single [authorize_batch] denial) refuses the WHOLE batch, not just itself -- there is
+    no partial-batch commit path anywhere in this module, and authorization does not create one.
 
     {b Why a call against an ALREADY-committed [idempotency_key] is correctly exempt from this
     checkpoint entirely}, stated precisely because Task 6 (the reactor wiring a real policy) must
