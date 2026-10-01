@@ -99,9 +99,13 @@ type materialize_sink = {
 
 This is independent of Decision 1 — a sink's own business logic (the ledger's actor-matching
 authorization check) needs this identity regardless of who owns dedup. This is **not** purely
-additive: every existing sink constructor needs updating to the new shape. Known call sites in this
-codebase: the ledger's own `Accumulator` wiring, and `test/fixtures/counter.wat`'s test harness —
-small and known, mechanical to update, not a design question.
+additive: every existing sink constructor needs updating to the new shape. Confirmed by grep before
+writing the plan: the ledger's own `Accumulator` wiring, plus roughly 15 sink-literal call sites
+spread across `test_module_end_to_end.ml`, `test_batch_commit_authorization_fuzz.ml`,
+`test_module_reactor.ml` (6), `test_batch_commit_materialize.ml` (6), `test_batch_commit.ml`, and
+`test_lattice_materialize_crypto_scenarios.ml` — real, known, enumerable volume, mechanical to update
+(most just accept and ignore the new labeled arguments), not a design question, but large enough that
+the plan should size it as its own task rather than an afterthought bundled into another one.
 
 ## Decision 3: committed-log query replaces in-memory decision mirrors (closes the other half of item 6)
 
@@ -137,25 +141,53 @@ The ledger's `authorize.ml` is retrofitted to supply the real "both legs present
 zero" check here, retiring the self-certifying-per-leg-plus-construction-time-pairing workaround Task
 6 had to invent in the absence of this hook. Its per-write checks shrink to pure well-formedness.
 
-## Decision 5: `propose` reports primary-liveness (closes items 4, 5)
+## Decision 5: primary-liveness becomes queryable before calling propose (closes items 4, 5)
 
-`Batch_commit.propose`'s return type changes from `unit` to `(unit, [\`Not_primary]) result`.
-Implementation: check `Riptide_vsr.Replica.is_primary replica && Riptide_vsr.Replica.status replica =
-Normal` before delegating to `Riptide_vsr.Replica.propose` (both already exist on `Replica.t` — no new
-Layer 0 primitive needed); return `Error \`Not_primary\`` otherwise.
+**Revised during plan-writing** (file-structure mapping surfaced a blast radius the spec didn't
+account for): the first draft of this decision changed `Batch_commit.propose`'s own return type from
+`unit` to `(unit, [\`Not_primary]) result`. A real count against this codebase shows that would touch
+110 existing `propose` call sites across six test files from several already-merged, unrelated plans
+(`test_batch_commit.ml`, `test_batch_commit_materialize.ml`, `test_module_reactor.ml`,
+`test_redaction.ml`, `test_lattice_materialize_crypto_scenarios.ml`, `test_dst_scenarios.ml`) —
+wildly disproportionate to what items 4/5 actually need, and a direct violation of this task's own
+"scoped fixes only" instruction. Corrected here rather than carried into the plan.
 
-Authorize-denial stays exactly as today — silent, counted via `authorization_denials` — deliberately
-not folded into this result type, since that is a separate, already-working observability mechanism
-and conflating the two isn't this item's job.
+What items 4/5 actually need already exists: `Riptide_vsr.Replica.is_primary`,
+`Riptide_vsr.Replica.status`, and `Batch_commit.replica` (handle → its underlying `Replica.t`) are
+all already public. A caller can already determine primary-liveness before ever calling `propose` —
+the only thing missing is that nobody does, and the pattern isn't documented anywhere as the thing a
+`~propose` closure must do.
 
-The reactor's own `~propose:(bytes -> (unit, string) result)` closure type needs **no change** —
-whoever builds that closure maps `Error \`Not_primary\`` to a descriptive string. What changes is the
-closure-construction *pattern*: re-derive current primary-liveness on every call via `Batch_commit`'s
-new result, rather than caching one handle built once at subscribe time. This does not add
-retry/acknowledgment machinery (`Batch_commit.propose` remains fire-and-forget; durable
-acknowledgment is still task-master Task 9's own job) — it only makes an existing silent gap
+Fix: one new, small, purely additive function —
+
+```ocaml
+val is_primary : t -> bool
+```
+
+— combining `Riptide_vsr.Replica.is_primary (replica t) && Riptide_vsr.Replica.status (replica t) =
+Normal` (the exact compound condition `propose`'s own existing silent-no-op guard already checks
+internally) into the one predicate a Layer 2 author actually needs, so they don't have to
+independently discover and reproduce that compound condition themselves. Zero existing call sites
+change — this is a brand new function, not a modified one.
+
+Authorize-denial is untouched by this decision — still silent, still counted via
+`authorization_denials` — which was always a separate, already-working observability mechanism.
+
+The reactor's own `~propose:(bytes -> (unit, string) result)` closure type needs **no change**.
+What changes is the closure-construction *pattern*, now documented and demonstrated: check
+`Batch_commit.is_primary handle` immediately before calling `propose`, on every call, rather than
+checking once or never; return `Error "not primary, retry"` from the closure without calling
+`propose` at all when it's `false`, instead of calling `propose` and having it silently do nothing.
+This does not add retry/acknowledgment machinery (`Batch_commit.propose` remains fire-and-forget;
+durable acknowledgment is still task-master Task 9's own job) — it only makes an existing silent gap
 observable. The ledger's own test harness (`with_ledger_env`) is retrofitted to this pattern,
 demonstrating the fix against the same view-change scenario that originally caught the bug live.
+
+**Residual gap, disclosed rather than hidden**: `is_primary` and the subsequent `propose` call are
+two separate operations, not atomic — a view change landing in between them (vanishingly unlikely in
+practice given both are synchronous, in-process, same-event-loop calls, but not structurally
+impossible) means `is_primary` can still observe stale liveness. This is strictly better than
+today (where `propose` never reports non-primary at all), not a claim of perfect liveness detection.
 
 ## Data flow
 
@@ -173,26 +205,32 @@ the watermark store, which survived the restart on the same disk the keystore al
 exactly this kind of durability. Every already-applied write is skipped; balances come out correct
 with no doubling.
 
-**View-change drop**: guest proposes legs mid-view-change → `Batch_commit.propose` returns
-`Error \`Not_primary\`` instead of silently no-opping → the closure maps it to a string error the
-reactor relays back to the guest's `propose_write` host call. Recovery is still via re-dispatch (the
-existing, now-explicitly-documented idempotent-under-re-dispatch obligation) — what changes is that
-this failure is now observable in logs/tests instead of indistinguishable from success.
+**View-change drop**: guest proposes legs mid-view-change → the `~propose` closure checks
+`Batch_commit.is_primary handle` first, finds it `false`, and returns `Error "not primary, retry"`
+without ever calling `propose` → the reactor relays that string back to the guest's `propose_write`
+host call. Recovery is still via re-dispatch (the existing, now-explicitly-documented
+idempotent-under-re-dispatch obligation) — what changes is that this failure is now observable in
+logs/tests instead of indistinguishable from success.
 
 ## Error handling
 
 See Decision 1's "Ordering, disclosed rather than hidden" for the watermark/business-state dual-write
 race and the deliberate choice of which failure mode to prefer. See Decision 4 for why
 `authorize_batch` denial shares `authorization_denials` rather than getting its own counter. See
-Decision 5 for why `Not_primary` and authorize-denial are deliberately not unified into one result
-type.
+Decision 5's own "Residual gap, disclosed rather than hidden" for the non-atomicity between checking
+`is_primary` and calling `propose`.
 
 **Backward compatibility**: every new parameter is optional with a behavior-preserving default — no
 `?materialize_watermark_store` means re-materialization is exactly as unsafe for non-idempotent sinks
-as it is today; no `?authorize_batch` means exactly today's per-write-only enforcement. Only the two
-signatures that actually changed shape (`materialize_sink.write`, `propose`'s return type) require
-updating their call sites, and that set is small and known (the ledger, its test harnesses, and
-`counter.wat`'s fixture).
+as it is today; no `?authorize_batch` means exactly today's per-write-only enforcement.
+`committed_writes_for` and `is_primary` are both brand new functions, touching zero existing call
+sites. Only `materialize_sink.write`'s shape actually changes, and every sink constructor in this
+codebase needs updating to match — a real, known, enumerable set (confirmed by grep before writing
+the plan): the ledger's own `Accumulator` wiring, and roughly 15 sink-literal call sites across
+`test_module_end_to_end.ml`, `test_batch_commit_authorization_fuzz.ml`, `test_module_reactor.ml`,
+`test_batch_commit_materialize.ml`, `test_batch_commit.ml`, and
+`test_lattice_materialize_crypto_scenarios.ml` — mechanical (most just need to accept and ignore the
+new labeled arguments), not a design question, but real volume worth sizing correctly in the plan.
 
 **Ledger retrofit's test consequence**: `test_restart_without_durable_dedup_state_doubles_balances`
 (the deliberate pin of the known-bad behavior) is replaced by a test with the same restart+catchup
@@ -212,9 +250,10 @@ in-memory tables are deleted entirely, not kept alongside the new mechanism.
    properties to batch-level denials at the same rigor as per-write ones; the ledger's own
    two-legs-balance test moves from "construction-time guarantee, fuzzed indirectly" to "checkpoint
    enforced, fuzzed directly."
-5. **`Not_primary`**: a DST scenario reproducing the exact original bug (a legs batch proposed during
+5. **`is_primary`**: a DST scenario reproducing the exact original bug (a legs batch proposed during
    a storm-driven view change, using the same fault-injection harness that caught it live) now
-   asserting `Error \`Not_primary\`` is observed instead of a silent, untraceable drop.
+   asserting the closure observes `is_primary = false` and reports it, instead of `propose` silently
+   swallowing the attempt with no trace.
 
 **Regression bar** (Task 7.2's own stated test strategy): the full existing ledger suite (end-to-end +
 fuzz + DST) must still pass after retrofit, with exactly one deliberate exception — the
