@@ -354,8 +354,17 @@ for the first time with a real domain and a real policy, instead of a toy counte
   > halves were made durable, exactly as sketched above and in that order: a decision is now
   > committed to the log as its own write shape (`Legs.decision_write`), and
   > `materialize_sink.write` now receives its write's own `(idempotency_key, position)` identity,
-  > which `Batch_commit` itself uses to keep a durable per-write materialization watermark. Both
-  > in-memory tables were deleted outright rather than persisted in parallel. The pin test named in
+  > which is the injective key a durable per-write materialization watermark is kept under.
+  > **That watermark is NOT something `Batch_commit` itself applies** (corrected by the final
+  > whole-branch review, Minor — this sentence said "which `Batch_commit` itself uses", the exact
+  > internal-gate framing that boundary revision's own Critical 1 removed, and this is the ledger
+  > module's own authoritative spec). It lives in `Batch_commit.deduplicate`, a composable sink
+  > wrapper the CALLER puts around this module's accumulating sink and *inside* any
+  > `Reactor.wrap_materialize_sink`; `propose`/`materialize_up_to` deliberately have no watermark
+  > parameter at all. Getting that composition backwards is a live-reproduced liveness bug, not a
+  > style choice — see that spec's Decision 1 revision note and `accumulator.mli`'s own "THE ONE REAL
+  > OBLIGATION" section, which is where this module states the obligation on its callers.
+  > Both in-memory tables were deleted outright rather than persisted in parallel. The pin test named in
   > this paragraph no longer exists: the same slot in `test/test_ledger_end_to_end.ml` is now
   > `test_restart_with_durable_watermark_leaves_balances_correct`, which runs the identical
   > restart-plus-catch-up scenario and asserts the balances come out right.

@@ -110,6 +110,15 @@ With this in place, `materialize_up_to` and `propose`'s own materialize step bec
 exactly-once per `(idempotency_key, position)` for any sink, not only lattice joins — the "safe to
 call repeatedly" doc claim becomes unconditionally true rather than conditioned on sink idempotency.
 
+> **Not retracted by the revision note above, and should have been** (final whole-branch review,
+> Minor). As shipped, that claim is *not* unconditionally true: it is conditioned on the caller having
+> wrapped its sink in `deduplicate` with a real store. `propose`/`materialize_up_to` apply no gate of
+> their own and deliberately have no `?watermark_store` parameter at all, so an unwrapped accumulating
+> sink re-applies on every replay exactly as it did before this plan. What the revision note changed
+> is *who* satisfies the condition, not that there is one — and `batch_commit.mli` states the
+> obligation at `propose`, `materialize_up_to` and `deduplicate` precisely because this sentence's
+> framing is the belief that reintroduces the restart-doubling bug.
+
 **`materialize_up_to` needs its own `?watermark_store` parameter, not just `create`'s** — caught
 during plan-writing: `materialize_up_to` takes a bare `Riptide_vsr.Replica.t`, never a `Batch_commit.t`
 (deliberately — see that function's own doc comment on why `materialize_write_failures` lives where it
@@ -243,16 +252,34 @@ today (where `propose` never reports non-primary at all), not a claim of perfect
 **Normal dispatch**: client's transfer request commits → reactor dispatches the ledger guest → guest
 decides, calls `propose_write` with the 33-byte ABI (decision tag + legs) → `Batch_commit.propose`
 evaluates `authorize_batch` (real two-legs-balance check) alongside the per-write checks → on commit,
-the materialize step calls `sink.write` with full write identity → the watermark store records
-`(idempotency_key, position)` as applied → the ledger's accumulator applies the delta exactly once.
+the materialize step calls `sink.write` with full write identity, on whatever sink the caller handed
+it — which, as shipped, is
+`Reactor.wrap_materialize_sink reactor (Batch_commit.deduplicate ~watermark_store (Accumulator.materialize_sink ...))`
+→ the reactor wrapper (OUTSIDE) relays the call to the `deduplicate` gate (INSIDE) → the gate finds no
+watermark for this `(idempotency_key, position)`, so it calls the ledger's accumulator sink, which
+applies the delta → **and only then**, after that `write` returned normally, records the watermark →
+back out in the reactor wrapper, the subscribed guest is dispatched.
+
+> **Corrected** (final whole-branch review, Minor): this paragraph used to say the watermark store
+> records presence *before* the accumulator applies the delta. The order is the reverse, and
+> deliberately so — see "Ordering, disclosed rather than hidden" in Decision 1 above for why
+> recording after a successful `write` is the correct choice. It also attributed the recording to "the
+> watermark store" as if it acted on its own, with no mention of the `deduplicate`-inside /
+> reactor-outside composition that is the whole substance of Decision 1's revision note.
 
 **Restart + catch-up**: process restarts, a fresh in-memory accumulator starts empty — no
 `decided_requests` table to lose, since the ledger now asks `committed_writes_for` directly against
 the already-durable log instead of keeping its own mirror. `materialize_up_to`'s catch-up walk
-re-processes the whole log as it always has, but before calling `sink.write` for each entry, checks
-the watermark store, which survived the restart on the same disk the keystore already trusts for
-exactly this kind of durability. Every already-applied write is skipped; balances come out correct
-with no doubling.
+re-processes the whole log as it always has, and calls the sink it was handed for every entry in range
+— it has no watermark parameter and performs no check of its own. The check is the caller-composed
+`deduplicate` wrapper inside that sink, consulting the watermark store, which survived the restart on
+the same disk the keystore already trusts for exactly this kind of durability. Every already-applied
+write is skipped there; balances come out correct with no doubling.
+
+> **Corrected** (final whole-branch review, Minor): this used to say `materialize_up_to`'s catch-up
+> walk itself "checks the watermark store". It does not, and cannot — per Decision 1's revision note
+> its `?watermark_store` parameter is gone, and keeping that framing is what would make a reader
+> expect the gate to be free rather than something a caller must compose.
 
 **View-change drop**: guest proposes legs mid-view-change → the `~propose` closure checks
 `Batch_commit.is_primary handle` first, finds it `false`, and returns `Error "not primary, retry"`
@@ -357,9 +384,13 @@ As of this task, all six items catalogued in the Context section above are close
    Task 4's own review and fixed before this task started (`b4217a3`, cleanup in `e7bde44`); a
    second, independent coverage gap (the `authorize_batch` actor-mismatch clause having no running-
    code coverage) was caught by Task 5's own review and closed the same way (`4afc211`). Both are
-   fully closed, re-reviewed, and already landed on this branch — see this plan's own
-   `.superpowers/sdd/2026-10-01-layer2-boundary-revision/progress.md` ledger for the full narrative;
-   nothing about either is reopened by this freeze. One honest exception to "closed," named here
+   fully closed, re-reviewed, and already landed on this branch — the four commits named above
+   (`b4217a3`, `e7bde44`, `4afc211`, `9191110`) are the record, and each carries its own finding
+   ID and reasoning in its commit message. (Those SHAs replace a citation to this plan's own
+   `.superpowers/sdd/.../progress.md` ledger: `.superpowers/` is entirely untracked, so the pointer
+   did not survive a clone — and this plan's own closing step deletes the workspace it pointed at.
+   Final whole-branch review, Minor.) Nothing about either is reopened by this freeze. One honest
+   exception to "closed," named here
    rather than left for a reader to infer: the committed-log-based decision query is not uniformly
    stronger than the in-memory table it replaced (Task 4's own review, Important 2) — a narrow,
    accepted window remains between a decision being appended and actually committing, where a second
