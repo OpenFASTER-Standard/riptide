@@ -1511,6 +1511,106 @@ let test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_
       true
       (contains ~needle:"did not converge" && contains ~needle:"FULL QUORUM OF REPLICAS IN `normal'")
 
+(* ── This plan's own Task 5, Step 1: the ORIGINAL view-change drop, now asserting OBSERVABILITY,
+   not just "the transfer eventually converges" (every scenario above already covers that). This
+   file's own [current_handle] doc comment (see above) names the bug directly: a handle FIXED to
+   one replica -- the shape this test deliberately reconstructs, unlike [current_handle]/
+   [propose_batch]'s own re-derivation -- becomes a silent, permanent no-op the instant a
+   storm-driven view change moves the real primary elsewhere: "hard-coding replicas.(0) here is
+   exactly what made a transfer's own legs batch, proposed correctly, never converge after a
+   storm-driven view change moved the real primary elsewhere."
+
+   Task 2's [Batch_commit.is_primary] and Task 4's own [dispatch]-closure pattern
+   (test_ledger_end_to_end.ml's own [dispatch]: check [is_primary] immediately before
+   [Batch_commit.propose] and report [Error "not primary, retry"] rather than calling it) exist so
+   a caller CAN observe this and surface it instead of losing the guest's decision with no trace.
+   But that file's own solo (replica_count = 1) environment can never exercise the FALSE branch --
+   its one replica is permanently the only replica, hence permanently primary (accumulator.mli's
+   own doc comment on [handle_guest_decision] says as much). This is that pattern's first REAL
+   exercise: a genuine, multi-replica storm-driven view change (via this file's own
+   [timeout_storm], reusing the existing fault-injection harness -- not a synthetic state
+   override) that actually moves the primary away from a handle still pinned to the replica that
+   used to hold it, with the assertion on the DISPATCH CLOSURE'S OWN RETURN VALUE -- [Error
+   "not primary, retry"], not merely "nothing committed", which the original silent-no-op shape
+   would ALSO produce and so could never be told apart from this fix by that alone (hence the
+   second assertion below, which pins that half too). *)
+let test_propose_closure_reports_not_primary_rather_than_silently_dropping_a_dispatch () =
+  let net_fault_config =
+    Riptide_sim.Network.
+      { drop_probability = 0.0; duplicate_probability = 0.0; corrupt_probability = 0.0;
+        min_delay = 0.0; max_delay = 0.0 }
+  in
+  with_ledger_dst_env ~seed:4242 ~replica_count:3 ~net_fault_config (fun env ->
+      (* [env.storm_cursor] starts at 0 (see [with_ledger_dst_env]'s own [env_handles] literal), so
+         this is replica 0 (my_id = 1) -- cluster.mli's own view-1-primary guarantee, confirmed
+         below rather than merely assumed. A handle pinned to it is exactly the shape
+         [current_handle]'s own doc comment names as the original bug. *)
+      let fixed_handle =
+        Batch_commit.create ~replica:env.replicas.(0) ~authorize:Authorize.authorize
+          ~authorize_batch:Authorize.authorize_batch ()
+      in
+      Alcotest.(check bool)
+        "replica 0 starts out the view-1 primary (cluster.mli's own guarantee)" true
+        (Batch_commit.is_primary fixed_handle);
+      (* This module's own trusted propose closure, pinned to [fixed_handle] rather than
+         re-derived every call (unlike [propose_for_module] above) -- deliberately, so a
+         storm-driven view change genuinely moves the primary out from under it. Mirrors
+         test_ledger_end_to_end.ml's own [dispatch] verbatim: check [is_primary] immediately
+         before the one call that can reach [Batch_commit.propose], and report
+         [Error "not primary, retry"] instead of calling it, rather than letting a non-primary
+         [Batch_commit.propose] silently swallow the guest's decision. *)
+      let dispatch (bytes : bytes) : (unit, string) result =
+        if not (Batch_commit.is_primary fixed_handle) then Error "not primary, retry"
+        else
+          Accumulator.handle_guest_decision env.accumulator ~actor:"ledger-module"
+            ~committed:(fun ~idempotency_key ->
+              Batch_commit.committed_writes_for env.replicas.(0) ~idempotency_key)
+            ~propose:(fun ~idempotency_key writes ->
+              Batch_commit.propose fixed_handle ~idempotency_key ~materialize:env.wrapped_sink
+                writes)
+            bytes
+      in
+      (* The storm: [timeout_storm]'s own cursor begins at replica 0 (see above), so this single
+         call fires [Replica.check_timeout] on exactly the replica [fixed_handle] is pinned to --
+         which (TimerSendSVC, VSR.tla:302-315; see [check_timeout]'s own doc comment) bumps its
+         OWN [view_number] and [status] immediately and locally, so [fixed_handle]'s own
+         [is_primary] already reads false with no settling needed at all; [env.settle ()] runs
+         anyway so the rest of the cluster gets the same real chance to react that every other
+         storm in this file gives it. *)
+      timeout_storm env;
+      env.settle ();
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "replica 0 is no longer the primary after one storm-driven view change (cluster %s)"
+           (cluster_state env))
+        false (Batch_commit.is_primary fixed_handle);
+      let r = Schema.{ request_id = 999_001L; from_account = 201L; to_account = 202L; amount = 10L } in
+      let idempotency_key = Schema.transfer_idempotency_key r.request_id in
+      let bytes = Wire.encode_decision ~accepted:true r in
+      (match dispatch bytes with
+      | Error "not primary, retry" -> ()
+      | Error other ->
+        Alcotest.failf
+          "dispatch reported an error, which is the right shape, but the wrong string -- got %S, \
+           wanted %S"
+          other "not primary, retry"
+      | Ok () ->
+        Alcotest.fail
+          "dispatch returned `Ok ()' despite is_primary being false -- the original silent-drop \
+           bug (a non-primary propose call swallowed with no trace) is back");
+      (* The other half of "reports the error string rather than silently doing nothing": nothing
+         was actually proposed either. A regression that merely misreported the return value while
+         still silently no-op'ing underneath would pass the assertion above for the wrong reason;
+         this confirms both halves of the claim, not just the one the first assertion already
+         names. *)
+      match Batch_commit.committed_writes_for env.replicas.(0) ~idempotency_key with
+      | None -> ()
+      | Some _ ->
+        Alcotest.fail
+          "the decision this dispatch attempted was committed anyway, despite dispatch itself \
+           reporting `Error \"not primary, retry\"' -- the closure's return value and its actual \
+           effect disagree")
+
 let tests =
   List.map
     (fun seed ->
@@ -1527,4 +1627,9 @@ let tests =
          wrapper -- seed 22 stalls permanently with it outside (Task 4 review, Critical 1)",
         `Slow,
         test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers );
+      ( "a propose closure pinned to a replica a storm-driven view change just moved off of \
+         reports `Error \"not primary, retry\"' rather than silently dropping the dispatch (Task \
+         5, Step 1)",
+        `Quick,
+        test_propose_closure_reports_not_primary_rather_than_silently_dropping_a_dispatch );
     ]

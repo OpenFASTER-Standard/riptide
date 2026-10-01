@@ -29,8 +29,11 @@
    > no write can bypass, not only a construction-time convention. The property-2 fuzzing below is
    > kept, and is still worth keeping: it covers [Legs.decision_of_bytes]'s own behaviour on
    > adversarial bytes (the guest-facing trust boundary), which is a genuinely different question
-   > from whether a malformed batch would be refused at commit time. Task 5 of this plan owns the
-   > [authorize_batch] fuzz property itself.
+   > from whether a malformed batch would be refused at commit time. {b Property 3 below, added by
+   > Task 5 of this plan, is the [authorize_batch] fuzz property itself} -- randomized adversarial
+   > PAIRS (mismatched transfer_id, same role twice, unequal amounts, wrong account pairing),
+   > deliberately a different kind of coverage from authorize.ml's own 25-case exhaustive truth
+   > table rather than a re-transcription of it.
 
    Three further named tests (not fuzzed) pin the exact Review Focus items this task owns: a
    self-transfer request's legs get denied, a non-positive-amount leg gets denied, and a
@@ -348,6 +351,184 @@ let test_decision_of_bytes_always_produces_nothing_or_a_balanced_pair =
             "decision_of_bytes produced a payload that doesn't decode as a transfer_leg for input %s"
             (print_bytes b)))
 
+(* ── Property 3: batch-level pairing (this plan's own task-5-brief.md, Step 2) ───────────────────
+   Authorize.authorize_batch's own pairing_verdict already has exhaustive coverage of a different
+   kind: authorize.ml's own doc comment records a 25-case exhaustive truth table built and verified
+   by Task 4's reviewer. This is deliberately NOT a re-transcription of that table -- it is
+   randomized adversarial generation over malformed PAIRS, the genuinely different complementary
+   coverage this task's own brief asks for: mismatched transfer_id, same role twice, unequal
+   amounts, and wrong account pairing, each applied to exactly one leg of an otherwise well-formed
+   pair built the one way a pair is ever built in production, Legs.legs_of_request (never
+   hand-rolled, so a bug in THAT construction would show up here too, not just a bug in
+   authorize_batch's own verdict). Property: every malformed pair authorize_batch DENIES; every
+   well-formed one (Legs.legs_of_request's own unmodified output) it ALLOWS. *)
+
+type pair_shape =
+  | Well_formed_pair
+  | Mismatched_transfer_id
+  | Same_role_twice
+  | Unequal_amounts
+  | Wrong_account_pairing
+
+let print_pair_shape = function
+  | Well_formed_pair -> "well_formed_pair"
+  | Mismatched_transfer_id -> "mismatched_transfer_id"
+  | Same_role_twice -> "same_role_twice"
+  | Unequal_amounts -> "unequal_amounts"
+  | Wrong_account_pairing -> "wrong_account_pairing"
+
+type generated_pair = {
+  pair_shape : pair_shape;
+  request_id : int64;
+  from_account : int64;
+  to_account : int64;
+  amount : int64;
+  mutate_debit : bool;
+      (* Which of the two legs a malformed shape's own mutation lands on -- the debit leg (true) or
+         the credit leg (false). Covers the pairing check from both sides rather than always
+         perturbing the same one. *)
+  delta : int64; (* always 1..1000, i.e. always nonzero -- every malformed shape's mutation below
+                     relies on "nonzero" to guarantee it actually changes the field it touches. *)
+}
+
+let pair_actor = "fuzz-batch"
+
+let pair_gen : generated_pair QCheck2.Gen.t =
+  let open QCheck2.Gen in
+  let* pair_shape =
+    oneof_weighted
+      [
+        (4, return Well_formed_pair);
+        (1, return Mismatched_transfer_id);
+        (1, return Same_role_twice);
+        (1, return Unequal_amounts);
+        (1, return Wrong_account_pairing);
+      ]
+  in
+  let* request_id = int64 in
+  let* from_account = int_range 0 1000 >|= Int64.of_int in
+  let* to_account_raw = int_range 0 1000 >|= Int64.of_int in
+  let* amount = int_range 1 1_000_000 >|= Int64.of_int in
+  let* mutate_debit = bool in
+  let* delta = int_range 1 1000 >|= Int64.of_int in
+  (* Distinct accounts, matching this generator's own baseline convention elsewhere in this file --
+     not required by Legs.legs_of_request (which never rejects a self-transfer, per its own doc
+     comment), but a self-transfer's own this_account=other_account on each leg would make
+     Wrong_account_pairing's mutation ambiguous with a merely-degenerate well-formed pair. *)
+  let to_account =
+    if to_account_raw = from_account then Int64.add to_account_raw 1L else to_account_raw
+  in
+  return { pair_shape; request_id; from_account; to_account; amount; mutate_debit; delta }
+
+let print_pair (g : generated_pair) =
+  Printf.sprintf
+    "{shape=%s; request_id=%Ld; from=%Ld; to=%Ld; amount=%Ld; mutate_debit=%b; delta=%Ld}"
+    (print_pair_shape g.pair_shape) g.request_id g.from_account g.to_account g.amount
+    g.mutate_debit g.delta
+
+let leg_of_write (w : Riptide_batch_commit.Batch_commit.write) : Schema.transfer_leg =
+  match Schema.transfer_leg_of_value w.payload with
+  | Some l -> l
+  | None ->
+    (* Legs.legs_of_request's own payload is always Schema.transfer_leg_to_value of a real leg --
+       see its own doc comment -- so this is unreachable for the ONLY writes this function is ever
+       called on. *)
+    assert false
+
+(* The two legs Legs.legs_of_request would produce for [g]'s own request fields, UNMUTATED --
+   [Well_formed_pair]'s own baseline, and every malformed shape's own starting point before one
+   field of one leg is perturbed. *)
+let baseline_pair (g : generated_pair) :
+    Riptide_batch_commit.Batch_commit.write * Riptide_batch_commit.Batch_commit.write =
+  let r =
+    Schema.
+      {
+        request_id = g.request_id;
+        from_account = g.from_account;
+        to_account = g.to_account;
+        amount = g.amount;
+      }
+  in
+  let event_id = Legs.event_id_of_request r in
+  match Legs.legs_of_request ~actor:pair_actor ~causation:event_id ~correlation:event_id r with
+  | [ debit_w; credit_w ] -> (debit_w, credit_w)
+  | _ ->
+    (* Legs.legs_of_request's own contract: always exactly [[debit; credit]] -- see its own doc
+       comment. *)
+    assert false
+
+(* [debit, credit]'s own mutated pair for [g.pair_shape] -- [Well_formed_pair] untouched, every
+   other shape perturbing exactly one field of exactly one leg (chosen by [g.mutate_debit]), always
+   by a nonzero [g.delta], so the perturbed field is GUARANTEED to differ from its own prior value
+   (and, since the baseline pair starts genuinely matched, from the sibling leg's corresponding
+   field too -- see each shape's own comment below for why). *)
+let mutated_pair (g : generated_pair) (debit : Schema.transfer_leg) (credit : Schema.transfer_leg) :
+    Schema.transfer_leg * Schema.transfer_leg =
+  match g.pair_shape with
+  | Well_formed_pair -> (debit, credit)
+  | Mismatched_transfer_id ->
+    (* pairing_verdict's very first check: a.transfer_id <> b.transfer_id. Both start equal to
+       g.request_id; nudging one by a nonzero delta makes them differ, whichever side is chosen. *)
+    if g.mutate_debit then ({ debit with transfer_id = Int64.add debit.transfer_id g.delta }, credit)
+    else (debit, { credit with transfer_id = Int64.add credit.transfer_id g.delta })
+  | Same_role_twice ->
+    (* pairing_verdict's role match: (Debit, Debit) | (Credit, Credit) is denied. Forcing ONE leg's
+       role to equal the OTHER (unmutated) leg's role -- rather than to some arbitrary third value,
+       there being only two roles -- is what makes both legs share a role instead of being
+       opposite. *)
+    if g.mutate_debit then (debit, { credit with role = debit.role })
+    else ({ debit with role = credit.role }, credit)
+  | Unequal_amounts ->
+    (* Reached only once roles are confirmed opposite (unchanged here), where pairing_verdict next
+       checks a.amount <> b.amount. Both start equal to g.amount; nudging one by a nonzero delta
+       makes them differ. *)
+    if g.mutate_debit then ({ debit with amount = Int64.add debit.amount g.delta }, credit)
+    else (debit, { credit with amount = Int64.add credit.amount g.delta })
+  | Wrong_account_pairing ->
+    (* Reached only once roles are opposite and amounts equal (both unchanged here), where
+       pairing_verdict checks a.this_account = b.other_account && a.other_account = b.this_account.
+       The baseline pair starts with debit.this_account = credit.other_account = from_account (and
+       the mirror for the other field); nudging one leg's this_account by a nonzero delta breaks
+       that mirror on whichever side is chosen. *)
+    if g.mutate_debit then ({ debit with this_account = Int64.add debit.this_account g.delta }, credit)
+    else (debit, { credit with this_account = Int64.add credit.this_account g.delta })
+
+let writes_of_pair (g : generated_pair) : Riptide_batch_commit.Batch_commit.write list =
+  let debit_w, credit_w = baseline_pair g in
+  let debit', credit' = mutated_pair g (leg_of_write debit_w) (leg_of_write credit_w) in
+  (* The rest of each write ([actor]/[causation]/[correlation]/[merge_key]) is passed through from
+     the real baseline write untouched -- authorize_batch's own pairing_verdict reads only the
+     DECODED PAYLOAD's fields, never merge_key, so this is exactly isolating the one thing this
+     property varies. *)
+  [
+    { debit_w with payload = Schema.transfer_leg_to_value debit' };
+    { credit_w with payload = Schema.transfer_leg_to_value credit' };
+  ]
+
+let test_authorize_batch_pairing_fuzz =
+  QCheck2.Test.make
+    ~name:"authorize_batch: every malformed pair is denied, every well-formed pair is allowed"
+    ~count:300 ~print:print_pair pair_gen (fun g ->
+      let writes = writes_of_pair g in
+      let verdict = Authorize.authorize_batch writes in
+      match g.pair_shape with
+      | Well_formed_pair ->
+        (match verdict with
+        | Riptide_batch_commit.Batch_commit.Allow -> ()
+        | Riptide_batch_commit.Batch_commit.Deny reason ->
+          QCheck2.Test.fail_reportf
+            "a well-formed pair (Legs.legs_of_request's own unmodified output) was denied: %s \
+             (reason: %s)"
+            (print_pair g) reason);
+        true
+      | Mismatched_transfer_id | Same_role_twice | Unequal_amounts | Wrong_account_pairing ->
+        (match verdict with
+        | Riptide_batch_commit.Batch_commit.Deny _ -> ()
+        | Riptide_batch_commit.Batch_commit.Allow ->
+          QCheck2.Test.fail_reportf "a malformed pair was allowed by authorize_batch: %s"
+            (print_pair g));
+        true)
+
 (* ── Three named Review Focus tests ────────────────────────────────────────────────────────── *)
 
 let test_a_self_transfer_request_produces_legs_authorize_denies () =
@@ -442,6 +623,7 @@ let tests =
   [
     QCheck_alcotest.to_alcotest test_no_malformed_leg_ever_reaches_the_log;
     QCheck_alcotest.to_alcotest test_decision_of_bytes_always_produces_nothing_or_a_balanced_pair;
+    QCheck_alcotest.to_alcotest test_authorize_batch_pairing_fuzz;
     ( "a self-transfer request produces legs authorize denies",
       `Quick,
       test_a_self_transfer_request_produces_legs_authorize_denies );
