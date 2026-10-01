@@ -41,8 +41,9 @@ let leg_key (leg : Schema.transfer_leg) : string =
      that nonetheless works): every segment except the actor is a fixed-arity rendering of an
      int64 or of one of the two role tags, and NONE of those renderings can contain "|". So any
      two legs whose keys are equal must split into the same number of "|"-separated segments, with
-     the SAME five non-actor segments at the same positions -- the first segment and the last four
-     -- which forces the remaining middle span, i.e. the actor, to match too. A "|" inside an
+     the SAME five non-actor segments at the same positions -- the first two segments (transfer_id,
+     role_tag) and the last three (this_account, other_account, amount) -- which forces the
+     remaining middle span, i.e. the actor, to match too. A "|" inside an
      actor id can only ever add segments in the middle, never move a numeric field across a
      delimiter boundary, because there are always exactly five numeric/tag segments pinned to the
      two ends. String.escaped is kept purely so a key is printable/diffable when debugging. *)
