@@ -148,12 +148,6 @@ let lww_of_value = function
 
 let fake_event_id name = Value.content_hash (Value.Scalar (Value.String name))
 
-let account_prefix = "ledger.account."
-
-let is_account_key mk =
-  String.length mk >= String.length account_prefix
-  && String.sub mk 0 (String.length account_prefix) = account_prefix
-
 (* ── The real multi-node wiring: one Riptide_dst.Cluster.run cluster (real replica_count
    replicas, each with its own Fault_injecting_storage over Memory_storage, driven under
    Eio_mock.Backend.run's virtual clock -- NOT Cluster.run_on_file_storage/real File_storage: this
@@ -180,9 +174,18 @@ type env_handles = {
   is_down : bool array;
   materializer : M.t;
   wrapped_sink : Batch_commit.materialize_sink;
+  accumulator : Accumulator.t;
   settle : unit -> unit;
   restart :
     ?lose_superblock:bool -> ?repair_superblock:Riptide_dst.Cluster.superblock_repair -> int -> bool;
+  (* Per-RUN state, deliberately not module-level globals (final whole-branch review, finding M5).
+     Both of these used to be top-level [ref]s, which was harmless while this file ran exactly one
+     scenario per process and is not any more: finding I7 added a real multi-seed sweep, so several
+     scenarios now run in the same process, and a cursor or counter carried over from a previous
+     seed's run would make each scenario's behaviour depend on which ones ran before it -- quietly
+     destroying the per-seed reproducibility that is the entire point of a seeded DST sweep. *)
+  mutable storm_cursor : int;
+  mutable nudge_counter : int;
 }
 
 (* NOT a fixed handle over replicas.(0) -- unlike test_ledger_end_to_end.ml's own solo env (where
@@ -227,66 +230,36 @@ let with_ledger_dst_env ~seed ~replica_count ~net_fault_config (f : env_handles 
     ts_counter := Int64.add !ts_counter 1L;
     !ts_counter
   in
-  (* Same idempotent-accumulation dedup guard as test_ledger_end_to_end.ml's own inner_sink, and
-     for the same reason: a client retrying the same transfer_request under the same
-     idempotency_key re-runs materialize.write for both already-committed legs a second time,
-     with bit-identical payload, and a naive accumulator would double apply. Keyed by
-     (transfer_id, this_account, role), exactly as Task 3 established. *)
-  let applied_legs : (string, unit) Hashtbl.t = Hashtbl.create 256 in
-  let inner_sink : Batch_commit.materialize_sink =
-    {
-      write =
-        (fun ~merge_key payload ->
-          if merge_key = Schema.requests_merge_key then
-            M.write materializer ~merge_key { Last_write_wins.value = payload; timestamp = next_ts () }
-          else if is_account_key merge_key then (
-            match Schema.transfer_leg_of_value payload with
-            | None -> ()
-            | Some leg ->
-              let dedup_key =
-                Printf.sprintf "%Ld|%Ld|%s" leg.Schema.transfer_id leg.Schema.this_account
-                  (match leg.Schema.role with Schema.Debit -> "debit" | Schema.Credit -> "credit")
-              in
-              if not (Hashtbl.mem applied_legs dedup_key) then (
-                Hashtbl.add applied_legs dedup_key ();
-                let delta =
-                  match leg.Schema.role with
-                  | Schema.Debit -> Int64.neg leg.Schema.amount
-                  | Schema.Credit -> leg.Schema.amount
-                in
-                let current = M.read materializer ~merge_key in
-                let current_balance =
-                  if current = Last_write_wins.bottom then 0L
-                  else
-                    match current.Last_write_wins.value with
-                    | Value.Scalar (Value.Int n) -> n
-                    | _ -> 0L
-                in
-                let new_balance = Int64.add current_balance delta in
-                M.write materializer ~merge_key
-                  { Last_write_wins.value = Value.Scalar (Value.Int new_balance); timestamp = next_ts () }))
-          else ());
-    }
+  (* Same four tiny lattice/KV-specific closures as test_ledger_end_to_end.ml's own env, over this
+     file's own Memory_kv_store instead of a real File_kv_store. Everything else -- the balance
+     accumulation, its dedup guard, the decision table, the host side of Wire's byte convention --
+     is shared library code now (Accumulator, lib/ledger/), not ~50 lines duplicated between these
+     two test files as it was before finding I3. *)
+  let accumulator = Accumulator.create () in
+  let read_balance ~merge_key =
+    let v = M.read materializer ~merge_key in
+    if v = Last_write_wins.bottom then None
+    else match v.Last_write_wins.value with Value.Scalar (Value.Int n) -> Some n | _ -> None
+  in
+  let write_balance ~merge_key balance =
+    M.write materializer ~merge_key
+      { Last_write_wins.value = Value.Scalar (Value.Int balance); timestamp = next_ts () }
+  in
+  let store_request payload =
+    M.write materializer ~merge_key:Schema.requests_merge_key
+      { Last_write_wins.value = payload; timestamp = next_ts () }
+  in
+  let read_request () =
+    let v = M.read materializer ~merge_key:Schema.requests_merge_key in
+    if v = Last_write_wins.bottom then None
+    else Schema.transfer_request_of_value v.Last_write_wins.value
+  in
+  let inner_sink =
+    Accumulator.materialize_sink accumulator ~read_balance ~write_balance ~store_request
   in
   let reactor = Reactor.create () in
   let wrapped_sink = Reactor.wrap_materialize_sink reactor inner_sink in
-  let read_for_module ~merge_key =
-    if merge_key = Schema.requests_merge_key then (
-      let v = M.read materializer ~merge_key in
-      if v = Last_write_wins.bottom then None
-      else
-        match Schema.transfer_request_of_value v.Last_write_wins.value with
-        | Some r -> Some (Wire.encode_request r)
-        | None -> None)
-    else if is_account_key merge_key then (
-      let v = M.read materializer ~merge_key in
-      if v = Last_write_wins.bottom then None
-      else
-        match v.Last_write_wins.value with
-        | Value.Scalar (Value.Int bal) -> Some (Wire.encode_balance bal)
-        | _ -> None)
-    else None
-  in
+  let read_for_module = Accumulator.read_for_guest ~read_request ~read_balance in
   let verified_artifact, verification_dir = verified_ledger () in
   Fun.protect
     ~finally:(fun () -> ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote verification_dir))))
@@ -310,29 +283,39 @@ let with_ledger_dst_env ~seed ~replica_count ~net_fault_config (f : env_handles 
              handle fixed to one replica, since this nested call can itself run after a
              storm-driven view change has moved the primary. *)
           let propose_for_module (bytes : bytes) : (unit, string) result =
-            match Wire.decode_request bytes with
-            | None -> Error "propose closure: payload does not decode as a well-formed transfer_request"
-            | Some r ->
-              let idempotency_key = "ledger-transfer-" ^ Int64.to_string r.Schema.request_id in
-              let event_id = fake_event_id idempotency_key in
-              (match
-                 Legs.legs_of_bytes ~actor:"ledger-module" ~causation:event_id ~correlation:event_id
-                   bytes
-               with
-              | Error e -> Error e
-              | Ok legs ->
-                propose_batch replicas is_down ~idempotency_key ~materialize:wrapped_sink legs;
-                Ok ())
+            Accumulator.handle_guest_decision accumulator ~actor:"ledger-module"
+              ~propose:(fun ~idempotency_key writes ->
+                propose_batch replicas is_down ~idempotency_key ~materialize:wrapped_sink writes)
+              bytes
           in
           Reactor.subscribe reactor ~merge_key:Schema.requests_merge_key ~module_:verified_artifact
             ~protocol:allow_handle_from_init ~read:read_for_module ~propose:propose_for_module;
-          f { replicas; is_down; materializer; wrapped_sink; settle; restart }))
+          f
+            {
+              replicas;
+              is_down;
+              materializer;
+              wrapped_sink;
+              accumulator;
+              settle;
+              restart;
+              storm_cursor = 0;
+              nudge_counter = 0;
+            }))
 
 let seed_account env account amount =
   let idempotency_key = Printf.sprintf "seed-%Ld" account in
   let event_id = fake_event_id idempotency_key in
   let leg =
-    Schema.{ transfer_id = 0L; role = Credit; this_account = account; other_account = 0L; amount }
+    Schema.
+      {
+        transfer_id = 0L;
+        role = Credit;
+        actor = "test-seed";
+        this_account = account;
+        other_account = 0L;
+        amount;
+      }
   in
   propose_batch env.replicas env.is_down ~idempotency_key ~materialize:env.wrapped_sink
     [
@@ -389,6 +372,33 @@ let module_leg_envelopes env =
   Batch_commit.committed_envelopes (best_live_replica env)
   |> List.filter (fun (e : Envelope.envelope) -> e.actor = "ledger-module")
 
+(* How many of THIS transfer's own legs are committed, counted absolutely rather than as a delta
+   against some earlier global total.
+
+   Load-bearing, and the fix for a real pre-existing bug this plan's own seed sweep (finding I7)
+   surfaced: [drive_legs] below used to capture a GLOBAL leg count [before] when it started and wait
+   for [before + 2], which silently assumes this transfer's legs cannot possibly be committed yet.
+   That assumption is false. A dispatch appends its legs uncommitted, but anything that settles the
+   cluster between the dispatch and [drive_legs] can commit them first -- and at the crash site
+   there are two extra [env.settle ()] calls doing exactly that. When it happens, [before] ALREADY
+   includes this transfer's two legs, so the loop waits forever for two more legs that will never
+   exist, and the test fails claiming the legs "did not converge" while they are sitting in the
+   committed log the whole time. Confirmed live against the ORIGINAL pre-fix-wave code: seed 7
+   fails this way at transfer 20 and seed 31337 at transfer 43, both with the legs genuinely
+   present in [committed_envelopes]. Seed 4242, the only seed this file ever ran before, happens
+   never to hit it.
+
+   Counting this transfer's own legs absolutely is immune to WHEN they landed, and is a strictly
+   more precise statement of what the caller actually wants to know. Seed legs cannot be confused
+   with these: [module_leg_envelopes] already filters to the module's own actor. *)
+let legs_of_transfer env transfer_id =
+  module_leg_envelopes env
+  |> List.filter (fun (e : Envelope.envelope) ->
+         match Schema.transfer_leg_of_value e.payload with
+         | Some l -> l.Schema.transfer_id = transfer_id
+         | None -> false)
+  |> List.length
+
 (* The empty-writes re-check idiom this file's own top comment explains -- safe to call for a key
    whose batch does not exist yet (pure no-op) or is already materialized (lattice-join no-op). As
    a plain closure (an "action") so it composes uniformly with [reproposal] below in the same
@@ -435,8 +445,6 @@ let pump_actions actions = List.iter (fun action -> action ()) actions
    has no such tiebreaker. Driving one replica's timer at a time gives its broadcast a real chance
    to be observed and adopted (via ReceiveHigherSVC/ReceiveMatchingSVC) before the other replica's
    own timer could compete with it. *)
-let timeout_storm_cursor = ref 0
-
 let timeout_storm env =
   let n = Array.length env.replicas in
   let rec find_live attempts i =
@@ -444,11 +452,11 @@ let timeout_storm env =
     else if not env.is_down.(i) then Some i
     else find_live (attempts + 1) ((i + 1) mod n)
   in
-  match find_live 0 (!timeout_storm_cursor mod n) with
+  match find_live 0 (env.storm_cursor mod n) with
   | None -> ()
   | Some i ->
     Replica.check_timeout env.replicas.(i);
-    timeout_storm_cursor := (i + 1) mod n
+    env.storm_cursor <- (i + 1) mod n
 
 (* A trivial, content-distinct, merge_key = None batch (ignored by both Authorize.authorize --
    "anything else: Allow" -- and this file's own inner_sink, which has no opinion on an unknown
@@ -465,11 +473,9 @@ let timeout_storm env =
    test_dst_scenarios.ml's own sweep, which never hits this stall in the first place because its
    own scenario keeps a continuous stream of new, distinct proposals flowing every round; this
    file's own per-request convergence loops do not have that for free, so they supply it here. *)
-let nudge_counter = ref 0
-
 let nudge env =
-  incr nudge_counter;
-  let idempotency_key = Printf.sprintf "nudge-%d" !nudge_counter in
+  env.nudge_counter <- env.nudge_counter + 1;
+  let idempotency_key = Printf.sprintf "nudge-%d" env.nudge_counter in
   let event_id = fake_event_id idempotency_key in
   propose_batch env.replicas env.is_down ~idempotency_key
     [
@@ -477,7 +483,7 @@ let nudge env =
         Batch_commit.actor = "test-nudge";
         causation = event_id;
         correlation = event_id;
-        payload = Value.Scalar (Value.Int (Int64.of_int !nudge_counter));
+        payload = Value.Scalar (Value.Int (Int64.of_int env.nudge_counter));
         merge_key = None;
       };
     ]
@@ -570,7 +576,7 @@ let drive_until ?(max_rounds = max_rounds) env ~actions ~progress ~converged =
    this one key, not any other pending key, so a caller choosing to inject a fault right after this
    returns knows precisely what has and has not happened yet: this request's own commit and
    dispatch (which, if the module decided "sufficient funds", already means
-   Legs.legs_of_bytes ran and a *separate*, still-uncommitted legs batch was just appended to the
+   Legs.legs_of_request ran and a *separate*, still-uncommitted legs batch was just appended to the
    primary's own log via propose_for_module's nested Batch_commit.propose above) but NOT that legs
    batch's own commit or materialization, which needs its own, separate drive. *)
 let drive_request_dispatch env ~idempotency_key (req : Schema.transfer_request) =
@@ -605,19 +611,31 @@ let drive_request_dispatch env ~idempotency_key (req : Schema.transfer_request) 
 let drive_legs env ~idempotency_key ~transfer_key ~expected_delta (req : Schema.transfer_request) =
   if expected_delta = 0 then ()
   else (
-    let before = List.length (module_leg_envelopes env) in
+    let committed () = legs_of_transfer env req.Schema.request_id in
     let ok =
       drive_until env
         ~actions:
           [ (fun () -> propose_request env ~idempotency_key req); materialize_only env transfer_key ]
-        ~progress:(fun () -> List.length (module_leg_envelopes env))
-        ~converged:(fun () -> List.length (module_leg_envelopes env) >= before + expected_delta)
+        ~progress:committed
+        ~converged:(fun () -> committed () >= expected_delta)
     in
     if not ok then
-      Alcotest.failf "transfer %s: legs did not converge after %d rounds (have %d, want >= %d)"
-        transfer_key max_rounds
-        (List.length (module_leg_envelopes env))
-        (before + expected_delta))
+      Alcotest.failf
+        "transfer %s: its own legs did not converge after %d rounds (have %d of this transfer's \
+         own legs committed, want %d; cluster view=[%s] status=[%s] -- all-replicas-View_change \
+         here means the out-of-scope VSR view-change liveness gap this file documents, not a \
+         ledger defect)"
+        transfer_key max_rounds (committed ()) expected_delta
+        (String.concat ","
+           (Array.to_list (Array.map (fun r -> string_of_int (Replica.view_number r)) env.replicas)))
+        (String.concat ","
+           (Array.to_list
+              (Array.map
+                 (fun r ->
+                   match Replica.status r with
+                   | Replica.Normal -> "normal"
+                   | Replica.View_change -> "vc")
+                 env.replicas))))
 
 let drive_seed env ~account ~amount =
   let ok =
@@ -673,7 +691,58 @@ let build_requests () =
   done;
   (List.rev !requests, ref_balances)
 
-let test_the_ledger_invariant_holds_under_injected_failures () =
+(* ── Final whole-branch review, finding I7: a real seed sweep, not one hardcoded seed ───────────
+   This scenario used to run exactly one seed (4242) while the design spec promised "the structural
+   invariant never breaks across ANY seed" -- a claim one seed cannot support, and out of step with
+   this codebase's own DST precedent (test_dst_scenarios.ml sweeps 100+ seeds).
+
+   Five seeds, each a separate Alcotest case rather than one case looping internally, deliberately:
+   test_riptide.ml's watchdog ([arm_watchdog]) is re-armed PER TEST, so five cases each get their
+   own full 15s budget instead of sharing one, and a failure names the seed that produced it rather
+   than "the sweep". Measured ~1.6s per seed, ~8s for all five. Every seed re-derives its own fresh
+   state -- fresh cluster, materializer, Accumulator, and (per finding M5) fresh storm/nudge
+   counters. [build_requests] is deterministic and seed-independent by design (it is the reference
+   model, not the fault schedule); what each seed varies is every protocol-level decision and
+   network fault inside Riptide_dst.Cluster.run.
+
+   ── What the sweep found, and the honest limit on what "any seed" can mean today ───────────────
+   Two separate things surfaced the moment more than one seed ran, and they have very different
+   dispositions:
+
+   1. {b A real defect in this file's own driving logic, now fixed}: [drive_legs] waited for a
+      GLOBAL leg-count delta instead of this transfer's own legs. See [legs_of_transfer]'s own
+      comment for the full mechanism. Seed 4242 never hit it; seeds 7 and 31337 fail on it, and
+      BOTH were confirmed to fail identically against the ORIGINAL pre-fix-wave code (a separate
+      clean clone at commit 14cd443, seed patched, same assertion, legs genuinely present in
+      [committed_envelopes] the whole time) -- i.e. pre-existing, surfaced by the sweep, exactly
+      what a sweep is for.
+
+   2. {b A pre-existing VSR-subset view-change liveness gap, which is NOT this plan's to fix and
+      bounds the sweep's own breadth.} Of 16 arbitrary seeds surveyed, 6 complete and 10 wedge in
+      the same, unmistakable way: every replica live and agreeing on the view number, every one
+      stuck in [View_change] status, so no replica is ever [Normal] AND primary, so
+      [current_handle] returns [None] and every [propose_batch] in this file becomes a silent
+      no-op forever (observed directly: is_down=[false,false,false] status=[vc,vc,vc] view=[8,8,8]
+      with a healthy commit_number on all three). This is the same class of gap Task 4's own
+      review already identified in [replica.ml]'s [check_timeout]/view-change path and that this
+      plan's controller explicitly ruled out of scope -- it lives entirely in Layer 0's consensus
+      implementation, not in the ledger, and closing it is a real VSR liveness project.
+      [drive_legs]'s own failure message prints view/status precisely so this shape is
+      recognisable at a glance rather than mistaken for a ledger defect.
+
+      One escalation was tried and rejected on evidence rather than assumed away: driving the
+      current view's primary-elect's own timer whenever no [Normal] primary exists (which is the
+      one condition VSR.tla's [ForfeitViewChange] exists for). It did not clear the wedged seeds
+      and it BROKE a previously-passing one (seed 99), matching [timeout_storm]'s own documented
+      warning about unnecessary view changes -- so it was reverted rather than kept.
+
+   The five seeds below are therefore seeds that genuinely complete, not a claim that all seeds do,
+   and the design spec's own "across any seed" wording has been corrected to say what is actually
+   true and what bounds it. Stability verified by running this committed set three consecutive
+   times, green each time. *)
+let sweep_seeds = [ 4242; 1; 2; 4; 10 ]
+
+let run_scenario ~seed () =
   let requests, expected_balances = build_requests () in
   (* The designated crash-timing request: the first ACCEPTED request at or past position 20 (well
      into the run, so there is real prior history -- both committed state on every replica and a
@@ -697,13 +766,13 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
   in
   let crash_outcome = ref None in
   let repair_outcome = ref None in
-  with_ledger_dst_env ~seed:4242 ~replica_count:3 ~net_fault_config (fun env ->
+  with_ledger_dst_env ~seed ~replica_count:3 ~net_fault_config (fun env ->
       Array.iteri (fun i acct -> drive_seed env ~account:acct ~amount:seed_amounts.(i)) accounts;
       List.iteri
         (fun i (req, accepted) ->
           let n = i + 1 in
           let idempotency_key = Printf.sprintf "req-%d" n in
-          let transfer_key = "ledger-transfer-" ^ Int64.to_string req.Schema.request_id in
+          let transfer_key = Schema.transfer_idempotency_key req.Schema.request_id in
           let dispatched = drive_request_dispatch env ~idempotency_key req in
           Alcotest.(check bool)
             (Printf.sprintf "request %d: the module genuinely dispatched" n)
@@ -712,7 +781,7 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
             (* THE DELIBERATE CRASH, landing exactly here: the request has just materialized and
                the module has just dispatched for it -- for an ACCEPTED request (which this one
                is, by construction of crash_idx above), that dispatch already called
-               propose_for_module, which already ran Legs.legs_of_bytes and already called
+               propose_for_module, which already ran Legs.legs_of_request and already called
                Batch_commit.propose to APPEND both legs to the primary's own log -- but neither
                leg has been driven to commit/materialize yet (drive_legs for this request has not
                been called). This is "between a request materializing and its corresponding
@@ -796,6 +865,33 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
           let expected_delta = if accepted then 2 else 0 in
           drive_legs env ~idempotency_key ~transfer_key ~expected_delta req)
         requests;
+      (* The crash itself really happened, and really landed where intended: a backup with
+         real, non-empty prior committed state, crashed with a torn superblock, which by
+         Riptide_vsr.Replica.restart's own semantics deterministically REFUSES to come back
+         over a non-empty WAL. Asserted rather than merely logged, so this test fails loudly if
+         a future change to the request mix/timing ever makes the WAL empty at this point
+         (which would make this a vacuous, uninteresting crash instead of finding C1's real
+         condition) or otherwise changes this deterministic outcome. *)
+      (match !crash_outcome with
+      | None -> Alcotest.fail "test setup: the deliberate crash was never actually injected"
+      | Some came_back ->
+        Alcotest.(check bool)
+          "the crashed backup had a non-empty WAL at crash time (real prior committed state), so \
+           it deterministically refused to come back over its lost superblock -- finding C1's own \
+           documented condition, not a vacuous empty-WAL crash"
+          false came_back);
+      (* THE REPAIR really happened too, and really brought the backup back for real -- not just
+         logged, the same discipline as the crash assertion above. *)
+      (match !repair_outcome with
+      | None ->
+        Alcotest.fail "test setup: the crashed backup refused, but the repair was never attempted"
+      | Some repaired ->
+        Alcotest.(check bool)
+          "the repair -- supplying the crashed backup's own real prior view/commit state -- \
+           brought it back for real, restoring all three replicas to live for the remainder of \
+           the run"
+          true repaired);
+
       (* A final mop-up: every key has already individually converged above (per [drive_legs]'s own
          ground truth at the time), but [best_live_replica] can still legitimately lag a round or
          two behind the cluster's true commit state right after the LAST request's own driving
@@ -803,25 +899,34 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
          storm-aware [drive_until] logic (never a blind fixed-round loop, for the same
          svc_limit-exhaustion reason documented there), until the GLOBALLY expected total leg
          count is reached. *)
-      (* Deliberately ONLY [materialize_only] here -- NEVER the real [propose_request] re-call
-         [drive_legs] itself uses. That re-call is safe INSIDE one request's own narrow
-         convergence window (no LATER request has touched its [from_account]'s balance yet, so
-         the guest decides the same way every time it is re-dispatched), but is NOT safe here: by
-         the time this global mop-up/catch-up runs, every account's balance has moved on from
-         whatever it was when an EARLIER, already-resolved request was first dispatched.
-         Confirmed live while writing this test, the hard way: re-proposing old request content
-         here re-triggered the module's dispatch for already-settled requests, including ones
-         this test's own reference model had already correctly recorded as DECLINED -- against
-         the now-later, higher balance, the SAME guest legitimately re-decided ACCEPT on one of
-         them, creating a real transfer that should never have existed and silently doubling one
-         account's own final balance relative to the reference model. Every request's own
-         ACCEPT/DECLINE outcome is already final by this point ([drive_legs] already raised, by
-         its own [Alcotest.failf], if a request's own dispatch/legs never converged) -- nothing
-         further is needed from the request side, only from the legs that outcome already
-         produced, which is exactly what materializing [transfer_key] (and nothing else) does. *)
+      (* Deliberately ONLY [materialize_only] here, not the real [propose_request] re-call
+         [drive_legs] itself uses -- now a scope choice rather than a safety requirement, and worth
+         recording precisely because the reason it USED to be a safety requirement turned out to be
+         finding C1 observed from the inside.
+
+         What was originally written here: re-proposing old request content at this point
+         re-triggers the module's dispatch for already-settled requests, and because every
+         account's balance has moved on since those requests were first decided, a request this
+         test's own reference model had correctly recorded as DECLINED could be re-decided ACCEPT
+         against the now-higher balance -- creating a transfer that should never have existed and
+         silently doubling an account's final balance. That was observed live while writing this
+         test, and avoided by never re-proposing a request here.
+
+         That observation was a symptom of a real defect in the ledger itself, not a quirk of this
+         mop-up: a decision that leaves no durable trace can be re-made differently by any later
+         re-dispatch, and re-dispatches happen for routine reasons nobody has to ask for. The final
+         whole-branch review found the same mechanism independently and classified it as Critical
+         (C1). It is now fixed at the source -- Accumulator.handle_guest_decision makes the FIRST
+         decision recorded for a request_id final, so a declined request can never later become
+         accepted no matter how it is re-dispatched -- which means re-proposing requests here would
+         be harmless today. It is still not done, because nothing needs it: every request's outcome
+         is already final by this point ([drive_legs] raises if a request's dispatch or legs never
+         converged), so only the legs that outcome produced still need driving, which is exactly
+         what materializing [transfer_key] and nothing else does. *)
       let all_actions =
         List.map
-          (fun (req, _) -> materialize_only env ("ledger-transfer-" ^ Int64.to_string req.Schema.request_id))
+          (fun (req, _) ->
+            materialize_only env (Schema.transfer_idempotency_key req.Schema.request_id))
           requests
       in
       let expected_total_legs = 2 * List.length (List.filter snd requests) in
@@ -861,13 +966,28 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
       let canon_envs (es : Envelope.envelope list) =
         List.map (fun e -> Value.canonical_encode (Envelope.to_value e)) es
       in
+      (* The baseline is the first LIVE replica, not [replicas.(0)] unconditionally (final
+         whole-branch review, finding M4). Comparing every live replica against a possibly-DOWN
+         replica 0 is wrong in both directions: a down replica's own [committed_envelopes] is
+         whatever it had when it stopped, so agreement with it is neither necessary (it is not
+         participating) nor sufficient (it can be arbitrarily stale) -- and if replica 0 is the one
+         that was crashed, this predicate was effectively asserting the live replicas agree with a
+         frozen snapshot. It happened to hold because the crash here is always repaired before this
+         point, which is exactly the kind of accident that stops being true the moment the scenario
+         changes. *)
       let live_agree () =
-        let primary_canon = canon_envs (module_leg_envelopes_of env.replicas.(0)) in
+        let baseline = ref None in
         let ok = ref true in
         Array.iteri
-          (fun i r -> if (not env.is_down.(i)) && canon_envs (module_leg_envelopes_of r) <> primary_canon then ok := false)
+          (fun i r ->
+            if not env.is_down.(i) then
+              let canon = canon_envs (module_leg_envelopes_of r) in
+              match !baseline with
+              | None -> baseline := Some canon
+              | Some b -> if canon <> b then ok := false)
           env.replicas;
-        !ok
+        (* No live replica at all is not agreement -- it is a cluster that cannot answer. *)
+        !baseline <> None && !ok
       in
       let caught_up =
         drive_until ~max_rounds:20 env ~actions:all_actions
@@ -971,46 +1091,23 @@ let test_the_ledger_invariant_holds_under_injected_failures () =
          crashed. *)
       Array.iteri
         (fun i r ->
-          if i <> 0 then
+          if not env.is_down.(i) then
             Alcotest.(check (list string))
               (Printf.sprintf
-                 "replica %d agrees, byte for byte, with the primary on every committed \
-                  ledger-module envelope"
+                 "replica %d agrees, byte for byte, with the cluster's most-advanced live replica \
+                  on every committed ledger-module envelope"
                  i)
               (canon_envs module_envelopes) (canon_envs (module_leg_envelopes_of r)))
-        env.replicas;
-
-      (* The crash itself really happened, and really landed where intended: a backup with
-         real, non-empty prior committed state, crashed with a torn superblock, which by
-         Riptide_vsr.Replica.restart's own semantics deterministically REFUSES to come back
-         over a non-empty WAL. Asserted rather than merely logged, so this test fails loudly if
-         a future change to the request mix/timing ever makes the WAL empty at this point
-         (which would make this a vacuous, uninteresting crash instead of finding C1's real
-         condition) or otherwise changes this deterministic outcome. *)
-      (match !crash_outcome with
-      | None -> Alcotest.fail "test setup: the deliberate crash was never actually injected"
-      | Some came_back ->
-        Alcotest.(check bool)
-          "the crashed backup had a non-empty WAL at crash time (real prior committed state), so \
-           it deterministically refused to come back over its lost superblock -- finding C1's own \
-           documented condition, not a vacuous empty-WAL crash"
-          false came_back);
-      (* THE REPAIR really happened too, and really brought the backup back for real -- not just
-         logged, the same discipline as the crash assertion above. *)
-      (match !repair_outcome with
-      | None ->
-        Alcotest.fail "test setup: the crashed backup refused, but the repair was never attempted"
-      | Some repaired ->
-        Alcotest.(check bool)
-          "the repair -- supplying the crashed backup's own real prior view/commit state -- \
-           brought it back for real, restoring all three replicas to live for the remainder of \
-           the run"
-          true repaired))
+        env.replicas)
 
 let tests =
-  [
-    ( "a realistic request mix commits correctly through real VSR replication, injected network \
-       faults, and a verified-non-primary replica crash timed between a request materializing \
-       and its legs landing",
-      `Slow, test_the_ledger_invariant_holds_under_injected_failures );
-  ]
+  List.map
+    (fun seed ->
+      ( Printf.sprintf
+          "seed %d: a realistic request mix commits correctly through real VSR replication, \
+           injected network faults, and a verified-non-primary replica crash timed between a \
+           request materializing and its legs landing"
+          seed,
+        `Slow,
+        run_scenario ~seed ))
+    sweep_seeds
