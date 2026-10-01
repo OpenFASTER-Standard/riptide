@@ -499,6 +499,23 @@ let module_leg_envelopes_of_replica r =
 
 let module_leg_envelopes env = module_leg_envelopes_of_replica (best_live_replica env)
 
+(* EVERY committed envelope the ledger module itself authored, whatever payload shape it carries --
+   legs AND the durable decision records, with no payload filter at all (final whole-branch review,
+   IMP-6).
+
+   This exists because the two filters answer genuinely different questions and the cross-replica
+   AGREEMENT check needs this one, not the leg-only one above. Checks (a) and (c) below are about leg
+   APPLICATION -- what a balance is derived from -- so filtering to legs is correct there. The
+   agreement check is about whether the replicas hold the SAME committed ledger-module log, and it
+   claimed to compare "every committed ledger-module envelope" while actually comparing only the legs:
+   the decision-record envelope kind this branch introduced was silently excluded, so two replicas
+   disagreeing on nothing but decision records would have converged and passed. That is the exact
+   hazard the (a2) comment below already identifies and closes for check (a); it was not closed for
+   agreement. *)
+let module_envelopes_of_replica r =
+  Batch_commit.committed_envelopes r
+  |> List.filter (fun (e : Envelope.envelope) -> e.actor = "ledger-module")
+
 (* The other half of the same partition: the module's own committed DECISION records, decoded back
    into the (accepted, request) pairs they durably attest to. *)
 let module_decision_envelopes env =
@@ -1245,9 +1262,19 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
          keep lagging the rest of the cluster by exactly one or two of THOSE forever, with
          [commit_number] parity never quite closing, while already agreeing on every real
          ledger-module envelope that actually matters. Converging on the real, final comparison
-         (every live replica's own ledger-module envelope list matches the primary's) is both the
-         thing this step exists to guarantee and immune to that red herring. *)
-      let module_leg_envelopes_of = module_leg_envelopes_of_replica in
+         (every live replica's own ledger-module envelope list matches the FIRST LIVE replica's --
+         not the primary's; final whole-branch review, Minor, this comment said "the primary's" while
+         [live_agree] below has always taken its baseline from the first replica that is not down,
+         which need not be the primary at all) is both the thing this step exists to guarantee and
+         immune to that red herring.
+
+         {b The comparison is over EVERY ledger-module envelope, legs and decision records alike}
+         (final whole-branch review, IMP-6): this used to bind a local alias for the LEG-ONLY filter
+         here, which excluded the decision-record kind this branch introduced from the agreement claim
+         it states. The alias is gone too -- it renamed a function to very nearly its own name for no
+         benefit (same review, Minor) -- and [module_envelopes_of_replica] is called directly below.
+         See its own comment for why agreement needs the unfiltered view while checks (a)/(c) below
+         correctly keep the leg-only one. *)
       let canon_envs (es : Envelope.envelope list) =
         List.map (fun e -> Value.canonical_encode (Envelope.to_value e)) es
       in
@@ -1266,7 +1293,7 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
         Array.iteri
           (fun i r ->
             if not env.is_down.(i) then
-              let canon = canon_envs (module_leg_envelopes_of r) in
+              let canon = canon_envs (module_envelopes_of_replica r) in
               match !baseline with
               | None -> baseline := Some canon
               | Some b -> if canon <> b then ok := false)
@@ -1279,7 +1306,7 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
           ~progress:(fun () ->
             let m = ref max_int in
             Array.iteri
-              (fun i r -> if not env.is_down.(i) then m := min !m (List.length (module_leg_envelopes_of r)))
+              (fun i r -> if not env.is_down.(i) then m := min !m (List.length (module_envelopes_of_replica r)))
               env.replicas;
             !m)
           ~converged:live_agree
@@ -1288,7 +1315,7 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
         Alcotest.failf
           "final catch-up: live replicas never converged on the same ledger-module envelope list \
            (lengths: [%s], is_down=[%s], commit=[%s])"
-          (String.concat "," (Array.to_list (Array.map (fun r -> string_of_int (List.length (module_leg_envelopes_of r))) env.replicas)))
+          (String.concat "," (Array.to_list (Array.map (fun r -> string_of_int (List.length (module_envelopes_of_replica r))) env.replicas)))
           (String.concat "," (Array.to_list (Array.map string_of_bool env.is_down)))
           (String.concat "," (Array.to_list (Array.map (fun r -> string_of_int (Replica.commit_number r)) env.replicas)));
 
@@ -1336,10 +1363,7 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
          That last part is the real end-to-end proof of this task's own durability claim: the
          accept/decline outcome is now a fact on the replicated log, independently checkable against
          an authority that never saw the log at all. ── *)
-      let all_module_envelopes =
-        Batch_commit.committed_envelopes (best_live_replica env)
-        |> List.filter (fun (e : Envelope.envelope) -> e.actor = "ledger-module")
-      in
+      let all_module_envelopes = module_envelopes_of_replica (best_live_replica env) in
       List.iter
         (fun (e : Envelope.envelope) ->
           match (Schema.transfer_leg_of_value e.payload, Wire.decision_of_value e.payload) with
@@ -1423,7 +1447,13 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
          its own doc comment). Proves VSR replication
          itself -- not just this test's own single-replica bookkeeping -- preserved every
          invariant-bearing entry cluster-wide, including on the replica that was actually
-         crashed. *)
+         crashed.
+
+         Compares EVERY ledger-module envelope -- legs and decision records alike (final
+         whole-branch review, IMP-6; both sides used the leg-only filter, so the assertion's own
+         message "every committed ledger-module envelope" overstated what it checked, and the
+         decision-record kind this branch introduced was excluded from cluster-wide agreement
+         entirely). *)
       Array.iteri
         (fun i r ->
           if not env.is_down.(i) then
@@ -1432,7 +1462,7 @@ let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
                  "replica %d agrees, byte for byte, with the cluster's most-advanced live replica \
                   on every committed ledger-module envelope"
                  i)
-              (canon_envs module_envelopes) (canon_envs (module_leg_envelopes_of r)))
+              (canon_envs all_module_envelopes) (canon_envs (module_envelopes_of_replica r)))
         env.replicas)
 
 (* ── Task 4's own review, Critical 1 (a Critical): THE REGRESSION TEST ──────────────────────────────
@@ -1525,8 +1555,12 @@ let test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_
    [Batch_commit.propose] and report [Error "not primary, retry"] rather than calling it) exist so
    a caller CAN observe this and surface it instead of losing the guest's decision with no trace.
    But that file's own solo (replica_count = 1) environment can never exercise the FALSE branch --
-   its one replica is permanently the only replica, hence permanently primary (accumulator.mli's
-   own doc comment on [handle_guest_decision] says as much). This is that pattern's first REAL
+   its one replica is permanently the only replica, hence permanently the primary in [Normal]
+   status, which is exactly the conjunction [Batch_commit.is_primary] is defined as (see its own
+   doc comment, and [Riptide_vsr.Replica.is_primary]). (Final whole-branch review, Minor: this used
+   to cite [accumulator.mli]'s [handle_guest_decision] doc comment as saying so; it does not -- it
+   says what a caller must DO about [is_primary], and separately that the appended-but-uncommitted
+   window is nil on a solo replica, neither of which is this claim.) This is that pattern's first REAL
    exercise: a genuine, multi-replica storm-driven view change (via this file's own
    [timeout_storm], reusing the existing fault-injection harness -- not a synthetic state
    override) that actually moves the primary away from a handle still pinned to the replica that
@@ -1598,11 +1632,19 @@ let test_propose_closure_reports_not_primary_rather_than_silently_dropping_a_dis
         Alcotest.fail
           "dispatch returned `Ok ()' despite is_primary being false -- the original silent-drop \
            bug (a non-primary propose call swallowed with no trace) is back");
-      (* The other half of "reports the error string rather than silently doing nothing": nothing
-         was actually proposed either. A regression that merely misreported the return value while
-         still silently no-op'ing underneath would pass the assertion above for the wrong reason;
-         this confirms both halves of the claim, not just the one the first assertion already
-         names. *)
+      (* The return value and the real effect agree: nothing was committed under this key either.
+         {b What this can and cannot discriminate} (final whole-branch review, Minor -- this comment
+         used to claim it rules out "a regression that merely misreported the return value while
+         still silently no-op'ing underneath", which it structurally cannot: a closure reporting
+         [Error "not primary, retry"] and proposing nothing IS the correct behaviour, so that shape
+         and a "misreport" are the same observation here). What it rules out is the opposite
+         disagreement -- a closure that reports the refusal and calls [Batch_commit.propose] anyway,
+         committing the decision it just said it refused. In THIS scenario that is doubly guarded
+         (replica 0 is no longer primary, so a propose through it would be a no-op regardless), so
+         the check is deliberately belt-and-braces rather than the sole evidence for anything: it is
+         here so that a future variant of this scenario -- a closure wired to a handle on a replica
+         that CAN still commit -- cannot quietly start passing while proposing behind its own
+         refusal. *)
       match Batch_commit.committed_writes_for env.replicas.(0) ~idempotency_key with
       | None -> ()
       | Some _ ->
