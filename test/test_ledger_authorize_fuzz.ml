@@ -31,9 +31,11 @@
    > adversarial bytes (the guest-facing trust boundary), which is a genuinely different question
    > from whether a malformed batch would be refused at commit time. {b Property 3 below, added by
    > Task 5 of this plan, is the [authorize_batch] fuzz property itself} -- randomized adversarial
-   > PAIRS (mismatched transfer_id, same role twice, unequal amounts, wrong account pairing),
-   > deliberately a different kind of coverage from authorize.ml's own 25-case exhaustive truth
-   > table rather than a re-transcription of it.
+   > PAIRS (mismatched transfer_id, same role twice, unequal amounts, wrong account pairing,
+   > different actor), deliberately a different kind of coverage from the Task 4 review pass's own
+   > live, exhaustive truth-table verification of [pairing_verdict] -- recorded only as prose in
+   > this plan's own progress.md ledger, never as a doc comment in authorize.ml itself or any other
+   > checked-in artifact -- rather than a re-transcription of it.
 
    Three further named tests (not fuzzed) pin the exact Review Focus items this task owns: a
    self-transfer request's legs get denied, a non-positive-amount leg gets denied, and a
@@ -352,16 +354,21 @@ let test_decision_of_bytes_always_produces_nothing_or_a_balanced_pair =
             (print_bytes b)))
 
 (* ── Property 3: batch-level pairing (this plan's own task-5-brief.md, Step 2) ───────────────────
-   Authorize.authorize_batch's own pairing_verdict already has exhaustive coverage of a different
-   kind: authorize.ml's own doc comment records a 25-case exhaustive truth table built and verified
-   by Task 4's reviewer. This is deliberately NOT a re-transcription of that table -- it is
-   randomized adversarial generation over malformed PAIRS, the genuinely different complementary
-   coverage this task's own brief asks for: mismatched transfer_id, same role twice, unequal
-   amounts, and wrong account pairing, each applied to exactly one leg of an otherwise well-formed
-   pair built the one way a pair is ever built in production, Legs.legs_of_request (never
-   hand-rolled, so a bug in THAT construction would show up here too, not just a bug in
-   authorize_batch's own verdict). Property: every malformed pair authorize_batch DENIES; every
-   well-formed one (Legs.legs_of_request's own unmodified output) it ALLOWS. *)
+   Authorize.authorize_batch's own pairing_verdict already received exhaustive coverage of a
+   different kind, once: a 25-case exhaustive truth table the Task 4 REVIEWER built and verified
+   LIVE during that review pass -- recorded only as prose in this plan's own progress.md ledger,
+   never checked in as running code (no such table exists in authorize.ml's or authorize.mli's own
+   doc comments; a fix round on this very task added the 5th [Different_actor] shape below for
+   exactly that reason, after that gap was caught leaving [pairing_verdict]'s "different actor"
+   clause with zero running-code coverage). This fuzz property is deliberately NOT a
+   re-transcription of that one-time table -- it is randomized adversarial generation over
+   malformed PAIRS, the genuinely different complementary coverage this task's own brief asks for:
+   mismatched transfer_id, same role twice, unequal amounts, wrong account pairing, and different
+   actor, each applied to exactly one leg of an otherwise well-formed pair built the one way a pair
+   is ever built in production, Legs.legs_of_request (never hand-rolled, so a bug in THAT
+   construction would show up here too, not just a bug in authorize_batch's own verdict). Property:
+   every malformed pair authorize_batch DENIES; every well-formed one (Legs.legs_of_request's own
+   unmodified output) it ALLOWS. *)
 
 type pair_shape =
   | Well_formed_pair
@@ -369,6 +376,12 @@ type pair_shape =
   | Same_role_twice
   | Unequal_amounts
   | Wrong_account_pairing
+  (* Task 5 fix round (Important finding): pairing_verdict's "different actor" denial clause
+     (authorize.ml:85-86) had zero running-code coverage anywhere in the suite -- the only prior
+     verification of it was a one-time, ephemeral hand-check the Task 4 REVIEWER performed live
+     during that review pass (progress.md's own ledger, not persisted as checked-in code). This
+     shape closes that gap for real. *)
+  | Different_actor
 
 let print_pair_shape = function
   | Well_formed_pair -> "well_formed_pair"
@@ -376,6 +389,7 @@ let print_pair_shape = function
   | Same_role_twice -> "same_role_twice"
   | Unequal_amounts -> "unequal_amounts"
   | Wrong_account_pairing -> "wrong_account_pairing"
+  | Different_actor -> "different_actor"
 
 type generated_pair = {
   pair_shape : pair_shape;
@@ -403,6 +417,7 @@ let pair_gen : generated_pair QCheck2.Gen.t =
         (1, return Same_role_twice);
         (1, return Unequal_amounts);
         (1, return Wrong_account_pairing);
+        (1, return Different_actor);
       ]
   in
   let* request_id = int64 in
@@ -492,6 +507,14 @@ let mutated_pair (g : generated_pair) (debit : Schema.transfer_leg) (credit : Sc
        that mirror on whichever side is chosen. *)
     if g.mutate_debit then ({ debit with this_account = Int64.add debit.this_account g.delta }, credit)
     else (debit, { credit with this_account = Int64.add credit.this_account g.delta })
+  | Different_actor ->
+    (* pairing_verdict's second check: a.actor <> b.actor (authorize.ml:85-86). Both legs start
+       sharing [pair_actor] (Legs.legs_of_request's own baseline); appending g.delta's own decimal
+       string to one leg's actor guarantees it differs from the sibling leg's, the same
+       "guaranteed different by construction" shape every other malformed case here uses, just
+       applied to a string field rather than an int64 one. *)
+    let mutate (l : Schema.transfer_leg) = { l with actor = Printf.sprintf "%s-mutated-%Ld" l.actor g.delta } in
+    if g.mutate_debit then (mutate debit, credit) else (debit, mutate credit)
 
 let writes_of_pair (g : generated_pair) : Riptide_batch_commit.Batch_commit.write list =
   let debit_w, credit_w = baseline_pair g in
@@ -521,7 +544,8 @@ let test_authorize_batch_pairing_fuzz =
              (reason: %s)"
             (print_pair g) reason);
         true
-      | Mismatched_transfer_id | Same_role_twice | Unequal_amounts | Wrong_account_pairing ->
+      | Mismatched_transfer_id | Same_role_twice | Unequal_amounts | Wrong_account_pairing
+      | Different_actor ->
         (match verdict with
         | Riptide_batch_commit.Batch_commit.Deny _ -> ()
         | Riptide_batch_commit.Batch_commit.Allow ->
