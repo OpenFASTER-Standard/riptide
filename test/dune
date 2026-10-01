@@ -1,7 +1,7 @@
 (test
  (name test_riptide)
  (libraries riptide riptide_batch_commit riptide_crypto riptide_dst riptide_lattice
-   riptide_lattice_conformance riptide_materialize riptide_module riptide_pki riptide_sim riptide_storage
+   riptide_lattice_conformance riptide_ledger riptide_materialize riptide_module riptide_pki riptide_sim riptide_storage
    riptide_transport riptide_vsr golden_fixtures
    alcotest qcheck-core qcheck-alcotest eio eio.mock eio_linux eio_main unix digestif
    mirage-crypto-rng.unix str x509 ptime ptime.clock.os domain-name fmt tls tls-eio)
