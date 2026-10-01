@@ -83,13 +83,30 @@ type t
     pattern match. *)
 
 val create :
-  replica:Riptide_vsr.Replica.t -> authorize:(write -> decision) -> ?require_encryption:bool -> unit -> t
-(** [create ~replica ~authorize ?require_encryption ()] builds a handle over [replica] with
+  replica:Riptide_vsr.Replica.t ->
+  authorize:(write -> decision) ->
+  ?require_encryption:bool ->
+  ?materialize_watermark_store:Riptide_storage.File_kv_store.t ->
+  unit ->
+  t
+(** [create ~replica ~authorize ?require_encryption ?materialize_watermark_store ()] builds a
+    handle over [replica] with
     [authorize] as the mandatory universal authorization policy every {!propose} call through this
     handle consults for every write of every batch (see {!propose}'s "Authorization" section), and
     [require_encryption] (default [false], matching {!propose}'s own pre-existing default -- this
     constructor changes WHERE the policy is set, never its default value) as the encryption policy
-    every {!propose} call through this handle enforces unless overridden per-call.
+    every {!propose} call through this handle enforces unless overridden per-call, and
+    [materialize_watermark_store] (Task 7, the Layer 0/Layer 2 boundary revision -- closing Task
+    6's own boundary friction item 1, final whole-branch review finding I9) as the durable,
+    per-write watermark {!propose}'s own materialize step consults so a repeated materialize of
+    the same committed write (e.g. the documented empty-[writes] drain idiom, or a crash-then-retry
+    re-proposing the same [idempotency_key]) applies at most once, for ANY sink -- including a
+    non-idempotent, accumulating one -- not merely for a pure lattice join. See
+    {!materialize_sink}'s own doc comment for the accumulating-sink hazard this closes, and
+    {!committed_writes_for}/{!materialize_up_to}'s own [?watermark_store] for the sibling
+    mechanism covering the OTHER materialization entry point. [None] (the default) omits the
+    watermark entirely, preserving exactly today's behaviour -- unconditionally safe only for an
+    idempotent sink, re-applied on every replay.
 
     [authorize] has NO default -- unlike [require_encryption], which has always defaulted to
     [false], this parameter is REQUIRED so that "no real policy yet" is something every call site
@@ -178,6 +195,23 @@ val committed_envelopes_keyed : Riptide_vsr.Replica.t -> (string * Riptide.Envel
 
     Callers that never encrypt have no use for this; callers that do cannot decrypt without it,
     since a committed envelope carries no record of which batch or position it came from. *)
+
+val committed_writes_for : Riptide_vsr.Replica.t -> idempotency_key:string -> write list option
+(** [committed_writes_for t ~idempotency_key] is the {!write} list of the batch that actually
+    COMMITTED under [idempotency_key] on [t], decoded from the committed bytes themselves -- [None]
+    if no well-formed committed batch carries that key (whether because nothing was ever proposed
+    under it, or because [t] has not yet learned of/committed it).
+
+    First-wins per key, deliberately identical to {!committed_envelopes_keyed}'s own dedup rule (a
+    malformed batch never claims a key, since it contributes no envelopes to skip in favour of), so
+    the writes this returns are exactly the writes whose envelopes that function publishes for the
+    same key. That agreement is the point of this function: it is the same lookup {!propose}'s own
+    materialize step already performs internally (see that function's own "Materialization" section
+    for why reading the committed bytes, rather than trusting a caller's own argument, is the root
+    fix for a real, previously-reproduced data-destruction bug) -- exported here (Task 7, the Layer
+    0/Layer 2 boundary revision) so a caller needing the same committed-writes-for-a-key answer
+    (e.g. a Layer 2 module auditing or re-deriving what it itself committed) does not have to
+    re-implement this lookup a second time outside this module. *)
 
 type materialize_sink = {
   write : merge_key:string -> Riptide.Value.value -> unit;
@@ -298,8 +332,12 @@ val materialize_write_failures : unit -> int
     skipped, rather than aborting anything past it). *)
 
 val materialize_up_to :
-  Riptide_vsr.Replica.t -> materialize:materialize_sink -> through_commit_number:int -> unit
-(** [materialize_up_to t ~materialize ~through_commit_number] walks [t]'s committed log from its
+  Riptide_vsr.Replica.t ->
+  materialize:materialize_sink ->
+  through_commit_number:int ->
+  ?watermark_store:Riptide_storage.File_kv_store.t ->
+  unit
+(** [materialize_up_to t ~materialize ~through_commit_number ?watermark_store] walks [t]'s committed log from its
     very start through [min through_commit_number (Riptide_vsr.Replica.commit_number t)] -- a
     1-based op-number/commit-count bound, INCLUSIVE, matching
     {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared against each batch's
@@ -333,44 +371,46 @@ val materialize_up_to :
     for the mechanism and for the honest [min (commit_number) (List.length entries)] bound a
     restart-capable caller must use instead.
 
-    {b Safe to call repeatedly over an overlapping or fully-covered range, FOR A SINK WHOSE WRITE
-    IS ITSELF IDEMPOTENT -- which is a real condition on the caller, not a property of this
-    function.} Calling this twice with the same (or a smaller) [through_commit_number] re-hands
-    every write in that range to [materialize.write] again, including writes already folded in.
-    For a sink that is a plain {!Riptide_materialize.Materializer.write} -- a read-join-put over a
+    {b Safe to call repeatedly over an overlapping or fully-covered range WHEN [?watermark_store]
+    IS SUPPLIED -- unconditionally so, for a sink of ANY shape, not only an idempotent one} (Task
+    7, the Layer 0/Layer 2 boundary revision, closing Task 6's own boundary friction item 1; final
+    whole-branch review finding I9). Every write in the walked range is checked against a durable,
+    per-[(idempotency_key, position)] watermark keyed by {!redaction_event_id} before
+    [materialize.write] is ever called for it, and the watermark is recorded strictly after
+    [materialize.write] returns successfully -- so calling this twice with the same (or a smaller)
+    [through_commit_number] against the same [watermark_store] re-hands each write to
+    [materialize.write] at most once total, across both calls, never twice.
+
+    {b Omitting [?watermark_store] preserves EXACTLY today's older, narrower guarantee, and this is
+    a real condition on the caller, not a property of this function.} Calling this twice with the
+    same (or a smaller) [through_commit_number] re-hands every write in that range to
+    [materialize.write] again, including writes already folded in. For a sink that is a plain
+    {!Riptide_materialize.Materializer.write} -- a read-join-put over a
     {!Riptide_lattice.Lattice_intf.S} -- that is harmless, because joining the same value into an
-    already-converged accumulator changes nothing by the lattice laws.
+    already-converged accumulator changes nothing by the lattice laws. For an ACCUMULATING sink
+    (the first real Layer 2 module built against this interface, a double-entry ledger
+    ([lib/ledger/]), maintains account balances by read-current-add-delta-write-new-total, which is
+    NOT idempotent) it is affirmatively unsafe: replaying one committed transfer leg applies its
+    delta twice, moving money that no client asked to move. This sentence cost that module two real
+    bugs before it was corrected: an initial double-application found while building it, and a
+    Critical finding in its own final review where a re-dispatch triggered by exactly this
+    re-materialization re-decided an already-declined transfer as accepted. A caller with an
+    accumulating sink that cannot supply [?watermark_store] (e.g. for a reason specific to its own
+    deployment) must still give the sink its own already-applied guard, keyed on something stable
+    across replays of the same committed write -- see {!materialize_sink}'s own disclosure of what
+    its [write] callback is and is not told about the write it is handed.
 
-    {b Known, disclosed residual gap: this doc used to state that as an unconditional guarantee,
-    and for a non-idempotent sink it is affirmatively FALSE} (Task 6's own boundary friction, item
-    1; final whole-branch review finding I9). The previous wording read "re-materializing a write
-    already folded into the accumulator is a no-op, because {!materialize_sink}'s underlying join
-    is idempotent" -- but a {!materialize_sink} is an arbitrary caller-supplied closure, and
-    nothing here constrains it to be a lattice join. The first real Layer 2 module built against
-    this interface needs exactly such a sink: a double-entry ledger ([lib/ledger/]) maintains
-    account balances by read-current-add-delta-write-new-total, which is NOT idempotent -- replaying
-    one committed transfer leg applies its delta twice, moving money that no client asked to move.
-    This sentence cost that module two real bugs before it was corrected: an initial
-    double-application found while building it, and a Critical finding in its own final review
-    where a re-dispatch triggered by exactly this re-materialization re-decided an
-    already-declined transfer as accepted.
-
-    {b What a caller with an accumulating sink must therefore do}: give the sink its own
-    already-applied guard, keyed on something stable across replays of the same committed write.
-    Note that this interface makes that harder than it needs to be -- see {!materialize_sink}'s own
-    disclosure of what its [write] callback is and is not told about the write it is handed.
-    Narrowing [materialize_sink] to lattice-join sinks only (so the original claim would be true by
-    construction), or passing enough identity for a caller to dedup reliably, are both real options
-    and both belong to the Layer 0/Layer 2 boundary revision (task-master Task 7), not to a
-    unilateral change here.
-
-    {b Does NOT track its own "last materialized" position} -- every call walks from the very
-    start of the log, unconditionally. The caller (task-master Task 6) owns any watermark it
-    wants to keep, to avoid redundant re-walks across calls; this function has no persistent state
-    of its own and is a pure function of [t]'s current log plus the range given. Its own cost is
-    real and disclosed, not hidden: {b O(through_commit_number)} work per call, since it always
-    re-decodes and re-walks the whole prefix up to the bound rather than resuming from where a
-    previous call left off. *)
+    {b Does NOT track its own "last materialized" position, even when [?watermark_store] is
+    supplied} -- every call still walks from the very start of the log, unconditionally, and still
+    decodes and re-checks the watermark for every write in range; [?watermark_store] makes each
+    write's own [materialize.write] call itself happen at most once, it does not let this function
+    skip re-walking or re-decoding a range it has already covered. The caller still owns any
+    "where did I leave off" walk-skip optimization it wants on top of this (e.g. a caller-tracked
+    lower [through_commit_number] starting point across calls); this function has no such state of
+    its own and is a pure function of [t]'s current log, the range given, and
+    [watermark_store]'s own current contents. Its own cost is real and disclosed, not hidden: {b
+    O(through_commit_number)} work per call, since it always re-decodes and re-walks the whole
+    prefix up to the bound rather than resuming from where a previous call left off. *)
 
 val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int -> bool
 (** [write_at_op_number_has_merge_key t ~op_number] is [true] iff the batch at the 1-based
@@ -658,17 +698,25 @@ val propose :
     call for the same key reaches the materialize step again and it fires, strictly before any
     LATER call on this replica could ever evict the WAL slot(s) this batch occupies.
 
-    {b This re-running is safe only for a sink whose own [write] is idempotent, and this doc
-    previously claimed it unconditionally} (Task 6's own boundary friction, item 1; final
-    whole-branch review finding I9 -- the identical correction as at {!materialize_up_to}, repeated
-    here because this is the call site that actually performs the re-materialization and so is
-    where a caller reads about it). The old wording -- "re-running [materialize.write] for an
-    already-materialized write is always safe: it is a read-join-put over a lattice" -- describes
-    what a {!Riptide_materialize.Materializer.write} sink does, not what a {!materialize_sink} IS:
-    the latter is an arbitrary caller-supplied closure. An ACCUMULATING sink (the first real Layer 2
-    module, a double-entry ledger in [lib/ledger/], maintains balances by
-    read-current-add-delta-write-new-total) applies its delta a second time on every such replay.
-    A caller whose sink is not a pure lattice join must carry its own already-applied guard; see
+    {b This re-running is unconditionally safe, for a sink of ANY shape, when [Batch_commit.t] was
+    built with [?materialize_watermark_store] (Task 7, the Layer 0/Layer 2 boundary revision,
+    closing Task 6's own boundary friction item 1; final whole-branch review finding I9) --
+    {!create}'s own store, consulted here via the same per-[(idempotency_key, position)] watermark
+    {!materialize_up_to}'s own [?watermark_store] uses, keyed by {!redaction_event_id}.} Each
+    committed write is materialized at most once, total, across however many [propose] calls for
+    the same [idempotency_key] supply [?materialize] -- the empty-[writes] drain idiom above
+    included.
+
+    {b Omitting [?materialize_watermark_store] at {!create} time preserves EXACTLY today's older,
+    narrower guarantee: safe only for a sink whose own [write] is idempotent, and this doc
+    previously claimed it unconditionally.} The old wording -- "re-running [materialize.write] for
+    an already-materialized write is always safe: it is a read-join-put over a lattice" --
+    describes what a {!Riptide_materialize.Materializer.write} sink does, not what a
+    {!materialize_sink} IS: the latter is an arbitrary caller-supplied closure. An ACCUMULATING sink
+    (the first real Layer 2 module, a double-entry ledger in [lib/ledger/], maintains balances by
+    read-current-add-delta-write-new-total) applies its delta a second time on every such replay
+    when no watermark store is in play. A caller whose sink is not a pure lattice join and cannot
+    supply [?materialize_watermark_store] must carry its own already-applied guard; see
     {!materialize_sink} and {!materialize_up_to} for the full account and for what this interface
     does not currently give such a caller to key that guard on.
 

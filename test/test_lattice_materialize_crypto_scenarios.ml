@@ -1117,8 +1117,8 @@ let with_watermark_cluster ~env ~sw ~wiring f =
                   match !(slots.(i)) with
                   | None -> () (* unreachable: the hook is never invoked retroactively at create *)
                   | Some r ->
-                    Batch_commit.materialize_up_to r ~materialize:sinks.(i)
-                      ~through_commit_number:new_commit;
+                    Batch_commit.materialize_up_to r ~materialize:sinks.(i) ~through_commit_number:new_commit
+                      ?watermark_store:None;
                     watermarks.(i) := new_commit)
         in
         let r =
@@ -1151,7 +1151,7 @@ let with_watermark_cluster ~env ~sw ~wiring f =
            [test_dst_scenarios.ml]'s
            [test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry]. *)
         Batch_commit.materialize_up_to r ~materialize:sinks.(i)
-          ~through_commit_number:(Replica.commit_number r);
+          ~through_commit_number:(Replica.commit_number r) ?watermark_store:None;
         watermarks.(i) := Replica.commit_number r;
         r)
   in
@@ -1179,7 +1179,7 @@ let with_watermark_cluster ~env ~sw ~wiring f =
   let clear_stall i =
     stalled.(i) := false;
     Batch_commit.materialize_up_to replicas.(i) ~materialize:sinks.(i)
-      ~through_commit_number:(Replica.commit_number replicas.(i));
+      ~through_commit_number:(Replica.commit_number replicas.(i)) ?watermark_store:None;
     watermarks.(i) := Replica.commit_number replicas.(i)
   in
   f

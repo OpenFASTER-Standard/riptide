@@ -185,9 +185,21 @@ type t = {
   replica : Riptide_vsr.Replica.t;
   authorize : write -> decision;
   require_encryption : bool;
+  (* Layer 0/Layer 2 boundary revision (task-master Task 7), closing Task 6's own boundary
+     friction item 1 (final whole-branch review finding I9): a durable, per-(idempotency_key,
+     position) watermark that {!materialize_write_catching} below consults BEFORE calling
+     [sink.write] and records strictly AFTER it returns successfully, making the repeated-
+     materialize idiom (the empty-[writes] drain in [propose], and any overlapping
+     [materialize_up_to] range) exactly-once for a sink of ANY shape -- including a
+     non-idempotent, accumulating one -- not merely safe for a pure lattice join. [None]
+     (the default) preserves today's behaviour exactly: no watermark is consulted or recorded,
+     so a repeated materialize re-applies every time, same as before this field existed. *)
+  materialize_watermark_store : Riptide_storage.File_kv_store.t option;
 }
 
-let create ~replica ~authorize ?(require_encryption = false) () = { replica; authorize; require_encryption }
+let create ~replica ~authorize ?(require_encryption = false) ?materialize_watermark_store () =
+  { replica; authorize; require_encryption; materialize_watermark_store }
+
 let replica (t : t) = t.replica
 
 (* The synthetic write [propose] appends to a batch it actually proposes, once every one of the
@@ -239,6 +251,26 @@ let materialize_write_failures_count = ref 0
 
 let materialize_write_failures () = !materialize_write_failures_count
 
+(* The keystore key for one write, derived from data available BEFORE the write enters the
+   replicated log -- which is the only moment encryption can happen, since Envelope.content_hash
+   covers the payload (lib/envelope.ml's to_value) and is therefore already committed to whatever
+   bytes the log holds. The envelope's own event_id (= its content_hash) is unusable here: it also
+   covers predecessor_hash and sequence, which only exist once the write's position in the
+   committed log is settled, i.e. strictly after the payload had to be final. See
+   batch_commit.mli's [redaction_event_id] and Riptide_crypto.Redaction_store's own header.
+
+   Length-prefixing the idempotency key makes the derivation injective by construction rather than
+   by argument: ("a", 1) and ("a#1", 0) produce "1:a#1" and "3:a#1#0", which cannot collide for
+   any pair of inputs, whatever characters an opaque caller-supplied idempotency key contains.
+
+   Moved ABOVE {!materialize_write_catching} (previously defined only just above {!propose},
+   further down this file) so the watermark mechanism below can reuse it directly -- OCaml has no
+   forward references across top-level [let]s, and the watermark's own key derivation must be this
+   exact function, not a second, hand-rolled scheme (see {!materialize_write_catching}'s own doc
+   comment for why). *)
+let redaction_event_id ~idempotency_key ~index =
+  Printf.sprintf "%d:%s#%d" (String.length idempotency_key) idempotency_key index
+
 (* Catches ONLY {!Riptide_materialize.Materializer.Value_too_large} -- and NOT a blanket
    [Invalid_argument] -- matching this codebase's own established discipline for narrow,
    documented-shape catches elsewhere: see {!Riptide_vsr.Replica.durable_append}'s own
@@ -264,11 +296,39 @@ let materialize_write_failures () = !materialize_write_failures_count
 
    Shared by BOTH [propose]'s materialize step and [materialize_up_to]'s replay loop, so the two
    loops cannot drift into different catch behaviour -- exactly the "one shared helper" this task
-   requires rather than duplicating the same try/with twice. *)
-let materialize_write_catching (sink : materialize_sink) ~(merge_key : string) (payload : Value.value) : unit =
-  match sink.write ~merge_key payload with
-  | () -> ()
-  | exception Riptide_materialize.Materializer.Value_too_large _ -> incr materialize_write_failures_count
+   requires rather than duplicating the same try/with twice.
+
+   [?watermark_store] (Task 7, closing Task 6's own boundary friction item 1): when supplied,
+   makes a replay of this exact [(idempotency_key, position)] write exactly-once regardless of
+   what [sink.write] itself does -- a watermark already present for
+   [redaction_event_id ~idempotency_key ~index:position] (the same injective key-derivation
+   {!propose}'s own [?encryption] path already uses, reused here rather than inventing a second,
+   delimiter-joined scheme -- see that function's own doc comment for why a hand-joined key would
+   not be injective) short-circuits straight to [()] without ever calling [sink.write] again. The
+   watermark is recorded ONLY strictly after [sink.write] returns normally: a write that raises
+   {!Riptide_materialize.Materializer.Value_too_large} did not successfully apply, so recording a
+   watermark for it would permanently and wrongly mark it as done, skipping it forever on every
+   later replay instead of leaving it eligible to be retried (e.g. against a KV backend with a
+   larger size bound). [None] (the default both call sites pass when their own [t]/call-site
+   argument supplies no store) skips the watermark check and record entirely, preserving exactly
+   today's behaviour: safe only for an idempotent sink, unconditionally re-applied on every
+   replay. *)
+let materialize_write_catching (sink : materialize_sink) ?(watermark_store : Riptide_storage.File_kv_store.t option)
+    ~(idempotency_key : string) ~(position : int) ~(merge_key : string) (payload : Value.value) : unit =
+  let watermark_key () = redaction_event_id ~idempotency_key ~index:position in
+  let already_applied =
+    match watermark_store with
+    | None -> false
+    | Some store -> Option.is_some (Riptide_storage.File_kv_store.get store ~key:(watermark_key ()))
+  in
+  if already_applied then ()
+  else
+    match sink.write ~merge_key payload with
+    | () -> (
+      match watermark_store with
+      | None -> ()
+      | Some store -> Riptide_storage.File_kv_store.put store ~key:(watermark_key ()) "1")
+    | exception Riptide_materialize.Materializer.Value_too_large _ -> incr materialize_write_failures_count
 
 (* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
    step: walks the committed prefix up to [through_commit_number] (not just the one batch
@@ -289,9 +349,24 @@ let materialize_write_catching (sink : materialize_sink) ~(merge_key : string) (
    was materialized (see [Replica_log.replace_with]), leaving permanently materialized data with
    no committed entry ever backing it -- the same class of "permanent, unauditable divergence a
    lattice join can never undo" this module's own [propose] doc comment already names for a
-   different hazard. *)
-let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
-    ~(through_commit_number : int) : unit =
+   different hazard.
+
+   [?watermark_store] (Task 7, closing Task 6's own boundary friction item 1): threaded straight
+   through to {!materialize_write_catching} for every write in the walk, keyed by each write's own
+   [idempotency_key] and its 0-based position within its own batch (the same convention
+   {!redaction_event_id} already establishes) -- making two calls over an overlapping range
+   exactly-once per write regardless of [materialize]'s own idempotence, not merely safe for a
+   pure lattice join. [None] (the default) preserves exactly today's behaviour.
+
+   [@warning "-16"]: this signature's shape (an optional [?watermark_store] with no trailing
+   [()], the labeled, required [~materialize]/[~through_commit_number] both lexically BEFORE it)
+   is exactly what this task's own brief specifies for this function and the exported .mli type
+   below. OCaml's warning 16 ("unerasable-optional-argument") fires on this shape purely from how
+   the value binding itself is parsed, regardless of the .mli's own type constraining it -- see
+   {!Riptide_module.Admission.verify}'s identical, already-precedented use of this same per-binding
+   attribute for the identical shape. *)
+let[@warning "-16"] materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
+    ~(through_commit_number : int) ?(watermark_store : Riptide_storage.File_kv_store.t option) : unit =
   let bound = min through_commit_number (Riptide_vsr.Replica.commit_number t) in
   let entries = Riptide_vsr.Replica.entries t in
   let seen_keys = Hashtbl.create 16 in
@@ -304,11 +379,13 @@ let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_si
           if Hashtbl.mem seen_keys idempotency_key then ()
           else begin
             Hashtbl.add seen_keys idempotency_key ();
-            List.iter
-              (fun (w : write) ->
+            List.iteri
+              (fun position (w : write) ->
                 match w.merge_key with
                 | None -> ()
-                | Some k -> materialize_write_catching materialize ~merge_key:k w.payload)
+                | Some merge_key ->
+                  materialize_write_catching materialize ?watermark_store ~idempotency_key ~position ~merge_key
+                    w.payload)
               writes
           end)
     entries
@@ -339,20 +416,6 @@ let write_at_op_number_has_merge_key (t : Riptide_vsr.Replica.t) ~(op_number : i
       match batch_of_value v with
       | None -> false
       | Some (_idempotency_key, writes) -> List.exists (fun (w : write) -> Option.is_some w.merge_key) writes)
-
-(* The keystore key for one write, derived from data available BEFORE the write enters the
-   replicated log -- which is the only moment encryption can happen, since Envelope.content_hash
-   covers the payload (lib/envelope.ml's to_value) and is therefore already committed to whatever
-   bytes the log holds. The envelope's own event_id (= its content_hash) is unusable here: it also
-   covers predecessor_hash and sequence, which only exist once the write's position in the
-   committed log is settled, i.e. strictly after the payload had to be final. See
-   batch_commit.mli's [redaction_event_id] and Riptide_crypto.Redaction_store's own header.
-
-   Length-prefixing the idempotency key makes the derivation injective by construction rather than
-   by argument: ("a", 1) and ("a#1", 0) produce "1:a#1" and "3:a#1#0", which cannot collide for
-   any pair of inputs, whatever characters an opaque caller-supplied idempotency key contains. *)
-let redaction_event_id ~idempotency_key ~index =
-  Printf.sprintf "%d:%s#%d" (String.length idempotency_key) idempotency_key index
 
 let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool option)
     ?(materialize : materialize_sink option) ?(encryption : encryption_sink option) (writes : write list) : unit =
@@ -550,11 +613,13 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
     match committed_writes_for replica ~idempotency_key with
     | None -> ()
     | Some committed_writes ->
-      List.iter
-        (fun (w : write) ->
+      List.iteri
+        (fun position (w : write) ->
           match w.merge_key with
           | None -> ()
-          | Some merge_key -> materialize_write_catching sink ~merge_key w.payload)
+          | Some merge_key ->
+            materialize_write_catching sink ?watermark_store:t.materialize_watermark_store ~idempotency_key ~position
+              ~merge_key w.payload)
         committed_writes)
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =

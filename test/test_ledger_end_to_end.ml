@@ -527,7 +527,7 @@ let test_a_declined_decision_survives_every_rematerialization_idiom () =
           propose_request env ~idempotency_key:"req-30" declined);
       check_idiom "materialize_up_to over the whole log" (fun () ->
           Batch_commit.materialize_up_to env.replica ~materialize:env.wrapped_sink
-            ~through_commit_number:(Replica.commit_number env.replica));
+            ~through_commit_number:(Replica.commit_number env.replica) ?watermark_store:None);
       (* The other direction, stated explicitly rather than left implied by the leg count: the
          whole-log replay above re-dispatched the ACCEPTED request 31 too, against a balance its own
          transfer had already drained, so that dispatch decided DECLINE. Its recorded accept had to
@@ -655,7 +655,7 @@ let test_restart_without_durable_dedup_state_doubles_balances () =
       let committed_legs_before = List.length (Batch_commit.committed_envelopes env.replica) in
       let walk sink =
         Batch_commit.materialize_up_to env.replica ~materialize:sink
-          ~through_commit_number:(Replica.commit_number env.replica)
+          ~through_commit_number:(Replica.commit_number env.replica) ?watermark_store:None
       in
       (* 1. The same walk, in the same process. This is the documented, working case. *)
       let repeats_before = Accumulator.repeat_dispatches env.accumulator in

@@ -289,7 +289,7 @@ let test_materialize_up_to_drains_the_whole_committed_prefix () =
       Alcotest.(check int64) "nothing materialized before materialize_up_to runs"
         Last_write_wins.bottom.timestamp (M.read materializer ~merge_key:"mk").timestamp;
       Batch_commit.materialize_up_to replica ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replica);
+        ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
       let expected : Last_write_wins.t =
         { value = Riptide.Value.Scalar (Riptide.Value.String "v3"); timestamp = 3L }
       in
@@ -305,9 +305,9 @@ let test_materialize_up_to_is_idempotent () =
       propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
       let materializer = make_materializer kv_dir env sw in
       let sink = make_sink materializer in
-      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1 ?watermark_store:None;
       let once = M.read materializer ~merge_key:"mk" in
-      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1 ?watermark_store:None;
       let twice = M.read materializer ~merge_key:"mk" in
       Alcotest.(check bool) "re-materializing an already-covered range is a safe no-op" true
         (once = twice))
@@ -321,7 +321,7 @@ let test_materialize_up_to_respects_the_through_bound () =
       propose_one_write replica ~idempotency_key:"k2" ~merge_key:(Some "mk2") ~timestamp:1 ~value_str:"v2";
       let materializer = make_materializer kv_dir env sw in
       let sink = make_sink materializer in
-      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1;
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1 ?watermark_store:None;
       Alcotest.(check bool) "only the first batch's key materialized" true
         (M.read materializer ~merge_key:"mk1" <> Last_write_wins.bottom);
       Alcotest.(check bool) "the second batch's key, past the bound, did not" true
@@ -379,7 +379,7 @@ let test_materialize_up_to_skips_writes_with_no_merge_key () =
     { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
   in
   Batch_commit.materialize_up_to replica ~materialize:sink
-    ~through_commit_number:(Replica.commit_number replica);
+    ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
   Alcotest.(check (list string))
     "materialize_up_to invoked the sink exactly once, only for the merge_key = Some write" [ "mk" ]
     !materialized_keys
@@ -400,7 +400,7 @@ let test_materialize_up_to_and_write_at_op_number_skip_a_malformed_entry () =
     { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
   in
   Batch_commit.materialize_up_to replica ~materialize:sink
-    ~through_commit_number:(Replica.commit_number replica);
+    ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
   Alcotest.(check (list string)) "materialize_up_to materializes nothing for a malformed entry" []
     !materialized_keys;
   Alcotest.(check bool) "write_at_op_number_has_merge_key is false for a malformed entry" false
@@ -484,7 +484,7 @@ let test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for
   (* through_commit_number:1 is >= the appended-but-uncommitted op-number (1), deliberately NOT
      <= commit_number (0) -- so a caller-side bound alone would not protect this call; only the
      function's own internal clamp against Replica.commit_number can. *)
-  Batch_commit.materialize_up_to primary ~materialize:sink ~through_commit_number:1;
+  Batch_commit.materialize_up_to primary ~materialize:sink ~through_commit_number:1 ?watermark_store:None;
   Alcotest.(check (list string))
     "materialize_up_to must not materialize the uncommitted entry even though through_commit_number \
      itself reaches its op-number -- only the internal commit_number clamp protects this"
@@ -546,7 +546,7 @@ let test_materialize_up_to_dedups_first_wins_per_idempotency_key () =
       let materializer = make_materializer kv_dir env sw in
       let sink = make_sink materializer in
       Batch_commit.materialize_up_to replica ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replica);
+        ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
       let expected : Last_write_wins.t =
         { value = Riptide.Value.Scalar (Riptide.Value.String "first-payload"); timestamp = 1L }
       in
@@ -657,7 +657,7 @@ let test_restart_replay_does_not_permanently_stop_after_one_poisoned_key () =
       let failures_before = Batch_commit.materialize_write_failures () in
       tolerating_the_known_overflow_exception (fun () ->
           Batch_commit.materialize_up_to replica ~materialize:sink
-            ~through_commit_number:(Replica.commit_number replica));
+            ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None);
       let late = M.read materializer ~merge_key:"late-mk" in
       Alcotest.(check bool) "a later, unrelated key materialized despite the earlier poison" true
         (late <> Last_write_wins.bottom);
@@ -690,7 +690,7 @@ let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned
       let failures_before = Batch_commit.materialize_write_failures () in
       tolerating_the_known_overflow_exception (fun () ->
           Batch_commit.materialize_up_to replica ~materialize:sink
-            ~through_commit_number:(Replica.commit_number replica));
+            ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None);
       let sibling = M.read materializer ~merge_key:"sibling-mk2" in
       Alcotest.(check bool)
         "the sibling write in the SAME poisoned batch still materialized via materialize_up_to's \
@@ -698,6 +698,162 @@ let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned
         true (sibling <> Last_write_wins.bottom);
       Alcotest.(check bool) "the poisoned write was counted as a materialize failure" true
         (Batch_commit.materialize_write_failures () > failures_before))
+
+(* ---- Durable materialization watermark (Task 1 of the layer2-boundary-revision plan,
+   .superpowers/sdd/2026-10-01-layer2-boundary-revision/) ----
+
+   Closes Task 6's own boundary friction item 1 (final whole-branch review finding I9): supplying
+   [?materialize_watermark_store]/[?watermark_store] makes a repeated materialize of the same
+   committed write apply AT MOST ONCE, for a sink of ANY shape -- not merely a pure lattice join.
+   These tests use a plain counting sink (a [ref] incremented on every [write] call) rather than a
+   real [Materializer], deliberately: the property under test is "how many times was [write]
+   called", which a counter answers directly without needing a real lattice/KV accumulator to read
+   back. Per this task's own brief, this counting sink is built directly against
+   [materialize_sink]'s CURRENT (pre-Task-3) 2-argument shape -- [~merge_key:string ->
+   Riptide.Value.value -> unit] -- since that type does not change until Task 3. *)
+
+let counting_sink (counter : int ref) : Batch_commit.materialize_sink =
+  { write = (fun ~merge_key:_ _payload -> incr counter) }
+
+let make_write ~merge_key ~tag : Batch_commit.write =
+  {
+    Batch_commit.actor = "actor-1";
+    causation = fake_event_id (tag ^ "-c");
+    correlation = fake_event_id (tag ^ "-r");
+    payload = Riptide.Value.Scalar (Riptide.Value.String ("payload-" ^ tag));
+    merge_key;
+  }
+
+let test_watermark_makes_repeated_materialize_exactly_once () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun watermark_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let watermark_store = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"watermark" watermark_dir in
+      let counter = ref 0 in
+      let sink = counting_sink counter in
+      let h =
+        Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ~materialize_watermark_store:watermark_store ()
+      in
+      let write = make_write ~merge_key:(Some "mk") ~tag:"wm1" in
+      Batch_commit.propose h ~idempotency_key:"wm-key-1" ~materialize:sink [ write ];
+      Alcotest.(check int) "materialized once on the proposing call" 1 !counter;
+      (* The documented empty-[writes] drain idiom: same idempotency_key, same sink, same store. *)
+      Batch_commit.propose h ~idempotency_key:"wm-key-1" ~materialize:sink [];
+      Alcotest.(check int) "the watermark makes the repeated drain a no-op -- not materialized twice" 1 !counter)
+
+let test_materialize_up_to_with_watermark_store_is_exactly_once_across_two_calls () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun watermark_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let watermark_store = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"watermark" watermark_dir in
+      propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk1") ~timestamp:1 ~value_str:"v1";
+      propose_one_write replica ~idempotency_key:"k2" ~merge_key:(Some "mk2") ~timestamp:1 ~value_str:"v2";
+      let counter = ref 0 in
+      let sink = counting_sink counter in
+      (* Overlapping ranges: the first call covers op 1, the second covers ops 1-2. *)
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:1 ~watermark_store;
+      Batch_commit.materialize_up_to replica ~materialize:sink ~through_commit_number:2 ~watermark_store;
+      Alcotest.(check int)
+        "exactly the 2 distinct merge_key-carrying writes materialized, not double-counted on the \
+         overlap"
+        2 !counter)
+
+let test_no_watermark_store_preserves_todays_double_apply () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  let counter = ref 0 in
+  let sink = counting_sink counter in
+  let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
+  let write = make_write ~merge_key:(Some "mk") ~tag:"wm2" in
+  Batch_commit.propose h ~idempotency_key:"wm-key-2" ~materialize:sink [ write ];
+  Batch_commit.propose h ~idempotency_key:"wm-key-2" ~materialize:sink [];
+  Alcotest.(check int)
+    "without a watermark store, the drain idiom double-applies exactly as before this mechanism \
+     existed"
+    2 !counter
+
+let test_watermark_does_not_collide_across_different_idempotency_keys_same_position () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun watermark_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let watermark_store = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"watermark" watermark_dir in
+      let counter = ref 0 in
+      let sink = counting_sink counter in
+      let h =
+        Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ~materialize_watermark_store:watermark_store ()
+      in
+      (* Two DIFFERENT idempotency_key batches, each with a single write at position 0 carrying a
+         DIFFERENT merge_key. If the watermark key were a delimiter-joined
+         [idempotency_key ^ "|" ^ string_of_int position] (or any other non-injective scheme) rather
+         than [redaction_event_id]'s own length-prefixed encoding, a collision here would wrongly
+         treat the second batch's position-0 write as already applied. *)
+      Batch_commit.propose h ~idempotency_key:"key-a" ~materialize:sink [ make_write ~merge_key:(Some "mk-a") ~tag:"a" ];
+      Batch_commit.propose h ~idempotency_key:"key-b" ~materialize:sink [ make_write ~merge_key:(Some "mk-b") ~tag:"b" ];
+      Alcotest.(check int) "both batches' own position-0 writes applied -- no cross-key collision" 2 !counter)
+
+(* ---- committed_writes_for (newly exported; implementation unchanged from before this task) ---- *)
+
+let test_committed_writes_for_returns_none_when_never_committed () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  Alcotest.(check bool) "None when the key was never committed" true
+    (Option.is_none (Batch_commit.committed_writes_for replica ~idempotency_key:"never-committed"))
+
+let test_committed_writes_for_returns_the_committed_writes () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  propose_one_write replica ~idempotency_key:"k1" ~merge_key:(Some "mk") ~timestamp:1 ~value_str:"v1";
+  match Batch_commit.committed_writes_for replica ~idempotency_key:"k1" with
+  | None -> Alcotest.fail "expected Some writes for a committed key"
+  | Some writes ->
+    (* 1 real write + 1 synthetic authorization-decision write (task-master Task 5, subtask 5) --
+       see test_batch_commit.ml's own dedicated test for that write's shape; propose_one_write goes
+       through Batch_commit.propose, which always appends that extra write to a successfully
+       proposed batch. *)
+    Alcotest.(check int) "the real write plus the synthetic authorization-decision write come back" 2
+      (List.length writes);
+    Alcotest.(check bool) "the real write (position 0) carries the proposed merge_key" true
+      (match writes with { Batch_commit.merge_key = Some "mk"; _ } :: _ -> true | _ -> false)
+
+let test_committed_writes_for_is_first_wins_per_key () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  let key = "dup-key-cwf" in
+  (* Raw Replica.propose, bypassing Batch_commit.propose's own already_in_log guard, to construct a
+     genuine duplicate -- two well-formed, separately committed batches under the SAME
+     idempotency_key, mirroring test_materialize_up_to_dedups_first_wins_per_idempotency_key above. *)
+  let make_batch_value payload_str =
+    Riptide.Value.Record
+      [
+        ("idempotency_key", Riptide.Value.Scalar (Riptide.Value.String key));
+        ("writes",
+          Riptide.Value.Sequence
+            [
+              Riptide.Value.Record
+                [
+                  ("actor", Riptide.Value.Scalar (Riptide.Value.String "actor-1"));
+                  ("causation", Riptide.Value.Scalar (Riptide.Value.Bytes (fake_event_id (payload_str ^ "-c"))));
+                  ("correlation", Riptide.Value.Scalar (Riptide.Value.Bytes (fake_event_id (payload_str ^ "-r"))));
+                  ("payload", Riptide.Value.Scalar (Riptide.Value.String payload_str));
+                  ("merge_key", Riptide.Value.Sum ("none", Riptide.Value.Record []));
+                ];
+            ]);
+      ]
+  in
+  Replica.propose replica (make_batch_value "first-payload");
+  Replica.propose replica (make_batch_value "second-payload-should-be-ignored");
+  Alcotest.(check int) "both batches genuinely committed as 2 separate entries" 2 (Replica.commit_number replica);
+  match Batch_commit.committed_writes_for replica ~idempotency_key:key with
+  | None -> Alcotest.fail "expected Some writes"
+  | Some [ w ] -> (
+    match w.payload with
+    | Riptide.Value.Scalar (Riptide.Value.String s) ->
+      Alcotest.(check string) "the FIRST batch's write comes back, not the second" "first-payload" s
+    | _ -> Alcotest.fail "unexpected payload shape")
+  | Some _ -> Alcotest.fail "expected exactly one write back"
 
 let tests =
   [
@@ -735,4 +891,21 @@ let tests =
     ( "materialize_up_to's own inner loop continues to a sibling write within the same poisoned \
        batch (Task 21 review fix round 1, Minor 1)",
       `Quick, test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned_batch );
+    ( "a durable materialize_watermark_store makes propose's repeated-drain idiom exactly-once \
+       (Task 1, layer2-boundary-revision)",
+      `Quick, test_watermark_makes_repeated_materialize_exactly_once );
+    ( "a durable watermark_store makes materialize_up_to exactly-once across two overlapping calls \
+       (Task 1)",
+      `Quick, test_materialize_up_to_with_watermark_store_is_exactly_once_across_two_calls );
+    ( "omitting the watermark store preserves today's double-apply on repeated drain (Task 1, \
+       Review Focus item 1)",
+      `Quick, test_no_watermark_store_preserves_todays_double_apply );
+    ( "the watermark does not collide across different idempotency_keys sharing the same write \
+       position (Task 1, Review Focus item 4)",
+      `Quick, test_watermark_does_not_collide_across_different_idempotency_keys_same_position );
+    ( "committed_writes_for returns None when the key was never committed",
+      `Quick, test_committed_writes_for_returns_none_when_never_committed );
+    ("committed_writes_for returns the committed writes", `Quick, test_committed_writes_for_returns_the_committed_writes);
+    ( "committed_writes_for is first-wins per idempotency_key",
+      `Quick, test_committed_writes_for_is_first_wins_per_key );
   ]
