@@ -24,26 +24,39 @@ val legs_of_request :
     Schema.transfer_leg_to_value leg] and [merge_key = Some (Schema.account_merge_key
     leg.this_account)] -- i.e. each leg's own write is always tagged with the account it is
     about. [actor]/[causation]/[correlation] are passed through unchanged to both legs, making
-    them two members of the same causal batch.
+    them two members of the same causal batch; [actor] is additionally recorded INSIDE each leg's
+    own payload (see {!Schema.transfer_leg}'s [actor] field for why that is load-bearing rather
+    than redundant), always the same value as the write's own, which is exactly the agreement
+    {!Authorize.authorize} enforces.
 
     This function never fails and never rejects [r] -- even a self-transfer
-    ([r.from_account = r.to_account]) or a non-positive [r.amount] produces two well-paired
-    (same [transfer_id], mirrored accounts, matching [amount]) legs; it is
-    {!Authorize.authorize}'s job, not this function's, to reject a malformed leg once proposed
+    ([r.from_account = r.to_account]), a non-positive [r.amount], or a negative account id
+    produces two well-paired (same [transfer_id], mirrored accounts, matching [amount]) legs; it
+    is {!Authorize.authorize}'s job, not this function's, to reject a malformed leg once proposed
     (see Decision 1). *)
 
-val legs_of_bytes :
+val decision_of_bytes :
   actor:Riptide.Envelope.actor_id ->
   causation:Riptide.Envelope.event_id ->
   correlation:Riptide.Envelope.event_id ->
   bytes ->
-  (Riptide_batch_commit.Batch_commit.write list, string) result
-(** [legs_of_bytes ~actor ~causation ~correlation b] is {!Wire.decode_request} applied to [b],
-    then {!legs_of_request} applied to the result -- [Error] (with a human-readable reason) if
-    [b] does not decode as a well-formed 32-byte {!Schema.transfer_request}, [Ok legs] otherwise,
-    where [legs] is always exactly the two well-paired legs {!legs_of_request} would have
-    produced for the decoded request. This is the guest-facing entry point: the host's
-    [~propose] closure (wired into this module's [Reactor.subscribe] call) calls this directly on
-    the raw bytes a WASM guest supplies via [propose_write], so it is this function -- not
-    anything inside the guest -- that is the actual trust boundary for "both legs of a transfer
-    are a genuine, matched pair." *)
+  (bool * Schema.transfer_request * Riptide_batch_commit.Batch_commit.write list, string) result
+(** [decision_of_bytes ~actor ~causation ~correlation b] is {!Wire.decode_decision} applied to
+    [b], then {!legs_of_request} applied to the decoded request -- [Error] (with a
+    human-readable reason) if [b] is not a well-formed {!Wire.decision_bytes}-byte decision
+    payload, and [Ok (accepted, request, legs)] otherwise, where [legs] is always exactly the two
+    well-paired legs {!legs_of_request} would have produced for [request], REGARDLESS of
+    [accepted].
+
+    Building the legs even for a declined decision is deliberate: it keeps this function a pure,
+    total decode-and-construct step with one behaviour to fuzz, and leaves the decision about
+    whether those legs are ever proposed where it belongs -- in
+    {!Accumulator.handle_guest_decision}, the only caller, which proposes them only for a
+    first-time accept.
+
+    {b This is the guest-facing trust boundary}: the host's [propose_write] closure calls this
+    (via {!Accumulator.handle_guest_decision}) on the raw bytes a WASM guest supplies, so it is
+    this function -- not anything inside the guest -- that is what actually guarantees "both legs
+    of a transfer are a genuine, matched pair". It decodes those bytes exactly ONCE and hands the
+    decoded request back to its caller alongside the legs, so no caller needs to decode them a
+    second time (final whole-branch review, finding M9). *)

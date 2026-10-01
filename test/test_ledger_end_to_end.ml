@@ -7,38 +7,26 @@
    end to end), and a real admission-verified guest (fixtures/ledger.wat) deciding real business
    logic (sufficient funds) instead of an arbitrary counter increment.
 
-   ── The one piece of glue this task owns that Tasks 1-2 do not provide ──────────────────────────
-   Schema/Wire/Legs/Authorize together give: a wire encoding, leg construction, and a per-write
+   ── Where this module's host half actually lives ────────────────────────────────────────────────
+   Schema/Wire/Legs/Authorize give a wire encoding, leg construction, and a per-write
    well-formedness check. None of them turn a committed transfer_leg write (role + amount +
-   accounts) into an account's own running BALANCE -- the design spec's own Decision 2 is explicit
-   that balances are "materialized state, not a new lattice/CRDT type", maintained via the same
-   read-materialized-then-propose-new-total pattern counter.wat already established, just applied
-   here by this test's own ~materialize sink closure (the host side) rather than inside the guest,
-   because what the guest's propose_write call produces (via the trusted Legs construction) is a
-   transfer_leg descriptor, not an absolute balance. This file's own inner_sink is that glue: for
-   every committed write at an "ledger.account.*" key, it decodes the leg, reads the account's
-   current materialized balance, applies the leg's own signed delta (-amount for Debit, +amount
-   for Credit), and writes the new absolute total back as a plain Value.Scalar (Value.Int _) --
-   analogous to test_module_end_to_end.ml's own lww_to_value/lww_of_value codec helpers, just
-   doing real accumulation instead of a pure encoding conversion, since Last_write_wins has no
-   accumulation of its own.
+   accounts) into an account's own running BALANCE, decide whether a request happens at all, or
+   implement the host side of this module's byte convention. All three of those now live in
+   Accumulator (lib/ledger/) -- real, documented library code with a single owner.
 
-   ── Why that accumulation needs an explicit dedup guard, found while writing this test, not
-      assumed ──────────────────────────────────────────────────────────────────────────────────
-   Batch_commit.propose's own doc comment states plainly that its materialize step "happen[s] on
-   EVERY call, not only the call that itself performs the durable commit" -- so a client retrying
-   the SAME transfer_request under the SAME idempotency_key genuinely re-runs materialize.write
-   for both of that transfer's already-committed legs a second time, with the bit-identical
-   payload each time (decoded from the committed bytes, never from a call's own writes argument).
-   A naive "read current, add delta, write new total" sink is NOT idempotent under that replay --
-   it would apply the delta twice. inner_sink therefore tracks which (transfer_id, this_account,
-   role) triples it has already applied, in a plain Hashtbl captured by its own closure, and skips
-   a repeat. This is exactly what
-   test_the_same_request_id_proposed_twice_does_not_double_apply below proves empirically, not
-   just by code inspection -- see that test's own comment for how the scenario is constructed so a
-   missing guard would actually be caught (an amount small enough that the SECOND, replayed
-   dispatch still independently decides "sufficient funds" and genuinely attempts a second
-   propose_write, rather than being saved by the business check alone). *)
+   They did not, originally: they lived here, as roughly 50 lines of inline closure duplicated
+   verbatim between this file and test_ledger_dst_load.ml, carrying a load-bearing correctness
+   guard that no .mli documented anywhere. The final whole-branch review called that out (finding
+   I3), and it was the right call for a reason the fix made obvious: two of the three bugs this fix
+   wave closed (C1, a declined decision that was not durable; I4, a dedup key that silently
+   destroyed money) were defects in exactly that undocumented, duplicated logic. Logic that decides
+   whether money moves is not test scaffolding.
+
+   What is left in this file is what genuinely belongs to a test: the real stack wired together
+   (real solo replica, real Batch_commit.t with ~authorize:Authorize.authorize -- the first use of
+   the real policy end to end in this whole plan -- real Materializer, real admission-verified
+   ledger.wat, Reactor.subscribe), plus four small closures naming this test's own choice of lattice
+   (Last_write_wins) and KV backend (File_kv_store). *)
 open Riptide
 open Riptide_ledger
 open Riptide_module
@@ -164,12 +152,6 @@ let create_solo_volatile () =
     ~send:(fun ~to_:_ (_ : string) -> ())
     ()
 
-let account_prefix = "ledger.account."
-
-let is_account_key mk =
-  String.length mk >= String.length account_prefix
-  && String.sub mk 0 (String.length account_prefix) = account_prefix
-
 (* ── The full real wiring: one replica, one Batch_commit.t (real Authorize.authorize policy, not
    allow_all), one Materializer, one Reactor subscribed to "ledger.requests" with ledger.wat --
    built fresh per test, matching this codebase's own test-isolation convention. ────────────────── *)
@@ -179,6 +161,7 @@ type env_handles = {
   replica : Replica.t;
   materializer : M.t;
   wrapped_sink : Batch_commit.materialize_sink;
+  accumulator : Accumulator.t;
 }
 
 let with_ledger_env (f : env_handles -> unit) =
@@ -198,104 +181,48 @@ let with_ledger_env (f : env_handles -> unit) =
         ts_counter := Int64.add !ts_counter 1L;
         !ts_counter
       in
-      (* This test's own idempotent-accumulation guard -- see this file's own top comment for the
-         real materialize-replay scenario that makes it necessary, not optional. Keyed by
-         (transfer_id, this_account, role): that triple is stable and identical across however
-         many times the SAME already-committed leg write is handed back to this sink. *)
-      let applied_legs : (string, unit) Hashtbl.t = Hashtbl.create 16 in
-      let inner_sink : Batch_commit.materialize_sink =
-        {
-          write =
-            (fun ~merge_key payload ->
-              if merge_key = Schema.requests_merge_key then
-                (* The request itself is stored as-is -- re-storing identical content under a
-                   fresh timestamp on a replay is harmless, since Last_write_wins converges to the
-                   same value regardless of which identical-content write "won". *)
-                M.write materializer ~merge_key
-                  { Last_write_wins.value = payload; timestamp = next_ts () }
-              else if is_account_key merge_key then (
-                match Schema.transfer_leg_of_value payload with
-                | None ->
-                  (* Can't happen via this module's own trusted ~propose closure below (Legs
-                     always produces a well-formed leg, and Authorize already denied anything else
-                     before this sink ever sees it) -- defensively a no-op, not a crash. *)
-                  ()
-                | Some leg ->
-                  let dedup_key =
-                    Printf.sprintf "%Ld|%Ld|%s" leg.Schema.transfer_id leg.Schema.this_account
-                      (match leg.Schema.role with
-                      | Schema.Debit -> "debit"
-                      | Schema.Credit -> "credit")
-                  in
-                  if not (Hashtbl.mem applied_legs dedup_key) then (
-                    Hashtbl.add applied_legs dedup_key ();
-                    let delta =
-                      match leg.Schema.role with
-                      | Schema.Debit -> Int64.neg leg.Schema.amount
-                      | Schema.Credit -> leg.Schema.amount
-                    in
-                    let current = M.read materializer ~merge_key in
-                    let current_balance =
-                      if current = Last_write_wins.bottom then 0L
-                      else
-                        match current.Last_write_wins.value with
-                        | Value.Scalar (Value.Int n) -> n
-                        | _ -> 0L
-                    in
-                    let new_balance = Int64.add current_balance delta in
-                    M.write materializer ~merge_key
-                      {
-                        Last_write_wins.value = Value.Scalar (Value.Int new_balance);
-                        timestamp = next_ts ();
-                      }))
-              else
-                (* This module has no opinion on any other merge_key shape -- matches Authorize's
-                   own "anything else: allow, untouched" framing. *)
-                ());
-        }
+      (* Everything that used to be ~50 lines of balance-accumulation, dedup-guarding and
+         wire-encoding inline here is now real library code (Accumulator, lib/ledger/) -- see
+         finding I3. What is left below is exactly the part that genuinely belongs to a test: four
+         tiny closures naming THIS test's own choice of lattice (Last_write_wins) and KV backend
+         (File_kv_store). Nothing about the ledger's own semantics lives in this file any more,
+         which is the point: it was never test logic. *)
+      let accumulator = Accumulator.create () in
+      let read_balance ~merge_key =
+        let v = M.read materializer ~merge_key in
+        if v = Last_write_wins.bottom then None
+        else match v.Last_write_wins.value with Value.Scalar (Value.Int n) -> Some n | _ -> None
+      in
+      let write_balance ~merge_key balance =
+        M.write materializer ~merge_key
+          { Last_write_wins.value = Value.Scalar (Value.Int balance); timestamp = next_ts () }
+      in
+      (* The request is stored as-is -- re-storing identical content under a fresh timestamp on a
+         replay is harmless, since Last_write_wins converges to the same value regardless of which
+         identical-content write "won". *)
+      let store_request payload =
+        M.write materializer ~merge_key:Schema.requests_merge_key
+          { Last_write_wins.value = payload; timestamp = next_ts () }
+      in
+      let read_request () =
+        let v = M.read materializer ~merge_key:Schema.requests_merge_key in
+        if v = Last_write_wins.bottom then None
+        else Schema.transfer_request_of_value v.Last_write_wins.value
+      in
+      let inner_sink =
+        Accumulator.materialize_sink accumulator ~read_balance ~write_balance ~store_request
       in
       let reactor = Reactor.create () in
       let wrapped_sink = Reactor.wrap_materialize_sink reactor inner_sink in
-      (* host.read_materialized's own half of this module's wire convention (Decision 3): the
-         guest asks for either "ledger.requests" (32 bytes, Wire.encode_request) or
-         "ledger.account.<id>" (8 bytes, Wire.encode_balance) -- [None] from this closure means
-         the guest sees a zero-length read, its own "no value yet" convention. *)
-      let read_for_module ~merge_key =
-        if merge_key = Schema.requests_merge_key then (
-          let v = M.read materializer ~merge_key in
-          if v = Last_write_wins.bottom then None
-          else
-            match Schema.transfer_request_of_value v.Last_write_wins.value with
-            | Some r -> Some (Wire.encode_request r)
-            | None -> None)
-        else if is_account_key merge_key then (
-          let v = M.read materializer ~merge_key in
-          if v = Last_write_wins.bottom then None
-          else
-            match v.Last_write_wins.value with
-            | Value.Scalar (Value.Int bal) -> Some (Wire.encode_balance bal)
-            | _ -> None)
-        else None
-      in
-      (* host.propose_write's own half: the guest forwards the SAME 32 bytes it read for
-         "ledger.requests" (Decision 3). This is the one piece of trusted host code that ever
-         builds a ledger transfer's two legs (Legs.legs_of_bytes, Task 2) and proposes them
-         together, atomically, under the exact idempotency-key convention the brief's own Global
-         Constraints section states: "ledger-transfer-" ^ Int64.to_string request_id. *)
+      let read_for_module = Accumulator.read_for_guest ~read_request ~read_balance in
+      (* host.propose_write's own half, now a single library call: the guest hands back 33 bytes (a
+         decision tag plus the request), and Accumulator.handle_guest_decision is what decides --
+         once and for all, per request_id -- whether that becomes a pair of committed legs. *)
       let propose_for_module (bytes : bytes) : (unit, string) result =
-        match Wire.decode_request bytes with
-        | None -> Error "propose closure: payload does not decode as a well-formed transfer_request"
-        | Some r ->
-          let idempotency_key = "ledger-transfer-" ^ Int64.to_string r.Schema.request_id in
-          let event_id = fake_event_id idempotency_key in
-          (match
-             Legs.legs_of_bytes ~actor:"ledger-module" ~causation:event_id ~correlation:event_id
-               bytes
-           with
-          | Error e -> Error e
-          | Ok legs ->
-            Batch_commit.propose handle ~idempotency_key ~materialize:wrapped_sink legs;
-            Ok ())
+        Accumulator.handle_guest_decision accumulator ~actor:"ledger-module"
+          ~propose:(fun ~idempotency_key writes ->
+            Batch_commit.propose handle ~idempotency_key ~materialize:wrapped_sink writes)
+          bytes
       in
       let verified_artifact, verification_dir = verified_ledger () in
       (* Same Fun.protect ~finally idiom as with_tmp_dir above, applied to the admission-
@@ -310,7 +237,7 @@ let with_ledger_env (f : env_handles -> unit) =
         (fun () ->
           Reactor.subscribe reactor ~merge_key:Schema.requests_merge_key ~module_:verified_artifact
             ~protocol:allow_handle_from_init ~read:read_for_module ~propose:propose_for_module;
-          f { handle; replica; materializer; wrapped_sink }))
+          f { handle; replica; materializer; wrapped_sink; accumulator }))
 
 (* This task's own documented test-setup convention (per task-3-brief.md step 6 and the design
    spec's own non-goals: no "mint"/account-opening flow exists in this focused-core scope) --
@@ -318,11 +245,21 @@ let with_ledger_env (f : env_handles -> unit) =
    merge_key, bypassing the request/module flow entirely. other_account = 0L is simply an
    unused/placeholder counterparty for this synthetic, test-only leg -- never itself seeded or
    asserted on. *)
-let seed_account env account amount =
-  let idempotency_key = Printf.sprintf "seed-%Ld" account in
+let seed_account ?key env account amount =
+  let idempotency_key =
+    match key with Some k -> k | None -> Printf.sprintf "seed-%Ld" account
+  in
   let event_id = fake_event_id idempotency_key in
   let leg =
-    Schema.{ transfer_id = 0L; role = Credit; this_account = account; other_account = 0L; amount }
+    Schema.
+      {
+        transfer_id = 0L;
+        role = Credit;
+        actor = "test-seed";
+        this_account = account;
+        other_account = 0L;
+        amount;
+      }
   in
   Batch_commit.propose env.handle ~idempotency_key ~materialize:env.wrapped_sink
     [
@@ -412,6 +349,83 @@ let test_the_same_request_id_proposed_twice_does_not_double_apply () =
         "the credit applied exactly once, despite the replayed materialize call" 100L
         (balance_of env 600L))
 
+(* ── Final whole-branch review, finding C1 (Critical): a DECLINED decision must be durable ─────
+   The scenario, reproduced here exactly as the reviewer found it: a request is declined for
+   insufficient funds, the sender's balance later rises for an entirely unrelated reason, and then
+   the SAME already-committed "ledger.requests" write is re-materialized -- which is not an exotic
+   act but one of three routine, documented idioms (the empty-writes drain used below,
+   Batch_commit.propose's own unconditional-on-retry materialize step, or
+   Batch_commit.materialize_up_to). Re-materializing re-dispatches the guest, which re-reads the
+   CURRENT balance; before this fix nothing recorded that the request had already been decided, so
+   the guest legitimately decided ACCEPT the second time and the host dutifully committed both legs
+   -- real money movement with no new client request behind it.
+
+   Note what the balance top-up here is NOT: no seeding trick, no hand-made leg. It is an ordinary
+   accepted transfer from a second seeded account, i.e. exactly the everyday traffic that makes a
+   stale decline dangerous in the first place. *)
+let test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization () =
+  with_ledger_env (fun env ->
+      seed_account env 700L 50L;
+      seed_account env 701L 1000L;
+      let declined =
+        Schema.{ request_id = 10L; from_account = 700L; to_account = 800L; amount = 500L }
+      in
+      propose_request env ~idempotency_key:"req-10" declined;
+      Alcotest.(check int) "request 10 was declined: no leg committed yet" 0
+        (List.length (module_leg_envelopes env));
+      (* Ordinary, unrelated traffic lifts account 700 well past the declined amount. *)
+      propose_request env ~idempotency_key:"req-11"
+        Schema.{ request_id = 11L; from_account = 701L; to_account = 700L; amount = 1000L };
+      Alcotest.(check int) "request 11 was accepted: exactly its own two legs committed" 2
+        (List.length (module_leg_envelopes env));
+      Alcotest.(check int64) "the sender now has far more than enough for the declined transfer"
+        1050L (balance_of env 700L);
+      let flips_before = Accumulator.prevented_flips env.accumulator in
+      (* The empty-writes drain idiom, verbatim from batch_commit.mli's own documented contract: a
+         pure "is it committed now? if so, materialize it" probe against an already-committed key.
+         Nothing here proposes any new content whatsoever. *)
+      Batch_commit.propose env.handle ~idempotency_key:"req-10" ~materialize:env.wrapped_sink [];
+      (* Positive evidence that the mechanism FIRED, not just that the outcome looks right: without
+         this, the test would pass equally well if the guest had simply declined a second time for
+         its own reasons, which would prove nothing about C1 at all. *)
+      Alcotest.(check int)
+        "the re-dispatched guest genuinely decided ACCEPT, and the first-decision-wins rule \
+         overrode it"
+        1
+        (Accumulator.prevented_flips env.accumulator - flips_before);
+      Alcotest.(check int)
+        "still only request 11's two legs -- request 10's decline survived the replay" 2
+        (List.length (module_leg_envelopes env));
+      Alcotest.(check int64) "the sender's balance is untouched by the replay" 1050L
+        (balance_of env 700L);
+      Alcotest.(check int64) "the would-be recipient never received anything" 0L
+        (balance_of env 800L))
+
+(* ── Final whole-branch review, finding I4 (Important): the accumulator's dedup key must not
+   collide across two genuinely different legs ───────────────────────────────────────────────────
+   Live-reproduced by the reviewer and again here: this file's own documented seeding convention
+   builds its synthetic leg with transfer_id = 0L, so before this fix a REAL transfer carrying
+   request_id = 0L shared the dedup key (0, account, role) with the seed leg of whichever account
+   it credited -- the accumulator saw the key already applied and silently skipped the credit. The
+   committed log stays perfectly correct (both legs are there), while the materialized balances
+   stop conserving value: the debit lands, the credit vanishes. Money destroyed, nothing raised.
+
+   request_id = 0L is a perfectly ordinary client-chosen identifier, not a reserved value, which is
+   what makes this a real defect rather than a theoretical one. *)
+let test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention () =
+  with_ledger_env (fun env ->
+      seed_account env 910L 500L;
+      seed_account env 911L 300L;
+      propose_request env ~idempotency_key:"req-0"
+        Schema.{ request_id = 0L; from_account = 910L; to_account = 911L; amount = 100L };
+      Alcotest.(check int) "both legs of the transfer committed" 2
+        (List.length (module_leg_envelopes env));
+      Alcotest.(check int64) "the debit landed" 400L (balance_of env 910L);
+      Alcotest.(check int64) "the credit landed too -- not swallowed by the seed leg's dedup key"
+        400L (balance_of env 911L);
+      Alcotest.(check int64) "value is conserved across the two accounts" 800L
+        (Int64.add (balance_of env 910L) (balance_of env 911L)))
+
 let tests =
   [
     ( "a request with sufficient funds commits both legs and updates both balances",
@@ -419,4 +433,8 @@ let tests =
     ("insufficient funds is a clean no-op", `Quick, test_insufficient_funds_is_a_clean_no_op);
     ( "the same request_id proposed twice does not double-apply",
       `Quick, test_the_same_request_id_proposed_twice_does_not_double_apply );
+    ( "a declined request cannot be accepted by a later re-materialization",
+      `Quick, test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization );
+    ( "a request_id of zero does not collide with the seeding convention",
+      `Quick, test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention );
   ]

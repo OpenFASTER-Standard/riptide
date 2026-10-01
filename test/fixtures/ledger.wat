@@ -11,9 +11,18 @@
 ;; NOT truncated to 32 bits. loader.ml links the REAL wasmtime (v49.0.1 C API, see loader.ml's own
 ;; top comment) and compiles this file through its genuine `wat_to_wasm`/wat2wasm -- i.e. this is
 ;; the real WebAssembly text format, with full native `i64` load/store/compare/div/rem support, not
-;; a hand-rolled minimal parser. Every amount/balance comparison below is a real `i64.gt_u` over the
+;; a hand-rolled minimal parser. Every amount/balance comparison below is a real `i64.gt_s` over the
 ;; full 64-bit value read straight out of the 8-byte LE fields Wire.ml writes -- no field is ever
-;; reduced to its low 32 bits. The one place a genuinely new, nontrivial routine was needed is
+;; reduced to its low 32 bits. SIGNED (`_s`), not unsigned, and that is a correctness fix rather
+;; than a style preference (final whole-branch review, finding I1): Wire.encode_balance/
+;; decode_balance round-trip NEGATIVE balances faithfully and are tested doing so, so an overdrawn
+;; account's balance really can arrive here as a negative i64. Read with `i64.gt_u` -- as this
+;; file originally did -- such a balance compares as roughly 1.8e19, i.e. richer than any
+;; conceivable transfer, and the sufficient-funds check silently approves every further withdrawal
+;; from an account that is already in the red. The account-id formatting routine below stays
+;; UNSIGNED, which is sound for the opposite reason: Authorize.authorize structurally refuses any
+;; leg or request naming a negative account, so an id reaching this guest is always non-negative
+;; (finding I2), and for those the unsigned and signed renderings are identical. The one place a genuinely new, nontrivial routine was needed is
 ;; `$u64_to_decimal` below (see its own comment) -- building the dynamic merge_key string
 ;; "ledger.account.<id>" this guest needs to look up its own counterparty's balance requires
 ;; converting a 64-bit account id to its decimal ASCII representation by hand, which has no
@@ -28,8 +37,22 @@
 ;;   - read_materialized("ledger.account." ++ decimal(account)) -> exactly 8 bytes (the balance, an
 ;;     LE i64, Wire.encode_balance) or zero bytes (balance 0, Wire's/counter.wat's "no value yet"
 ;;     convention).
-;;   - propose_write takes the SAME 32 bytes handle read for "ledger.requests" -- this guest simply
-;;     forwards what it already has resident in memory, never re-encodes anything.
+;;   - propose_write takes 33 bytes: a one-byte DECISION TAG (0 = declined, 1 = accepted)
+;;     immediately followed by the SAME 32 bytes handle read for "ledger.requests"
+;;     (Wire.encode_decision). The request bytes are forwarded verbatim from where
+;;     read_materialized already left them; only the tag byte is written here.
+;;
+;; ── Why this guest calls propose_write on BOTH outcomes, including a decline ────────────────────
+;; Final whole-branch review, finding C1 (a Critical). This guest originally returned early, with
+;; no propose_write call at all, when it decided insufficient funds -- a "clean no-op", which read
+;; as obviously correct and was not. A decision nothing records leaves no trace anywhere, and this
+;; guest is re-dispatched whenever its triggering "ledger.requests" write is re-materialized, which
+;; is routine rather than exotic (Batch_commit.propose re-materializes unconditionally on every
+;; retry; the empty-writes drain idiom and materialize_up_to do too). On such a re-dispatch this
+;; guest re-reads the CURRENT balance -- which may have grown since -- legitimately decides ACCEPT
+;; where it previously declined, and a transfer no client ever re-requested moves real money.
+;; Reporting the decline explicitly is what lets the host record it and make it final; see
+;; Accumulator.handle_guest_decision for that half.
 ;;
 ;; ── Memory layout (all offsets fixed, chosen so no two buffers below ever overlap) ─────────────
 ;;   0..14    "ledger.requests"            (15 bytes, read_materialized's own fixed key)
@@ -40,6 +63,9 @@
 ;;   32..46   "ledger.account."            (15 bytes, the fixed merge_key prefix every account key
 ;;                                           is built from -- matches Schema.account_merge_key's
 ;;                                           own "ledger.account.%Ld" format exactly)
+;;   63       the 1-byte decision tag (0 = declined, 1 = accepted), written immediately before the
+;;              request bytes below so that offset 63, length 33, is exactly the contiguous
+;;              Wire.encode_decision payload propose_write expects -- no copying needed
 ;;   64..95   the 32-byte transfer_request read_materialized("ledger.requests") writes here:
 ;;              64..71 request_id, 72..79 from_account, 80..87 to_account, 88..95 amount
 ;;   128..162 the dynamically-built "ledger.account.<from_account>" key: prefix copied to
@@ -135,8 +161,11 @@
       (then
         ;; Defensive only -- Decision 3's own sequential-dispatch contract (materialize always
         ;; happens before this dispatch, never concurrently) means this should never actually be
-        ;; reached by this module's own test driver; a clean no-op is still the right response to
-        ;; an unexpectedly-shaped read, same convention as the insufficient-funds case below.
+        ;; reached by this module's own test driver. A silent no-op IS right here, and this is the
+        ;; one path where it still is: with no readable request there is no request_id to report a
+        ;; decision ABOUT, so there is nothing propose_write could usefully say. That is the
+        ;; opposite of the insufficient-funds case below, which has a perfectly well-formed request
+        ;; in hand and must therefore report its decline rather than stay silent (finding C1).
         (return (i32.const 0) (i32.const 0))))
 
     (local.set $from_account (i64.load (i32.const 72)))
@@ -163,16 +192,23 @@
       (then (local.set $balance (i64.const 0)))
       (else (local.set $balance (i64.load (i32.const 192)))))
 
-    ;; The business decision this module exists to make: sufficient funds, full 64-bit compare.
-    (if (i64.gt_u (local.get $amount) (local.get $balance))
+    ;; The business decision this module exists to make: sufficient funds, full 64-bit SIGNED
+    ;; compare (see this file's own top comment on finding I1 for why `_s` and not `_u`).
+    (if (i64.gt_s (local.get $amount) (local.get $balance))
       (then
-        ;; Insufficient funds: a clean no-op, per the design spec's own Error-handling section --
-        ;; no propose_write call at all, nothing committed.
-        (return (i32.const 0) (i32.const 0))))
+        ;; Insufficient funds. Still reported, explicitly, via propose_write with the decision tag
+        ;; set to 0 -- NOT a silent early return (finding C1; see this file's top comment). The
+        ;; host records the decline and proposes nothing, which is what makes it final.
+        (i32.store8 (i32.const 63) (i32.const 0)))
+      (else
+        ;; Sufficient funds: the same tag byte set to 1.
+        (i32.store8 (i32.const 63) (i32.const 1))))
 
-    ;; Sufficient: forward the SAME 32 bytes already read for "ledger.requests" -- the host's own
-    ;; ~propose closure decodes these directly into the transfer_request it builds both legs from.
-    (drop (call $propose_write (i32.const 64) (i32.const 32)))
+    ;; One call on BOTH paths: the tag byte at 63 followed by the SAME 32 request bytes already
+    ;; resident at 64..95, i.e. exactly Wire.encode_decision's 33-byte layout. The host's own
+    ;; ~propose closure decodes these directly into the decision plus the transfer_request it
+    ;; builds both legs from.
+    (drop (call $propose_write (i32.const 63) (i32.const 33)))
     (i32.const 0)
     (i32.const 0))
 )
