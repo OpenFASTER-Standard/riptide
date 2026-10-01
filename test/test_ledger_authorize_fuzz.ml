@@ -241,8 +241,12 @@ let test_a_self_transfer_request_produces_legs_authorize_denies () =
   let r = Schema.{ request_id = 1L; from_account = 5L; to_account = 5L; amount = 10L } in
   let event_id = fake_event_id "self-transfer" in
   let legs = Legs.legs_of_request ~actor:"t" ~causation:event_id ~correlation:event_id r in
-  Alcotest.(check bool) "at least one leg is denied" true
-    (List.exists
+  (* A self-transfer's debit and credit legs are BOTH symmetrically same-account
+     (this_account = other_account on each, since from_account = to_account), so each
+     independently fails authorize's own `this_account <> other_account` check -- not merely
+     "at least one of them" happens to. *)
+  Alcotest.(check bool) "both legs are independently denied" true
+    (List.for_all
        (fun w -> Authorize.authorize w <> Riptide_batch_commit.Batch_commit.Allow)
        legs)
 
