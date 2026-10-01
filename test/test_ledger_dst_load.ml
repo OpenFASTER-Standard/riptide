@@ -608,6 +608,28 @@ let drive_request_dispatch env ~idempotency_key (req : Schema.transfer_request) 
    legs batch gets a fresh, genuine propose_for_module attempt on the very next round -- never a
    double-apply, since Batch_commit.propose's own "already in my log" check only skips
    re-appending when the PRIOR attempt is still actually present. *)
+(* The cluster's own liveness state, rendered for a failure message. Shared by both drivers below
+   so a wedge is equally diagnosable whichever of them notices it first (fix-wave round 2, finding
+   M5: the dispatch driver's own assertion previously printed nothing at all, which is what let an
+   inaccurate description of the wedge shape survive in this file's comments unchallenged).
+
+   What matters for progress is not any single field: [propose_batch] needs a live, [Normal] replica
+   that is the CURRENT view's primary (see [current_handle]), and a commit additionally needs a
+   QUORUM of replicas in [Normal] in that same view -- so a cluster with a perfectly good Normal
+   primary and both backups in [View_change] appends forever and commits nothing. All three columns
+   are printed for exactly that reason. *)
+let cluster_state env =
+  let col f = String.concat "," (Array.to_list (Array.mapi f env.replicas)) in
+  Printf.sprintf "view=[%s] status=[%s] primary=[%s]"
+    (col (fun _ r -> string_of_int (Replica.view_number r)))
+    (col (fun i r ->
+         if env.is_down.(i) then "down"
+         else match Replica.status r with Replica.Normal -> "normal" | Replica.View_change -> "vc"))
+    (col (fun i r ->
+         if env.is_down.(i) then "down"
+         else if Replica.is_primary r then "primary"
+         else "backup"))
+
 let drive_legs env ~idempotency_key ~transfer_key ~expected_delta (req : Schema.transfer_request) =
   if expected_delta = 0 then ()
   else (
@@ -622,20 +644,10 @@ let drive_legs env ~idempotency_key ~transfer_key ~expected_delta (req : Schema.
     if not ok then
       Alcotest.failf
         "transfer %s: its own legs did not converge after %d rounds (have %d of this transfer's \
-         own legs committed, want %d; cluster view=[%s] status=[%s] -- all-replicas-View_change \
-         here means the out-of-scope VSR view-change liveness gap this file documents, not a \
-         ledger defect)"
-        transfer_key max_rounds (committed ()) expected_delta
-        (String.concat ","
-           (Array.to_list (Array.map (fun r -> string_of_int (Replica.view_number r)) env.replicas)))
-        (String.concat ","
-           (Array.to_list
-              (Array.map
-                 (fun r ->
-                   match Replica.status r with
-                   | Replica.Normal -> "normal"
-                   | Replica.View_change -> "vc")
-                 env.replicas))))
+         own legs committed, want %d; cluster %s -- FEWER THAN A QUORUM OF REPLICAS IN `normal' IN \
+         THE CURRENT VIEW here means the out-of-scope VSR view-change liveness gap this file \
+         documents, not a ledger defect; see this file's own sweep_seeds comment)"
+        transfer_key max_rounds (committed ()) expected_delta (cluster_state env))
 
 let drive_seed env ~account ~amount =
   let ok =
@@ -718,17 +730,51 @@ let build_requests () =
       what a sweep is for.
 
    2. {b A pre-existing VSR-subset view-change liveness gap, which is NOT this plan's to fix and
-      bounds the sweep's own breadth.} Of 16 arbitrary seeds surveyed, 6 complete and 10 wedge in
-      the same, unmistakable way: every replica live and agreeing on the view number, every one
-      stuck in [View_change] status, so no replica is ever [Normal] AND primary, so
-      [current_handle] returns [None] and every [propose_batch] in this file becomes a silent
-      no-op forever (observed directly: is_down=[false,false,false] status=[vc,vc,vc] view=[8,8,8]
-      with a healthy commit_number on all three). This is the same class of gap Task 4's own
+      bounds the sweep's own breadth.} Of 16 arbitrary seeds surveyed, 6 complete and 10 wedge. The
+      invariant every one of those 10 shares, measured rather than assumed (see below):
+      {b every replica is live and agrees on the view number, and FEWER THAN A QUORUM of them are
+      in [Normal] status in that view} -- so no batch can ever gather the 2-of-3 [Prepare_ok]s a
+      commit needs, [progress] never moves, and this file's drivers spin out their round budget.
+
+      {b Corrected in fix-wave round 2 (finding M5), because the earlier wording of this paragraph
+      was a real overstatement and so was the correction first proposed for it.} It used to say
+      "every one stuck in [View_change] status, so no replica is ever [Normal] AND primary, so
+      [current_handle] returns [None] and every [propose_batch] becomes a silent no-op forever".
+      Neither half survives contact with the full set of wedging seeds, which were re-run with the
+      cluster vector printed on both drivers' failure messages (see [cluster_state]) to find out
+      instead of reasoning about it:
+
+        seed  3: view=[4,4,4]    status=[vc,vc,vc]      primary=[primary,backup,backup]
+        seed  5: view=[14,14,14] status=[vc,vc,vc]      primary=[backup,primary,backup]
+        seed  6: view=[14,14,14] status=[vc,vc,vc]      primary=[backup,primary,backup]
+        seed  7: view=[8,8,8]    status=[vc,vc,vc]      primary=[backup,primary,backup]
+        seed  8: view=[4,4,4]    status=[normal,vc,vc]  primary=[primary,backup,backup]
+        seed  9: view=[8,8,8]    status=[vc,vc,vc]      primary=[backup,primary,backup]
+        seed 11: view=[4,4,4]    status=[vc,vc,vc]      primary=[primary,backup,backup]
+        seed 15: view=[8,8,8]    status=[vc,vc,vc]      primary=[backup,primary,backup]
+        seed 16: view=[6,6,6]    status=[vc,vc,vc]      primary=[backup,backup,primary]
+        seed 31337: view=[8,8,8] status=[vc,vc,vc]      primary=[backup,primary,backup]
+
+      All-[View_change] is the common shape (9 of 10) but not universal: {b seed 8 wedges with a
+      replica that is BOTH [Normal] AND the current view's own primary}, so "[current_handle]
+      returns [None]" is false there -- [propose_batch] genuinely goes through, appends to that
+      primary's log, and still never commits, because both backups are in [View_change] and a
+      quorum is 2. That also rules out the narrower replacement claim "no live replica is both
+      [Normal] and the current view's primary": seed 8 has exactly such a replica. The quorum
+      statement above is the one that actually holds for all 10, which is why it is the one written
+      down.
+
+      Two further details worth keeping, since both cost real time to re-derive: no replica is ever
+      [down] in any wedged seed (the deliberate crash is repaired long before this), and the
+      commit_number is healthy on all three -- the cluster has agreed on plenty of history and
+      simply cannot agree on any more. Also, which driver notices the wedge varies (4 of the 10
+      stall in [drive_request_dispatch], before any legs exist to drive at all; 6 in [drive_legs]),
+      which is why both now print the same vector. This is the same class of gap Task 4's own
       review already identified in [replica.ml]'s [check_timeout]/view-change path and that this
       plan's controller explicitly ruled out of scope -- it lives entirely in Layer 0's consensus
-      implementation, not in the ledger, and closing it is a real VSR liveness project.
-      [drive_legs]'s own failure message prints view/status precisely so this shape is
-      recognisable at a glance rather than mistaken for a ledger defect.
+      implementation, not in the ledger, and closing it is a real VSR liveness project. Both
+      drivers' failure messages print [cluster_state] precisely so this shape is recognisable at a
+      glance rather than mistaken for a ledger defect.
 
       One escalation was tried and rejected on evidence rather than assumed away: driving the
       current view's primary-elect's own timer whenever no [Normal] primary exists (which is the
@@ -775,7 +821,13 @@ let run_scenario ~seed () =
           let transfer_key = Schema.transfer_idempotency_key req.Schema.request_id in
           let dispatched = drive_request_dispatch env ~idempotency_key req in
           Alcotest.(check bool)
-            (Printf.sprintf "request %d: the module genuinely dispatched" n)
+            (* Prints the same cluster-liveness vector [drive_legs] does (fix-wave round 2, finding
+               M5): several wedging seeds stall HERE, before any legs are ever driven, and this
+               message previously said nothing about why -- so the one failure mode this file
+               explicitly documents as out of scope was indistinguishable from a ledger defect at
+               the exact point it most often shows up. *)
+            (Printf.sprintf "request %d: the module genuinely dispatched (cluster %s)" n
+               (cluster_state env))
             true dispatched;
           if n = crash_idx then (
             (* THE DELIBERATE CRASH, landing exactly here: the request has just materialized and
