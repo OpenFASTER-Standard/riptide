@@ -594,7 +594,7 @@ let test_an_overdrawn_account_cannot_withdraw_further_because_the_funds_check_is
          read (50 > -200) declines it. That gap is the entire test. *)
       propose_request env ~idempotency_key:"req-40"
         Schema.{ request_id = 40L; from_account = 950L; to_account = 951L; amount = 50L };
-      Alcotest.(check int) "the module's handle genuinely ran for this request" 1
+      Alcotest.(check int) "the client's request write was committed, exactly once" 1
         (List.length
            (List.filter
               (fun (e : Envelope.envelope) -> e.actor = "client")
