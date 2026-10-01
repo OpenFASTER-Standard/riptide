@@ -359,7 +359,14 @@ As of this task, all six items catalogued in the Context section above are close
    code coverage) was caught by Task 5's own review and closed the same way (`4afc211`). Both are
    fully closed, re-reviewed, and already landed on this branch — see this plan's own
    `.superpowers/sdd/2026-10-01-layer2-boundary-revision/progress.md` ledger for the full narrative;
-   nothing about either is reopened by this freeze.
+   nothing about either is reopened by this freeze. One honest exception to "closed," named here
+   rather than left for a reader to infer: the committed-log-based decision query is not uniformly
+   stronger than the in-memory table it replaced (Task 4's own review, Important 2) — a narrow,
+   accepted window remains between a decision being appended and actually committing, where a second
+   dispatch racing a view-change-discarded batch can still flip a decline to an accept (or vice
+   versa), a state unreachable under the old table and reachable now. It is bounded and disclosed in
+   full at `accumulator.mli`'s `decision` doc comment; closing it for real would need a Layer 0
+   durable pre-commit intent record, out of scope for this plan.
 
 This interface — `lib/batch_commit/batch_commit.mli` and `lib/module/reactor.mli` — now carries the
 same "changes require re-verification" discipline as the rest of Layer 0, per this repo's own
