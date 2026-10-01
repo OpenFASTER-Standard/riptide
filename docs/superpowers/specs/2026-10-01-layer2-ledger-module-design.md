@@ -426,3 +426,15 @@ Maps directly onto subtasks 6.2 and 6.4:
 - **A client-facing API layer.** That's Task 9's own job. This task's "client" is its own test
   driver proposing requests directly through `Batch_commit.propose`, the same way every existing
   test in this codebase already drives writes.
+
+## Implementation notes
+
+- **Two commit messages in the first whole-branch-review fix wave claimed a clean build that
+  wasn't true at authoring time.** Commits `62c769a` and `3f8cb5d` each say "dune build @all
+  clean" in their own commit message, but neither actually compiled in isolation when checked
+  independently (confirmed twice): `62c769a` referenced a record field that didn't exist yet, and
+  `3f8cb5d` called a function that had since been renamed. Both were fixed by later commits within
+  that same fix wave, and the branch tip has always built clean — but the two commit messages
+  themselves remain false as written, and `git log` doesn't let that be corrected after the fact.
+  Recorded here (fix-wave round 3, item NF3) so the correction survives this plan's own SDD
+  workspace being deleted, rather than leaving only the two inaccurate commit messages behind.
