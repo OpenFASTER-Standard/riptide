@@ -319,15 +319,31 @@ type materialize_sink = {
     the only honest identity for "this committed write has already been applied" is the
     [(idempotency_key, position)] pair now passed here. Independent of {!deduplicate}: wrapping a
     sink in that already makes a replay of this exact write exactly-once regardless of what [write]
-    itself does, but a sink's own business logic (e.g. the ledger's actor-matching authorization
-    check) needs this identity on every call it receives, deduplicated or not. The first real Layer 2 module
+    itself does, but a sink that needs to dedup on its own terms (or to record, audit or attribute
+    what it applied) needs this identity on every call it receives, deduplicated or not. The first
+    real Layer 2 module
     built against the OLD shape (a double-entry ledger, [lib/ledger/]) had been forced to dedup on
     payload CONTENT instead, which is exact for content that happens to be unique per write and
     silently wrong for content that is not -- it hit the wrong case for real, collapsing two
     genuinely different account-credit legs into one and destroying money while the committed log
-    stayed perfectly correct. It also had to push an [actor] field into its own payload schema, and
-    enforce agreement with the real [actor] at the authorization checkpoint, purely to recover
-    information this callback already had and dropped. *)
+    stayed perfectly correct.
+
+    {b Which arguments a real sink actually reads, stated accurately} (final whole-branch review,
+    Minor -- this comment used to cite "the ledger's actor-matching authorization check" as a sink's
+    own business logic needing [~actor], and that is wrong on both counts). No sink in this repo reads
+    [~actor] at all: [Riptide_ledger.Accumulator.materialize_sink] binds it as [~actor:_], and the
+    actor-matching check lives in [Riptide_ledger.Authorize.authorize] -- a per-WRITE authorization
+    hook evaluated before the commit, which already receives the whole {!write} and never needed this
+    callback to carry anything. [~actor]/[~causation]/[~correlation] are passed here because a sink is
+    an arbitrary caller-composed closure and withholding a committing write's own identity from it is
+    what forced the content-keyed workaround above, not because any current sink consumes them.
+
+    {b And this does NOT make a payload's own [actor] field redundant.} The ledger keeps one, and
+    keeps the authorization-checkpoint agreement check that makes it trustworthy, for a different
+    reason than the one this callback closed: a MATERIALIZED balance is derived from these payloads
+    and has no envelope of its own, so a committed leg's own payload is the only place its provenance
+    survives at rest. See [Riptide_ledger.Schema.transfer_leg]'s [actor] field, which states that
+    reason itself and distinguishes it from the dedup justification that expired here. *)
 
 val deduplicate : ?watermark_store:Riptide_storage.File_kv_store.t -> materialize_sink -> materialize_sink
 (** [deduplicate ?watermark_store sink] is [sink] made EXACTLY-ONCE per committed write, for a sink
@@ -463,7 +479,10 @@ val materialize_up_to :
     0-based {!Riptide_vsr.Replica.entries} list position [i] as [i < bound], the same
     correspondence [committed_batch_values] already establishes: list position [i] is commit
     position/op-number [i + 1]) -- materializing every write of every well-formed batch in that
-    range that carries [merge_key = Some k], via [materialize.write ~merge_key:k payload], in
+    range that carries [merge_key = Some k], via [materialize.write ~merge_key:k ~idempotency_key
+    ~position ~actor ~causation ~correlation payload] -- the full {!materialize_sink} [write]
+    signature, every argument taken from the committed batch and the write's own place in it (final
+    whole-branch review, Minor: this line described the pre-Task-3 two-argument shape) -- in
     commit order, first-wins per [idempotency_key] (the same dedup rule
     {!committed_envelopes_keyed} uses: a later batch sharing a key already seen earlier in the
     walk contributes nothing, matching what [committed_writes_for] would return for that key). A
@@ -721,22 +740,30 @@ val propose :
     - [scripts/check-authorization-checkpoint] -- the STRUCTURAL half. A grep-class audit (in the
       style of [scripts/check-citations]) over all of [lib/], with comments and string literals
       stripped first, proving: {!Riptide_vsr.Replica.propose} has exactly ONE caller in [lib/] and
-      it is this function; that call is lexically inside this function; [~authorize] is evaluated
-      here exactly once, before it, over EVERY element of [writes]; that call sits inside the
-      [else] branch of the resulting denial guard; and [~authorize] remains a REQUIRED argument of
+      it is this function; that call is lexically inside this function; BOTH hooks are evaluated
+      here before it -- [~authorize] exactly once over EVERY element of [writes], and
+      [?authorize_batch] exactly once over the whole [writes] list (Task 7; the script's own check 3
+      covers both, and the final whole-branch review corrected this bullet, which named only
+      [~authorize] after that extension landed); that call sits inside the [else] branch of the
+      resulting combined denial guard; and [~authorize] remains a REQUIRED argument of
       {!create}, so no handle can exist with no policy. Module aliases of {!Riptide_vsr.Replica}
       are resolved, and an [open Riptide_vsr.Replica] anywhere in [lib/] (which would make a bare
       [propose] call unfindable by any lexical means) fails the audit rather than being silently
       unaudited.
     - [test/test_batch_commit_authorization_fuzz.ml] -- the BEHAVIOURAL half. QCheck properties
       over randomly generated SEQUENCES of {!propose} calls against one shared replica (random
-      batch sizes including empty, random [Allow]/[Deny] mixes within one batch, random
+      batch sizes including empty, random [Allow]/[Deny] mixes within one batch, an INDEPENDENT
+      batch-level axis driving a real cross-write [?authorize_batch] policy, random
       [merge_key] presence, random [?materialize] presence, random retries of an already-used
-      idempotency key), asserting no denied write ever reaches {!committed_envelopes} or a
-      {!materialize_sink}, that every batch that SHOULD have committed did (so the property cannot
-      be satisfied by an implementation that commits nothing), and that
-      {!authorization_denials} counts exactly once per refused BATCH rather than once per denied
-      write.
+      idempotency key), asserting no write from a batch EITHER hook refused ever reaches
+      {!committed_envelopes} or a {!materialize_sink} -- including a batch refused only by
+      [?authorize_batch], whose every write the per-write hook allowed -- that every batch that
+      SHOULD have committed did (so the property cannot be satisfied by an implementation that
+      commits nothing), and that {!authorization_denials} counts exactly once per refused BATCH
+      rather than once per denied write OR once per denying hook. The [?authorize_batch] axis was
+      added by the final whole-branch review (IMP-3): this bullet claimed coverage of the whole
+      checkpoint while that file had zero [authorize_batch] references, the structural half having
+      been extended for the second hook and the behavioural half not.
 
     Checks first whether [idempotency_key] already appears among the batches in
     [Batch_commit.replica t]'s own log -- the WHOLE log as {!Riptide_vsr.Replica.entries} reports
@@ -758,7 +785,9 @@ val propose :
     committed by THIS call or an earlier one?) -- reusing that existing commit-confirmation
     mechanism rather than adding a new, separate one. If and only if the batch is committed, every
     write of that {b committed} batch carrying [merge_key = Some k] has its [payload] handed to
-    [materialize.write ~merge_key:k] -- synchronously, before this call returns.
+    [materialize.write ~merge_key:k ~idempotency_key ~position ~actor ~causation ~correlation] --
+    the full {!materialize_sink} [write] signature, not the pre-Task-3 two-argument shape this line
+    used to describe (final whole-branch review, Minor) -- synchronously, before this call returns.
 
     {b What is materialized is decoded from the committed bytes, never from the [writes] argument
     of this call}, and that distinction is load-bearing for correctness rather than cosmetic (Task
