@@ -118,12 +118,29 @@ Hand-written `to_value`/`of_value` over `Riptide.Value.value`, per the resolved 
   for a hand-written `.wat` fixture to parse (see Decision 3 below) — variable-length string
   parsing inside hand-written WebAssembly text is a real, separate complexity this task has no
   need to take on.
-- `transfer_leg : { transfer_id : int64; role : [ `Debit | `Credit ]; this_account : int64;
-  other_account : int64; amount : int64 }` — **self-certifying**: every field `authorize` needs to
-  validate THIS leg alone is present in THIS leg's own payload (no need to see its sibling).
-  `amount` is always positive; this leg's own signed balance delta is derived, not stored —
-  `-amount` if `role = Debit`, `+amount` if `role = Credit`. `merge_key = "ledger.account." ^
-  Int64.to_string this_account`.
+- `transfer_leg : { transfer_id : int64; role : [ `Debit | `Credit ]; actor : actor_id;
+  this_account : int64; other_account : int64; amount : int64 }` — **self-certifying**: every field
+  `authorize` needs to validate THIS leg alone is present in THIS leg's own payload (no need to see
+  its sibling). `amount` is always positive; this leg's own signed balance delta is derived, not
+  stored — `-amount` if `role = Debit`, `+amount` if `role = Credit`. `merge_key =
+  "ledger.account." ^ Int64.to_string this_account`.
+
+  `actor` records who authored the leg, and `authorize` **denies any leg whose payload `actor`
+  disagrees with the `actor` of the write carrying it** — so for any leg that reaches the committed
+  log the field is a structurally-guaranteed fact, not a claim. It is in the payload deliberately
+  (final whole-branch review, finding I4): a `materialize_sink`'s own `write` callback receives only
+  `~merge_key` and the payload, never the committing write's `actor`, so without this field the
+  host-side accumulator downstream cannot tell a module-authored leg apart from one authored by any
+  other path, and legs from the two can collide in its already-applied table. This is how that
+  information reaches the sink without changing a Layer 0 signature.
+
+**Account identifiers are constrained to be non-negative** (final whole-branch review, finding I2),
+enforced by `authorize` on both write shapes. `Schema.account_merge_key` renders an id as *signed*
+decimal while the guest's own hand-rolled routine renders it *unsigned*, so host and guest agree on
+the key for a non-negative id and disagree for a negative one — which made a negatively-identified
+account structurally unaddressable by the guest (it read balance 0 at a key nothing is ever written
+to, and declined everything). Shrinking the valid domain to the range both sides already agree on
+was chosen over hand-writing two's-complement decimal rendering in WebAssembly text.
 
 **Both legs of a transfer are always constructed together, from one request, by the same trusted
 closure**: given an approved `transfer_request {transfer_id = request_id; from_account; to_account;
@@ -134,10 +151,37 @@ and proposes them as one atomic `Batch_commit.propose` call — see Decision 1 f
 construction-time guarantee, not `authorize`, is what makes the pair genuinely balanced.
 
 **Account balances are materialized state, not a new lattice/CRDT type.** Each account's balance
-is the Last-Write-Wins materialized value at `"ledger.account.<id>"`, maintained via the exact
-read-materialized-then-propose-new-total pattern Task 7's own `counter.wat` already established
-and proved correct end to end. An account implicitly exists (balance 0) the first time it's
-referenced — no separate "open account" flow, consistent with the focused-core scope.
+is the Last-Write-Wins materialized value at `"ledger.account.<id>"`. An account implicitly exists
+(balance 0) the first time it's referenced — no separate "open account" flow, consistent with the
+focused-core scope.
+
+**Correction (final whole-branch review, finding I5): balances are maintained by host-side
+accumulation over delta-carrying legs, not by the guest proposing a new absolute total.** This
+paragraph previously described the balance mechanism as "the exact
+read-materialized-then-propose-new-total pattern `counter.wat` already established" — that
+mechanism was never built, and could not have been: what the guest's `propose_write` produces (via
+the trusted `Legs` construction) is a `transfer_leg` *descriptor* carrying a role and a positive
+magnitude, not an absolute balance, and a single transfer moves *two* accounts, so there is no one
+total for a guest to propose. What actually ships, and is what this correction describes:
+
+- A committed `transfer_leg` carries a signed *delta* by construction — `-amount` for `Debit`,
+  `+amount` for `Credit` (`Accumulator.balance_delta`, the one place that derivation lives).
+- `Accumulator.materialize_sink` — host-side, in `lib/ledger/`, wired as the `~materialize` sink —
+  reads the account's current materialized balance, adds that delta, and writes the new absolute
+  total back. It is `counter.wat`'s read-then-write-new-total *shape*, moved to the host where the
+  information to do it actually exists.
+- That accumulation is **not idempotent under replay**, unlike an ordinary lattice-join sink, so it
+  carries an explicit already-applied guard. `Batch_commit.propose`'s materialize step re-runs on
+  every call for a key, not only the one that committed, and re-hands the same committed leg
+  payloads to the sink each time; without the guard a delta applies twice. See
+  `accumulator.mli` for the guard's key and the two limits disclosed alongside it.
+
+*(Cross-reference corrected in the same pass, finding M10: the `counter.wat` referred to here is
+from plan-local **Task 7 of the Layer 0/Layer 2 boundary plan**
+(`docs/superpowers/plans/2026-09-30-layer0-layer2-boundary.md`, commit `4227bae`) — **not**
+task-master Task 7 ("Revise the Layer 0/Layer 2 boundary based on real usage"), which is still
+pending and is where this module's own friction findings feed. The two numberings collide, and the
+original wording did not say which was meant.)*
 
 **Atomicity across the two legs of a transfer** comes for free from `Batch_commit`'s own existing
 all-or-nothing multi-write commit (hardened since Task 3.3) — nothing new needed: if either leg's
@@ -187,11 +231,26 @@ length-prefixing needed anywhere since every field is fixed-width.
   0, matching `counter.wat`'s own "no value yet" convention). A separate call from the request
   read above, matching the two genuinely different concerns involved — "what was requested" versus
   "what is the current state of a different key."
-- `propose_write` takes the same 32 bytes as the `"ledger.requests"` read above (`request_id ++
-  from_account ++ to_account ++ amount`) — the guest simply forwards what it already decoded,
-  self-contained and independent of any cross-call state-sharing argument between the `~read` and
-  `~propose` closures. The `~propose` closure decodes these 32 bytes directly into the one
-  `transfer_request` it needs to construct both legs from (Decision 2).
+- `propose_write` takes **33** bytes: a one-byte **decision tag** (`0` = declined, `1` = accepted)
+  followed by the same 32 bytes as the `"ledger.requests"` read above (`request_id ++ from_account
+  ++ to_account ++ amount`). The guest forwards the request bytes it already has resident and writes
+  only the tag, so this stays self-contained and independent of any cross-call state-sharing between
+  the `~read` and `~propose` closures. The `~propose` closure
+  (`Accumulator.handle_guest_decision`) decodes these 33 bytes exactly once into the decision plus
+  the one `transfer_request` it constructs both legs from (Decision 2). A tag byte that is neither
+  `0` nor `1` is rejected outright rather than coerced — "nonzero means accepted" would silently
+  turn a corrupt payload into an authorisation to move money.
+
+  **Correction (final whole-branch review, finding C1): the tag, and the fact that the guest calls
+  `propose_write` on BOTH outcomes, are a fix for a Critical defect, not a convenience.** Originally
+  the guest called `propose_write` only on approval and simply returned otherwise, which left a
+  decline with no trace anywhere. See Error handling below for the full mechanism.
+
+  **Signedness is part of this convention** (finding I1): every field is a *signed* `int64`, and the
+  balance encoding round-trips negative values faithfully, so a guest comparing them must use
+  WebAssembly's signed comparisons (`i64.gt_s`, not `i64.gt_u`). Reading an overdrawn account's
+  negative balance as unsigned yields roughly 1.8e19 and approves every further withdrawal from an
+  account already in the red.
 
 ## Data flow (end to end)
 
@@ -201,17 +260,27 @@ Client proposes {request_id, from, to, amount}
   -> materializes at "ledger.requests"
   -> Reactor dispatches the ledger module (fresh Loader.instantiate, Protocol check on "handle")
   -> module calls read_materialized("ledger.account.<from>") -> current balance
-  -> module checks amount <= balance
-       - insufficient: no propose_write call -- clean no-op, nothing committed
-       - sufficient: module calls propose_write(encode(approved request))
-            -> host ~propose closure ALWAYS constructs both legs together from the one
-               request (Decision 2) -> [debit_leg; credit_leg]
-            -> Batch_commit.propose (authorize: per-leg self-certifying well-formedness check)
-                 - both legs individually well-formed: Allow
-                      -> VSR commits both legs atomically
-                      -> re-materializes "ledger.account.<from>" and "ledger.account.<to>"
-                 - either leg malformed (amount<=0, same-account): Deny -> whole batch
-                   refused, authorization_denials++
+  -> module checks amount <= balance, SIGNED compare (finding I1)
+  -> module ALWAYS calls propose_write(decision_tag ++ encode(request)), on both outcomes
+       (finding C1 -- a decline that reports nothing is not durable)
+  -> host ~propose closure = Accumulator.handle_guest_decision
+       - request_id already decided? the FIRST decision stands, always:
+            - previously DECLINED: nothing proposed, ever (this is C1's fix)
+            - previously ACCEPTED: legs re-proposed from the RECORDED request, under the same
+              idempotency key -- the recovery path for a legs batch a view change discarded
+              before it committed; idempotent, and cannot alter amount or accounts
+       - first decision for this request_id: recorded, then
+            - declined: recorded and nothing proposed
+            - accepted: ALWAYS constructs both legs together from the one request
+              (Decision 2) -> [debit_leg; credit_leg]
+                 -> Batch_commit.propose (authorize: per-leg self-certifying check)
+                      - both legs individually well-formed: Allow
+                           -> VSR commits both legs atomically
+                           -> Accumulator.materialize_sink folds each leg's signed delta into
+                              "ledger.account.<from>" and "ledger.account.<to>"
+                      - either leg malformed (amount<=0, same-account, negative account,
+                        merge_key/account mismatch, actor mismatch): Deny -> whole batch
+                        refused, authorization_denials++
 ```
 
 Every arrow is an existing, already-tested mechanism (materialize-then-dispatch,
@@ -220,16 +289,52 @@ for the first time with a real domain and a real policy, instead of a toy counte
 
 ## Error handling
 
-- **Insufficient funds**: not an error — a legitimate business decision. The module simply never
-  calls `propose_write`. Matches the "a module legitimately choosing not to act must be a clean
-  no-op" convention already established and tested in the boundary work.
+- **Insufficient funds**: not an error — a legitimate business decision. **Corrected (final
+  whole-branch review, finding C1): the module still reports the decline, explicitly, rather than
+  "simply never calling `propose_write`" as this bullet originally said.** The original wording
+  described a silent early return, which reads as the obvious implementation of "a module
+  legitimately choosing not to act must be a clean no-op" and was a Critical defect. A decision
+  nothing records is not durable, and this guest is re-dispatched whenever its triggering
+  `"ledger.requests"` write is re-materialized — which happens for entirely routine reasons nobody
+  has to ask for: `Batch_commit.propose` re-materializes unconditionally on every retry, and the
+  empty-writes drain idiom and `materialize_up_to` both do it on demand. On such a re-dispatch the
+  guest re-reads the *current* balance, which may have grown since, legitimately decides ACCEPT
+  where it previously declined, and both legs commit — a transfer no client ever re-requested,
+  moving real money. Live-reproduced, then fixed on both sides: the guest always calls
+  `propose_write` with a decision tag (Decision 3), and `Accumulator.handle_guest_decision` makes
+  the first decision recorded for a `request_id` final. The no-op convention is preserved where it
+  genuinely applies — a declined request still commits nothing — it just is not implemented by
+  staying silent. One place a silent return *is* still right: a dispatch that cannot read a
+  well-formed request at all has no `request_id` to report a decision about.
+
+  Scope of that guarantee, stated rather than implied: the decision table is in-memory, so a
+  decision can never flip *within a process's lifetime*, which is what makes every idiom that
+  actually triggered the bug unreachable. Making it durable across a restart means committing the
+  decision to the replicated log as its own write shape — a real schema extension, and a question
+  about what a module may durably record that belongs with the boundary revision (task-master Task
+  7). Disclosed at `Accumulator.t`.
 - **A single malformed or adversarial transfer leg** (non-positive amount, same account on both
-  sides, a client attempting to propose a transfer leg directly without going through the module):
-  caught by the self-certifying `authorize` check regardless of origin — `Deny`, whole batch
-  refused, `authorization_denials` increments, nothing enters the log. Same "guard failure ⇒ total
-  no-op" convention used throughout Layer 0. (A genuinely mismatched *pair* — two otherwise
-  well-formed legs that don't actually belong together — cannot arise from this module's own
-  `~propose` closure by construction, per Decision 1; it is out of `authorize`'s own reach.)
+  sides, a negative account id, a merge_key naming a different account than the leg claims, a
+  payload `actor` disagreeing with its write's): caught by the self-certifying `authorize` check
+  regardless of origin — `Deny`, whole batch refused, `authorization_denials` increments, nothing
+  enters the log. Same "guard failure ⇒ total no-op" convention used throughout Layer 0. (A
+  genuinely mismatched *pair* — two otherwise well-formed legs that don't actually belong together —
+  cannot arise from this module's own `~propose` closure by construction, per Decision 1; it is out
+  of `authorize`'s own reach.)
+
+  **Correction (final whole-branch review, finding I6): a well-formed transfer leg proposed
+  DIRECTLY, by a client that never went through the module, is ALLOWED — by design.** This bullet
+  originally listed "a client attempting to propose a transfer leg directly without going through
+  the module" among the things `authorize` catches "regardless of origin". That is only true of a
+  *malformed* direct leg. `authorize`'s argument is one write; it has no way to know whether a
+  well-formed leg came from this module's trusted `Legs` construction or from anywhere else, and
+  nothing about a single well-formed leg is self-evidently wrong. The permission is also
+  load-bearing rather than incidental: it is exactly how both of this module's test harnesses seed
+  an account's opening balance, there being no "mint"/account-opening flow in this focused-core
+  scope (see Non-goals). What is structurally unbypassable is the *well-formedness* of every
+  committed leg, on every axis listed above — not the provenance of one. Provenance would need a
+  batch-aware `authorize` signature, which Decision 1 already records as boundary friction for
+  task-master Task 7.
 - **WASM trap or session-type violation** in the module: `Loader.invoke` returns `Error`, the
   reactor logs it (with merge_key/module-identity context) and continues — a trap on one request
   never blocks processing of the next, per the sibling-independence guarantee already proven.
@@ -268,6 +373,20 @@ Maps directly onto subtasks 6.2 and 6.4:
   balance change is correct; no accepted transfer is ever lost or double-applied despite failures.
   Every friction point this surfaces against the Task 5 boundary gets written down, feeding
   directly into Task 7 per this repo's own established convention.
+
+  **Corrected (final whole-branch review, finding I7): "the structural invariant never breaks
+  across any seed" overstated what is actually verified, and what is currently verifiable at all.**
+  As shipped this scenario ran one hardcoded seed (4242); it now runs a real five-seed sweep, each
+  seed its own test case, asserting all four correctness properties. Five rather than the 100+ a
+  dedicated sweep would run is a deliberate proportion call for this plan's scope. More
+  importantly, the honest ceiling is not the sweep's width: of 16 arbitrary seeds surveyed, 6
+  complete and 10 wedge in Layer 0's own consensus implementation — every replica live and agreeing
+  on the view number, all stuck in `View_change`, so no replica is ever `Normal` *and* primary and
+  every proposal becomes a silent no-op. That is the pre-existing VSR-subset view-change liveness
+  gap Task 4's own review identified in `replica.ml` and this plan ruled out of scope; it is not a
+  ledger defect, and it bounds what "any seed" can mean for any DST test on this stack until it is
+  closed. The sweep's seeds are therefore seeds that genuinely complete, which is stated plainly in
+  `test_ledger_dst_load.ml` rather than left to look like a universal claim.
 
 ## Non-goals (explicitly out of scope for this task)
 
