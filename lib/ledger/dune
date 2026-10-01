@@ -1,3 +1,3 @@
 (library
  (name riptide_ledger)
- (libraries riptide))
+ (libraries riptide riptide_batch_commit))
