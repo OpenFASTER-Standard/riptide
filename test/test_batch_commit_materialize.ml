@@ -699,9 +699,10 @@ let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned
       Alcotest.(check bool) "the poisoned write was counted as a materialize failure" true
         (Batch_commit.materialize_write_failures () > failures_before))
 
-(* ---- Durable materialization watermark, via [Batch_commit.deduplicate] (Task 1 of the
-   layer2-boundary-revision plan, .superpowers/sdd/2026-10-01-layer2-boundary-revision/; moved onto
-   [deduplicate] by Task 4's own review, Critical 1) ----
+(* ---- Durable materialization watermark, via [Batch_commit.deduplicate] (Task 1 of the Layer
+   0/Layer 2 boundary revision, task-master Task 7 -- see
+   docs/superpowers/specs/2026-10-01-layer2-boundary-revision-design.md, which is checked in; moved
+   onto [deduplicate] by Task 4's own review, Critical 1, commit b4217a3) ----
 
    Closes Task 6's own boundary friction item 1 (final whole-branch review finding I9): wrapping a
    sink in [Batch_commit.deduplicate ~watermark_store] makes a repeated materialize of the same
@@ -748,7 +749,7 @@ let test_watermark_makes_repeated_materialize_exactly_once () =
       Batch_commit.propose h ~idempotency_key:"wm-key-1" ~materialize:sink [];
       Alcotest.(check int) "the watermark makes the repeated drain a no-op -- not materialized twice" 1 !counter)
 
-let test_materialize_up_to_with_watermark_store_is_exactly_once_across_two_calls () =
+let test_materialize_up_to_deduplicated_is_exactly_once_across_two_calls () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun watermark_dir ->
       Eio.Switch.run @@ fun sw ->
@@ -784,6 +785,78 @@ let test_no_watermark_store_preserves_todays_double_apply () =
      existed"
     2 !counter
 
+(* ── Watermark-key injectivity: the genuinely ambiguous naive scheme, and inputs that really do
+   collide under it ───────────────────────────────────────────────────────────────────────────────
+   Rewritten by the final whole-branch review's IMP-5. The previous version of the test below
+   proposed ["key-a"]/["key-b"], both at position 0, and its own comment named a delimiter-joined
+   [idempotency_key ^ "|" ^ string_of_int position] as the non-injective scheme it was ruling out.
+   Those inputs cannot collide under that scheme (or under any derivation that includes the
+   idempotency key at all), so the test could only ever prove that two distinct keys are two distinct
+   keys -- it could not fail for the reason it claimed, and nothing else covered the property.
+
+   Worse, the named counterexample scheme was not even a counterexample. A separator-joined
+   [ik ^ "|" ^ string_of_int pos] is INJECTIVE: if two pairs produced the same string, the two "|"
+   -prefixed decimal suffixes would both be suffixes of it, so the longer would have to contain the
+   shorter -- i.e. a [string_of_int] output would have to contain a "|", which it never does. No
+   inputs whatsoever could have exercised it.
+
+   The scheme that genuinely IS ambiguous, and therefore the real mistake the length prefix in
+   [redaction_event_id] defends against, is separator-free concatenation: with no delimiter at all,
+   the boundary between an opaque key's trailing digits and the position's own digits is lost.
+   Defined here as real code rather than described in prose, so the inputs below are PROVEN to
+   exercise the collision class instead of merely asserted to -- which is exactly what the old
+   version of this test failed to do. *)
+let naive_watermark_key ~idempotency_key ~index = idempotency_key ^ string_of_int index
+
+(* ("wm-collide-1", 0) and ("wm-collide-", 10): naive gives "wm-collide-10" for BOTH.
+   [redaction_event_id] gives "12:wm-collide-1#0" and "11:wm-collide-#10". *)
+let collide_key_a, collide_pos_a = ("wm-collide-1", 0)
+let collide_key_b, collide_pos_b = ("wm-collide-", 10)
+
+let test_watermark_key_is_injective_where_a_naive_concatenation_collides () =
+  (* Precondition, asserted rather than assumed: these two (key, position) pairs really are a
+     collision under the naive scheme. Without this check the test below could silently stop
+     exercising the collision class -- the exact defect IMP-5 found. *)
+  Alcotest.(check string)
+    "the chosen inputs genuinely collide under a separator-free concatenation"
+    (naive_watermark_key ~idempotency_key:collide_key_a ~index:collide_pos_a)
+    (naive_watermark_key ~idempotency_key:collide_key_b ~index:collide_pos_b);
+  (* And the real, length-prefixed derivation tells them apart. *)
+  Alcotest.(check bool)
+    "redaction_event_id keeps them distinct" true
+    (Batch_commit.redaction_event_id ~idempotency_key:collide_key_a ~index:collide_pos_a
+    <> Batch_commit.redaction_event_id ~idempotency_key:collide_key_b ~index:collide_pos_b)
+
+let test_watermark_does_not_collide_on_a_naive_concatenation_collision () =
+  Eio_main.run @@ fun env ->
+  with_tmp_dir (fun watermark_dir ->
+      Eio.Switch.run @@ fun sw ->
+      let replica = create_solo_volatile () in
+      let watermark_store = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"watermark" watermark_dir in
+      let counter = ref 0 in
+      let sink = Batch_commit.deduplicate ~watermark_store (counting_sink counter) in
+      let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
+      (* Batch A: one materializing write, at position 0, under [collide_key_a]. *)
+      Batch_commit.propose h ~idempotency_key:collide_key_a ~materialize:sink
+        [ make_write ~merge_key:(Some "mk-a") ~tag:"collide-a" ];
+      Alcotest.(check int) "batch A's position-0 write applied" 1 !counter;
+      (* Batch B: [collide_pos_b] non-materializing writes (merge_key = None, which propose's own
+         materialize loop skips while still counting their positions) followed by the materializing
+         one, so it lands at exactly position [collide_pos_b] -- the position that collides with
+         batch A's under a separator-free concatenation. *)
+      let padding =
+        List.init collide_pos_b (fun i ->
+            make_write ~merge_key:None ~tag:(Printf.sprintf "collide-pad-%d" i))
+      in
+      Batch_commit.propose h ~idempotency_key:collide_key_b ~materialize:sink
+        (padding @ [ make_write ~merge_key:(Some "mk-b") ~tag:"collide-b" ]);
+      (* Under the naive scheme batch B's write would find batch A's watermark already present and
+         be skipped, leaving this at 1. *)
+      Alcotest.(check int)
+        "batch B's colliding-under-naive write ALSO applied -- the length prefix keeps the two \
+         watermark keys apart"
+        2 !counter)
+
 let test_watermark_does_not_collide_across_different_idempotency_keys_same_position () =
   Eio_main.run @@ fun env ->
   with_tmp_dir (fun watermark_dir ->
@@ -794,10 +867,9 @@ let test_watermark_does_not_collide_across_different_idempotency_keys_same_posit
       let sink = Batch_commit.deduplicate ~watermark_store (counting_sink counter) in
       let h = Batch_commit.create ~replica ~authorize:Batch_commit.allow_all () in
       (* Two DIFFERENT idempotency_key batches, each with a single write at position 0 carrying a
-         DIFFERENT merge_key. If the watermark key were a delimiter-joined
-         [idempotency_key ^ "|" ^ string_of_int position] (or any other non-injective scheme) rather
-         than [redaction_event_id]'s own length-prefixed encoding, a collision here would wrongly
-         treat the second batch's position-0 write as already applied. *)
+         DIFFERENT merge_key. Kept as the plain, weaker baseline it actually is -- that the watermark
+         is keyed on the idempotency key at all, not merely on the position -- with the real
+         collision class covered by the two tests above. *)
       Batch_commit.propose h ~idempotency_key:"key-a" ~materialize:sink [ make_write ~merge_key:(Some "mk-a") ~tag:"a" ];
       Batch_commit.propose h ~idempotency_key:"key-b" ~materialize:sink [ make_write ~merge_key:(Some "mk-b") ~tag:"b" ];
       Alcotest.(check int) "both batches' own position-0 writes applied -- no cross-key collision" 2 !counter)
@@ -1034,10 +1106,16 @@ let tests =
       `Quick, test_watermark_makes_repeated_materialize_exactly_once );
     ( "a deduplicate-wrapped sink makes materialize_up_to exactly-once across two overlapping calls \
        (Task 1)",
-      `Quick, test_materialize_up_to_with_watermark_store_is_exactly_once_across_two_calls );
+      `Quick, test_materialize_up_to_deduplicated_is_exactly_once_across_two_calls );
     ( "deduplicate with no watermark store is a transparent pass-through, preserving today's \
        double-apply on repeated drain (Task 1, Review Focus item 1)",
       `Quick, test_no_watermark_store_preserves_todays_double_apply );
+    ( "the watermark key is injective on a (key, position) pair that a separator-free concatenation \
+       collides on (final whole-branch review, IMP-5)",
+      `Quick, test_watermark_key_is_injective_where_a_naive_concatenation_collides );
+    ( "the watermark applies BOTH writes of a pair that a separator-free concatenation would have \
+       collided (final whole-branch review, IMP-5)",
+      `Quick, test_watermark_does_not_collide_on_a_naive_concatenation_collision );
     ( "the watermark does not collide across different idempotency_keys sharing the same write \
        position (Task 1, Review Focus item 4)",
       `Quick, test_watermark_does_not_collide_across_different_idempotency_keys_same_position );
