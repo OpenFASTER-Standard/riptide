@@ -48,26 +48,61 @@ schema-morphism mechanism remains a separate, unbuilt prerequisite; this task do
 and does not pretend to use it. Task 6.3's own wording should be read as aspirational/premature at
 the time it was written, not as a literal requirement this task can actually satisfy as stated.
 
-## Decision 1: two enforcement layers, not one
+## Decision 1: two enforcement layers, not one — and a real constraint on what the second layer can actually check
 
 The module's logic (WASM, admission-verified, Reactor-dispatched) decides WHETHER a transfer
-should happen (a business rule — sufficient funds). The actual safety invariant (debits=credits,
-real atomicity) is enforced separately, host-side, at the `Batch_commit` authorization checkpoint
-Task 5.5 already built as "mechanism only, no policy" — this is the first real policy that
-checkpoint ever carries.
+should happen (a business rule — sufficient funds). A structural well-formedness check (is this
+ONE write, by itself, a valid-looking ledger entry) is enforced separately, host-side, at the
+`Batch_commit` authorization checkpoint Task 5.5 already built as "mechanism only, no policy" —
+this is the first real policy that checkpoint ever carries.
 
-**Why not enforce the invariant only inside the WASM guest** (the simpler-looking alternative):
+**Why not enforce well-formedness only inside the WASM guest** (the simpler-looking alternative):
 a guest-only check can't satisfy Task 6.2's own test requirement — "the invariant cannot be
 violated by any sequence of valid-looking module operations" — because nothing stops a buggy or
 compromised guest (or any other code that can reach `propose_write` with this module's merge_key
 shape) from skipping the check. Putting the authoritative check at the one chokepoint every write
 already passes through (independently audited and fuzz-tested by the final whole-branch review's
 own `scripts/check-authorization-checkpoint` and `test_batch_commit_authorization_fuzz.ml`) makes
-the invariant structurally unbypassable, not just conventionally respected.
+single-write well-formedness structurally unbypassable, not just conventionally respected.
 
-This split is deliberate, not redundant: "does this request make business sense" (can evolve, can
-have bugs, lives in WASM) is a different concern from "is this batch actually a valid double-entry
-transfer" (must never break, lives at the authorization checkpoint).
+**A real limit, found while writing the implementation plan, not assumed away**: `Batch_commit`'s
+real, current signature is `val authorize : write -> decision` — it is evaluated **once per write,
+in isolation**, with no visibility into the other writes in the same `propose` call. The original
+version of this design (now corrected) assumed `authorize` could check "do the two legs of this
+transfer, together, sum to zero" — genuinely impossible with this signature, since a single call
+to `authorize` never sees both legs at once. Extending `Batch_commit`'s own authorize signature to
+take the whole batch would be a Layer 0 change, which this repo's own governance model (small,
+aligned group, everyone who approves has implemented against it) puts outside this task's scope to
+decide unilaterally.
+
+**Resolution, scoped to what the real mechanism can actually guarantee:**
+- `authorize`, per write, checks exactly what a SINGLE write can self-certify: this leg's own
+  `amount` is positive, its two named accounts are distinct, and its `merge_key` matches the
+  account it claims to be about. This is real, structurally-enforced, un-bypassable protection
+  against any malformed or self-inconsistent single write — including one constructed by a future
+  caller that never goes through this module's own trusted code at all.
+- The property `authorize` genuinely cannot check — that a transfer's two legs are truly a matched,
+  balancing pair, both present in the same batch — is instead guaranteed **by construction**, in
+  the one piece of trusted host code that ever builds a ledger transfer's write list: the
+  `~propose` closure wired into this module's `Reactor.subscribe` call (Decision 2 below). WASM
+  guest code can only reach `Batch_commit.propose` through that closure — never directly — so an
+  adversarial or buggy guest can influence *which* accounts/amount a transfer names, but never
+  *whether* the two legs it produces are a consistent pair, because the closure always derives both
+  legs from the one `transfer_id`/`amount`/`from_account`/`to_account` tuple of a single decoded
+  request.
+- This is a real, disclosed difference in guarantee strength, not a hidden weakening: a
+  single-write property (an individual leg's own well-formedness) gets the authorize checkpoint's
+  full, structurally-unbypassable treatment; a cross-write property (two legs forming a true pair)
+  gets construction-correctness instead, verified by direct fuzz-testing of the construction code
+  itself (Testing strategy, below) rather than by the checkpoint. **This is exactly the kind of
+  concrete boundary friction Task 6.4 exists to surface for Task 7** — record it there as a
+  candidate for a future batch-aware `authorize` signature, not something to solve inside this task.
+
+This split is still deliberate, not redundant: "does this request make business sense" (can
+evolve, can have bugs, lives in WASM) is a different concern from "is this one write, by itself,
+well-formed" (must never break, lives at the authorization checkpoint) is a different concern again
+from "are both legs of this transfer really a matched pair" (guaranteed by construction, verified
+by fuzzing the construction code directly).
 
 ## Decision 2: schema and components
 
@@ -77,11 +112,20 @@ Hand-written `to_value`/`of_value` over `Riptide.Value.value`, per the resolved 
   — proposed directly by a client (or this task's own test driver) at merge_key `"ledger.requests"`.
   `amount` is always a positive magnitude. Not itself balance-affecting; `authorize` allows it
   unconditionally.
-- `transfer_leg : { transfer_id : string; account : string; delta : int64 }` — exactly two of
-  these, derived by the module from one approved request as `{account = from_account; delta =
-  -amount}` and `{account = to_account; delta = +amount}`, sharing one `transfer_id`, proposed
-  together as a single atomic `Batch_commit.propose` call at merge_key
-  `"ledger.account.<account-id>"`.
+- `transfer_leg : { transfer_id : string; role : [ `Debit | `Credit ]; this_account : string;
+  other_account : string; amount : int64 }` — **self-certifying**: every field `authorize` needs to
+  validate THIS leg alone is present in THIS leg's own payload (no need to see its sibling).
+  `amount` is always positive; this leg's own signed balance delta is derived, not stored —
+  `-amount` if `role = Debit`, `+amount` if `role = Credit`. `merge_key = "ledger.account." ^
+  this_account`.
+
+**Both legs of a transfer are always constructed together, from one request, by the same trusted
+closure**: given an approved `transfer_request {transfer_id = request_id; from_account; to_account;
+amount}`, the module's `~propose` closure always builds exactly
+`[ { transfer_id; role = Debit; this_account = from_account; other_account = to_account; amount };
+   { transfer_id; role = Credit; this_account = to_account; other_account = from_account; amount } ]`
+and proposes them as one atomic `Batch_commit.propose` call — see Decision 1 for why this
+construction-time guarantee, not `authorize`, is what makes the pair genuinely balanced.
 
 **Account balances are materialized state, not a new lattice/CRDT type.** Each account's balance
 is the Last-Write-Wins materialized value at `"ledger.account.<id>"`, maintained via the exact
@@ -90,16 +134,18 @@ and proved correct end to end. An account implicitly exists (balance 0) the firs
 referenced — no separate "open account" flow, consistent with the focused-core scope.
 
 **Atomicity across the two legs of a transfer** comes for free from `Batch_commit`'s own existing
-all-or-nothing multi-write commit (hardened since Task 3.3) — nothing new needed.
+all-or-nothing multi-write commit (hardened since Task 3.3) — nothing new needed: if either leg's
+own well-formedness check fails `authorize`, the WHOLE batch (both legs) is refused, never a
+partial transfer.
 
 **One `Batch_commit.t` handle for the whole module**, one `authorize` function branching on write
 shape: a `"ledger.requests"` write is allowed unconditionally; a `"ledger.account.*"` write (a
-transfer leg) is checked structurally — exactly two legs share a `transfer_id` within the batch,
-their deltas sum to exactly zero, the two accounts are distinct (a `from_account = to_account`
-request therefore produces two same-account legs and is structurally **Deny**'d here, not silently
-accepted as a no-op net-zero transfer — the module itself has no special case for it either; it is
-the authorize check's job to reject it, consistent with "the invariant cannot be violated by any
-sequence of valid-looking module operations" covering this case too).
+transfer leg) gets the self-certifying per-write check described in Decision 1 — `amount > 0`,
+`this_account <> other_account`, `this_account` matches the merge_key's own account suffix. A
+`from_account = to_account` request therefore produces two same-account legs and is structurally
+**Deny**'d here (via the `this_account <> other_account` check), not silently accepted as a no-op
+net-zero transfer — the module itself has no special case for it either; it is the authorize
+check's job to reject it.
 
 **The ledger WASM module**: admission-verified (real `cosign`-signed artifact), declares a
 `Protocol` permitting `handle` from `init` (same shape every existing module uses), subscribed via
@@ -115,13 +161,15 @@ Client proposes {request_id, from, to, amount}
   -> module calls read_materialized("ledger.account.<from>") -> current balance
   -> module checks amount <= balance
        - insufficient: no propose_write call -- clean no-op, nothing committed
-       - sufficient: module calls propose_write(encode(debit_leg, credit_leg))
-            -> host ~propose closure decodes into [debit_leg; credit_leg]
-            -> Batch_commit.propose (authorize: structural debits=credits check)
-                 - balanced, same transfer_id, distinct accounts: Allow
+       - sufficient: module calls propose_write(encode(approved request))
+            -> host ~propose closure ALWAYS constructs both legs together from the one
+               request (Decision 2) -> [debit_leg; credit_leg]
+            -> Batch_commit.propose (authorize: per-leg self-certifying well-formedness check)
+                 - both legs individually well-formed: Allow
                       -> VSR commits both legs atomically
                       -> re-materializes "ledger.account.<from>" and "ledger.account.<to>"
-                 - malformed/unbalanced: Deny -> whole batch refused, authorization_denials++
+                 - either leg malformed (amount<=0, same-account): Deny -> whole batch
+                   refused, authorization_denials++
 ```
 
 Every arrow is an existing, already-tested mechanism (materialize-then-dispatch,
@@ -133,11 +181,13 @@ for the first time with a real domain and a real policy, instead of a toy counte
 - **Insufficient funds**: not an error — a legitimate business decision. The module simply never
   calls `propose_write`. Matches the "a module legitimately choosing not to act must be a clean
   no-op" convention already established and tested in the boundary work.
-- **Malformed or adversarial transfer legs** (wrong account, mismatched `transfer_id`,
-  non-balancing deltas, a client attempting to propose a transfer leg directly without going
-  through the module): caught by the structural `authorize` check regardless of origin — `Deny`,
-  whole batch refused, `authorization_denials` increments, nothing enters the log. Same
-  "guard failure ⇒ total no-op" convention used throughout Layer 0.
+- **A single malformed or adversarial transfer leg** (non-positive amount, same account on both
+  sides, a client attempting to propose a transfer leg directly without going through the module):
+  caught by the self-certifying `authorize` check regardless of origin — `Deny`, whole batch
+  refused, `authorization_denials` increments, nothing enters the log. Same "guard failure ⇒ total
+  no-op" convention used throughout Layer 0. (A genuinely mismatched *pair* — two otherwise
+  well-formed legs that don't actually belong together — cannot arise from this module's own
+  `~propose` closure by construction, per Decision 1; it is out of `authorize`'s own reach.)
 - **WASM trap or session-type violation** in the module: `Loader.invoke` returns `Error`, the
   reactor logs it (with merge_key/module-identity context) and continues — a trap on one request
   never blocks processing of the next, per the sibling-independence guarantee already proven.
@@ -150,13 +200,20 @@ for the first time with a real domain and a real policy, instead of a toy counte
 
 Maps directly onto subtasks 6.2 and 6.4:
 
-- **Domain-invariant conformance suite (6.2, "mandatory-certification discipline from Task 5.5")**:
-  a QCheck property-fuzz test driving random batches of transfer-leg writes — balanced and
-  deliberately malformed (mismatched deltas, wrong `transfer_id` pairing, self-transfers,
-  single-leg batches) — directly against the real `authorize` function and `Batch_commit.propose`,
-  asserting no unbalanced write ever reaches `committed_envelopes`, regardless of how it's
-  constructed. Same pattern as the final whole-branch review's own
-  `test_batch_commit_authorization_fuzz.ml`, applied to this module's real policy.
+- **Domain-invariant conformance suite (6.2, "mandatory-certification discipline from Task 5.5")**
+  — two distinct properties, matching the two distinct guarantees Decision 1 actually provides:
+  1. **Authorize-level fuzz test**: a QCheck property-fuzz test driving random `transfer_leg`
+     writes — well-formed and deliberately malformed (non-positive amount, same-account,
+     merge_key/account mismatch) — directly against the real `authorize` function and
+     `Batch_commit.propose`, asserting no single malformed leg ever reaches `committed_envelopes`,
+     regardless of how it's constructed (including constructed directly, bypassing the module
+     entirely). Same pattern as the final whole-branch review's own
+     `test_batch_commit_authorization_fuzz.ml`, applied to this module's real, narrower policy.
+  2. **Construction-level fuzz test**: a QCheck property-fuzz test feeding arbitrary/adversarial
+     bytes directly into the `~propose` closure's own request-decode-and-construct function,
+     asserting the result is always either nothing (malformed input cleanly rejected) or exactly
+     two well-paired, genuinely balancing legs — proving the pairing guarantee Decision 1 relies on
+     construction (not `authorize`) for, empirically, not just by code inspection.
 - **Schema round-trip tests**: `to_value`/`of_value` for both `transfer_request` and `transfer_leg`.
 - **A real end-to-end module test** (same shape as `test_module_end_to_end.ml`): a real
   admission-verified ledger guest, a real solo replica, a sequence of requests exercising both the
