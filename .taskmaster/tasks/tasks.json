@@ -588,7 +588,7 @@
         "id": "6",
         "title": "Build one real, demanding Layer 2 module end to end",
         "description": "Pick ONE genuine, demanding real use case - not several imagined ones - and build it fully against the Task 5 boundary. This is what actually proves or breaks the boundary design.",
-        "status": "pending",
+        "status": "done",
         "priority": "high",
         "dependencies": [
           "5"
@@ -600,43 +600,83 @@
             "id": 1,
             "title": "Choose the first real, demanding domain and use case",
             "description": "DECISION NEEDED from the project owner - must be a genuine, currently-real need, not a demonstration of generality. Candidates already surfaced across this design process include a real ledger/accounting use case (TigerBeetle-style double-entry, directly informed by the extensive banking-readiness research already done) but this must be a real, owned need, not chosen for architectural symmetry.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Not test-strategy-applicable - this is a decision gate, not an implementation step.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "ba558222e003a1ba627cf3c6f5d5bb8202e8447d",
+                "bb1289c31adf65189bba4ca3ca36af1ce0a2523f",
+                "9a2b645df0ee39521f4d462df394fcc0e7de45ee"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-10-01T13:59:56.043Z"
           },
           {
             "id": 2,
             "title": "Design and formally specify the module's own domain invariant",
             "description": "TigerBeetle's lesson: the invariant is domain-specific by design, not domain-agnostic - do not try to make it generalize prematurely. Give it its own conformance suite, following the mandatory-certification discipline from Task 5.5.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: the invariant cannot be violated by any sequence of valid-looking module operations.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "ba558222e003a1ba627cf3c6f5d5bb8202e8447d",
+                "ba6d06b480e7c1cb015699a082aded6e19603aa8",
+                "78f996175e260caccfafb59e2abb2ca36a82c62f",
+                "3f8cb5d45ea1f493dc9e2eb276d47fa2aa842f4e"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-10-01T13:59:56.051Z"
           },
           {
             "id": 3,
             "title": "Build the module's schema using Task 2.1's functorial value universe",
             "description": "A concrete domain schema, not the mechanism itself - built using the schema-morphism machinery, not extending it.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: schema evolution within this module is checked via the morphism mechanism, never an unchecked migration script.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "2b9985e4236774dae5c5b95c35e05927b280538d",
+                "62c769a5f8dbaedcab6d7c1eac1729664a2f149c"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-10-01T13:59:56.056Z"
           },
           {
             "id": 4,
             "title": "Integrate against the Task 5 boundary and run real production-shaped load",
             "description": "This is the actual pressure test. Document every friction point, every place the boundary made something harder than it should have been - this record feeds directly into Task 7.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [],
             "details": "Test: the module operates correctly under the deterministic simulation harness from Task 3.4, including injected node failures.",
             "testStrategy": "",
-            "parentId": "undefined"
+            "parentId": "undefined",
+            "evidence": {
+              "commits": [
+                "f9e929dd91c35bc4b660504883cb68a5a1f122d6",
+                "8b33cfb746db582318d6e2c4e1255d888c4754b5",
+                "6be9755875877525839e78637f16809f01d8de58",
+                "14cd443a9be9faa41283092358e1e43b18cc5d8d",
+                "3b750c31e411579e9b12b9336156d08933de85ce",
+                "5b5e63d650ed4d7b9633dbae57921fe622865420"
+              ],
+              "prs": []
+            },
+            "updatedAt": "2026-10-01T13:59:56.061Z"
           }
-        ]
+        ],
+        "updatedAt": "2026-10-01T13:59:56.061Z"
       },
       {
         "id": "7",
@@ -653,7 +693,7 @@
           {
             "id": 1,
             "title": "Catalog every friction point Task 6 surfaced",
-            "description": "A concrete list, grounded in what actually broke or was awkward while building a real module - not speculative future requirements.",
+            "description": "A concrete list, grounded in what actually broke or was awkward while building a real module - not speculative future requirements. Task 6 (the Layer 2 double-entry ledger, lib/ledger/) surfaced five, each now disclosed at the interface it concerns rather than only in a workspace note - see commit 5b5e63d650ed4d7b9633dbae57921fe622865420: (1) batch_commit.mli stated that re-materializing an already-folded write is a no-op because the underlying join is idempotent - affirmatively FALSE for any accumulating (non-lattice-join) materialize_sink, and the direct cause of two real ledger bugs including that plan's own Critical finding; decide whether to narrow materialize_sink to lattice joins or to pass write identity through. (2) Batch_commit.create's ~authorize is write -> decision, evaluated per write with no sibling visibility, so no cross-write invariant (e.g. 'these two legs balance and are both in this batch') can be enforced at the checkpoint at all; consider a batch-aware form. (3) materialize_sink's write callback receives only ~merge_key and the payload - never the committing write's actor, idempotency_key or batch position - forcing any sink that must dedup replays onto content-based keys, which silently collapsed two distinct ledger legs and destroyed money. (4) reactor.mli: a ~propose closure holding a fixed Batch_commit.t silently no-ops forever once a view change moves the primary, since propose through a non-primary is a silent no-op; and the closure's (unit, string) result type cannot express 'no primary right now, retry'. (5) reactor.mli: a guest's proposed write can be discarded by a view change after ~propose already returned Ok, with no re-proposal anywhere; recovery works only via re-dispatch, which makes 'a dispatched guest must be idempotent under re-dispatch' a real but previously unstated obligation on module authors.",
             "status": "pending",
             "dependencies": [],
             "details": "Deliverable: a written record, not a code change.",
@@ -1467,9 +1507,9 @@
     ],
     "metadata": {
       "version": "1.0.0",
-      "lastModified": "2026-09-30T16:46:42.714Z",
+      "lastModified": "2026-10-01T13:59:56.061Z",
       "taskCount": 12,
-      "completedCount": 6,
+      "completedCount": 7,
       "tags": [
         "master"
       ]
