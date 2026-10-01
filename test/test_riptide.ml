@@ -109,6 +109,7 @@ let () =
          ("ledger_schema", Test_ledger_schema.tests);
          ("ledger_authorize_fuzz", Test_ledger_authorize_fuzz.tests);
          ("ledger_end_to_end", Test_ledger_end_to_end.tests);
+         ("ledger_dst_load", Test_ledger_dst_load.tests);
          ("storage_shared_file_storage", Test_storage_shared.file_storage_tests);
          ("storage_shared_fault_injecting_storage", Test_storage_shared.fault_injecting_storage_tests);
          ("storage_shared_memory_storage", Test_storage_shared.memory_storage_tests);
