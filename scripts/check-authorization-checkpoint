@@ -18,7 +18,9 @@ own CLAUDE.md ("no spec without running code") says is not enough.
 WHAT IT ACTUALLY PROVES (and what it cannot). The checkpoint is a structural claim about ONE call
 site: `Riptide_vsr.Replica.propose` is the only way anything enters the replicated log, and the
 only caller of it in `lib/` is `Batch_commit.propose`, which evaluates `~authorize` over every
-write in the batch before reaching it. So the claim decomposes into four checks, all of them
+write in the batch, AND `~authorize_batch` (task-master Task 7, the Layer 0/Layer 2 boundary
+revision -- a second, optional, whole-batch-at-once hook added alongside `~authorize`) once over
+the whole batch, before reaching it. So the claim decomposes into five checks, all of them
 lexical -- this is a grep-class tool, not a theorem prover:
 
   1. `lib/` contains exactly ONE call to `Replica.propose`, and it is in
@@ -28,13 +30,16 @@ lexical -- this is a grep-class tool, not a theorem prover:
      silently unaudited.)
   2. That call is lexically inside `Batch_commit.propose`.
   3. `Batch_commit.propose` evaluates `t.authorize` exactly once, before that call, over EVERY
-     element of `writes` (matched as a whole expression, so narrowing it to a subset of the batch --
+     element of `writes`, and `t.authorize_batch` exactly once, before that call, over the WHOLE
+     `writes` list (matched as a whole expression, so narrowing either to a subset of the batch --
      the shape a "the first write is enough" refactor would produce -- fails here).
   4. The call sits inside the `else` branch of `if denied then ...`, i.e. it is unreachable when any
-     write was denied.
+     write, or the batch as a whole, was denied.
 
 Plus one guard on the policy's own reachability: `Batch_commit.create` takes `~authorize` as a
-REQUIRED labeled argument, so no `Batch_commit.t` can exist with no policy attached.
+REQUIRED labeled argument, so no `Batch_commit.t` can exist with no policy attached. (`~authorize_batch`
+is deliberately NOT required the same way -- it is an optional extension with a permissive default,
+per its own `create` doc comment -- so this script does not and must not pin it as required.)
 
 Comments and string literals are stripped before any of this is matched, so a doc comment that
 merely TALKS about `Replica.propose` (batch_commit.mli alone mentions it a dozen times) is never
@@ -64,10 +69,13 @@ DEFAULT_ROOTS = ("lib",)
 EXPECTED_CALL_SITE = "lib/batch_commit/batch_commit.ml"
 
 # Check 3: the checkpoint expression itself, whitespace-normalized. `writes` -- the whole batch,
-# unqualified -- is the load-bearing token here.
+# unqualified -- is the load-bearing token for both the per-write `t.authorize` loop and the
+# whole-batch `t.authorize_batch` call, which must be evaluated against the SAME `writes`, not some
+# other binding that could have been narrowed.
 AUTHORIZE_OVER_EVERY_WRITE = (
     "let denied = List.exists (fun (w : write) -> match t.authorize w with "
-    "Deny _ -> true | Allow -> false) writes in"
+    "Deny _ -> true | Allow -> false) writes || match t.authorize_batch writes with "
+    "Deny _ -> true | Allow -> false in"
 )
 # Check 4: the guard the propose call must sit behind.
 DENIAL_GUARD = "if denied then"
@@ -323,11 +331,32 @@ def main(argv):
                 f"{line_of(code, authorize_hits[0])}, AFTER the Replica.propose call at line "
                 f"{call_line} -- a write could reach the log before the checkpoint ran"
             )
+
+        # Check 3, continued: t.authorize_batch, same discipline -- exactly once, before the call.
+        authorize_batch_hits = [m.start() + fn_start for m in re.finditer(r"\bt\.authorize_batch\b", body)]
+        if len(authorize_batch_hits) != 1:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: expected exactly 1 evaluation of `t.authorize_batch` inside "
+                f"`propose`, found {len(authorize_batch_hits)}"
+                + (
+                    " (lines " + ", ".join(str(line_of(code, h)) for h in authorize_batch_hits) + ")"
+                    if authorize_batch_hits
+                    else ""
+                )
+            )
+        elif authorize_batch_hits[0] > call_idx:
+            problems.append(
+                f"{EXPECTED_CALL_SITE}: `t.authorize_batch` is evaluated at line "
+                f"{line_of(code, authorize_batch_hits[0])}, AFTER the Replica.propose call at line "
+                f"{call_line} -- a batch could reach the log before the checkpoint ran"
+            )
+
         if norm(AUTHORIZE_OVER_EVERY_WRITE) not in normalized_body:
             problems.append(
                 f"{EXPECTED_CALL_SITE}: `propose` no longer contains the exact checkpoint "
                 "expression this audit pins, which evaluates ~authorize over EVERY write in the "
-                f"batch:\n    {AUTHORIZE_OVER_EVERY_WRITE}\n  (see this script's own docstring: an "
+                "batch AND ~authorize_batch over the whole batch:\n    "
+                f"{AUTHORIZE_OVER_EVERY_WRITE}\n  (see this script's own docstring: an "
                 "equivalent rewrite fails here on purpose)"
             )
 
@@ -372,7 +401,8 @@ def main(argv):
         "ok: Replica.propose has exactly 1 caller in "
         + "/".join(roots)
         + f" ({EXPECTED_CALL_SITE}:{line_of(stripped[EXPECTED_CALL_SITE], calls[0][0])}), it is "
-        "inside Batch_commit.propose, it evaluates ~authorize over every write in the batch first, "
+        "inside Batch_commit.propose, it evaluates ~authorize over every write in the batch and "
+        "~authorize_batch over the whole batch first, "
         f"and it sits behind the `{DENIAL_GUARD}` guard "
         f"({len(files)} .ml files scanned via {discovery})"
     )

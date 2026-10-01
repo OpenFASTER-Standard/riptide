@@ -184,6 +184,18 @@ let authorization_denials () = !authorization_denials_count
 type t = {
   replica : Riptide_vsr.Replica.t;
   authorize : write -> decision;
+  (* Layer 0/Layer 2 boundary revision (task-master Task 7, this task's own brief), closing the
+     Known, disclosed residual gap batch_commit.mli's own [create] doc comment names: [authorize]
+     above sees ONE write at a time, with no visibility into any sibling write in the same batch, so
+     no cross-write invariant (e.g. a double-entry ledger's "these two legs are a matched, balancing
+     pair, both present in this batch") could ever be enforced by this module's checkpoint at all.
+     [authorize_batch] is that batch-aware extension: evaluated once per batch, given the WHOLE
+     [writes] list, under the exact same guard [authorize] above is evaluated under (see [propose]
+     below) -- not a separate check with its own, possibly-divergent gating. [fun _ -> Allow] (the
+     default every existing call site gets for free, unlike [authorize] itself, which has no
+     default) preserves exactly today's behaviour: no batch-level policy, per-write enforcement
+     only. *)
+  authorize_batch : write list -> decision;
   require_encryption : bool;
   (* Layer 0/Layer 2 boundary revision (task-master Task 7), closing Task 6's own boundary
      friction item 1 (final whole-branch review finding I9): a durable, per-(idempotency_key,
@@ -197,10 +209,20 @@ type t = {
   materialize_watermark_store : Riptide_storage.File_kv_store.t option;
 }
 
-let create ~replica ~authorize ?(require_encryption = false) ?materialize_watermark_store () =
-  { replica; authorize; require_encryption; materialize_watermark_store }
+let create ~replica ~authorize ?(authorize_batch = fun (_ : write list) -> Allow) ?(require_encryption = false)
+    ?materialize_watermark_store () =
+  { replica; authorize; authorize_batch; require_encryption; materialize_watermark_store }
 
 let replica (t : t) = t.replica
+
+(* Layer 0/Layer 2 boundary revision (task-master Task 7, this task's own brief; spec Decision 5) --
+   see batch_commit.mli's own [is_primary] doc comment for the full contract and its disclosed
+   residual gap. Exactly the compound condition [propose]'s own existing silent-no-op guard already
+   checks internally (see [Riptide_vsr.Replica.propose]'s own doc comment), exposed here as the one
+   predicate a Layer 2 caller actually needs rather than something it has to independently discover
+   and reproduce. *)
+let is_primary (t : t) : bool =
+  Riptide_vsr.Replica.is_primary t.replica && Riptide_vsr.Replica.status t.replica = Riptide_vsr.Replica.Normal
 
 (* The synthetic write [propose] appends to a batch it actually proposes, once every one of the
    batch's real writes is [Allow]ed -- see batch_commit.mli's own [propose] "Authorization"
@@ -496,7 +518,18 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
        {!materialize_up_to} -- see the .mli for the full three-idiom account, and why all three
        are equally exempt from this checkpoint by construction: {!materialize_up_to} takes a bare
        {!Riptide_vsr.Replica.t}, with no {!t}/[~authorize] in scope at all to consult. *)
-    let denied = List.exists (fun (w : write) -> match t.authorize w with Deny _ -> true | Allow -> false) writes in
+    (* [authorize_batch] (task-master Task 7, this task's own brief) is evaluated under the exact
+       same guard as the per-write [authorize] loop above -- not a separate, possibly-divergent
+       check -- so it inherits that guard's own exemptions by construction: it is never consulted
+       for the empty-[writes] drain idiom, nor for a retry of an already-logged key, for precisely
+       the reasons the per-write checkpoint's own comment above already gives. Either hook denying
+       refuses the WHOLE batch and increments [authorization_denials_count] exactly once, matching
+       the per-write checkpoint's own once-per-batch counting discipline -- not once per denying
+       hook. *)
+    let denied =
+      List.exists (fun (w : write) -> match t.authorize w with Deny _ -> true | Allow -> false) writes
+      || match t.authorize_batch writes with Deny _ -> true | Allow -> false
+    in
     if denied then incr authorization_denials_count
     else begin
       (* Encryption happens HERE, inside the "this key is not already anywhere in the log" guard,

@@ -85,14 +85,24 @@ type t
 val create :
   replica:Riptide_vsr.Replica.t ->
   authorize:(write -> decision) ->
+  ?authorize_batch:(write list -> decision) ->
   ?require_encryption:bool ->
   ?materialize_watermark_store:Riptide_storage.File_kv_store.t ->
   unit ->
   t
-(** [create ~replica ~authorize ?require_encryption ?materialize_watermark_store ()] builds a
-    handle over [replica] with
+(** [create ~replica ~authorize ?authorize_batch ?require_encryption ?materialize_watermark_store ()]
+    builds a handle over [replica] with
     [authorize] as the mandatory universal authorization policy every {!propose} call through this
-    handle consults for every write of every batch (see {!propose}'s "Authorization" section), and
+    handle consults for every write of every batch (see {!propose}'s "Authorization" section),
+    [authorize_batch] (Task 7, the Layer 0/Layer 2 boundary revision, closing Task 6's own boundary
+    friction item 2; final whole-branch review finding I9) as an OPTIONAL, additional whole-batch
+    policy evaluated once per batch against the full [write list], under the exact same guard
+    {!propose} evaluates [authorize] under -- see {!propose}'s own "Authorization" section for the
+    precise gating, which is identical for both hooks. [fun _ -> Allow] (the default) preserves
+    exactly today's behaviour: no batch-level policy, per-write enforcement only -- unlike
+    [authorize], which has no default (see below), [authorize_batch] does, since "no batch-level
+    policy yet" is a reasonable, common starting point that every pre-existing call site should not
+    have to state out loud the way "no policy at all" must, and
     [require_encryption] (default [false], matching {!propose}'s own pre-existing default -- this
     constructor changes WHERE the policy is set, never its default value) as the encryption policy
     every {!propose} call through this handle enforces unless overridden per-call, and
@@ -113,25 +123,34 @@ val create :
     states out loud, via {!allow_all}, rather than something the type signature quietly assumes
     for it.
 
-    {b Known, disclosed residual gap: [authorize] sees ONE write at a time, with no visibility into
-    any sibling write in the same batch, so no cross-write invariant can be enforced here at all}
-    (Task 6's own boundary friction, item 2; final whole-branch review finding I9). The type says
+    {b [authorize] sees ONE write at a time, with no visibility into any sibling write in the same
+    batch, so no cross-write invariant can be enforced through [authorize] alone} (Task 6's own
+    boundary friction, item 2; final whole-branch review finding I9). The type says
     [write -> decision], and {!propose} evaluates it per write -- which is enough for any property a
     single write can self-certify, and structurally unable to express any property relating two of
-    them. That is a real limit on what this checkpoint can be trusted for, and the first real policy
-    it ever carried ran straight into it: a double-entry ledger ([lib/ledger/]) needs "these two
-    legs are a matched, balancing pair, both present in this batch", which is precisely a
-    cross-write property, so it cannot live here. That module's resolution -- guarantee the pairing
-    BY CONSTRUCTION, in the single piece of trusted code that builds both legs together from one
-    request, and let this checkpoint enforce only each leg's own well-formedness -- works, but it is
-    a genuinely weaker kind of guarantee: construction-correctness verified by fuzzing the
-    constructor, rather than a checkpoint no write can bypass. A consequence worth stating because
-    it surprises readers of this interface: a WELL-FORMED single leg proposed directly, by a client
-    that never went through that module, is necessarily ALLOWED here, since nothing in one write
-    reveals its provenance. A batch-aware form (e.g. [write list -> decision], or an additional
-    whole-batch hook) is the obvious extension and has a real consumer asking for it; it is a Layer
-    0 signature change and so belongs to the boundary revision (task-master Task 7). A deployment that wants "every write through this path is encrypted, no exceptions" as
-    an enforced invariant sets [~require_encryption:true] ONCE here, at the one place that builds
+    them. That is a real limit on what [authorize] alone can be trusted for, and the first real
+    policy this module ever carried ran straight into it: a double-entry ledger ([lib/ledger/])
+    needs "these two legs are a matched, balancing pair, both present in this batch", which is
+    precisely a cross-write property, so it could not live in [authorize]. That module's original
+    resolution -- guarantee the pairing BY CONSTRUCTION, in the single piece of trusted code that
+    builds both legs together from one request, and let [authorize] enforce only each leg's own
+    well-formedness -- worked, but was a genuinely weaker kind of guarantee: construction-correctness
+    verified by fuzzing the constructor, rather than a checkpoint no write can bypass. A consequence
+    worth stating because it surprises readers of this interface: a WELL-FORMED single leg proposed
+    directly, by a client that never went through that module, was necessarily ALLOWED by [authorize]
+    alone, since nothing in one write reveals its provenance.
+
+    {b This gap is now CLOSEABLE, via [authorize_batch] above -- not closed by default.} [authorize_batch]
+    is exactly the batch-aware extension this paragraph used to describe as "the obvious extension
+    [with] a real consumer asking for it" (Task 7, the Layer 0/Layer 2 boundary revision, closing
+    this item): a deployment that needs a cross-write invariant enforced now has somewhere to put it,
+    evaluated once per batch against the full [write list], under the same guard [authorize] itself
+    is evaluated under. [authorize_batch]'s own default ([fun _ -> Allow]) means a handle built with
+    only [~authorize] gets EXACTLY the single-write-at-a-time enforcement described above, unchanged
+    -- supplying [~authorize_batch] is an opt-in a deployment must make explicitly, the same way
+    [require_encryption] below is opt-in, not something this constructor infers from the shape of
+    [authorize] itself. A deployment that wants "every write through this path is encrypted, no
+    exceptions" as an enforced invariant sets [~require_encryption:true] ONCE here, at the one place that builds
     the handle, rather than trusting every {!propose} call site scattered through its own code to
     remember [~require_encryption:true] unaided -- the same reasoning now applies to [~authorize]
     itself: a deployment's real policy lives here, once, not at each of {!propose}'s many call
@@ -143,6 +162,31 @@ val replica : t -> Riptide_vsr.Replica.t
     {!Riptide_vsr.Replica.t}, e.g. {!committed_envelopes}, {!materialize_up_to}) or
     {!Riptide_vsr.Replica}'s own functions (e.g. {!Riptide_vsr.Replica.commit_number},
     {!Riptide_vsr.Replica.entries}) against the same underlying replica a [t] wraps. *)
+
+val is_primary : t -> bool
+(** [is_primary t] is [true] iff [t] can currently cause a NEW {!propose} call through it to have any
+    effect at all -- exactly [Riptide_vsr.Replica.is_primary (replica t) && Riptide_vsr.Replica.status
+    (replica t) = Riptide_vsr.Replica.Normal], the same compound condition {!propose}'s own existing
+    silent-no-op guard already checks internally (see {!Riptide_vsr.Replica.propose}'s own doc
+    comment), surfaced here as the one predicate a Layer 2 caller needs rather than something it has
+    to independently discover and reproduce (Task 7, the Layer 0/Layer 2 boundary revision, closing
+    Task 6's own boundary friction items 4/5; design spec Decision 5). A caller whose own
+    [~propose:(bytes -> (unit, string) result)]-shaped closure (e.g. {!Riptide_module.Reactor
+    .subscribe}'s own) wants to report failure rather than silently swallow a proposal should check
+    this IMMEDIATELY BEFORE every {!propose} call, not once, not cached -- primary/view status can
+    change between any two calls -- and return an error without calling {!propose} at all when it is
+    [false], instead of calling {!propose} and having it do nothing with no trace.
+
+    {b Residual gap, disclosed rather than hidden: checking [is_primary t] and then calling
+    {!propose} is NOT atomic.} [t] can stop being primary (a view change can start and complete)
+    in the gap between the two calls, in which case {!propose}'s own silent-no-op guard is what
+    actually protects correctness -- the proposal is simply dropped, exactly as it always was before
+    this function existed -- but the caller that checked [is_primary t] moments earlier and saw
+    [true] has no way to learn that from this function alone; it is not re-consulted, and {!propose}
+    itself gives no acknowledgment either way (this layer's fire-and-forget contract, unchanged by
+    this function). This function narrows the window in which a caller proposes blind -- it does not
+    close it, and does not add any retry/acknowledgment machinery of its own (durable acknowledgment
+    remains a separate, later task's job). *)
 
 val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope list
 (** [committed_envelopes t] is the real, hash-chained Envelope view of everything durably
@@ -520,13 +564,17 @@ val propose :
     finding, this task's own review round 1; an earlier version of this checkpoint evaluated
     [~authorize] unconditionally, ahead of that guard, which is the design this paragraph
     supersedes). When that guard is reached, [Batch_commit.t]'s own [~authorize] (supplied once,
-    at {!create} time) is evaluated against EVERY write in [writes]. If any write's [authorize w]
-    returns [Deny reason], this function increments {!authorization_denials} and proposes nothing
-    for this call -- the materialize step below still runs, exactly as it does for a batch that
-    was simply never proposed at all, and finds nothing committed under [idempotency_key] either
-    way, so this is not a special case needing its own check. A batch is one atomic, indivisible
-    unit, so a single denied write refuses the WHOLE batch, not just itself -- there is no
-    partial-batch commit path anywhere in this module, and authorization does not create one.
+    at {!create} time) is evaluated against EVERY write in [writes], and [Batch_commit.t]'s own
+    [~authorize_batch] (Task 7, the Layer 0/Layer 2 boundary revision -- see {!create}'s own doc
+    comment) is evaluated once, against the WHOLE [writes] list, under this exact same guard -- not
+    a second, separately-gated check. If any write's [authorize w] returns [Deny reason], OR
+    [authorize_batch writes] itself returns [Deny reason], this function increments
+    {!authorization_denials} EXACTLY ONCE and proposes nothing for this call -- the materialize step
+    below still runs, exactly as it does for a batch that was simply never proposed at all, and finds
+    nothing committed under [idempotency_key] either way, so this is not a special case needing its
+    own check. A batch is one atomic, indivisible unit, so a single denied write (or a single
+    [authorize_batch] denial) refuses the WHOLE batch, not just itself -- there is no partial-batch
+    commit path anywhere in this module, and authorization does not create one.
 
     {b Why a call against an ALREADY-committed [idempotency_key] is correctly exempt from this
     checkpoint entirely}, stated precisely because Task 6 (the reactor wiring a real policy) must
@@ -554,9 +602,10 @@ val propose :
     the other two don't. A caller's ability to catch its own materializer up on data the cluster
     already committed depended on which of three equally-valid idioms it happened to call, which
     is the inconsistency this restructuring closes: all three are now uniformly exempt, and
-    [~authorize] is consulted exactly once per batch, at the one moment ([writes <> []] and the
-    key is genuinely new to this replica's log) where a [Deny] can still prevent something from
-    happening. This is also the more literal reading of "every write ... passes through the
+    this checkpoint (both [~authorize] and [~authorize_batch]) is consulted exactly once per batch,
+    at the one moment ([writes <> []] and the key is genuinely new to this replica's log) where a
+    [Deny] can still prevent something from happening. This is also the more literal reading of
+    "every write ... passes through the
     checkpoint": a materialize-only call against already-committed data is not proposing a
     "write" in the log-entry sense at all, so excluding it from the checkpoint is consistency
     with that reading, not a weakening of it.

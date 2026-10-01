@@ -659,6 +659,77 @@ let test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_aut
     Alcotest.(check bool) "...with its own original payload" true (payload = record_value "1")
   | _ -> Alcotest.fail "expected exactly one materialized write"
 
+(* Layer 0/Layer 2 boundary revision (task-master Task 7, this task's own brief): [~authorize_batch]
+   is the batch-aware extension the Known, disclosed residual gap in [create]'s own .mli doc comment
+   names as "the obvious extension [with] a real consumer asking for it" -- a double-entry ledger's
+   own "these two legs are a matched, balancing pair" invariant, which no per-write [~authorize] can
+   ever express. Mirrors [test_propose_refuses_the_whole_batch_when_any_write_is_denied]'s own shape
+   (same assertions: nothing committed, exactly one denial counted), but driven by the NEW
+   batch-level hook instead of a per-write [Deny]. *)
+let test_authorize_batch_deny_refuses_the_whole_batch () =
+  let t = create_solo () in
+  let h =
+    Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all
+      ~authorize_batch:(fun (_ : Batch_commit.write list) -> Batch_commit.Deny "batch-level policy violation")
+      ()
+  in
+  let actor = "actor-1" in
+  let before = Batch_commit.authorization_denials () in
+  Batch_commit.propose h ~idempotency_key:"k-authz-batch-deny"
+    [
+      w ~actor ~causation:(fake_event_id "c1") ~correlation:(fake_event_id "c1") (record_value "1");
+      w ~actor ~causation:(fake_event_id "c2") ~correlation:(fake_event_id "c2") (record_value "2");
+    ];
+  Alcotest.(check int) "nothing committed: the batch-level checkpoint refused the whole batch, not \
+                        just one write of it"
+    0 (List.length (Batch_commit.committed_envelopes t));
+  Alcotest.(check int) "denial counted exactly once, matching the per-write checkpoint's own \
+                        once-per-batch counting discipline"
+    (before + 1) (Batch_commit.authorization_denials ())
+
+(* Review Focus item 2 (this task's own brief): [~authorize_batch] must be evaluated under the EXACT
+   SAME "writes <> [] && not (already_in_log ...)" guard the per-write [~authorize] already uses --
+   proven here the same way [test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_authorize]
+   proves it for the per-write hook, but for the simpler, more direct empty-[writes] drain idiom
+   specifically: [~authorize_batch] asserts [false] if it is ever called at all, so this test passing
+   (not raising) is itself the proof. *)
+let test_authorize_batch_not_consulted_for_empty_writes_drain () =
+  let t = create_solo () in
+  let h =
+    Batch_commit.create ~replica:t ~authorize:Batch_commit.allow_all
+      ~authorize_batch:(fun (_ : Batch_commit.write list) -> assert false)
+      ()
+  in
+  Batch_commit.propose h ~idempotency_key:"k-authz-batch-drain"
+    ~materialize:{ write = (fun ~merge_key:_ _ -> ()) }
+    []
+
+(* Review Focus item 3 (this task's own brief): [is_primary] combines
+   [Riptide_vsr.Replica.is_primary]/[Riptide_vsr.Replica.status] into the one compound predicate
+   [propose]'s own existing silent-no-op guard already checks internally -- see spec Decision 5. A
+   solo, [replica_count = 1] replica is both its own primary (vacuously -- VSR.tla's own
+   [Primary(v) == 1 + ((v-1) % ReplicaCount)] with [ReplicaCount = 1] is always [1]) AND, freshly
+   created, still [Normal], so this is the simplest case where both halves of the compound condition
+   must independently hold [true]. *)
+let test_is_primary_true_for_normal_solo_replica () =
+  let t = create_solo () in
+  let h = bc t in
+  Alcotest.(check bool) "a freshly-created, solo replica is its own Normal-status primary" true
+    (Batch_commit.is_primary h)
+
+(* [for_test_set_view] (not [for_test_set_view_number], which is valid only for [status = Normal] --
+   see replica.mli) moves this solo replica into [View_change] without touching [my_id]/
+   [replica_count], so [Riptide_vsr.Replica.is_primary] (identity alone) stays [true] throughout --
+   isolating that [is_primary]'s [false] here comes specifically from the [status] half of the
+   compound condition, not from a changed primary identity. *)
+let test_is_primary_false_after_for_test_set_view_to_view_change () =
+  let t = create_solo () in
+  let h = bc t in
+  Replica.for_test_set_view t ~status:Replica.View_change ~view_number:2 ~last_normal_view:0;
+  Alcotest.(check bool) "a replica mid-view-change is not usable as primary, even though it is \
+                        still nominally Primary(view) by identity alone"
+    false (Batch_commit.is_primary h)
+
 let tests =
   [
     ("empty batch commits as zero envelopes", `Quick, test_empty_batch_commits_as_zero_envelopes);
@@ -698,4 +769,11 @@ let tests =
       test_allow_all_is_the_explicit_no_policy_choice);
     ("catch-up materialization of an already-committed key is exempt from ~authorize", `Quick,
       test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_authorize);
+    ("authorize_batch denial refuses the whole batch", `Quick,
+      test_authorize_batch_deny_refuses_the_whole_batch);
+    ("authorize_batch is not consulted for an empty-writes drain call", `Quick,
+      test_authorize_batch_not_consulted_for_empty_writes_drain);
+    ("is_primary is true for a normal solo replica", `Quick, test_is_primary_true_for_normal_solo_replica);
+    ("is_primary is false after for_test_set_view moves it to View_change", `Quick,
+      test_is_primary_false_after_for_test_set_view_to_view_change);
   ]
