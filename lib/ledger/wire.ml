@@ -39,6 +39,21 @@ let decode_decision (b : bytes) : (bool * Schema.transfer_request) option =
     | '\001' -> Some (true, decode_request_at b 1)
     | _ -> None
 
+(* The SAME 33 bytes [encode_decision] hands the host, carried verbatim as a Value.value so a
+   decision can be committed to the replicated log as its own write (Task 7, the Layer 0/Layer 2
+   boundary revision -- see accumulator.mli's own account of why a DECLINE has to be durable).
+   Deliberately a byte-for-byte carrier rather than a second, Record-shaped encoding of the same
+   four fields: there is then exactly one decision wire format in this module, exactly one tag-byte
+   validation ([decode_decision] above, the one the fuzz test hammers), and a committed decision is
+   bit-identical to the bytes the guest actually produced rather than a re-serialization of them. *)
+let decision_to_value ~(accepted : bool) (r : Schema.transfer_request) : Riptide.Value.value =
+  Riptide.Value.Scalar (Riptide.Value.Bytes (Bytes.to_string (encode_decision ~accepted r)))
+
+let decision_of_value (v : Riptide.Value.value) : (bool * Schema.transfer_request) option =
+  match v with
+  | Riptide.Value.Scalar (Riptide.Value.Bytes s) -> decode_decision (Bytes.of_string s)
+  | _ -> None
+
 let encode_balance (bal : int64) : bytes =
   let buf = Bytes.make 8 '\000' in
   Bytes.set_int64_le buf 0 bal;

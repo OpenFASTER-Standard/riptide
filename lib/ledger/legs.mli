@@ -2,10 +2,19 @@
     {!Schema.transfer_request} into the two {!Riptide_batch_commit.Batch_commit.write}s of its
     debit and credit legs. See docs/superpowers/specs/2026-10-01-layer2-ledger-module-design.md,
     Decision 1: {!Authorize.authorize} can only check what a single write can self-certify, in
-    isolation -- the guarantee that both legs of a transfer are truly a matched, balancing pair
-    comes entirely from BOTH legs always being derived here, together, from the same single
-    decoded request. There is no other way to produce a {!Schema.transfer_leg} write anywhere in
-    this module's own trusted code. *)
+    isolation -- so both legs of a transfer are always derived here, together, from the same single
+    decoded request, and there is no other way to produce a {!Schema.transfer_leg} write anywhere in
+    this module's own trusted code.
+
+    {b That construction-time derivation is no longer the ONLY thing standing behind the pairing}
+    (Task 7, the Layer 0/Layer 2 boundary revision). It used to be, and that was a genuinely weaker
+    kind of guarantee than it looked: construction-correctness verified by fuzzing the constructor,
+    rather than a checkpoint no write could bypass -- a well-formed single leg proposed directly, by a
+    caller that never came through here, was necessarily allowed.
+    {!Riptide_batch_commit.Batch_commit.create}'s own [?authorize_batch] closed that, and
+    {!Authorize.authorize_batch} is this module's implementation of it. This module now gets BOTH:
+    the pairing is built correctly here, and it is independently verified at the one checkpoint every
+    committed write passes through. *)
 
 val event_id_of_request : Schema.transfer_request -> Riptide.Envelope.event_id
 (** [event_id_of_request r] is the {!Riptide.Envelope.event_id} every leg of [r]'s own batch uses
@@ -46,6 +55,53 @@ val legs_of_request :
     produces two well-paired (same [transfer_id], mirrored accounts, matching [amount]) legs; it
     is {!Authorize.authorize}'s job, not this function's, to reject a malformed leg once proposed
     (see Decision 1). *)
+
+val decision_write :
+  actor:Riptide.Envelope.actor_id ->
+  accepted:bool ->
+  Schema.transfer_request ->
+  Riptide_batch_commit.Batch_commit.write
+(** [decision_write ~actor ~accepted r] is the ONE durable record that [r] has been decided, and how
+    (Task 7, the Layer 0/Layer 2 boundary revision): [payload = ]{!Wire.decision_to_value}
+    [~accepted r], [merge_key = None], and [causation = correlation = ]{!event_id_of_request}[ r],
+    the same identity its legs carry.
+
+    [merge_key = None] is deliberate and load-bearing in two directions. A decision is a log fact,
+    not materialized state: {!Accumulator.handle_guest_decision} reads it back with
+    {!Riptide_batch_commit.Batch_commit.committed_writes_for}, i.e. out of the committed log, never
+    out of a materializer -- so handing it a [merge_key] would opt it into a materialization no sink
+    in this module has any use for. It also keeps it invisible to {!Accumulator.materialize_sink},
+    which is what makes an accepted transfer's batch materialize to exactly its two balance updates
+    and nothing else.
+
+    {b The one consequence this carries, disclosed rather than hidden}: a write with no [merge_key]
+    is, by {!Riptide_batch_commit.Batch_commit.write}'s own doc comment, as vulnerable to
+    {!Riptide_storage.File_storage}'s bounded ring WAL evicting it as any other. For an ACCEPTED
+    transfer that costs nothing -- the decision shares its batch with two legs that DO carry
+    [merge_key]s, so {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key} reports
+    that entry as materialization-protected. A DECLINED transfer's batch carries this write alone, so
+    it is reported as freely evictable, and a deployment that evicts it loses the decline record and
+    becomes able to re-decide that request. That is strictly better than the in-memory table this
+    replaced (which lost EVERY decision, accepted and declined alike, on every restart), it is
+    governed by eviction-gating machinery that is a different task's own scope, and it is a bounded
+    ring's inherent trade rather than something this module can decide for its deployment. *)
+
+val batch_of_decision :
+  actor:Riptide.Envelope.actor_id ->
+  accepted:bool ->
+  Schema.transfer_request ->
+  Riptide_batch_commit.Batch_commit.write list
+(** [batch_of_decision ~actor ~accepted r] is the WHOLE batch a decision about [r] commits as one
+    atomic unit, under {!Schema.transfer_idempotency_key} of [r]'s own [request_id]:
+    - declined: exactly [[decision_write ~actor ~accepted:false r]] -- one write, no legs.
+    - accepted: [decision_write ~actor ~accepted:true r] followed by the two
+      {!legs_of_request} legs, in that order.
+
+    Atomicity is the point, not an incidental convenience: the record that a transfer was accepted
+    and the legs that move its money either both commit or neither does, so no log state exists in
+    which a transfer is on record as accepted while its legs are absent (or the reverse).
+    {!Authorize.authorize_batch} enforces exactly that correspondence at the commit checkpoint, for
+    every batch, including ones this function did not build. *)
 
 val decision_of_bytes :
   actor:Riptide.Envelope.actor_id ->

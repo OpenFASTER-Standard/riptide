@@ -62,6 +62,33 @@ val decode_decision : bytes -> (bool * Schema.transfer_request) option
     rejected rather than coerced}: "not zero, so accepted" would silently turn a corrupt or
     truncated-then-padded payload into an approval to move money. *)
 
+val decision_to_value : accepted:bool -> Schema.transfer_request -> Riptide.Value.value
+(** [decision_to_value ~accepted r] is exactly {!encode_decision}[ ~accepted r]'s own
+    {!decision_bytes} bytes, carried verbatim inside a [Value.Scalar (Value.Bytes _)] -- the payload
+    of the DURABLE DECISION WRITE {!Legs.decision_write} builds and
+    {!Accumulator.handle_guest_decision} commits (Task 7, the Layer 0/Layer 2 boundary revision).
+
+    {b Why a decision is committed to the replicated log at all}, since the two legs of an accepted
+    transfer already are: a DECLINE has no legs. Before this write shape existed, a declined request
+    left no durable trace anywhere -- only an in-memory table in {!Accumulator} -- so a restart
+    plus any catch-up materialization could re-dispatch the guest against a since-changed balance,
+    get an ACCEPT, and move money no client ever asked twice for (final whole-branch review, finding
+    C1, whose first fix was that volatile table). Committing the decision makes "has this request
+    already been decided, and how?" a question the replicated log answers, which is what let that
+    table be deleted outright rather than persisted in parallel.
+
+    {b Why it carries the guest's own bytes rather than a Record of the same four fields}: so this
+    module has exactly ONE decision wire format, with exactly one tag-byte validation
+    ({!decode_decision}, the function the authorize fuzz test hammers), and so a committed decision
+    is bit-identical to what the guest actually produced rather than a re-serialization of it. *)
+
+val decision_of_value : Riptide.Value.value -> (bool * Schema.transfer_request) option
+(** [decision_of_value v] is {!decode_decision} of the bytes [v] carries, or [None] -- never an
+    exception -- if [v] is not a [Value.Scalar (Value.Bytes _)] at all. Total, and deliberately
+    usable as a test for "is this write a decision record?": every OTHER payload this module ever
+    commits (a {!Schema.transfer_request}, a {!Schema.transfer_leg}) is a [Value.Record], so no
+    payload can be read as both. *)
+
 val encode_balance : int64 -> bytes
 (** [encode_balance bal] is exactly 8 bytes, [bal] as a little-endian signed [int64]. This is what
     the host's own [read_materialized] closure returns for an {!Schema.account_merge_key}. A

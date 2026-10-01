@@ -98,6 +98,18 @@ decide unilaterally.
   concrete boundary friction Task 6.4 exists to surface for Task 7** — record it there as a
   candidate for a future batch-aware `authorize` signature, not something to solve inside this task.
 
+  > **CLOSED by Task 7** (`2026-10-01-layer2-boundary-revision-design.md`, Decision 4, and that
+  > plan's Task 4). `Batch_commit.create` gained `?authorize_batch:(write list -> decision)`,
+  > evaluated once per batch under the same guard as the per-write hook, and `Authorize.authorize_batch`
+  > is this module's implementation of it: a batch carrying transfer legs must carry exactly two, same
+  > `transfer_id`, same actor, opposite roles, equal amounts, each naming the other's account — and,
+  > when the batch also carries this module's own committed decision record, legs that match exactly
+  > the request that decision authorises. The cross-write property is therefore now checkpoint-enforced
+  > rather than construction-guaranteed; construction in `Legs` still happens, so the module gets both.
+  > The two consequences this paragraph and the Error-handling section below draw from the gap are
+  > correspondingly obsolete: a well-formed single leg proposed directly is now DENIED, which is why
+  > both test harnesses' seeding conventions became balanced mint pairs.
+
 This split is still deliberate, not redundant: "does this request make business sense" (can
 evolve, can have bugs, lives in WASM) is a different concern from "is this one write, by itself,
 well-formed" (must never break, lives at the authorization checkpoint) is a different concern again
@@ -336,6 +348,17 @@ for the first time with a real domain and a real policy, instead of a toy counte
   applied" is answerable from the log rather than from memory. That second half is already
   recorded as boundary friction (3) in task-master subtask 7.1, and this restart consequence is
   recorded there too; both are Task 7's, not this module's.
+
+  > **CLOSED by Task 7** (the Layer 0/Layer 2 boundary revision — see
+  > `2026-10-01-layer2-boundary-revision-design.md`, Decisions 1-3, and that plan's Task 4). Both
+  > halves were made durable, exactly as sketched above and in that order: a decision is now
+  > committed to the log as its own write shape (`Legs.decision_write`), and
+  > `materialize_sink.write` now receives its write's own `(idempotency_key, position)` identity,
+  > which `Batch_commit` itself uses to keep a durable per-write materialization watermark. Both
+  > in-memory tables were deleted outright rather than persisted in parallel. The pin test named in
+  > this paragraph no longer exists: the same slot in `test/test_ledger_end_to_end.ml` is now
+  > `test_restart_with_durable_watermark_leaves_balances_correct`, which runs the identical
+  > restart-plus-catch-up scenario and asserts the balances come out right.
 - **A single malformed or adversarial transfer leg** (non-positive amount, same account on both
   sides, a negative account id, a merge_key naming a different account than the leg claims, a
   payload `actor` disagreeing with its write's): caught by the self-certifying `authorize` check
@@ -358,6 +381,12 @@ for the first time with a real domain and a real policy, instead of a toy counte
   committed leg, on every axis listed above — not the provenance of one. Provenance would need a
   batch-aware `authorize` signature, which Decision 1 already records as boundary friction for
   task-master Task 7.
+
+  > **CLOSED by Task 7** — see Decision 1's own closure note above. `Authorize.authorize_batch`,
+  > wired as `Batch_commit.create`'s `?authorize_batch`, now refuses any batch carrying other than
+  > exactly two matched, balancing legs, so a lone well-formed leg proposed directly is DENIED. Both
+  > of this module's test harnesses consequently seed an opening balance as a BALANCED pair against a
+  > mint account rather than as a single unpaired credit.
 - **WASM trap or session-type violation** in the module: `Loader.invoke` returns `Error`, the
   reactor logs it (with merge_key/module-identity context) and continues — a trap on one request
   never blocks processing of the next, per the sibling-independence guarantee already proven.

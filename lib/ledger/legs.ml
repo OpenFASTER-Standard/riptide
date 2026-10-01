@@ -42,6 +42,28 @@ let legs_of_request ~actor ~causation ~correlation (r : Schema.transfer_request)
   in
   [ write_of_leg debit_leg; write_of_leg credit_leg ]
 
+(* The durable decision record (Task 7, the Layer 0/Layer 2 boundary revision). [merge_key = None]:
+   a decision is not materialized state, it is a log fact -- the host reads it back with
+   Batch_commit.committed_writes_for, never out of a materializer. Same actor and the same
+   deterministic causation/correlation as the legs it travels with, so an accepted transfer's whole
+   batch is one causally-linked unit and a re-proposal of it is byte-identical to the original. *)
+let decision_write ~actor ~(accepted : bool) (r : Schema.transfer_request) :
+    Riptide_batch_commit.Batch_commit.write =
+  let eid = event_id_of_request r in
+  {
+    actor;
+    causation = eid;
+    correlation = eid;
+    payload = Wire.decision_to_value ~accepted r;
+    merge_key = None;
+  }
+
+let batch_of_decision ~actor ~(accepted : bool) (r : Schema.transfer_request) :
+    Riptide_batch_commit.Batch_commit.write list =
+  let eid = event_id_of_request r in
+  decision_write ~actor ~accepted r
+  :: (if accepted then legs_of_request ~actor ~causation:eid ~correlation:eid r else [])
+
 let decision_of_bytes ~actor (b : bytes) :
     (bool * Schema.transfer_request * Riptide_batch_commit.Batch_commit.write list, string) result
     =

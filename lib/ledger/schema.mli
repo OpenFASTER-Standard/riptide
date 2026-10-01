@@ -60,15 +60,21 @@ type transfer_leg = {
     [actor] is {b the same actor as the {!Riptide_batch_commit.Batch_commit.write} carrying this
     payload}, and {!Authorize.authorize} DENIES any leg whose payload disagrees with its own
     write's [actor] -- so for any leg that ever reaches the committed log, this field is a
-    structurally-guaranteed record of who authored it. It is duplicated into the payload
-    deliberately, not redundantly (final whole-branch review, finding I4): a
-    {!Riptide_batch_commit.Batch_commit.materialize_sink}'s own [write] callback receives only
-    [~merge_key] and the payload -- never the committing write's [actor] -- so without this field
-    the accumulator downstream of it has no way to tell a module-authored leg apart from a leg
-    authored by any other path (e.g. a test harness's own account-seeding convention), and legs
-    from the two can collide in its dedup table. Putting the actor inside the self-certifying
-    payload, where the authorization checkpoint can pin it to the real one, is how that
-    information reaches the sink without changing the Layer 0 sink signature. *)
+    structurally-guaranteed record of who authored it.
+
+    {b Why it is here, stated accurately rather than as it was originally justified} (Task 7, the
+    Layer 0/Layer 2 boundary revision). The original reason (final whole-branch review, finding I4)
+    was that a {!Riptide_batch_commit.Batch_commit.materialize_sink}'s [write] callback received only
+    [~merge_key] and the payload -- never the committing write's [actor] -- so the accumulator
+    downstream of it could not tell a module-authored leg apart from one authored by any other path
+    (a test harness's own seeding convention, say), and legs from the two could collide in its dedup
+    table. {b Both halves of that reason are now gone}: [write] receives the committing write's real
+    [actor] (spec Decision 2), and the accumulator has no dedup table at all any more (spec Decision
+    1 -- a durable watermark replaced it). The field is kept anyway, and this is a deliberate choice
+    rather than inertia: a MATERIALIZED balance is derived from these payloads and has no envelope,
+    so a leg's own payload is the only place a committed leg's provenance survives at rest, and
+    {!Authorize.authorize}'s agreement check is what makes that record trustworthy. What it is NOT
+    any more is load-bearing for deduplication -- nothing in this module keys anything on it. *)
 
 val requests_merge_key : string
 (** ["ledger.requests"] -- the one key clients propose {!transfer_request}s at, and the one key
