@@ -84,6 +84,15 @@ With this in place, `materialize_up_to` and `propose`'s own materialize step bec
 exactly-once per `(idempotency_key, position)` for any sink, not only lattice joins — the "safe to
 call repeatedly" doc claim becomes unconditionally true rather than conditioned on sink idempotency.
 
+**`materialize_up_to` needs its own `?watermark_store` parameter, not just `create`'s** — caught
+during plan-writing: `materialize_up_to` takes a bare `Riptide_vsr.Replica.t`, never a `Batch_commit.t`
+(deliberately — see that function's own doc comment on why `materialize_write_failures` lives where it
+does), so it has no access to a `t`'s stored watermark store at all. It gains the identical optional
+parameter directly: `?watermark_store:Riptide_storage.File_kv_store.t`. The shared
+`materialize_write_catching` helper both `propose` and `materialize_up_to` already call takes it too,
+so the two loops cannot drift into different watermark behavior — the same reasoning that already
+governs why that helper is shared for `materialize_write_failures` counting.
+
 ## Decision 2: write identity on the sink (closes item 3)
 
 `materialize_sink.write` changes shape:
@@ -109,18 +118,26 @@ the plan should size it as its own task rather than an afterthought bundled into
 
 ## Decision 3: committed-log query replaces in-memory decision mirrors (closes the other half of item 6)
 
+**Revised during plan-writing**: reading `batch_commit.ml` directly (not just its `.mli`) found this
+function already exists, privately, at `lib/batch_commit/batch_commit.ml:115-123` — it's what
+`propose`'s own materialize step already calls internally (line 550), and `batch_commit.mli` itself
+already references it by name in a doc comment (line 312) without ever exporting it. This decision is
+therefore not "implement a new function," it's "expose an existing, already-exercised one":
+
 ```ocaml
 val committed_writes_for : Riptide_vsr.Replica.t -> idempotency_key:string -> write list option
 ```
 
 Same first-wins-per-key rule `committed_envelopes_keyed` already uses: `Some writes` for the first
-well-formed committed batch under that key, `None` if not yet committed. The ledger's own
-`decided_requests` table — an in-memory mirror of something the replicated log already durably knows
-— is deleted outright, not persisted in parallel. "Has request 50 already been decided, and what was
-the decision?" becomes a direct query against already-durable, already-replicated data (the ledger
-decodes the decision tag itself from the returned write's payload), not a second, volatile source of
-truth that can diverge from the log on restart. `Batch_commit` stays ledger-agnostic — it exposes a
-read path, not a ledger-specific concept.
+well-formed committed batch under that key, `None` if not yet committed. Add the `val` and a doc
+comment to `batch_commit.mli`; no change to the existing `.ml` implementation.
+
+The ledger's own `decided_requests` table — an in-memory mirror of something the replicated log
+already durably knows — is deleted outright, not persisted in parallel. "Has request 50 already been
+decided, and what was the decision?" becomes a direct query against already-durable, already-replicated
+data (the ledger decodes the decision tag itself from the returned write's payload), not a second,
+volatile source of truth that can diverge from the log on restart. `Batch_commit` stays
+ledger-agnostic — it exposes a read path, not a ledger-specific concept.
 
 ## Decision 4: optional batch-level authorize hook (closes item 2)
 
