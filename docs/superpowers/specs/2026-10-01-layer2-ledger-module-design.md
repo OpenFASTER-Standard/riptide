@@ -108,16 +108,22 @@ by fuzzing the construction code directly).
 
 Hand-written `to_value`/`of_value` over `Riptide.Value.value`, per the resolved gap above:
 
-- `transfer_request : { request_id : string; from_account : string; to_account : string; amount : int64 }`
+- `transfer_request : { request_id : int64; from_account : int64; to_account : int64; amount : int64 }`
   — proposed directly by a client (or this task's own test driver) at merge_key `"ledger.requests"`.
   `amount` is always a positive magnitude. Not itself balance-affecting; `authorize` allows it
-  unconditionally.
-- `transfer_leg : { transfer_id : string; role : [ `Debit | `Credit ]; this_account : string;
-  other_account : string; amount : int64 }` — **self-certifying**: every field `authorize` needs to
+  unconditionally. **Account identifiers are fixed-width `int64`, not free-form strings** — this
+  is a deliberate schema choice, not an incidental one: it matches TigerBeetle's own real
+  convention (128-bit integer account/transfer IDs, simplified here to OCaml's native `int64` for
+  the focused-core scope), and it is what makes the wire encoding between host and guest tractable
+  for a hand-written `.wat` fixture to parse (see Decision 3 below) — variable-length string
+  parsing inside hand-written WebAssembly text is a real, separate complexity this task has no
+  need to take on.
+- `transfer_leg : { transfer_id : int64; role : [ `Debit | `Credit ]; this_account : int64;
+  other_account : int64; amount : int64 }` — **self-certifying**: every field `authorize` needs to
   validate THIS leg alone is present in THIS leg's own payload (no need to see its sibling).
   `amount` is always positive; this leg's own signed balance delta is derived, not stored —
   `-amount` if `role = Debit`, `+amount` if `role = Credit`. `merge_key = "ledger.account." ^
-  this_account`.
+  Int64.to_string this_account`.
 
 **Both legs of a transfer are always constructed together, from one request, by the same trusted
 closure**: given an approved `transfer_request {transfer_id = request_id; from_account; to_account;
@@ -150,6 +156,42 @@ check's job to reject it.
 **The ledger WASM module**: admission-verified (real `cosign`-signed artifact), declares a
 `Protocol` permitting `handle` from `init` (same shape every existing module uses), subscribed via
 `Reactor.subscribe` to `"ledger.requests"`.
+
+## Decision 3: the guest reads its trigger via `read_materialized`, not `arg` — and why
+
+`Reactor.wrap_materialize_sink` hard-wires `arg` to `Riptide.Value.canonical_encode` of the
+triggering write's own payload — not something a subscribing module can override. Parsing that
+real canonical encoding (sorted-key records, tagged sums, length-prefixed sequences) by hand inside
+a `.wat` guest is real, separate complexity this task has no need to take on, and the established,
+already-proven precedent in this codebase (`counter.wat`) avoids it entirely: it ignores `arg` and
+instead calls `host.read_materialized` on its own subscribed key, using a **host-chosen, simple,
+fixed-width byte convention** the host-side `~read` closure controls completely.
+
+This module follows the same precedent: `handle` ignores `arg` and calls
+`read_materialized("ledger.requests")` to learn the triggering request's own fields. This is sound
+specifically because `wrap_materialize_sink` materializes a write BEFORE dispatching it (never
+after, never batched with others) and dispatch is sequential, never concurrent (Decision 1's own
+cited contract) — so during THIS dispatch, "the current materialized value of `ledger.requests`"
+and "the request that triggered this dispatch" are always the same thing, even though
+`"ledger.requests"` itself is an ordinary Last-Write-Wins key with no queue semantics of its own.
+
+**Wire convention between host and guest** (this module's own private agreement between its
+`~read`/`~propose` closures and `ledger.wat`, exactly as `counter.wat` and its own test already
+established a private raw-little-endian-i32 convention for `"count"` — not part of the general
+loader ABI): every `int64` field is 8 bytes, little-endian, fields in struct order, no
+length-prefixing needed anywhere since every field is fixed-width.
+- `read_materialized("ledger.requests")` returns exactly 32 bytes: `request_id ++ from_account ++
+  to_account ++ amount` (4 × 8-byte LE `int64`).
+- `read_materialized("ledger.account." ^ Int64.to_string account)` returns exactly 8 bytes: the
+  account's current balance as one LE `int64` (absent/`None` from the host closure means balance
+  0, matching `counter.wat`'s own "no value yet" convention). A separate call from the request
+  read above, matching the two genuinely different concerns involved — "what was requested" versus
+  "what is the current state of a different key."
+- `propose_write` takes the same 32 bytes as the `"ledger.requests"` read above (`request_id ++
+  from_account ++ to_account ++ amount`) — the guest simply forwards what it already decoded,
+  self-contained and independent of any cross-call state-sharing argument between the `~read` and
+  `~propose` closures. The `~propose` closure decodes these 32 bytes directly into the one
+  `transfer_request` it needs to construct both legs from (Decision 2).
 
 ## Data flow (end to end)
 
