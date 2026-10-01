@@ -94,7 +94,26 @@ val create :
     [authorize] has NO default -- unlike [require_encryption], which has always defaulted to
     [false], this parameter is REQUIRED so that "no real policy yet" is something every call site
     states out loud, via {!allow_all}, rather than something the type signature quietly assumes
-    for it. A deployment that wants "every write through this path is encrypted, no exceptions" as
+    for it.
+
+    {b Known, disclosed residual gap: [authorize] sees ONE write at a time, with no visibility into
+    any sibling write in the same batch, so no cross-write invariant can be enforced here at all}
+    (Task 6's own boundary friction, item 2; final whole-branch review finding I9). The type says
+    [write -> decision], and {!propose} evaluates it per write -- which is enough for any property a
+    single write can self-certify, and structurally unable to express any property relating two of
+    them. That is a real limit on what this checkpoint can be trusted for, and the first real policy
+    it ever carried ran straight into it: a double-entry ledger ([lib/ledger/]) needs "these two
+    legs are a matched, balancing pair, both present in this batch", which is precisely a
+    cross-write property, so it cannot live here. That module's resolution -- guarantee the pairing
+    BY CONSTRUCTION, in the single piece of trusted code that builds both legs together from one
+    request, and let this checkpoint enforce only each leg's own well-formedness -- works, but it is
+    a genuinely weaker kind of guarantee: construction-correctness verified by fuzzing the
+    constructor, rather than a checkpoint no write can bypass. A consequence worth stating because
+    it surprises readers of this interface: a WELL-FORMED single leg proposed directly, by a client
+    that never went through that module, is necessarily ALLOWED here, since nothing in one write
+    reveals its provenance. A batch-aware form (e.g. [write list -> decision], or an additional
+    whole-batch hook) is the obvious extension and has a real consumer asking for it; it is a Layer
+    0 signature change and so belongs to the boundary revision (task-master Task 7). A deployment that wants "every write through this path is encrypted, no exceptions" as
     an enforced invariant sets [~require_encryption:true] ONCE here, at the one place that builds
     the handle, rather than trusting every {!propose} call site scattered through its own code to
     remember [~require_encryption:true] unaided -- the same reasoning now applies to [~authorize]
@@ -184,7 +203,26 @@ type materialize_sink = {
     lattice value being written -- [decode] is a pure [Value.value -> L.t] projection of it, not a
     separate wire format; {!Riptide_materialize.Materializer.create}'s own [decode]/[encode] (a
     DIFFERENT pair, [string -> L.t]/[L.t -> string], for the materializer's own KV codec) are
-    orthogonal to this one and not reused by it. *)
+    orthogonal to this one and not reused by it.
+
+    {b Known, disclosed residual gap: [write] is told the merge_key and the payload, and NOTHING
+    about the write or batch it came from} (Task 6's own boundary friction, item 3; final
+    whole-branch review finding I9). It does not receive the committing {!write}'s own [actor], its
+    [causation]/[correlation], its [idempotency_key], or its position within its batch. For a pure
+    lattice-join sink none of that matters. For an ACCUMULATING sink it matters a great deal,
+    because such a sink must dedup replays itself (see {!materialize_up_to} and {!propose} for why
+    replays happen and are not a caller error), and the only honest identity for "this committed
+    write has already been applied" is the [(idempotency_key, position)] pair this callback is not
+    given. The first real Layer 2 module built against this interface (a double-entry ledger,
+    [lib/ledger/]) is therefore forced to dedup on payload CONTENT instead, which is exact for
+    content that happens to be unique per write and silently wrong for content that is not -- it hit
+    the wrong case for real, collapsing two genuinely different account-credit legs into one and
+    destroying money while the committed log stayed perfectly correct. It also had to push an
+    [actor] field into its own payload schema, and enforce agreement with the real [actor] at the
+    authorization checkpoint, purely to recover information this callback already had and dropped.
+    Passing the write's own identity through to [write] is a small signature change with a real
+    consumer waiting for it, and belongs to the Layer 0/Layer 2 boundary revision (task-master
+    Task 7). *)
 
 type encryption_sink = {
   encrypt : event_id:string -> Riptide.Value.value -> Riptide.Value.value;
@@ -295,11 +333,36 @@ val materialize_up_to :
     for the mechanism and for the honest [min (commit_number) (List.length entries)] bound a
     restart-capable caller must use instead.
 
-    {b Safe to call repeatedly over an overlapping or fully-covered range}: re-materializing a
-    write already folded into the accumulator is a no-op, because {!materialize_sink}'s
-    underlying join is idempotent (joining the same value into an already-converged accumulator
-    changes nothing) -- so calling this function twice with the same (or a smaller)
-    [through_commit_number] is always safe, including immediately after a crash and restart.
+    {b Safe to call repeatedly over an overlapping or fully-covered range, FOR A SINK WHOSE WRITE
+    IS ITSELF IDEMPOTENT -- which is a real condition on the caller, not a property of this
+    function.} Calling this twice with the same (or a smaller) [through_commit_number] re-hands
+    every write in that range to [materialize.write] again, including writes already folded in.
+    For a sink that is a plain {!Riptide_materialize.Materializer.write} -- a read-join-put over a
+    {!Riptide_lattice.Lattice_intf.S} -- that is harmless, because joining the same value into an
+    already-converged accumulator changes nothing by the lattice laws.
+
+    {b Known, disclosed residual gap: this doc used to state that as an unconditional guarantee,
+    and for a non-idempotent sink it is affirmatively FALSE} (Task 6's own boundary friction, item
+    1; final whole-branch review finding I9). The previous wording read "re-materializing a write
+    already folded into the accumulator is a no-op, because {!materialize_sink}'s underlying join
+    is idempotent" -- but a {!materialize_sink} is an arbitrary caller-supplied closure, and
+    nothing here constrains it to be a lattice join. The first real Layer 2 module built against
+    this interface needs exactly such a sink: a double-entry ledger ([lib/ledger/]) maintains
+    account balances by read-current-add-delta-write-new-total, which is NOT idempotent -- replaying
+    one committed transfer leg applies its delta twice, moving money that no client asked to move.
+    This sentence cost that module two real bugs before it was corrected: an initial
+    double-application found while building it, and a Critical finding in its own final review
+    where a re-dispatch triggered by exactly this re-materialization re-decided an
+    already-declined transfer as accepted.
+
+    {b What a caller with an accumulating sink must therefore do}: give the sink its own
+    already-applied guard, keyed on something stable across replays of the same committed write.
+    Note that this interface makes that harder than it needs to be -- see {!materialize_sink}'s own
+    disclosure of what its [write] callback is and is not told about the write it is handed.
+    Narrowing [materialize_sink] to lattice-join sinks only (so the original claim would be true by
+    construction), or passing enough identity for a caller to dedup reliably, are both real options
+    and both belong to the Layer 0/Layer 2 boundary revision (task-master Task 7), not to a
+    unilateral change here.
 
     {b Does NOT track its own "last materialized" position} -- every call walks from the very
     start of the log, unconditionally. The caller (task-master Task 6) owns any watermark it
@@ -593,10 +656,21 @@ val propose :
     happened during the first call. This is what makes materialization robust to a crash between
     {!Riptide_vsr.Replica.propose}'s durable commit and the materialize step: the next retried
     call for the same key reaches the materialize step again and it fires, strictly before any
-    LATER call on this replica could ever evict the WAL slot(s) this batch occupies. Re-running
-    [materialize.write] for an already-materialized write is always safe: it is a read-join-put
-    over a lattice, and joining the same value into an already-converged accumulator is a no-op
-    by the lattice laws.
+    LATER call on this replica could ever evict the WAL slot(s) this batch occupies.
+
+    {b This re-running is safe only for a sink whose own [write] is idempotent, and this doc
+    previously claimed it unconditionally} (Task 6's own boundary friction, item 1; final
+    whole-branch review finding I9 -- the identical correction as at {!materialize_up_to}, repeated
+    here because this is the call site that actually performs the re-materialization and so is
+    where a caller reads about it). The old wording -- "re-running [materialize.write] for an
+    already-materialized write is always safe: it is a read-join-put over a lattice" -- describes
+    what a {!Riptide_materialize.Materializer.write} sink does, not what a {!materialize_sink} IS:
+    the latter is an arbitrary caller-supplied closure. An ACCUMULATING sink (the first real Layer 2
+    module, a double-entry ledger in [lib/ledger/], maintains balances by
+    read-current-add-delta-write-new-total) applies its delta a second time on every such replay.
+    A caller whose sink is not a pure lattice join must carry its own already-applied guard; see
+    {!materialize_sink} and {!materialize_up_to} for the full account and for what this interface
+    does not currently give such a caller to key that guard on.
 
     {b Scope, stated precisely because it does not cover every commit path}: this hook only fires
     synchronously inside SOME [propose] call that supplies [?materialize] and observes the batch

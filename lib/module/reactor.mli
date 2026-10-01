@@ -167,6 +167,46 @@ val subscribe :
     module-failure signals today has to read this process's stderr; a future task owns deciding
     whether such events belong on Layer 0's replica-event channel or on a reactor-owned one.
 
+    {b Known, disclosed residual gap: a [~propose] closure wired to a FIXED
+    {!Riptide_batch_commit.Batch_commit.t} silently stops working when the primary moves, and
+    nothing here warns you.} (Task 6's own boundary friction, item 4; final whole-branch review
+    finding I9.) A {!Riptide_batch_commit.Batch_commit.t} is built over one
+    {!Riptide_vsr.Replica.t}, and {!Riptide_batch_commit.Batch_commit.propose} through a replica
+    that is not currently the primary in [Normal] status is a documented SILENT NO-OP -- not an
+    error, not a [Deny], no counter, nothing. So the natural way to wire this parameter (build one
+    handle at subscribe time, close over it) is correct exactly until the first view change, after
+    which every write the guest proposes vanishes without trace. Confirmed live while building the
+    first real module against this boundary: a ledger's legs batch, proposed correctly by a guest
+    that ran correctly, never converged because a storm-driven view change had moved the primary and
+    the closure was still holding a handle on the old one. A caller must re-derive the current
+    primary on every single proposal, as a real client would, rather than caching one -- and because
+    [propose]'s own result type here is [(unit, string) result], a closure that finds no live primary
+    has to decide between reporting [Error] (which the guest will see as a failure it cannot
+    distinguish from a real rejection) and [Ok] (which claims something happened). Neither is right.
+    This reactor cannot fix it: it deliberately holds no {!Riptide_vsr.Replica.t} at all. Giving
+    this interface a way to express "not now, retry" distinctly from "refused" belongs to the
+    boundary revision (task-master Task 7).
+
+    {b Known, disclosed residual gap: a write a guest proposes can be silently DISCARDED after
+    [~propose] returned [Ok], and the only recovery is to re-trigger the dispatch that produced
+    it.} (Task 6's own boundary friction, item 5; final whole-branch review finding I9.) A batch
+    that has been appended but not yet committed is exactly what a VSR view change is entitled to
+    throw away -- correctly, since nobody could yet have assumed it durable -- and nothing in this
+    reactor, in {!Riptide_batch_commit.Batch_commit}, or anywhere else re-proposes it. Observed for
+    real while building the first module against this boundary (a legs batch dropped across all
+    three replicas, entries 9 -> 8, after a view change landed in that window). What makes recovery
+    possible at all is an accident of the gap documented above: because dispatch fires on every
+    materialize of a subscribed key rather than on a merged-value change, re-materializing the
+    already-committed write that triggered the guest the first time dispatches it again, and the
+    guest proposes again. That means correctness here depends on a guest being safely
+    re-dispatchable, which is a real and non-obvious obligation this interface places on module
+    authors and currently states nowhere else: the ledger module had to add a host-side
+    first-decision-wins table to be safe under it, because re-running its guest against a
+    since-changed balance could otherwise reach a DIFFERENT decision and move money no client
+    asked to move (that module's own Critical finding). A durable, acknowledged propose path -- or
+    at minimum a documented contract that a dispatched guest must be idempotent under re-dispatch
+    -- belongs to the boundary revision (task-master Task 7).
+
     {b Known, disclosed residual gap: [~propose] is fire-and-forget from this reactor's own
     perspective.} {!wrap_materialize_sink} calls [propose] and relays only the [Ok]/[Error] shape
     it returns back to the guest as a status byte -- it does not await, retry, or otherwise confirm
