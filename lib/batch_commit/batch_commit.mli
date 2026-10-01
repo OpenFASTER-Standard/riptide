@@ -164,20 +164,21 @@ val replica : t -> Riptide_vsr.Replica.t
     {!Riptide_vsr.Replica.entries}) against the same underlying replica a [t] wraps. *)
 
 val is_primary : t -> bool
-(** [is_primary t] is [true] iff [t] can currently cause a NEW {!propose} call through it to have any
-    effect at all -- exactly [Riptide_vsr.Replica.is_primary (replica t) && Riptide_vsr.Replica.status
-    (replica t) = Riptide_vsr.Replica.Normal], the same compound condition {!propose}'s own existing
-    silent-no-op guard already checks internally (see {!Riptide_vsr.Replica.propose}'s own doc
-    comment), surfaced here as the one predicate a Layer 2 caller needs rather than something it has
-    to independently discover and reproduce (Task 7, the Layer 0/Layer 2 boundary revision, closing
-    Task 6's own boundary friction items 4/5; design spec Decision 5). A caller whose own
-    [~propose:(bytes -> (unit, string) result)]-shaped closure (e.g. {!Riptide_module.Reactor
-    .subscribe}'s own) wants to report failure rather than silently swallow a proposal should check
-    this IMMEDIATELY BEFORE every {!propose} call, not once, not cached -- primary/view status can
-    change between any two calls -- and return an error without calling {!propose} at all when it is
-    [false], instead of calling {!propose} and having it do nothing with no trace.
+(** [is_primary t] is [true] iff [Riptide_vsr.Replica.is_primary (replica t) &&
+    Riptide_vsr.Replica.status (replica t) = Riptide_vsr.Replica.Normal] -- two of
+    {!Riptide_vsr.Replica.propose}'s three silent-no-op guard conditions (see that function's own
+    doc comment), surfaced here as the predicate a Layer 2 caller would otherwise have to
+    independently discover and reproduce (Task 7, the Layer 0/Layer 2 boundary revision, closing
+    Task 6's own boundary friction items 4/5; design spec Decision 5). [true] is NECESSARY but NOT
+    ALONE SUFFICIENT for a new {!propose} call to have any effect -- see the third, undisclosed-here
+    guard below. A caller whose own [~propose:(bytes -> (unit, string) result)]-shaped closure (e.g.
+    {!Riptide_module.Reactor.subscribe}'s own) wants to report failure rather than silently swallow
+    a proposal should still check this IMMEDIATELY BEFORE every {!propose} call, not once, not
+    cached -- primary/view status can change between any two calls -- and return an error without
+    calling {!propose} at all when it is [false]; a [true] result narrows, but does not eliminate,
+    the chance of a silent no-op.
 
-    {b Residual gap, disclosed rather than hidden: checking [is_primary t] and then calling
+    {b Residual gap 1, disclosed rather than hidden: checking [is_primary t] and then calling
     {!propose} is NOT atomic.} [t] can stop being primary (a view change can start and complete)
     in the gap between the two calls, in which case {!propose}'s own silent-no-op guard is what
     actually protects correctness -- the proposal is simply dropped, exactly as it always was before
@@ -186,7 +187,19 @@ val is_primary : t -> bool
     itself gives no acknowledgment either way (this layer's fire-and-forget contract, unchanged by
     this function). This function narrows the window in which a caller proposes blind -- it does not
     close it, and does not add any retry/acknowledgment machinery of its own (durable acknowledgment
-    remains a separate, later task's job). *)
+    remains a separate, later task's job).
+
+    {b Residual gap 2, disclosed rather than hidden: [is_primary t] does not check for a durable/
+    in-memory log gap.} {!Riptide_vsr.Replica.propose} has a THIRD silent-no-op guard beyond the two
+    this function surfaces: it also declines when [Replica_log.length (log of (replica t)) <>
+    Riptide_vsr.Replica.op_number (replica t)], i.e. this replica's in-memory log is a strict prefix
+    of what it durably owes (only reachable via {!Riptide_vsr.Replica.restart}; see that module's own
+    restart guidance). Being primary, [Normal], AND in this log-gap state simultaneously is possible
+    -- the three conditions are orthogonal -- so [is_primary t = true] does not guarantee a NEW
+    {!propose} call will have any effect; it only guarantees the first two of {!propose}'s three
+    guards are clear. A caller that needs a true predictor of "will this specific {!propose} call do
+    something" has no function to call for that today; closing that gap, if ever needed, is a
+    separate, later task's job, the same way durable acknowledgment is. *)
 
 val committed_envelopes : Riptide_vsr.Replica.t -> Riptide.Envelope.envelope list
 (** [committed_envelopes t] is the real, hash-chained Envelope view of everything durably
