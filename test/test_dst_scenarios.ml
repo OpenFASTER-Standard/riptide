@@ -1513,7 +1513,7 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
          [?on_commit_advanced] is involved -- this test is about the construction-time re-prime
          Decision 2 specifies, which is what a restart actually depends on. *)
       Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replicas.(0)) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number replicas.(0));
       watermark := Replica.commit_number replicas.(0);
       let before_restart = Lww_materializer.read materializer ~merge_key in
       (* NON-VACUITY, first direction: there is a real, non-bottom materialized value to compare. *)
@@ -1534,7 +1534,7 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
          store of the consumer's own, because there is none to read. *)
       let fresh_watermark = ref 0 in
       Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replicas.(0)) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number replicas.(0));
       fresh_watermark := Replica.commit_number replicas.(0);
       let after_restart = Lww_materializer.read materializer ~merge_key in
       Alcotest.(check bool)
@@ -1581,7 +1581,7 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
          precisely because it is derived from the replica rather than from consumer-side state. *)
       let recovered_watermark = ref 0 in
       Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replicas.(0)) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number replicas.(0));
       recovered_watermark := Replica.commit_number replicas.(0);
       Alcotest.(check bool)
         "the construction-time re-prime alone recovered the committed-but-unmaterialized write"
@@ -1599,7 +1599,7 @@ let test_restart_recovery_needs_no_new_durable_watermark_state () =
          genuinely a no-op, which is the only place the claim is falsifiable. *)
       let snapshot_caught_up = durable_snapshot mat_dir in
       Riptide_batch_commit.Batch_commit.materialize_up_to replicas.(0) ~materialize:sink
-        ~through_commit_number:(Replica.commit_number replicas.(0)) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number replicas.(0));
       Alcotest.(check (list string))
         "a second, redundant re-prime writes no new durable state at all"
         (fingerprint snapshot_caught_up)
@@ -1695,7 +1695,7 @@ let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry (
       settle ();
       Alcotest.(check int) "precondition: op 1 committed" 1 (Replica.commit_number r);
       Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
-        ~through_commit_number:1 ?watermark_store:None;
+        ~through_commit_number:1;
       let watermark = ref 1 in
       Alcotest.(check bool) "precondition: op 1 really was materialized before the crash" true
         (read () = lww 1);
@@ -1747,7 +1747,7 @@ let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry (
         (List.length (Replica.entries r));
       (* THE WHOLE OF RESTART RECOVERY, byte-for-byte the same two lines test 12's part 2 runs. *)
       Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
-        ~through_commit_number:(Replica.commit_number r) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number r);
       (* FINDING (2), stated honestly: it recovered NOTHING. Ops 2, 3 and 4 each carry a strictly
          higher LWW timestamp than op 1, so folding any single one of them in would have moved this
          value -- this assertion cannot pass by accident. *)
@@ -1759,7 +1759,7 @@ let test_restart_after_the_ring_wrapped_cannot_recover_an_unmaterialized_entry (
       (* Not a one-shot timing artefact: re-running the re-prime does not help, and never will,
          because the bytes it would need are gone. *)
       Riptide_batch_commit.Batch_commit.materialize_up_to r ~materialize:sink
-        ~through_commit_number:(Replica.commit_number r) ?watermark_store:None;
+        ~through_commit_number:(Replica.commit_number r);
       Alcotest.(check bool) "...and a second re-prime recovers nothing either" true
         (read () = lww 1);
       (* THE HONEST WATERMARK, and the reason the naive one is wrong. *)

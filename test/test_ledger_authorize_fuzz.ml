@@ -16,12 +16,32 @@
       other's. Fuzzing the construction code directly (not just inspecting it) is what Decision 1's
       own Testing strategy section calls out as the way to verify this empirically.
 
+   > {b CLOSED by Task 7} (the Layer 0/Layer 2 boundary revision; annotation added by Task 4's own
+   > review, Minor -- every other interface file in this plan got such a note and this one was
+   > missed, leaving the framing above reading as current when it describes the pre-Task-7 world).
+   > Point 2's premise -- that the pairing invariant is something "the checkpoint alone CANNOT
+   > enforce" and so must rest on construction-correctness -- is no longer true.
+   > [Batch_commit.create]'s [?authorize_batch] (Task 7, closing Task 6's boundary friction item 2)
+   > evaluates a whole-batch policy against the full write list under the same guard [~authorize]
+   > runs under, and [Authorize.authorize_batch] uses it to enforce exactly the pairing property:
+   > a batch carrying transfer legs must carry exactly two, equal and opposite, same transfer_id,
+   > mirrored accounts -- plus decision/leg correspondence. So the pairing is now ALSO a checkpoint
+   > no write can bypass, not only a construction-time convention. The property-2 fuzzing below is
+   > kept, and is still worth keeping: it covers [Legs.decision_of_bytes]'s own behaviour on
+   > adversarial bytes (the guest-facing trust boundary), which is a genuinely different question
+   > from whether a malformed batch would be refused at commit time. Task 5 of this plan owns the
+   > [authorize_batch] fuzz property itself.
+
    Three further named tests (not fuzzed) pin the exact Review Focus items this task owns: a
    self-transfer request's legs get denied, a non-positive-amount leg gets denied, and a
    DIRECTLY-constructed (not Legs-originated) but individually well-formed-looking leg write is
-   still correctly denied when it's missing its sibling in the same batch -- i.e. "looks fine in
-   isolation" is not the same as "actually a well-formed, self-certifying single write", and
-   authorize's own checks (not just whole-pair balancing) still gate it. *)
+   still correctly denied -- and {b the reason it is denied is a merge_key that does not name its own
+   this_account}, not the absence of a sibling leg (Task 4's own review, Minor: this summary used to
+   say "missing its sibling in the same batch", which the test's own inline comment already
+   contradicted -- it is proposed alone, but what actually denies it is a per-write check, which is
+   the whole point, since a lone leg is precisely what [Authorize.authorize] by itself cannot judge).
+   I.e. "looks fine in isolation" is not the same as "actually a well-formed, self-certifying single
+   write", and authorize's own per-write checks (not just whole-pair balancing) still gate it. *)
 open Riptide_ledger
 
 let () = Mirage_crypto_rng_unix.use_default ()

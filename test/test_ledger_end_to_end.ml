@@ -237,7 +237,7 @@ let with_ledger_env (f : env_handles -> unit) =
          be a construction-time convention in Legs; it is now a checkpoint no write can bypass. *)
       let handle =
         Batch_commit.create ~replica ~authorize:Authorize.authorize
-          ~authorize_batch:Authorize.authorize_batch ~materialize_watermark_store:watermark_store ()
+          ~authorize_batch:Authorize.authorize_batch ()
       in
       let kv = File_kv_store.create ~sw ~fs:(Eio.Stdenv.fs env) ~owner:"materializer" kv_dir in
       let materializer =
@@ -282,11 +282,32 @@ let with_ledger_env (f : env_handles -> unit) =
       let reactor = Reactor.create () in
       (* ONE sink, for the whole env's lifetime, restart included. Accumulator.materialize_sink no
          longer takes an Accumulator.t at all: with the applied-legs table deleted it holds no state
-         whatsoever, which is exactly the property that lets the durable watermark above be the
-         single source of already-applied truth. *)
+         whatsoever, which is exactly the property that lets the durable watermark below be the
+         single source of already-applied truth.
+
+         {b The nesting order here is correctness-critical, not stylistic} (Task 4's own review,
+         Critical 1 -- live-reproduced on two DST seeds). [Batch_commit.deduplicate] wraps ONLY the
+         accumulator sink, and [Reactor.wrap_materialize_sink] sits strictly OUTSIDE it:
+
+         - the ledger's own non-idempotent read-add-write balance bookkeeping is gated, so a replay
+           of an already-materialized committed leg does not move money twice (the restart doubling
+           this plan's Task 1 exists to close), and
+         - the reactor's guest DISPATCH, which lives inside its own [write], runs unconditionally on
+           every materialize call -- because re-dispatching an already-materialized
+           "ledger.requests" write is the one and only recovery path for a legs batch a VSR view
+           change discarded before it committed (Accumulator.handle_guest_decision's own
+           already-accepted/never-decided branches).
+
+         Getting it backwards -- which is what a gate applied INTERNALLY by
+         [Batch_commit.propose] to the whole composed sink necessarily did, i.e. this plan's own
+         Task 1 shape -- silently deleted that recovery path entirely while still looking correct on
+         every balance assertion. See batch_commit.mli's [deduplicate] and
+         [test_batch_commit_materialize.ml]'s own
+         [test_deduplicate_only_suppresses_what_it_wraps_not_an_outer_wrappers_side_effect]. *)
       let wrapped_sink =
         Reactor.wrap_materialize_sink reactor
-          (Accumulator.materialize_sink ~read_balance ~write_balance ~store_request)
+          (Batch_commit.deduplicate ~watermark_store
+             (Accumulator.materialize_sink ~read_balance ~write_balance ~store_request))
       in
       (* The currently-live accumulator, held in a ref so [restart] can swap it and the ~propose
          closure below follows the swap rather than capturing the retired instance. *)
@@ -442,16 +463,21 @@ let module_decision_envelopes env =
   |> List.filter_map (fun (e : Envelope.envelope) ->
          if e.actor <> "ledger-module" then None else Wire.decision_of_value e.payload)
 
-(* A catch-up materialization walk over the whole committed log, WITH the durable watermark -- the
-   shape a restarting node is documented to perform, and the shape every call in this file uses.
-   Supplying ~watermark_store is not optional for this ledger: its sink accumulates balances by
-   read-add-write, which is not idempotent under replay, and the already-applied table that used to
-   guard that in memory is deleted (that table dying with the process is exactly what used to double
-   every balance here). *)
+(* A catch-up materialization walk over the whole committed log -- the shape a restarting node is
+   documented to perform, and the shape every call in this file uses. The durable watermark is not
+   optional for this ledger: its sink accumulates balances by read-add-write, which is not idempotent
+   under replay, and the already-applied table that used to guard that in memory is deleted (that
+   table dying with the process is exactly what used to double every balance here).
+
+   It arrives here through [env.wrapped_sink] itself rather than as a [~watermark_store] argument to
+   this function (Task 4's own review, Critical 1): the gate is composed around the accumulator sink
+   at [with_ledger_env]'s own [wrapped_sink] -- INSIDE Reactor.wrap_materialize_sink, see that
+   comment -- so this walk gets exactly-once balance bookkeeping AND an unconditional guest
+   re-dispatch for every "ledger.requests" write it replays, which is what makes a catch-up walk a
+   real recovery path for a view-change-discarded legs batch rather than a silent no-op. *)
 let walk env =
   Batch_commit.materialize_up_to env.replica ~materialize:env.wrapped_sink
     ~through_commit_number:(Replica.commit_number env.replica)
-    ~watermark_store:env.watermark_store
 
 (* Feed a decision in as if the guest had just produced it, against a chosen Accumulator.t. The
    guest fixture decides on its own business logic (sufficient funds), so this is the only way to
@@ -553,26 +579,38 @@ let test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization () 
       (* The empty-writes drain idiom, verbatim from batch_commit.mli's own documented contract: a
          pure "is it committed now? if so, materialize it" probe against an already-committed key.
          Nothing here proposes any new content whatsoever. *)
+      let flips_before_drain = Accumulator.prevented_flips env.accumulator in
       Batch_commit.propose env.handle ~idempotency_key:"req-10" ~materialize:env.wrapped_sink [];
       (* Positive evidence that the mechanism FIRED, not just that the outcome looks right: without
          this, the test would pass equally well if the guest had simply declined a second time for
          its own reasons, which would prove nothing about C1 at all.
 
-         What supplies that evidence CHANGED with Task 7's durable watermark, and the change is worth
-         naming rather than silently reshuffling: the drain above no longer re-dispatches the guest at
-         all, because the request write it would re-materialize is already recorded as applied in the
-         durable watermark store, so materialization is now exactly-once per committed write for every
-         consequence it has, the reactor's own re-dispatch included. Asserting a prevented flip from
-         the drain would therefore be asserting a side effect that is correctly gone. The rule itself
-         is instead exercised head-on: a dispatch is fed in directly, deciding ACCEPT for the request
-         that is on record as DECLINED, which is finding C1's exact shape with no reliance on which
-         idiom happens to reach the guest. *)
+         This evidence comes out of the DRAIN ITSELF, which is the whole point: the drain
+         re-dispatches the guest, the guest re-reads the now-ample balance and genuinely decides
+         ACCEPT, and the first-decision-wins rule overrides it. That is finding C1's exact shape,
+         through the exact idiom the reviewer used, with nothing injected.
+
+         {b Briefly, between this plan's Task 1 and Task 4's own review, this assertion could not be
+         made and was replaced by an injected dispatch} (Critical 1): the watermark gate sat OUTSIDE
+         [Reactor.wrap_materialize_sink], so the drain skipped the already-watermarked request write
+         entirely and never reached the guest at all -- a delta of 0 here, and, far worse, no recovery
+         path left for a view-change-discarded batch. The gate now wraps only the accumulator sink, so
+         re-dispatch is back and so is this assertion. A route that silently stops reaching the guest
+         fails here rather than passing quietly. *)
+      Alcotest.(check int)
+        "the drain re-dispatched the guest, it decided ACCEPT against the now-ample balance, and the \
+         first-decision-wins rule overrode it (Task 4 review, Critical 1)"
+        1
+        (Accumulator.prevented_flips env.accumulator - flips_before_drain);
+      (* The same rule once more, head-on and independent of any idiom: a decision deciding ACCEPT is
+         fed in directly, so this assertion holds even if every re-materialization route were to
+         change. *)
       let flips_before = Accumulator.prevented_flips env.accumulator in
       Alcotest.(check bool) "the injected ACCEPT dispatch was accepted as a well-formed decision"
         true
         (dispatch_decision env env.accumulator ~accepted:true declined = Ok ());
       Alcotest.(check int)
-        "the dispatch genuinely decided ACCEPT, and the first-decision-wins rule overrode it" 1
+        "the injected dispatch genuinely decided ACCEPT, and was overridden too" 1
         (Accumulator.prevented_flips env.accumulator - flips_before);
       Alcotest.(check bool) "and the DURABLE record still says DECLINED" true
         (Accumulator.decision ~committed:env.committed ~request_id:10L = Some false);
@@ -617,22 +655,37 @@ let test_a_declined_decision_survives_every_rematerialization_idiom () =
         Schema.{ request_id = 31L; from_account = 721L; to_account = 720L; amount = 5000L };
       Alcotest.(check int64) "the sender is now richly funded" 5040L (balance_of env 720L);
       let legs_after_funding = List.length (module_leg_envelopes env) in
-      (* Each idiom is run, and then -- separately -- a dispatch deciding ACCEPT is injected
-         directly, which is where the positive "the rule FIRED" evidence now comes from.
+      (* Each idiom is proven to GENUINELY REACH THE GUEST (a nonzero [repeat_dispatches] delta out of
+         the idiom itself, plus a prevented flip -- the guest really does re-decide ACCEPT against the
+         now-ample balance and really is overridden), and then -- separately -- a dispatch deciding
+         ACCEPT is injected directly too, so the rule is also pinned independently of which idiom
+         happens to reach the guest.
 
-         Why the evidence moved (Task 7, the Layer 0/Layer 2 boundary revision): with a durable
-         materialization watermark in place, none of these three idioms re-dispatches the guest any
-         more. Each one re-materializes the same already-committed request write, and the watermark
-         makes materializing a given committed write happen at most once ever -- including the
-         reactor's own re-dispatch side effect, which is the thing that used to reach the guest.
-         Asserting a prevented flip out of the idiom itself would therefore be asserting a side
-         effect that is correctly gone, and would fail for the right reason. The thing actually
-         under test here -- "no route to re-materialization can resurrect a declined transfer" --
-         is now proven in two layers instead: each idiom leaves the declined request with no legs,
-         no balance movement, and the same DURABLE decision on record; and a dispatch that genuinely
-         decides the other way, injected right after it, is still overridden. *)
+         {b Between this plan's Task 1 and Task 4's own review, the per-idiom half of that was
+         impossible and had been removed} (Critical 1): the durable watermark was applied by
+         [Batch_commit] itself to the WHOLE composed sink, so it suppressed
+         [Reactor.wrap_materialize_sink]'s guest dispatch along with the balance bookkeeping, and
+         none of these three idioms re-dispatched at all. The watermark now wraps only the accumulator
+         sink (see [with_ledger_env]), so each idiom re-dispatches exactly as it did before Task 1 --
+         while STILL not re-applying a single balance delta, which the untouched-balance assertions
+         below are what prove. That is the whole shape of this plan's own goal: exactly-once
+         materialization, unconditional re-dispatch. *)
       let check_idiom name run =
+        let dispatches_before = Accumulator.repeat_dispatches env.accumulator in
+        let flips_before_idiom = Accumulator.prevented_flips env.accumulator in
         run ();
+        Alcotest.(check bool)
+          (Printf.sprintf
+             "%s: genuinely re-dispatched the guest -- not silently suppressed by the watermark (Task \
+              4 review, Critical 1)"
+             name)
+          true
+          (Accumulator.repeat_dispatches env.accumulator > dispatches_before);
+        Alcotest.(check bool)
+          (Printf.sprintf
+             "%s: and the re-dispatched guest's ACCEPT was overridden by the committed DECLINE" name)
+          true
+          (Accumulator.prevented_flips env.accumulator > flips_before_idiom);
         Alcotest.(check int)
           (Printf.sprintf "%s: still no leg for the declined request" name)
           legs_after_funding
@@ -707,18 +760,32 @@ let test_a_declined_decision_survives_every_rematerialization_idiom () =
       Alcotest.(check int64) "and its recipient kept every unit it was credited" 5040L
         (balance_of env 720L))
 
-(* ── Final whole-branch review, finding I4 (Important): the accumulator's dedup key must not
-   collide across two genuinely different legs ───────────────────────────────────────────────────
-   Live-reproduced by the reviewer and again here: this file's own documented seeding convention
-   builds its synthetic leg with transfer_id = 0L, so before this fix a REAL transfer carrying
-   request_id = 0L shared the dedup key (0, account, role) with the seed leg of whichever account
-   it credited -- the accumulator saw the key already applied and silently skipped the credit. The
-   committed log stays perfectly correct (both legs are there), while the materialized balances
-   stop conserving value: the debit lands, the credit vanishes. Money destroyed, nothing raised.
+(* ── Value conservation for request_id = 0L, the identifier a historical dedup-key bug singled out ─
+   {b Renamed and reframed by Task 4's own review (Minor).} This test and its comment were written
+   around a mechanism the codebase no longer has: the accumulator's own in-memory dedup key
+   [(transfer_id, this_account, role)]. Final whole-branch review finding I4 live-reproduced a real
+   collision in it -- this file's seeding convention builds its synthetic leg with [transfer_id = 0L],
+   so a REAL transfer carrying [request_id = 0L] (a perfectly ordinary client-chosen identifier, not a
+   reserved value) shared a key with the seed leg of whichever account it credited, and had its credit
+   silently skipped as a duplicate: the committed log stayed perfectly correct while the materialized
+   balances stopped conserving value, money destroyed with nothing raised.
 
-   request_id = 0L is a perfectly ordinary client-chosen identifier, not a reserved value, which is
-   what makes this a real defect rather than a theoretical one. *)
-let test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention () =
+   That key is GONE. Task 7 deleted the accumulator's dedup table outright and dedup is now
+   [Batch_commit.deduplicate]'s durable, per-[(idempotency_key, position)] watermark -- an identity
+   that is injective by construction ([Batch_commit.redaction_event_id]'s length-prefixing) and shares
+   nothing with a leg's payload content, so a seed leg and a client transfer cannot collide in it
+   whatever [transfer_id]s they carry. Describing this test as guarding "the accumulator's dedup key"
+   therefore describes nothing real.
+
+   {b What it still genuinely tests, and why it is kept rather than deleted}: end-to-end VALUE
+   CONSERVATION for [request_id = 0L] specifically -- both legs committed, both applied exactly once,
+   total value across the two accounts unchanged. The mechanism changed; the property a reader cares
+   about did not, and [request_id = 0L] remains the input that historically broke it, which is reason
+   enough to keep exercising it rather than trusting that a new mechanism cannot fail on the same
+   input for a new reason. (The injectivity of the replacement key is tested directly, at the unit
+   level, by [test_batch_commit_materialize.ml]'s own
+   [test_watermark_does_not_collide_across_different_idempotency_keys_same_position].) *)
+let test_value_is_conserved_for_a_request_id_of_zero () =
   with_ledger_env (fun env ->
       seed_account env 910L 500L;
       seed_account env 911L 300L;
@@ -727,8 +794,9 @@ let test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention () =
       Alcotest.(check int) "both legs of the transfer committed" 2
         (List.length (module_leg_envelopes env));
       Alcotest.(check int64) "the debit landed" 400L (balance_of env 910L);
-      Alcotest.(check int64) "the credit landed too -- not swallowed by the seed leg's dedup key"
-        400L (balance_of env 911L);
+      Alcotest.(check int64)
+        "the credit landed too -- applied exactly once, neither swallowed nor doubled" 400L
+        (balance_of env 911L);
       Alcotest.(check int64) "value is conserved across the two accounts" 800L
         (Int64.add (balance_of env 910L) (balance_of env 911L)))
 
@@ -790,10 +858,11 @@ let test_an_overdrawn_account_cannot_withdraw_further_because_the_funds_check_is
    What actually closed it, and why both halves are needed:
      - [Accumulator]'s own in-memory [applied_legs] table is DELETED. Nothing about "already
        applied" lives in a process's memory any more.
-     - Batch_commit now carries a DURABLE, per-(idempotency_key, position) materialization watermark
-       (Task 7's Decision 1, wired in by this env at [Batch_commit.create] time and passed to every
-       [materialize_up_to] walk), keyed on the write identity Decision 2 added. It survives the
-       restart on the same disk the keystore already trusts for exactly this kind of durability.
+     - Batch_commit now offers a DURABLE, per-(idempotency_key, position) materialization watermark
+       (Task 7's Decision 1), keyed on the write identity Decision 2 added, which this env composes
+       around the accumulator sink via [Batch_commit.deduplicate] (see [with_ledger_env]). It
+       survives the restart on the same disk the keystore already trusts for exactly this kind of
+       durability.
      - [Accumulator]'s own in-memory [decided_requests] table is deleted too, which this test also
        exercises: the restarted instance's decision for request 50 comes from the committed log.
 
@@ -842,17 +911,34 @@ let test_restart_with_durable_watermark_leaves_balances_correct () =
         (Int64.add (balance_of env 960L) (balance_of env 961L));
       (* Positive evidence that the restart genuinely happened and the fresh instance is genuinely
          the one in play -- without this, every assertion above would pass equally well if [restart]
-         had quietly done nothing. A dispatch fed to the fresh instance is recognised as a REPEAT of
-         an already-decided request (which only the committed log can tell it), and a dispatch that
-         decides the other way is still overridden. *)
-      Alcotest.(check int) "the fresh instance starts with no dispatch history of its own" 0
+         had quietly done nothing.
+
+         {b This assertion was `0' until Task 4's own review, Critical 1, and the change from 0 to 1
+         IS that Critical's fix, observed from the inside.} With the watermark gate placed OUTSIDE
+         [Reactor.wrap_materialize_sink] -- which is what a gate applied internally by
+         [Batch_commit.propose]/[materialize_up_to] to the whole composed sink necessarily did -- the
+         catch-up walk above skipped the already-watermarked "ledger.requests" write ENTIRELY, so the
+         reactor never dispatched, so the fresh instance genuinely had no dispatch history: 0 was a
+         true reading of a broken mechanism. The gate now wraps only the accumulator sink, so the
+         walk re-dispatches the guest for every request it replays (while still not re-applying a
+         single balance delta -- the four assertions above), and the fresh instance recognises
+         request 50 as already decided from the COMMITTED LOG alone, having never seen it decided
+         itself. That re-dispatch is not incidental: it is the one and only recovery path a legs
+         batch a view change discarded before it committed has. *)
+      Alcotest.(check int)
+        "the catch-up walk re-dispatched the guest to the FRESH instance -- the recovery path the \
+         watermark must not suppress (Task 4 review, Critical 1)"
+        1
         (Accumulator.repeat_dispatches restarted);
+      Alcotest.(check int)
+        "and that re-dispatch agreed with the log's ACCEPT, so nothing was overridden by it" 0
+        (Accumulator.prevented_flips restarted);
       ignore
         (dispatch_decision env restarted ~accepted:false
            Schema.{ request_id = 50L; from_account = 960L; to_account = 961L; amount = 300L });
-      Alcotest.(check int) "and immediately recognised a dispatch for request 50 as a repeat" 1
+      Alcotest.(check int) "an injected DECLINE for request 50 is recognised as a repeat too" 2
         (Accumulator.repeat_dispatches restarted);
-      Alcotest.(check int) "overriding its DECLINE, because the log's ACCEPT is final" 1
+      Alcotest.(check int) "and overridden, because the log's ACCEPT is final" 1
         (Accumulator.prevented_flips restarted);
       Alcotest.(check int64) "so the balances still did not move" 700L (balance_of env 960L);
       Alcotest.(check int64) "on either side" 800L (balance_of env 961L);
@@ -878,8 +964,8 @@ let tests =
       `Quick, test_a_declined_request_cannot_be_accepted_by_a_later_re_materialization );
     ( "a declined decision survives every re-materialization idiom",
       `Quick, test_a_declined_decision_survives_every_rematerialization_idiom );
-    ( "a request_id of zero does not collide with the seeding convention",
-      `Quick, test_a_request_id_of_zero_does_not_collide_with_the_seeding_convention );
+    ( "value is conserved for a request_id of zero (the input a historical dedup-key collision broke)",
+      `Quick, test_value_is_conserved_for_a_request_id_of_zero );
     ( "an overdrawn account cannot withdraw further because the funds check is signed",
       `Quick, test_an_overdrawn_account_cannot_withdraw_further_because_the_funds_check_is_signed );
     ( "a restart with a durable watermark leaves balances correct",

@@ -239,7 +239,18 @@ let propose_batch replicas is_down ~idempotency_key ?materialize writes =
     if Batch_commit.is_primary handle then
       Batch_commit.propose handle ~idempotency_key ?materialize writes
 
-let with_ledger_dst_env ~seed ~replica_count ~net_fault_config (f : env_handles -> unit) =
+(* Where this file's own stand-in materialization watermark sits relative to
+   [Reactor.wrap_materialize_sink] (Task 4's own review, Critical 1 -- see [with_ledger_dst_env]'s own
+   wiring comment for the mechanism, and [test_a_view_change_discarded_legs_batch_recovers_...] for
+   the A/B that makes the difference an asserted fact rather than a claim).
+
+   [Inside_reactor] is the real, production-shaped composition and the default every scenario uses.
+   [Outside_reactor] exists ONLY so one regression test can exercise the broken shape and observe,
+   positively, that the guest is never re-reached under it -- it is not a supported wiring. *)
+type watermark_placement = Inside_reactor | Outside_reactor
+
+let with_ledger_dst_env ~seed ~replica_count ~net_fault_config
+    ?(watermark_placement = Inside_reactor) (f : env_handles -> unit) =
   let kv = Memory_kv_store.create ~owner:"materializer" in
   let materializer =
     M.create ~kv ~owner:"materializer"
@@ -280,49 +291,59 @@ let with_ledger_dst_env ~seed ~replica_count ~net_fault_config (f : env_handles 
     else Schema.transfer_request_of_value v.Last_write_wins.value
   in
   let inner_sink = Accumulator.materialize_sink ~read_balance ~write_balance ~store_request in
-  (* ── This file's own test-local stand-in for Batch_commit's DURABLE materialization watermark
-     (Task 7, the Layer 0/Layer 2 boundary revision) ──────────────────────────────────────────────
+  (* ── This file's own test-local stand-in for [Batch_commit.deduplicate]'s DURABLE materialization
+     watermark (Task 7, the Layer 0/Layer 2 boundary revision) ────────────────────────────────────
      [Accumulator.materialize_sink] has no already-applied table of its own any more (that table
      dying with the process is what used to double every balance in this ledger on restart), so
      exactly-once materialization is now the watermark's job -- and accumulator.mli states that as a
      real obligation on whoever wires the sink up, not an internal detail. The production shape is
-     [Batch_commit.create ~materialize_watermark_store], which takes a
-     [Riptide_storage.File_kv_store.t]; this file deliberately runs under [Eio_mock.Backend.run] with
-     a [Memory_kv_store] materializer precisely to avoid real file I/O (see this file's own top
-     comment), and a [File_kv_store] needs a real [~fs] and an [Eio_main.run] scope, so there is no
-     such store to hand it here. The watermark is therefore kept in memory, keyed on exactly the
-     identity the real one uses -- the [(idempotency_key, position)] pair Decision 2 added to
-     [materialize_sink.write] -- which is the same substitution this file already makes for the
-     materializer's own backend.
+     [Batch_commit.deduplicate ~watermark_store], which takes a [Riptide_storage.File_kv_store.t];
+     this file deliberately runs under [Eio_mock.Backend.run] with a [Memory_kv_store] materializer
+     precisely to avoid real file I/O (see this file's own top comment), and a [File_kv_store] needs a
+     real [~fs] and an [Eio_main.run] scope, so there is no such store to hand it here. The watermark
+     is therefore kept in memory, keyed on exactly the identity the real one uses -- the
+     [(idempotency_key, position)] pair Decision 2 added to [materialize_sink.write], derived through
+     [Batch_commit.redaction_event_id] itself -- which is the same substitution this file already
+     makes for the materializer's own backend. Everything else about it is
+     [Batch_commit.deduplicate]'s own semantics verbatim: check the watermark, skip the wrapped
+     [write] ENTIRELY if present, otherwise call it and record the watermark strictly AFTER it returns
+     normally (a write that raises must stay unapplied and retryable).
 
-     {b Deliberately scoped to ACCOUNT keys only, not to every write.} What needs exactly-once
-     treatment is the non-idempotent part: the read-add-write balance accumulation. Re-materializing
-     the [ledger.requests] write is the opposite -- it is what RE-DISPATCHES the guest, and this
+     {b It covers EVERY write, and what keeps the guest re-dispatchable is PLACEMENT, not key
+     scoping} (Task 4's own review, Important 1 -- correcting both this stand-in and the comment that
+     used to be here). Until that review this stand-in deduplicated only [Schema.is_account_key]
+     writes and justified that by calling re-materialization of the [ledger.requests] write "the
+     opposite" of something needing exactly-once treatment. The reasoning was wrong in a way that
+     mattered: key-scoping was not what preserved re-dispatch, and because the production harness had
+     no equivalent scoping, this file diverged from production exactly where it most needed to match
+     -- and so could not catch a Critical liveness bug in it (a view-change-discarded legs batch
+     became permanently unrecoverable). The load-bearing property is that the watermark sits INSIDE
+     [Reactor.wrap_materialize_sink]: the reactor's [write] runs its inner sink and THEN dispatches,
+     so a gate on the inner sink suppresses only the inner sink's own effect, while dispatch fires on
+     every materialize call unconditionally. A gate covering every write is therefore perfectly safe
+     here -- re-materializing the [ledger.requests] write still re-dispatches, which is what this
      file's own drive loops ([drive_legs]'s [propose_request] + [materialize_only] actions) depend on
-     that re-dispatch as the one recovery path for a legs batch a storm-driven view change discarded
-     before it committed. Storing the request under [Last_write_wins] is itself idempotent, so
-     watermarking it would buy nothing and would cost the recovery this file exists to exercise. *)
+     as the one recovery path for a legs batch a storm-driven view change discarded before it
+     committed. [Outside_reactor] composes the identical gate the other way round purely so that
+     claim is a measured A/B rather than an argument; see
+     [test_a_view_change_discarded_legs_batch_recovers_only_with_the_watermark_inside_the_reactor]. *)
   let applied : (string, unit) Hashtbl.t = Hashtbl.create 256 in
-  let deduped_sink : Batch_commit.materialize_sink =
+  let deduplicate (inner : Batch_commit.materialize_sink) : Batch_commit.materialize_sink =
     {
       write =
         (fun ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload ->
-          let apply () =
-            inner_sink.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation
-              payload
-          in
-          if not (Schema.is_account_key merge_key) then apply ()
-          else
-            let key = Batch_commit.redaction_event_id ~idempotency_key ~index:position in
-            if not (Hashtbl.mem applied key) then (
-              (* Recorded strictly AFTER the write returns normally, exactly as the real watermark
-                 does: a write that raises must stay unapplied and retryable. *)
-              apply ();
-              Hashtbl.add applied key ()));
+          let key = Batch_commit.redaction_event_id ~idempotency_key ~index:position in
+          if not (Hashtbl.mem applied key) then (
+            inner.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload;
+            Hashtbl.add applied key ()));
     }
   in
   let reactor = Reactor.create () in
-  let wrapped_sink = Reactor.wrap_materialize_sink reactor deduped_sink in
+  let wrapped_sink =
+    match watermark_placement with
+    | Inside_reactor -> Reactor.wrap_materialize_sink reactor (deduplicate inner_sink)
+    | Outside_reactor -> deduplicate (Reactor.wrap_materialize_sink reactor inner_sink)
+  in
   let read_for_module = Accumulator.read_for_guest ~read_request ~read_balance in
   let verified_artifact, verification_dir = verified_ledger () in
   Fun.protect
@@ -953,10 +974,30 @@ let build_requests () =
    [cluster_state] gained [commit]/[entries]/[denials] columns in the same work, for the same reason
    the view/status/primary columns exist: those three are what made the above diagnosable instead of
    guessable. The historical vectors tabulated earlier in this comment predate them and are recorded
-   in the narrower format they were observed in. *)
-let sweep_seeds = [ 4242; 1; 2; 12; 10 ]
+   in the narrower format they were observed in.
 
-let run_scenario ~seed () =
+   {b Seeds 22 and 24 were added by Task 4's own review (Critical 1), and they are regression seeds
+   rather than merely two more completing ones.} They are the two the reviewer used to reproduce the
+   Critical: with the materialization watermark composed OUTSIDE
+   [Reactor.wrap_materialize_sink] -- which is what [Batch_commit] applying the gate internally to the
+   whole sink necessarily did -- a request's batch that a view change discarded before it committed
+   became PERMANENTLY unrecoverable, because re-materializing the already-watermarked
+   "ledger.requests" write no longer re-dispatched the guest, and re-dispatch is the only thing that
+   ever re-proposes such a batch. Both converge with the corrected composition and both are confirmed
+   to FAIL without it ([Outside_reactor]; see
+   [test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers], which
+   pins that failure deliberately). The wedge they produce under the broken composition is
+   diagnostically NOTHING like the out-of-scope VSR gap tabulated above, which is worth recording
+   because the vector is what tells them apart: seed 22 stalls at [ledger-transfer-3] with
+   [view=[5,5,5] status=[normal,normal,normal] commit=[28,29,28] entries=[29,29,29] denials=0] -- all
+   three replicas live, all three in [Normal], a full quorum available, commit numbers healthy and
+   still advancing. A cluster in that state is not failing to agree on anything; it is simply never
+   being ASKED to, because nothing re-proposes the discarded batch. "Decision committed: false with
+   every replica Normal" is the signature of a ledger-level liveness defect, and "fewer than a quorum
+   in Normal" is the signature of the VSR one. *)
+let sweep_seeds = [ 4242; 1; 2; 12; 10; 22; 24 ]
+
+let run_scenario ?(watermark_placement = Inside_reactor) ~seed () =
   let requests, expected_balances = build_requests () in
   (* The designated crash-timing request: the first ACCEPTED request at or past position 20 (well
      into the run, so there is real prior history -- both committed state on every replica and a
@@ -980,7 +1021,7 @@ let run_scenario ~seed () =
   in
   let crash_outcome = ref None in
   let repair_outcome = ref None in
-  with_ledger_dst_env ~seed ~replica_count:3 ~net_fault_config (fun env ->
+  with_ledger_dst_env ~seed ~replica_count:3 ~net_fault_config ~watermark_placement (fun env ->
       Array.iteri (fun i acct -> drive_seed env ~account:acct ~amount:seed_amounts.(i)) accounts;
       List.iteri
         (fun i (req, accepted) ->
@@ -1371,6 +1412,71 @@ let run_scenario ~seed () =
               (canon_envs module_envelopes) (canon_envs (module_leg_envelopes_of r)))
         env.replicas)
 
+(* ── Task 4's own review, Critical 1 (a Critical): THE REGRESSION TEST ──────────────────────────────
+   Every other test in this file asserts the system WORKS. This one asserts that the one composition
+   that breaks it is still broken -- i.e. that this file's own scenario has the power to NOTICE the
+   Critical, which it did not before the review (the reviewer's Important 1: this file's own watermark
+   stand-in was key-scoped, so it accidentally avoided the bug instead of reproducing it, and five
+   green seeds proved nothing about the real production wiring).
+
+   The Critical, restated in mechanism terms: [Batch_commit]'s materialization watermark used to be a
+   gate [propose]/[materialize_up_to] applied INTERNALLY to the whole sink they were handed. A real
+   sink is composed, and the outermost layer here is [Reactor.wrap_materialize_sink], whose own [write]
+   runs its inner sink AND THEN dispatches the subscribed guest. Gating the composed sink therefore
+   skipped the DISPATCH along with the balance bookkeeping the gate was for -- and re-dispatch of an
+   already-committed "ledger.requests" write is the one and only thing that ever re-proposes a legs
+   batch a VSR view change discarded before it committed (Accumulator.handle_guest_decision). The
+   result was a transfer that could never complete, on a cluster with nothing whatsoever wrong with
+   it: no money moved wrongly, nothing corrupted, a permanent liveness softlock.
+
+   The fix is [Batch_commit.deduplicate], a composable wrapper, placed INSIDE the reactor wrapper.
+   [Outside_reactor] here composes the identical gate the other way round -- exactly the shape the old
+   internal gate produced -- so the two arms differ in NOTHING but that ordering:
+
+     - [Inside_reactor]  (the real wiring): seeds 22 and 24 are in [sweep_seeds] above and both pass.
+     - [Outside_reactor] (the broken wiring): asserted HERE to stall, and asserted to stall for the
+       RIGHT REASON -- the failure message is checked to be a convergence stall, so an unrelated
+       exception cannot make this pass by accident.
+
+   Pinning a failure is unusual and deliberate. The alternative -- deleting [Outside_reactor] once the
+   production wiring was fixed -- would leave the ordering rule asserted only by comments, on an
+   interface ([deduplicate]) whose whole contract is that the caller chooses the order. This keeps the
+   consequence of choosing wrong measured rather than argued. The matching statement at the unit level,
+   with no cluster or guest involved, is
+   [test_batch_commit_materialize.ml]'s own
+   [test_deduplicate_only_suppresses_what_it_wraps_not_an_outer_wrappers_side_effect]. *)
+let test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers () =
+  let probe_seed = 22 in
+  match run_scenario ~watermark_placement:Outside_reactor ~seed:probe_seed () with
+  | () ->
+    Alcotest.failf
+      "seed %d completed with the materialization watermark composed OUTSIDE \
+       Reactor.wrap_materialize_sink. That composition suppresses the reactor's guest re-dispatch for \
+       any already-materialized write, which is the only recovery path a view-change-discarded legs \
+       batch has -- so either this scenario has lost the ability to reach that path at all (and no \
+       longer protects against Task 4 review Critical 1), or Batch_commit.deduplicate has stopped \
+       short-circuiting the sink it wraps. Investigate before relaxing this assertion."
+      probe_seed
+  | exception e ->
+    let msg = Printexc.to_string e in
+    (* Asserted on the failure's SHAPE, not merely on the fact that one happened: a convergence stall
+       is the documented symptom (a decision/legs batch that no longer has anything to re-propose
+       it), and anything else -- a decode error, an authorization denial, a crash in the harness --
+       would mean this test is passing for a reason that has nothing to do with the Critical. *)
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "seed %d stalls with the watermark OUTSIDE the reactor wrapper, and stalls as a CONVERGENCE \
+          failure (the documented symptom of a discarded batch nothing re-proposes), not as some \
+          unrelated error. Actual failure: %s"
+         probe_seed msg)
+      true
+      (let needle = "did not converge" in
+       let rec contains i =
+         i + String.length needle <= String.length msg
+         && (String.sub msg i (String.length needle) = needle || contains (i + 1))
+       in
+       contains 0)
+
 let tests =
   List.map
     (fun seed ->
@@ -1380,5 +1486,11 @@ let tests =
            request materializing and its legs landing"
           seed,
         `Slow,
-        run_scenario ~seed ))
+        fun () -> run_scenario ~seed () ))
     sweep_seeds
+  @ [
+      ( "a view-change-discarded legs batch recovers ONLY with the watermark INSIDE the reactor \
+         wrapper -- seed 22 stalls permanently with it outside (Task 4 review, Critical 1)",
+        `Slow,
+        test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers );
+    ]

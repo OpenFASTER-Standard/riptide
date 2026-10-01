@@ -201,21 +201,23 @@ type t = {
      only. *)
   authorize_batch : write list -> decision;
   require_encryption : bool;
-  (* Layer 0/Layer 2 boundary revision (task-master Task 7), closing Task 6's own boundary
-     friction item 1 (final whole-branch review finding I9): a durable, per-(idempotency_key,
-     position) watermark that {!materialize_write_catching} below consults BEFORE calling
-     [sink.write] and records strictly AFTER it returns successfully, making the repeated-
-     materialize idiom (the empty-[writes] drain in [propose], and any overlapping
-     [materialize_up_to] range) exactly-once for a sink of ANY shape -- including a
-     non-idempotent, accumulating one -- not merely safe for a pure lattice join. [None]
-     (the default) preserves today's behaviour exactly: no watermark is consulted or recorded,
-     so a repeated materialize re-applies every time, same as before this field existed. *)
-  materialize_watermark_store : Riptide_storage.File_kv_store.t option;
+      (* NO materialize-watermark field here, deliberately, and this absence is a RULED CORRECTION
+         rather than an omission (Task 4's own review, Critical 1 -- see {!deduplicate} below for
+         the full account). The first cut of this plan's Task 1 put a
+         [materialize_watermark_store : Riptide_storage.File_kv_store.t option] field here and had
+         [propose]/[materialize_up_to] consult it internally, wrapping the ENTIRE sink handed to
+         [~materialize] in a dedup gate. That is the wrong layer: a [materialize_sink] is an
+         arbitrary caller-supplied closure, and once it is composed with
+         [Riptide_module.Reactor.wrap_materialize_sink] its [write] also carries a guest-DISPATCH
+         side effect which must NOT be suppressed by the gate protecting business-logic
+         idempotency. Gating the composed sink silently deleted the only recovery path a
+         view-change-discarded batch has (live-reproduced). The gate is now the standalone,
+         composable {!deduplicate} below, which a caller wraps around exactly the sink that needs
+         it and nothing else. *)
 }
 
-let create ~replica ~authorize ?(authorize_batch = fun (_ : write list) -> Allow) ?(require_encryption = false)
-    ?materialize_watermark_store () =
-  { replica; authorize; authorize_batch; require_encryption; materialize_watermark_store }
+let create ~replica ~authorize ?(authorize_batch = fun (_ : write list) -> Allow) ?(require_encryption = false) () =
+  { replica; authorize; authorize_batch; require_encryption }
 
 let replica (t : t) = t.replica
 
@@ -324,38 +326,56 @@ let redaction_event_id ~idempotency_key ~index =
    loops cannot drift into different catch behaviour -- exactly the "one shared helper" this task
    requires rather than duplicating the same try/with twice.
 
-   [?watermark_store] (Task 7, closing Task 6's own boundary friction item 1): when supplied,
-   makes a replay of this exact [(idempotency_key, position)] write exactly-once regardless of
-   what [sink.write] itself does -- a watermark already present for
-   [redaction_event_id ~idempotency_key ~index:position] (the same injective key-derivation
-   {!propose}'s own [?encryption] path already uses, reused here rather than inventing a second,
-   delimiter-joined scheme -- see that function's own doc comment for why a hand-joined key would
-   not be injective) short-circuits straight to [()] without ever calling [sink.write] again. The
-   watermark is recorded ONLY strictly after [sink.write] returns normally: a write that raises
+   Knows NOTHING about watermarks/dedup, deliberately (Task 4's own review, Critical 1): this
+   plan's Task 1 briefly had it consult a [?watermark_store] and skip [sink.write] entirely when a
+   write was already applied, which silently suppressed every side effect the composed sink
+   carried -- including {!Riptide_module.Reactor.wrap_materialize_sink}'s guest dispatch, i.e. the
+   only recovery path a view-change-discarded batch has. The gate now lives in {!deduplicate}
+   below, composed around whichever sink actually needs it, so this function is back to being
+   exactly what its name says: call [sink.write], classify the one documented exception. *)
+let materialize_write_catching (sink : materialize_sink) ~(idempotency_key : string) ~(position : int)
+    ~(merge_key : string) ~(actor : Envelope.actor_id) ~(causation : Envelope.event_id)
+    ~(correlation : Envelope.event_id) (payload : Value.value) : unit =
+  match sink.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload with
+  | () -> ()
+  | exception Riptide_materialize.Materializer.Value_too_large _ -> incr materialize_write_failures_count
+
+(* The durable per-(idempotency_key, position) materialization watermark, as a COMPOSABLE SINK
+   WRAPPER rather than something {!propose}/{!materialize_up_to} apply internally to whatever sink
+   they are handed (Task 4's own review, Critical 1 -- the ruled correction to this plan's own Task
+   1; see batch_commit.mli's own [deduplicate] doc comment for the full reasoning and the
+   live-reproduced failure that forced it).
+
+   Semantics are byte-for-byte what Task 1 already built, only relocated: a watermark already
+   present for [redaction_event_id ~idempotency_key ~index:position] (the same injective
+   key-derivation {!propose}'s own [?encryption] path uses, reused rather than hand-joining a
+   second, non-injective scheme) short-circuits straight to [()] without calling the WRAPPED sink's
+   [write] at all; otherwise the wrapped [write] runs and the watermark is recorded strictly AFTER
+   it returns normally. That ordering is load-bearing: a write that raises
    {!Riptide_materialize.Materializer.Value_too_large} did not successfully apply, so recording a
-   watermark for it would permanently and wrongly mark it as done, skipping it forever on every
-   later replay instead of leaving it eligible to be retried (e.g. against a KV backend with a
-   larger size bound). [None] (the default both call sites pass when their own [t]/call-site
-   argument supplies no store) skips the watermark check and record entirely, preserving exactly
-   today's behaviour: safe only for an idempotent sink, unconditionally re-applied on every
-   replay. *)
-let materialize_write_catching (sink : materialize_sink) ?(watermark_store : Riptide_storage.File_kv_store.t option)
-    ~(idempotency_key : string) ~(position : int) ~(merge_key : string) ~(actor : Envelope.actor_id)
-    ~(causation : Envelope.event_id) ~(correlation : Envelope.event_id) (payload : Value.value) : unit =
-  let watermark_key () = redaction_event_id ~idempotency_key ~index:position in
-  let already_applied =
-    match watermark_store with
-    | None -> false
-    | Some store -> Option.is_some (Riptide_storage.File_kv_store.get store ~key:(watermark_key ()))
-  in
-  if already_applied then ()
-  else
-    match sink.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload with
-    | () -> (
-      match watermark_store with
-      | None -> ()
-      | Some store -> Riptide_storage.File_kv_store.put store ~key:(watermark_key ()) "1")
-    | exception Riptide_materialize.Materializer.Value_too_large _ -> incr materialize_write_failures_count
+   watermark for it would wrongly mark it done forever instead of leaving it eligible for a later
+   retry (e.g. against a KV backend with a larger bound). Note the exception propagates out of
+   here to {!materialize_write_catching}, which is what counts and absorbs it -- so a raising write
+   is left unwatermarked whichever order the two wrappers are composed in.
+
+   [?watermark_store = None] makes this a transparent pass-through: [deduplicate sink] with no
+   store is behaviourally identical to [sink] itself, which is exactly this module's pre-Task-1
+   behaviour (no gate at all). *)
+let deduplicate ?(watermark_store : Riptide_storage.File_kv_store.t option) (sink : materialize_sink) :
+    materialize_sink =
+  match watermark_store with
+  | None -> sink
+  | Some store ->
+    {
+      write =
+        (fun ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload ->
+          let key = redaction_event_id ~idempotency_key ~index:position in
+          if Option.is_some (Riptide_storage.File_kv_store.get store ~key) then ()
+          else begin
+            sink.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload;
+            Riptide_storage.File_kv_store.put store ~key "1"
+          end);
+    }
 
 (* Range-based generalization of [committed_writes_for]/[propose]'s own single-key materialize
    step: walks the committed prefix up to [through_commit_number] (not just the one batch
@@ -378,22 +398,13 @@ let materialize_write_catching (sink : materialize_sink) ?(watermark_store : Rip
    lattice join can never undo" this module's own [propose] doc comment already names for a
    different hazard.
 
-   [?watermark_store] (Task 7, closing Task 6's own boundary friction item 1): threaded straight
-   through to {!materialize_write_catching} for every write in the walk, keyed by each write's own
-   [idempotency_key] and its 0-based position within its own batch (the same convention
-   {!redaction_event_id} already establishes) -- making two calls over an overlapping range
-   exactly-once per write regardless of [materialize]'s own idempotence, not merely safe for a
-   pure lattice join. [None] (the default) preserves exactly today's behaviour.
-
-   [@warning "-16"]: this signature's shape (an optional [?watermark_store] with no trailing
-   [()], the labeled, required [~materialize]/[~through_commit_number] both lexically BEFORE it)
-   is exactly what this task's own brief specifies for this function and the exported .mli type
-   below. OCaml's warning 16 ("unerasable-optional-argument") fires on this shape purely from how
-   the value binding itself is parsed, regardless of the .mli's own type constraining it -- see
-   {!Riptide_module.Admission.verify}'s identical, already-precedented use of this same per-binding
-   attribute for the identical shape. *)
-let[@warning "-16"] materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
-    ~(through_commit_number : int) ?(watermark_store : Riptide_storage.File_kv_store.t option) : unit =
+   Takes NO watermark/dedup argument of its own (Task 4's own review, Critical 1 -- reverting the
+   [?watermark_store] this plan's Task 1 added here): exactly-once replay is obtained by handing
+   this function [deduplicate ~watermark_store sink] as its [~materialize], which composes the gate
+   around precisely the sink that needs it instead of around whatever composed sink this function
+   happens to be handed. *)
+let materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize : materialize_sink)
+    ~(through_commit_number : int) : unit =
   let bound = min through_commit_number (Riptide_vsr.Replica.commit_number t) in
   let entries = Riptide_vsr.Replica.entries t in
   let seen_keys = Hashtbl.create 16 in
@@ -411,7 +422,7 @@ let[@warning "-16"] materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize 
                 match w.merge_key with
                 | None -> ()
                 | Some merge_key ->
-                  materialize_write_catching materialize ?watermark_store ~idempotency_key ~position ~merge_key
+                  materialize_write_catching materialize ~idempotency_key ~position ~merge_key
                     ~actor:w.actor ~causation:w.causation ~correlation:w.correlation w.payload)
               writes
           end)
@@ -656,8 +667,8 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
           match w.merge_key with
           | None -> ()
           | Some merge_key ->
-            materialize_write_catching sink ?watermark_store:t.materialize_watermark_store ~idempotency_key ~position
-              ~merge_key ~actor:w.actor ~causation:w.causation ~correlation:w.correlation w.payload)
+            materialize_write_catching sink ~idempotency_key ~position ~merge_key ~actor:w.actor
+              ~causation:w.causation ~correlation:w.correlation w.payload)
         committed_writes)
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =

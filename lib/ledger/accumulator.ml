@@ -24,9 +24,19 @@ let repeat_dispatches t = t.repeat_dispatches
 (* The decision a committed batch attests to, if any: the first of its writes whose payload decodes
    as a decision record. Exactly one such write exists in any batch Legs.batch_of_decision built,
    and Authorize.authorize_batch refuses a batch carrying more than one, so "the first" is "the
-   only" for anything this module can commit. Every other payload shape it commits (a
-   transfer_request, a transfer_leg) is a Value.Record, so none can be misread as a decision -- see
-   Wire.decision_of_value. *)
+   only" for anything this module can commit.
+
+   Exhaustive enumeration of every OTHER payload shape this scan walks past, and why none of them can
+   be misread as a decision (Wire.decision_of_value only ever accepts a Value.Scalar (Value.Bytes _)
+   of exactly Wire.decision_bytes length, so every Record shape is rejected structurally):
+     - a transfer_request         -- a Value.Record (Schema.transfer_request_to_value)
+     - a transfer_leg            -- a Value.Record (Schema.transfer_leg_to_value)
+     - the "riptide.module.authz" authorization-decision write that
+       Batch_commit.propose APPENDS to every batch it proposes, after every write is Allowed
+       (batch_commit.mli's own "Authorization" section; a Value.Record of idempotency_key +
+       decision). Added to this enumeration by Task 4's own review (Minor) -- it was omitted, which
+       made the list read as complete while leaving out the one write shape in a committed ledger
+       batch that this module does not itself author and cannot see at propose time. *)
 let decision_of_committed_writes (writes : Riptide_batch_commit.Batch_commit.write list) :
     (bool * Schema.transfer_request) option =
   List.find_map

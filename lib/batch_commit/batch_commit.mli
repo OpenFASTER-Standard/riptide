@@ -87,10 +87,9 @@ val create :
   authorize:(write -> decision) ->
   ?authorize_batch:(write list -> decision) ->
   ?require_encryption:bool ->
-  ?materialize_watermark_store:Riptide_storage.File_kv_store.t ->
   unit ->
   t
-(** [create ~replica ~authorize ?authorize_batch ?require_encryption ?materialize_watermark_store ()]
+(** [create ~replica ~authorize ?authorize_batch ?require_encryption ()]
     builds a handle over [replica] with
     [authorize] as the mandatory universal authorization policy every {!propose} call through this
     handle consults for every write of every batch (see {!propose}'s "Authorization" section),
@@ -105,18 +104,14 @@ val create :
     have to state out loud the way "no policy at all" must, and
     [require_encryption] (default [false], matching {!propose}'s own pre-existing default -- this
     constructor changes WHERE the policy is set, never its default value) as the encryption policy
-    every {!propose} call through this handle enforces unless overridden per-call, and
-    [materialize_watermark_store] (Task 7, the Layer 0/Layer 2 boundary revision -- closing Task
-    6's own boundary friction item 1, final whole-branch review finding I9) as the durable,
-    per-write watermark {!propose}'s own materialize step consults so a repeated materialize of
-    the same committed write (e.g. the documented empty-[writes] drain idiom, or a crash-then-retry
-    re-proposing the same [idempotency_key]) applies at most once, for ANY sink -- including a
-    non-idempotent, accumulating one -- not merely for a pure lattice join. See
-    {!materialize_sink}'s own doc comment for the accumulating-sink hazard this closes, and
-    {!committed_writes_for}/{!materialize_up_to}'s own [?watermark_store] for the sibling
-    mechanism covering the OTHER materialization entry point. [None] (the default) omits the
-    watermark entirely, preserving exactly today's behaviour -- unconditionally safe only for an
-    idempotent sink, re-applied on every replay.
+    every {!propose} call through this handle enforces unless overridden per-call.
+
+    {b There is deliberately NO [?materialize_watermark_store] parameter here, and its absence is a
+    ruled correction rather than a gap} (Task 4's own review of this plan, Critical 1 -- reverting
+    part of this same plan's own Task 1). Exactly-once materialization for a non-idempotent sink is
+    obtained by composing {!deduplicate} around that sink before passing it as [~materialize], never
+    by a gate this handle applies internally to whatever composed sink it is handed. See
+    {!deduplicate} for the live-reproduced liveness bug that distinction exists to prevent.
 
     [authorize] has NO default -- unlike [require_encryption], which has always defaulted to
     [false], this parameter is REQUIRED so that "no real policy yet" is something every call site
@@ -315,11 +310,10 @@ type materialize_sink = {
     above). For an ACCUMULATING sink it matters a great deal: such a sink must dedup replays itself
     (see {!materialize_up_to} and {!propose} for why replays happen and are not a caller error), and
     the only honest identity for "this committed write has already been applied" is the
-    [(idempotency_key, position)] pair now passed here. Independent of {!t}'s own
-    [materialize_watermark_store]: that field (if supplied) already makes a replay of this exact
-    write exactly-once regardless of what [write] itself does (see {!materialize_write_catching}),
-    but a sink's own business logic (e.g. the ledger's actor-matching authorization check) needs
-    this identity on every call it receives, watermarked or not. The first real Layer 2 module
+    [(idempotency_key, position)] pair now passed here. Independent of {!deduplicate}: wrapping a
+    sink in that already makes a replay of this exact write exactly-once regardless of what [write]
+    itself does, but a sink's own business logic (e.g. the ledger's actor-matching authorization
+    check) needs this identity on every call it receives, deduplicated or not. The first real Layer 2 module
     built against the OLD shape (a double-entry ledger, [lib/ledger/]) had been forced to dedup on
     payload CONTENT instead, which is exact for content that happens to be unique per write and
     silently wrong for content that is not -- it hit the wrong case for real, collapsing two
@@ -327,6 +321,55 @@ type materialize_sink = {
     stayed perfectly correct. It also had to push an [actor] field into its own payload schema, and
     enforce agreement with the real [actor] at the authorization checkpoint, purely to recover
     information this callback already had and dropped. *)
+
+val deduplicate : ?watermark_store:Riptide_storage.File_kv_store.t -> materialize_sink -> materialize_sink
+(** [deduplicate ?watermark_store sink] is [sink] made EXACTLY-ONCE per committed write, for a sink
+    of ANY shape -- including a non-idempotent, accumulating one -- not merely safe for a pure
+    lattice join. Its [write] checks [watermark_store] for
+    {!redaction_event_id}[ ~idempotency_key ~index:position] and, if a watermark is already there,
+    returns without calling [sink]'s own [write] at all; otherwise it calls [sink.write] and records
+    the watermark strictly AFTER that returns normally. Compose it around the sink you pass as
+    {!propose}'s [?materialize] / {!materialize_up_to}'s [~materialize] and every replay of a
+    committed write -- the documented empty-[writes] drain idiom, a crash-then-retry re-proposing
+    the same [idempotency_key], an overlapping {!materialize_up_to} range, a restarting node's
+    catch-up walk -- applies at most once in total.
+
+    The watermark is recorded only after a successful [write] because a write that raises
+    {!Riptide_materialize.Materializer.Value_too_large} did not apply: watermarking it would
+    permanently mark it done and skip it on every later replay, instead of leaving it eligible for
+    retry (e.g. against a KV backend with a larger size bound). Such an exception propagates out of
+    this wrapper to the same place it already went -- {!propose}/{!materialize_up_to} count it via
+    {!materialize_write_failures} -- so a raising write stays unwatermarked no matter which side of
+    this wrapper the raise comes from.
+
+    {b [?watermark_store = None] is a transparent pass-through}: [deduplicate sink] returns
+    something behaviourally identical to [sink] itself -- no gate at all, i.e. exactly the older,
+    narrower contract where a replay re-applies every time and is safe only for an idempotent sink.
+
+    {b WHY THIS IS A COMPOSABLE WRAPPER AND NOT A PARAMETER OF {!create}/{!materialize_up_to}, which
+    is where this plan's own Task 1 first put it} (Task 4's own review, Critical 1 -- a ruled
+    correction, live-reproduced on two DST seeds, not a stylistic preference). A gate that lives
+    inside {!propose}/{!materialize_up_to} necessarily wraps the WHOLE sink the caller handed in --
+    and a {!materialize_sink} is an arbitrary closure, which a real caller composes out of several
+    layers. The first real one does exactly that:
+    {!Riptide_module.Reactor.wrap_materialize_sink} returns a sink whose [write] runs the inner
+    sink AND THEN dispatches every module subscribed to that [merge_key]. An internal gate therefore
+    skipped the DISPATCH too, the moment a write had been materialized once -- and re-dispatch is
+    the one and only recovery path a batch that a VSR view change discarded before it committed has
+    (see {!Riptide_module.Reactor.wrap_materialize_sink} and, for the ledger's own use of it,
+    [Riptide_ledger.Accumulator.handle_guest_decision]). Observed consequence: a transfer whose legs
+    batch was discarded pre-commit became PERMANENTLY unrecoverable -- no money moved wrongly and
+    nothing corrupted, but a working recovery path stopped working, which is a liveness bug.
+    Composing the gate explicitly is what makes the distinction expressible at all: wrap the inner,
+    business-logic sink that genuinely needs exactly-once semantics, and leave the dispatch-carrying
+    wrapper OUTSIDE it, so dispatch fires on every materialize call unconditionally:
+    {[
+      let sink =
+        Reactor.wrap_materialize_sink reactor
+          (Batch_commit.deduplicate ~watermark_store (Accumulator.materialize_sink ...))
+    ]}
+    Ordering is the load-bearing property here, not which keys the gate covers: a gate that covers
+    every write is correct INSIDE the reactor wrapper and wrong OUTSIDE it. *)
 
 type encryption_sink = {
   encrypt : event_id:string -> Riptide.Value.value -> Riptide.Value.value;
@@ -405,9 +448,8 @@ val materialize_up_to :
   Riptide_vsr.Replica.t ->
   materialize:materialize_sink ->
   through_commit_number:int ->
-  ?watermark_store:Riptide_storage.File_kv_store.t ->
   unit
-(** [materialize_up_to t ~materialize ~through_commit_number ?watermark_store] walks [t]'s committed log from its
+(** [materialize_up_to t ~materialize ~through_commit_number] walks [t]'s committed log from its
     very start through [min through_commit_number (Riptide_vsr.Replica.commit_number t)] -- a
     1-based op-number/commit-count bound, INCLUSIVE, matching
     {!Riptide_vsr.Replica.commit_number}'s own counting convention (compared against each batch's
@@ -441,17 +483,19 @@ val materialize_up_to :
     for the mechanism and for the honest [min (commit_number) (List.length entries)] bound a
     restart-capable caller must use instead.
 
-    {b Safe to call repeatedly over an overlapping or fully-covered range WHEN [?watermark_store]
-    IS SUPPLIED -- unconditionally so, for a sink of ANY shape, not only an idempotent one} (Task
-    7, the Layer 0/Layer 2 boundary revision, closing Task 6's own boundary friction item 1; final
-    whole-branch review finding I9). Every write in the walked range is checked against a durable,
-    per-[(idempotency_key, position)] watermark keyed by {!redaction_event_id} before
-    [materialize.write] is ever called for it, and the watermark is recorded strictly after
-    [materialize.write] returns successfully -- so calling this twice with the same (or a smaller)
-    [through_commit_number] against the same [watermark_store] re-hands each write to
-    [materialize.write] at most once total, across both calls, never twice.
+    {b Safe to call repeatedly over an overlapping or fully-covered range WHEN [~materialize] IS A
+    {!deduplicate}-WRAPPED SINK -- unconditionally so, for a sink of ANY shape, not only an
+    idempotent one} (Task 7, the Layer 0/Layer 2 boundary revision, closing Task 6's own boundary
+    friction item 1; final whole-branch review finding I9 -- as a composable wrapper rather than this
+    function's own [?watermark_store] parameter since Task 4's own review, Critical 1). Every write
+    in the walked range is then checked against a durable, per-[(idempotency_key, position)]
+    watermark keyed by {!redaction_event_id} before the wrapped sink's [write] is ever called for it,
+    and the watermark is recorded strictly after it returns successfully -- so calling this twice
+    with the same (or a smaller) [through_commit_number] through the same
+    [deduplicate ~watermark_store] wrapper re-hands each write at most once total, across both calls,
+    never twice.
 
-    {b Omitting [?watermark_store] preserves EXACTLY today's older, narrower guarantee, and this is
+    {b Passing an UNWRAPPED sink preserves EXACTLY today's older, narrower guarantee, and this is
     a real condition on the caller, not a property of this function.} Calling this twice with the
     same (or a smaller) [through_commit_number] re-hands every write in that range to
     [materialize.write] again, including writes already folded in. For a sink that is a plain
@@ -465,22 +509,28 @@ val materialize_up_to :
     bugs before it was corrected: an initial double-application found while building it, and a
     Critical finding in its own final review where a re-dispatch triggered by exactly this
     re-materialization re-decided an already-declined transfer as accepted. A caller with an
-    accumulating sink that cannot supply [?watermark_store] (e.g. for a reason specific to its own
-    deployment) must still give the sink its own already-applied guard, keyed on something stable
-    across replays of the same committed write -- see {!materialize_sink}'s own disclosure of what
-    its [write] callback is and is not told about the write it is handed.
+    accumulating sink that cannot supply a {!deduplicate} watermark store (e.g. for a reason specific
+    to its own deployment) must still give the sink its own already-applied guard, keyed on something
+    stable across replays of the same committed write -- see {!materialize_sink}'s own disclosure of
+    what its [write] callback is and is not told about the write it is handed.
 
-    {b Does NOT track its own "last materialized" position, even when [?watermark_store] is
-    supplied} -- every call still walks from the very start of the log, unconditionally, and still
-    decodes and re-checks the watermark for every write in range; [?watermark_store] makes each
-    write's own [materialize.write] call itself happen at most once, it does not let this function
+    {b Does NOT track its own "last materialized" position, even behind a {!deduplicate}
+    wrapper} -- every call still walks from the very start of the log, unconditionally, and still
+    decodes and re-checks the watermark for every write in range; {!deduplicate} makes each
+    write's own inner [write] call itself happen at most once, it does not let this function
     skip re-walking or re-decoding a range it has already covered. The caller still owns any
     "where did I leave off" walk-skip optimization it wants on top of this (e.g. a caller-tracked
     lower [through_commit_number] starting point across calls); this function has no such state of
     its own and is a pure function of [t]'s current log, the range given, and
     [watermark_store]'s own current contents. Its own cost is real and disclosed, not hidden: {b
     O(through_commit_number)} work per call, since it always re-decodes and re-walks the whole
-    prefix up to the bound rather than resuming from where a previous call left off. *)
+    prefix up to the bound rather than resuming from where a previous call left off.
+
+    {b A {!deduplicate} wrapper belongs INSIDE any sink wrapper that carries a side effect which must
+    keep firing on every replay} -- most concretely
+    {!Riptide_module.Reactor.wrap_materialize_sink}'s guest dispatch. See {!deduplicate}'s own doc
+    comment: this ordering is what a catch-up walk's ability to recover a view-change-discarded batch
+    depends on, and getting it backwards is a real, live-reproduced liveness bug. *)
 
 val write_at_op_number_has_merge_key : Riptide_vsr.Replica.t -> op_number:int -> bool
 (** [write_at_op_number_has_merge_key t ~op_number] is [true] iff the batch at the 1-based
@@ -773,27 +823,35 @@ val propose :
     call for the same key reaches the materialize step again and it fires, strictly before any
     LATER call on this replica could ever evict the WAL slot(s) this batch occupies.
 
-    {b This re-running is unconditionally safe, for a sink of ANY shape, when [Batch_commit.t] was
-    built with [?materialize_watermark_store] (Task 7, the Layer 0/Layer 2 boundary revision,
-    closing Task 6's own boundary friction item 1; final whole-branch review finding I9) --
-    {!create}'s own store, consulted here via the same per-[(idempotency_key, position)] watermark
-    {!materialize_up_to}'s own [?watermark_store] uses, keyed by {!redaction_event_id}.} Each
-    committed write is materialized at most once, total, across however many [propose] calls for
-    the same [idempotency_key] supply [?materialize] -- the empty-[writes] drain idiom above
-    included.
+    {b This re-running is unconditionally safe, for a sink of ANY shape, when the sink passed as
+    [?materialize] is wrapped in {!deduplicate} with a real store} (Task 7, the Layer 0/Layer 2
+    boundary revision, closing Task 6's own boundary friction item 1; final whole-branch review
+    finding I9 -- as a caller-composed wrapper rather than a {!create} parameter since Task 4's own
+    review, Critical 1). Each committed write passes the wrapper's own
+    per-[(idempotency_key, position)] watermark, keyed by {!redaction_event_id}, so the business
+    logic behind it runs at most once, total, across however many [propose] calls for the same
+    [idempotency_key] supply [?materialize] -- the empty-[writes] drain idiom above included.
 
-    {b Omitting [?materialize_watermark_store] at {!create} time preserves EXACTLY today's older,
-    narrower guarantee: safe only for a sink whose own [write] is idempotent, and this doc
-    previously claimed it unconditionally.} The old wording -- "re-running [materialize.write] for
+    {b Passing an UNWRAPPED sink preserves EXACTLY today's older, narrower guarantee: safe only for a
+    sink whose own [write] is idempotent, and this doc previously claimed it unconditionally.} The
+    old wording -- "re-running [materialize.write] for
     an already-materialized write is always safe: it is a read-join-put over a lattice" --
     describes what a {!Riptide_materialize.Materializer.write} sink does, not what a
     {!materialize_sink} IS: the latter is an arbitrary caller-supplied closure. An ACCUMULATING sink
     (the first real Layer 2 module, a double-entry ledger in [lib/ledger/], maintains balances by
     read-current-add-delta-write-new-total) applies its delta a second time on every such replay
-    when no watermark store is in play. A caller whose sink is not a pure lattice join and cannot
-    supply [?materialize_watermark_store] must carry its own already-applied guard; see
+    when no watermark is in play. A caller whose sink is not a pure lattice join and cannot
+    supply a {!deduplicate} store must carry its own already-applied guard; see
     {!materialize_sink} and {!materialize_up_to} for the full account and for what this interface
     does not currently give such a caller to key that guard on.
+
+    {b What {!deduplicate} must NOT be wrapped around} (Task 4's own review, Critical 1): any sink
+    wrapper whose own [write] carries a side effect that has to keep firing on every replay --
+    concretely {!Riptide_module.Reactor.wrap_materialize_sink}, whose [write] dispatches subscribed
+    guest modules. {!deduplicate} skips the wrapped sink's [write] ENTIRELY on an already-applied
+    write, so a gate placed OUTSIDE the reactor wrapper silently suppresses re-dispatch -- deleting
+    the only recovery path a view-change-discarded batch has. Compose it INSIDE instead; see
+    {!deduplicate}.
 
     {b Scope, stated precisely because it does not cover every commit path}: this hook only fires
     synchronously inside SOME [propose] call that supplies [?materialize] and observes the batch

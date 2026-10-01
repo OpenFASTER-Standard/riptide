@@ -57,6 +57,32 @@ that already has its own disclosed size limit to worry about.
 
 ## Decision 1: durable materialization watermark (closes items 1, part of 6)
 
+> **REVISED by Task 4's own review (Critical 1).** The watermark MECHANISM below — its key derivation,
+> its check-then-write ordering, its `None`-preserves-today's-behavior default — is exactly what
+> shipped and is unchanged. **Where it is applied is not.** This section specifies it as a parameter
+> of `Batch_commit.create`/`materialize_up_to`, i.e. a gate `propose`/`materialize_up_to` apply
+> INTERNALLY to whatever sink they are handed. That turned out to be the wrong layer, and it was a
+> real, live-reproduced liveness bug rather than a style problem: a `materialize_sink` is an arbitrary
+> caller-composed closure, and once composed with `Reactor.wrap_materialize_sink` its `write` also
+> carries a guest-DISPATCH side effect. An internal gate suppressed that dispatch along with the
+> business-logic write it was meant to deduplicate — and re-dispatch is the only path by which a legs
+> batch a VSR view change discarded before it committed is ever re-proposed, so such a transfer became
+> permanently unrecoverable (no money moved wrongly; it simply never completed). Reproduced on DST
+> seeds 22 and 24.
+>
+> **Shipped instead**: one standalone, composable function,
+> `val deduplicate : ?watermark_store:Riptide_storage.File_kv_store.t -> materialize_sink -> materialize_sink`,
+> which the caller wraps around exactly the sink that needs exactly-once semantics, with any
+> dispatch-carrying wrapper OUTSIDE it:
+> `Reactor.wrap_materialize_sink reactor (Batch_commit.deduplicate ?watermark_store (Accumulator.materialize_sink ...))`.
+> `?materialize_watermark_store` on `create` and `?watermark_store` on `materialize_up_to` are both
+> GONE; `materialize_write_catching` knows nothing about watermarks again. `deduplicate` with no store
+> is a transparent pass-through, which is how the "preserves today's behavior exactly" property below
+> is retained. See `lib/batch_commit/batch_commit.mli`'s own `deduplicate` doc comment for the full
+> account, and `test_ledger_dst_load.ml`'s
+> `test_the_watermark_must_sit_inside_the_reactor_wrapper_or_a_discarded_batch_never_recovers` for the
+> A/B that keeps the ordering rule measured rather than argued.
+
 `Batch_commit.create` gains `?materialize_watermark_store:Riptide_storage.File_kv_store.t` (mirrors
 how `encryption_sink`'s own keystore is caller-supplied; `None` preserves today's behavior exactly for
 any call site that doesn't opt in). Key derivation reuses `redaction_event_id`'s own already-proven
@@ -148,6 +174,12 @@ val create :
   ?materialize_watermark_store:Riptide_storage.File_kv_store.t -> unit -> t
 ```
 
+> **The `?materialize_watermark_store` line above was REMOVED by Task 4's own review (Critical 1)** —
+> see Decision 1's own revision note. `create`'s shipped signature ends at `?require_encryption:bool ->
+> unit -> t`; the watermark is `Batch_commit.deduplicate`, a composable sink wrapper. `?authorize_batch`
+> itself is unchanged.
+
+
 `?authorize_batch` defaults to always-`Allow`. Evaluated once per batch, inside the same
 "not already in the log" guard the existing per-write checks use — a `Deny` here refuses the whole
 batch identically to a per-write `Deny`, and folds into the existing `authorization_denials` counter
@@ -238,8 +270,10 @@ Decision 5's own "Residual gap, disclosed rather than hidden" for the non-atomic
 `is_primary` and calling `propose`.
 
 **Backward compatibility**: every new parameter is optional with a behavior-preserving default — no
-`?materialize_watermark_store` means re-materialization is exactly as unsafe for non-idempotent sinks
-as it is today; no `?authorize_batch` means exactly today's per-write-only enforcement.
+watermark means re-materialization is exactly as unsafe for non-idempotent sinks
+as it is today (as shipped, per Decision 1's revision note, that is `Batch_commit.deduplicate` called
+with no `?watermark_store`, which is a transparent pass-through, rather than an omitted
+`?materialize_watermark_store` on `create`); no `?authorize_batch` means exactly today's per-write-only enforcement.
 `committed_writes_for` and `is_primary` are both brand new functions, touching zero existing call
 sites. Only `materialize_sink.write`'s shape actually changes, and every sink constructor in this
 codebase needs updating to match — a real, known, enumerable set (confirmed by grep before writing

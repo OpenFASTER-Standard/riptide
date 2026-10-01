@@ -49,25 +49,54 @@ type t
       legs it authorises, under the transfer's own {!Schema.transfer_idempotency_key}. "Has this
       request already been decided, and how?" is answered by
       {!Riptide_batch_commit.Batch_commit.committed_writes_for}, threaded in as this module's
-      {!committed} parameter. A restart cannot lose it, and two processes cannot disagree about it.
+      {!committed} parameter. Two processes cannot disagree about it, and a restart cannot lose it
+      {b for as long as the log entry carrying it is still in the WAL} -- which, for a DECLINE, is a
+      real qualifier rather than a formality (Task 4's own review, Minor): a decline's batch is that
+      one decision write alone, it carries [merge_key = None], and
+      {!Riptide_batch_commit.Batch_commit.write_at_op_number_has_merge_key} therefore reports its
+      entry as freely evictable by {!Riptide_storage.File_storage}'s bounded ring WAL. Evicting it
+      loses the decline record and makes that request re-decidable. See {!Legs.decision_write}'s own
+      doc comment, which discloses this in full, including why an ACCEPT does not have the same
+      exposure (its batch shares an entry with two [merge_key]-carrying legs). Still strictly better
+      than the in-memory table this replaced, which lost EVERY decision, accepted and declined alike,
+      on every restart -- but not the unconditional "a restart cannot lose it" this paragraph used to
+      claim.
     - The already-applied-legs table became
-      {!Riptide_batch_commit.Batch_commit.create}'s own [?materialize_watermark_store]: a durable,
-      per-[(idempotency_key, position)] record that a committed write has already been handed to a
-      sink. {b This is a real obligation on whoever builds the {!Riptide_batch_commit.Batch_commit.t}
-      this module's sink is wired to}, not an internal detail -- {!materialize_sink} below is a
-      plain read-add-write accumulator with no dedup of its own, so a caller that omits
-      [?materialize_watermark_store] (or omits [?watermark_store] on a
+      {!Riptide_batch_commit.Batch_commit.deduplicate}: a durable, per-[(idempotency_key, position)]
+      record that a committed write has already been handed to a sink, composed around a sink as a
+      wrapper. {b This is a real obligation on whoever wires this module's sink up}, not an internal
+      detail -- {!materialize_sink} below is a plain read-add-write accumulator with no dedup of its
+      own, so a caller that passes it UNWRAPPED (to
+      {!Riptide_batch_commit.Batch_commit.propose}'s [?materialize], or to a
       {!Riptide_batch_commit.Batch_commit.materialize_up_to} walk) re-applies every replayed leg and
       reintroduces exactly the doubling described above. See {!materialize_sink}.
 
-    {b One behavioural consequence of the durable watermark worth knowing before reading the tests}:
-    materialization of a given committed write now happens at most once ever, which includes the
-    re-dispatch {!Riptide_module.Reactor.wrap_materialize_sink} performs when a
-    {!Schema.requests_merge_key} write is materialized. So re-materializing an already-materialized
-    request no longer re-reaches the guest at all. That is the watermark working as designed rather
-    than a gap -- but it does mean the "re-propose an already-accepted request's batch" recovery path
-    {!handle_guest_decision} implements is reached by a fresh dispatch of a request whose
-    materialization has NOT yet been watermarked, not by replaying one that has. *)
+    {b HOW THAT WRAPPER MUST BE COMPOSED, which is correctness-critical and not a matter of taste}
+    (Task 4's own review, Critical 1 -- live-reproduced on two DST seeds). The watermark wraps ONLY
+    this module's own accumulator sink, and {!Riptide_module.Reactor.wrap_materialize_sink} sits
+    strictly OUTSIDE it:
+    {[
+      Reactor.wrap_materialize_sink reactor
+        (Batch_commit.deduplicate ~watermark_store
+           (Accumulator.materialize_sink ~read_balance ~write_balance ~store_request))
+    ]}
+    The reactor wrapper's own [write] runs its inner sink and THEN dispatches every subscribed guest.
+    {!Riptide_batch_commit.Batch_commit.deduplicate} skips the sink it wraps ENTIRELY for an
+    already-applied write -- so with the two nested the other way round, re-materializing an
+    already-materialized {!Schema.requests_merge_key} write stops re-dispatching the guest. That is
+    not a harmless optimization: {!handle_guest_decision}'s "re-propose an already-accepted request's
+    batch" path is reached ONLY by a fresh dispatch, and nothing else in this system ever re-proposes
+    a batch a VSR view change discarded before it committed, so suppressing re-dispatch makes such a
+    transfer PERMANENTLY unrecoverable -- a liveness softlock on a cluster with nothing wrong with it
+    (no money moves wrongly; it simply never completes).
+
+    {b This paragraph previously documented that softlock as correct behaviour}, saying
+    re-materializing an already-materialized request "no longer re-reaches the guest at all... the
+    watermark working as designed rather than a gap". It was neither by design nor acceptable. With
+    the composition above, materialization of a given committed write still happens at most once ever
+    -- that is the exactly-once property this plan exists to deliver -- while guest dispatch fires on
+    every materialize call unconditionally. Both at once is the point; they are not in tension once the
+    gate is composed at the right layer. *)
 
 val create : unit -> t
 
@@ -105,9 +134,31 @@ val decision : committed:committed -> request_id:int64 -> bool option
     replica yet (replication lag, or a batch a view change discarded before quorum); or a batch
     exists under this request's own idempotency key but carries no decision record at all, which
     nothing in this module can produce and {!Authorize.authorize_batch} does not itself forbid for a
-    batch carrying no legs either. Once [Some _], it never changes -- the log's own first-wins-per-key
-    rule guarantees that, which is strictly stronger than the in-memory table this replaced (that one
-    was immutable only for one process's lifetime). *)
+    batch carrying no legs either.
+
+    {b Once [Some _], it never changes} -- the log's own first-wins-per-key rule guarantees that, and
+    that part really is stronger than the in-memory table this replaced (which was immutable only for
+    one process's lifetime, and which a restart lost entirely).
+
+    {b But the committed-log scheme is NOT uniformly "strictly stronger" than that table, and this
+    doc claimed it was} (Task 4's own review, Important 2). There is one window where it is strictly
+    WEAKER: between a decision being APPENDED by {!handle_guest_decision}'s [~propose] and that batch
+    actually COMMITTING. The in-memory table recorded a decision the instant the guest produced it, so
+    a second dispatch in that window saw it and could not change it. This function cannot -- it reads
+    the committed log, so it answers [None] for an appended-but-uncommitted decision, and a second
+    dispatch in that window therefore takes the "never decided" branch and proposes its own decision
+    under the same key. Normally harmless: {!Riptide_batch_commit.Batch_commit.propose}'s own "already
+    in my log" skip makes the second proposal a no-op while the first is still present. {b It stops
+    being harmless if a view change discards the first batch before quorum} -- the second decision is
+    then free to become the record, so a DECLINE genuinely can end up recorded as an ACCEPT (or vice
+    versa). That outcome was unreachable with the in-memory table and is reachable now. It is bounded:
+    whichever decision commits is still a real decision the guest really made for this request, about
+    this request's own amount and accounts (so no transfer is fabricated), it is final once committed,
+    and the window is exactly "appended but not yet committed" -- nil on a solo replica, where
+    {!Riptide_batch_commit.Batch_commit.propose} commits synchronously. Closing it would mean a
+    decision that is durable before it is committed, which is a Layer 0 question (a pre-commit
+    intent record) rather than something this module can answer. Named here as a real, disclosed
+    trade of the Task 7 design rather than left for a reader to infer from an overclaim. *)
 
 val handle_guest_decision :
   t ->
@@ -130,8 +181,18 @@ val handle_guest_decision :
     {!Riptide_batch_commit.Batch_commit.propose} call} (Task 7, design spec Decision 5), or, more
     simply, the caller's own [~propose] closure should check it before calling this function at all
     and report [Error "not primary, retry"] without dispatching -- which is what this module's own
-    test harness does, and is correct because EVERY outcome of this function proposes something (see
-    below), so there is no dispatch shape that is exempt. Without that check, a non-primary (or
+    test harness does. {b Why checking once, up front, rather than per outcome is correct} (Task 4's
+    own review, Minor -- this used to claim "EVERY outcome of this function proposes something", which
+    is false: the already-decided-DECLINED outcome proposes nothing by design, and a decode error
+    returns [Error] before reaching any outcome at all): the outcomes that DO propose -- a first
+    decision, accept or decline, and the re-proposal of an already-accepted batch -- are the ones a
+    silent non-primary no-op would actually lose, and they are not distinguishable from the
+    propose-nothing outcomes until after the guest's bytes have been decoded and the committed log
+    consulted. Checking up front costs one predicate and covers every outcome that has something to
+    lose; checking per outcome would mean re-deriving the same answer in three places for no
+    additional guarantee, since nothing between the two points can make a primary stop being one in a
+    way an earlier check would have caught (see {!Riptide_batch_commit.Batch_commit.is_primary}'s own
+    disclosed residual non-atomicity). Without the check at all, a non-primary (or
     non-[Normal]) replica turns {!Riptide_batch_commit.Batch_commit.propose} into a silent no-op and
     the guest's decision is lost with no trace and no way to tell that from success.
 
@@ -242,13 +303,15 @@ val materialize_sink :
     durable.
 
     {b THE ONE REAL OBLIGATION THIS PLACES ON A CALLER: this sink is NOT idempotent, and it carries
-    no already-applied check of its own, so every path that drives it MUST supply the durable
-    watermark.} Concretely:
-
-    - build the {!Riptide_batch_commit.Batch_commit.t} this sink is wired to with
-      {!Riptide_batch_commit.Batch_commit.create}'s [?materialize_watermark_store], and
-    - pass [?watermark_store] to every
-      {!Riptide_batch_commit.Batch_commit.materialize_up_to} catch-up walk.
+    no already-applied check of its own, so every path that drives it MUST drive it through the
+    durable watermark.} Concretely: wrap it, once, in
+    {!Riptide_batch_commit.Batch_commit.deduplicate} with a real [~watermark_store], and pass THAT
+    everywhere this sink would otherwise go -- as {!Riptide_batch_commit.Batch_commit.propose}'s
+    [?materialize] and as every {!Riptide_batch_commit.Batch_commit.materialize_up_to} catch-up walk's
+    [~materialize]. {b And wrap it INSIDE
+    {!Riptide_module.Reactor.wrap_materialize_sink}, never outside} -- see {!t}'s own doc comment above
+    for why that ordering is correctness-critical rather than stylistic, and for the liveness softlock
+    that getting it backwards produced.
 
     Why it is necessary at all: {!Riptide_batch_commit.Batch_commit.propose}'s materialize step runs
     on EVERY call for a key, not only the one that performed the durable commit, and re-hands the
