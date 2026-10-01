@@ -3,9 +3,11 @@ type t = {
      observability counters. The [decided_requests] and [applied_legs] tables that used to live here
      are DELETED, not persisted in parallel -- "has this request been decided?" is now a query
      against the committed log (see [committed] below) and "has this write already been applied?" is
-     a durable watermark Batch_commit itself owns. Neither is a fact a process's own memory has any
-     business being the source of truth for; both being so is what made a restart double every
-     balance in this ledger. *)
+     a durable watermark in the Batch_commit.deduplicate wrapper the CALLER composes around this
+     module's own sink (never a parameter of Batch_commit.propose, which deliberately has none -- see
+     accumulator.mli's "THE ONE REAL OBLIGATION" section). Neither is a fact a process's own memory
+     has any business being the source of truth for; both being so is what made a restart double
+     every balance in this ledger. *)
   mutable repeat_dispatches : int;
   mutable prevented_flips : int;
 }
@@ -50,13 +52,16 @@ let decision ~(committed : committed) ~request_id =
 
 let handle_guest_decision t ~actor ~(committed : committed) ~propose (decision_bytes : bytes) :
     (unit, string) result =
-  (* Decoded exactly once, by Legs.decision_of_bytes -- the guest-facing trust boundary the fuzz
-     test hammers -- and nothing here or downstream re-decodes these bytes (finding M9, and
-     fix-wave round 2's re-review finding I3, which caught that this call had been left as
-     duplicated inline decode logic while legs.mli already claimed to be on this path). The legs it
-     hands back are not used directly any more: this function proposes a WHOLE batch
-     (Legs.batch_of_decision -- the durable decision record plus, for an accept, those same two
-     legs), because a decline has no legs and still has to leave a durable trace. *)
+  (* The GUEST's bytes are decoded exactly once, by Legs.decision_of_bytes -- the guest-facing trust
+     boundary the fuzz test hammers -- and nothing here or downstream re-decodes THOSE bytes (finding
+     M9, and fix-wave round 2's re-review finding I3, which caught that this call had been left as
+     duplicated inline decode logic while legs.mli already claimed to be on this path). Not a claim
+     that nothing is ever decoded twice (final whole-branch review, Minor): the COMMITTED decision
+     record's own payload is decoded again, below, by decision_of_committed_writes -- a different
+     artifact answering a different question (what does the log say?), not duplication to remove.
+     The legs decision_of_bytes hands back are not used at all: this function proposes a WHOLE batch
+     (Legs.batch_of_decision -- the durable decision record plus, for an accept, legs that same
+     constructor rebuilds), because a decline has no legs and still has to leave a durable trace. *)
   match Legs.decision_of_bytes ~actor decision_bytes with
   | Error e -> Error e
   | Ok (accepted, r, _legs) ->
@@ -96,8 +101,10 @@ let materialize_sink ~read_balance ~write_balance ~store_request :
             if Schema.account_of_merge_key merge_key <> Some leg.this_account then ()
             else
               (* A plain read-add-write, with no already-applied check of its own: exactly-once is
-                 Batch_commit's durable watermark's job now, not a table in this process. See
-                 accumulator.mli for the one real obligation that places on a caller. *)
+                 the job of the Batch_commit.deduplicate wrapper the CALLER composes around this
+                 sink, not of a table in this process and not of anything Batch_commit.propose does
+                 on its own. See accumulator.mli for the one real obligation that places on a
+                 caller. *)
               let current = Option.value (read_balance ~merge_key) ~default:0L in
               write_balance ~merge_key (Int64.add current (balance_delta leg))
         else ());

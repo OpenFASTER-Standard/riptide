@@ -227,15 +227,39 @@ val handle_guest_decision :
     is exactly what a VSR view change is entitled to discard, and nothing else in this system ever
     re-proposes it -- so re-triggering the dispatch that produced it is the only recovery path there
     is, and it is a real one, exercised for real by this module's own DST test. Re-proposing is safe
-    on both counts that matter: under the same idempotency key
-    {!Riptide_batch_commit.Batch_commit.propose} skips re-appending a batch already in the log, and
-    its own durable watermark will not re-hand a write it has already handed to the sink. Taking the
-    request from the log's own record makes this strictly STRONGER than merely pinning the
+    on both counts that matter, and NEITHER of them is a watermark
+    {!Riptide_batch_commit.Batch_commit.propose} owns internally (final whole-branch review, IMP-4:
+    this sentence used to say "its own durable watermark will not re-hand a write it has already
+    handed to the sink", the [.mli] twin of a sentence already corrected in [accumulator.ml]; there
+    is deliberately no [?materialize_watermark_store] parameter on
+    {!Riptide_batch_commit.Batch_commit.propose} at all, and believing dedup is automatic is exactly
+    the belief that reintroduces the restart-doubling bug this module's own "THE ONE REAL OBLIGATION"
+    section exists to prevent):
+    - {b propose-side}: under the same idempotency key,
+      {!Riptide_batch_commit.Batch_commit.propose}'s own "already in my log" check skips re-appending
+      a batch that is already committed, so no duplicate entry is ever created.
+    - {b materialize-side}: the CALLER's own sink, which it is the caller's obligation to have
+      composed as {!Riptide_batch_commit.Batch_commit.deduplicate}[ ~watermark_store inner] (inside
+      any {!Riptide_module.Reactor.wrap_materialize_sink}), is what declines to re-hand a write it
+      has already handed to [inner]. A caller that omits that wrapper gets a sink re-applied on
+      every replay -- correct for a pure lattice join, and double-counting for this module's
+      accumulating one.
+
+    Taking the request from the log's own record makes this strictly STRONGER than merely pinning the
     accept/decline bit, not a weakening of it: a later dispatch can change neither the decision nor
-    the amount or accounts the transfer moves. (Note that this branch is only reachable at all while
-    the decision has COMMITTED but its sibling legs have not yet been materialized on this replica --
-    if [committed] returns [None] because the whole batch was discarded pre-quorum, the first branch
-    above re-proposes it from scratch instead, which is equally correct.)
+    the amount or accounts the transfer moves.
+
+    {b When is this branch reachable?} On ANY re-dispatch of a request whose decision has already
+    COMMITTED -- which, because dispatch fires per materialize of the "ledger.requests" write rather
+    than per merged-value change, includes a request that is already fully materialized and settled,
+    not only one caught mid-flight (final whole-branch review, Minor: this used to claim it was "only
+    reachable while the decision has COMMITTED but its sibling legs have not yet been materialized",
+    which is false -- the legs commit in the SAME batch as the decision record, and this module's own
+    tests drive this branch against a fully-materialized request). The re-proposal is then a no-op on
+    both sides by the two bullets above, which is why making the common case harmless matters as much
+    as making the recovery case work. If [committed] returns [None] because the whole batch was
+    discarded pre-quorum, the first branch above re-proposes it from scratch instead, which is
+    equally correct.
 
     [actor] is the identity the decision record and both legs are proposed under, and is recorded
     inside each leg's own payload as well (see {!Schema.transfer_leg}'s [actor] field). Each batch's

@@ -123,19 +123,47 @@ val decision_of_bytes :
     [accepted], with [causation = correlation = ]{!event_id_of_request} of that request.
 
     Building the legs even for a declined decision is deliberate: it keeps this function a pure,
-    total decode-and-construct step with one behaviour to fuzz, and leaves the decision about
-    whether those legs are ever proposed where it belongs -- in
-    {!Accumulator.handle_guest_decision}, this function's only production caller, which proposes
-    them only for a first-time accept.
+    total decode-and-construct step with one behaviour to fuzz, and leaves every decision about what
+    to propose where it belongs -- in {!Accumulator.handle_guest_decision}, this function's only
+    production caller.
+
+    {b That caller DISCARDS this third component} (final whole-branch review, Minor -- this used to say
+    it "proposes them only for a first-time accept", which is not what happens). It binds the legs as
+    [_legs] and proposes a whole {!batch_of_decision} batch instead, rebuilt from the decoded request:
+    the durable decision record plus, for an accept, legs that are equal to -- but not the same values
+    as -- the ones returned here. The distinction matters because a decline has to commit a record with
+    NO legs, which this tuple cannot express. So the legs here have no production consumer at all;
+    they exist for the fuzz test, which checks the pairing property of exactly what this function
+    constructs. {!batch_of_decision} calls {!legs_of_request} itself, so both paths derive their legs
+    from the same one constructor and cannot disagree.
 
     {b This is the guest-facing trust boundary}: the host's [propose_write] closure calls this
-    (via {!Accumulator.handle_guest_decision}) on the raw bytes a WASM guest supplies, so it is
-    this function -- not anything inside the guest -- that is what actually guarantees "both legs
-    of a transfer are a genuine, matched pair". It decodes those bytes exactly ONCE and hands the
-    decoded request back to its caller alongside the legs, so no caller needs to decode them a
-    second time (final whole-branch review, finding M9).
+    (via {!Accumulator.handle_guest_decision}) on the raw bytes a WASM guest supplies, so it is this
+    function -- not anything inside the guest -- that turns untrusted bytes into a well-formed
+    {!Schema.transfer_request} at all, and the pairing it derives from that request is correct by
+    construction rather than by anything the guest did.
 
-    That sentence used to be false, and the fix was to make it true rather than to soften it
+    {b It is no longer the only thing guaranteeing the pairing, and must not be read as if it were}
+    (Task 7; final whole-branch review, Minor -- this paragraph used to say it "is what actually
+    guarantees 'both legs of a transfer are a genuine, matched pair'", pre-Task-7 framing in tension
+    with this file's own header and with {!Authorize.authorize_batch}). {!Authorize.authorize_batch}
+    now enforces the same pairing property at the commit checkpoint, independently, for every
+    committed batch including ones that never came through here. Construction-correctness here and
+    checkpoint enforcement there are two different guarantees against two different threats -- a
+    malformed guest payload versus a write proposed by a path that bypasses this module entirely --
+    and this module deliberately has both.
+
+    {b On decoding exactly once}: these particular bytes are decoded here, once, and the decoded
+    request is handed back to the caller alongside the legs so no caller re-decodes them (final
+    whole-branch review, finding M9). That is a statement about THIS decode on the propose path, not
+    a global one: the decision record's committed copy is decoded again later, by
+    {!Wire.decision_of_value}, every time {!Accumulator.handle_guest_decision} or
+    {!Authorize.authorize_batch} asks what a committed batch decided. That second decode is a
+    different question (what does the LOG say?) about a different artifact (a committed payload, not a
+    guest's in-flight bytes) and is not duplication to remove -- a later Minor in the same review
+    caught this sentence reading as though it forbade it.
+
+    That first sentence used to be false, and the fix was to make it true rather than to soften it
     (fix-wave round 2, re-review finding I3): fix round 1 renamed this function from
     [legs_of_bytes] and documented it as the trust boundary, but left
     {!Accumulator.handle_guest_decision} calling {!Wire.decode_decision} and {!legs_of_request}

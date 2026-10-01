@@ -32,9 +32,13 @@ type transfer_request = {
 
     [request_id] is the client's own identifier for this transfer, and becomes the
     {!transfer_leg.transfer_id} of both legs it produces. It is also what
-    {!transfer_idempotency_key} derives the legs batch's own idempotency key from, and what the
-    first-decision-wins table in {!Accumulator} is keyed on -- so two genuinely different transfers
-    must not share one.
+    {!transfer_idempotency_key} derives the decision batch's own idempotency key from, and -- via
+    that key -- what the first-decision-wins rule in {!Accumulator} looks a committed decision record
+    up by, so two genuinely different transfers must not share one. (Task 7, the Layer 0/Layer 2
+    boundary revision: that rule used to be a [decided_requests] TABLE held in {!Accumulator.t}'s own
+    memory, keyed directly on [request_id]. The table is deleted -- it lost every decline it held on a
+    restart -- and the question is now a query against the committed log. This sentence described the
+    table in the present tense; final whole-branch review, Minor.)
 
     [from_account]/[to_account] are {b constrained to be non-negative} by
     {!Authorize.authorize} (final whole-branch review, finding I2) -- see that function for why
@@ -50,10 +54,17 @@ type transfer_leg = {
   amount : int64;
 }
 (** One side of a transfer: the balance-affecting write shape, proposed at
-    [account_merge_key this_account]. {b Self-certifying}: every field
-    {!Authorize.authorize} needs in order to judge THIS leg alone is present in THIS leg's own
-    payload, with no need to see its sibling -- which is exactly what makes the per-write
-    authorization checkpoint able to carry a real policy at all (design spec Decision 1).
+    [account_merge_key this_account]. {b Self-certifying}: {!Authorize.authorize} can judge THIS leg
+    alone with no need to see its sibling, or any other write in the batch -- which is exactly what
+    makes the per-write authorization checkpoint able to carry a real policy at all (design spec
+    Decision 1). Precisely: it judges this payload against ITSELF and against its own enclosing
+    {!Riptide_batch_commit.Batch_commit.write}, nothing further. Two of its clauses genuinely do read
+    that enclosing write rather than this payload -- [merge_key] must equal
+    [account_merge_key this_account], and the write's [actor] must equal this payload's [actor] -- and
+    both are the point rather than an exception: a payload that could only be checked against itself
+    could claim any account and any author it liked. (Final whole-branch review, Minor: this used to
+    say every field [authorize] needs "is present in THIS leg's own payload", which those two clauses
+    contradict.)
 
     [amount] is always a positive magnitude; [role] supplies the sign.
 
@@ -105,8 +116,13 @@ val account_of_merge_key : string -> int64 option
 
 val transfer_idempotency_key : int64 -> string
 (** [transfer_idempotency_key request_id] is the {!Riptide_batch_commit.Batch_commit.propose}
-    idempotency key the two legs of that request's transfer are always proposed under --
-    ["ledger-transfer-" ^ decimal request_id]. Deterministic from [request_id] alone, with no
+    idempotency key EVERY batch {!Legs.batch_of_decision} builds for that request is proposed under --
+    ["ledger-transfer-" ^ decimal request_id]. That is the decision record plus, for an ACCEPT, the
+    two legs; a DECLINE carries no legs at all and is proposed under this same key (final whole-branch
+    review, Minor: this used to describe the key as what "the two legs" are proposed under, which
+    misses the decline case entirely and would make a reader expect no committed batch under this key
+    for a declined transfer -- there always is one, and that durability is the whole reason the
+    in-memory decision table could be deleted). Deterministic from [request_id] alone, with no
     timestamp or nonce in it, which is what makes a retried or recovery-driven re-proposal of the
     same transfer land on the same key and therefore be absorbed rather than duplicated. *)
 

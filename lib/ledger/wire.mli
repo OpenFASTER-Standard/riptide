@@ -85,9 +85,19 @@ val decision_to_value : accepted:bool -> Schema.transfer_request -> Riptide.Valu
 val decision_of_value : Riptide.Value.value -> (bool * Schema.transfer_request) option
 (** [decision_of_value v] is {!decode_decision} of the bytes [v] carries, or [None] -- never an
     exception -- if [v] is not a [Value.Scalar (Value.Bytes _)] at all. Total, and deliberately
-    usable as a test for "is this write a decision record?": every OTHER payload this module ever
-    commits (a {!Schema.transfer_request}, a {!Schema.transfer_leg}) is a [Value.Record], so no
-    payload can be read as both. *)
+    usable as a test for "is this write a decision record?": every OTHER payload that can appear in a
+    batch this module commits is a [Value.Record], so no payload can be read as both. Exhaustively,
+    those are:
+    - a {!Schema.transfer_request} ({!Schema.transfer_request_to_value});
+    - a {!Schema.transfer_leg} ({!Schema.transfer_leg_to_value});
+    - the synthetic ["riptide.module.authz"] authorization-decision write that
+      {!Riptide_batch_commit.Batch_commit.propose} APPENDS to every batch it proposes once every write
+      has been [Allow]ed ([batch_commit.mli]'s own "Authorization" section) -- a [Value.Record] of
+      idempotency_key + decision. This module neither authors nor can see it at propose time, but
+      every caller walking a COMMITTED batch's writes scans past it, so leaving it out of this
+      enumeration made the list read as complete while omitting the one shape a committed ledger batch
+      carries that this module did not write (final whole-branch review, Minor -- the same omission was
+      already closed in [accumulator.ml]'s own copy of this enumeration and left unfixed here). *)
 
 val encode_balance : int64 -> bytes
 (** [encode_balance bal] is exactly 8 bytes, [bal] as a little-endian signed [int64]. This is what
