@@ -105,16 +105,42 @@ val authorize_batch :
       [amount], the debit leg's [this_account] the request's [from_account], and the credit leg's
       [this_account] its [to_account].
 
-    That correspondence is what makes the log's decision record and the money it moves inseparable:
-    no committed state can exist in which a transfer is on record as accepted while its legs are
-    absent, nor in which legs exist that no committed decision authorised, nor in which a decline
-    somehow carries legs. {!Legs.batch_of_decision} constructs exactly such batches, and this
-    function is what makes that true of every committed batch rather than only of the ones that
-    function built.
+    {b Exactly three properties, stated precisely because an earlier wording overclaimed a fourth
+    this function does not enforce and the suite depends on it not enforcing} (final whole-branch
+    review, IMP-2). What no committed batch can violate, for every batch, including ones
+    {!Legs.batch_of_decision} did not build:
 
-    {b What this function deliberately does NOT check}: anything a single write can self-certify
-    (that is {!authorize}'s job, and duplicating it here would create two places to keep in
-    agreement), and anything about the business question -- whether the sender can afford the
+    + {b accepted ⇒ exactly its own two matching legs.} A batch carrying an ACCEPTED decision
+      record carries exactly the balancing pair that record's own request authorises -- so a
+      transfer can never be on record as accepted while the legs that move its money are absent,
+      short, over-stuffed, or for a different transfer/amount/account pair.
+    + {b declined ⇒ no legs.} A batch carrying a DECLINED decision record carries no transfer leg
+      at all, so a decline can never quietly move money.
+    + {b at most one decision record per batch.} Two or more is [Deny], which is what makes "the
+      decision this batch attests to" a well-defined single thing for every committed batch.
+
+    {b What is deliberately NOT enforced here: the converse direction.} A batch carrying transfer
+    legs is NOT required to carry a decision record. With no decision record present, the legs are
+    judged on the pairing criteria above and a well-formed pair is [Allow]ed -- so a committed batch
+    CAN consist of two matched legs with nothing on the log attesting that a decision authorised
+    them. That is deliberate and load-bearing, not an oversight: it is what lets a test seed an
+    opening balance through the real handle, and more generally what keeps this checkpoint's job
+    "no batch may be internally inconsistent" rather than "every leg must be traceable to a decision
+    record". The decision ⇒ legs direction is what is checkpoint-enforced; the legs ⇒ decision
+    direction remains CONSTRUCTION-guaranteed for this module's own writes ({!Legs.batch_of_decision}
+    is the only thing {!Accumulator.handle_guest_decision} ever proposes, and it always emits the
+    record alongside the legs), and is not something a committed batch is structurally prevented
+    from violating.
+
+    {b What this function deliberately does NOT check}: anything a single write can self-certify --
+    that is {!authorize}'s job, and re-checking it here would mean two places to keep in agreement
+    for no additional guarantee, since either hook denying refuses the whole batch. (Stated as a
+    preference rather than an absolute, because one such check IS duplicated and has to be: payload
+    DECODABILITY. [authorize_batch] cannot form an opinion about a leg it could not decode, so a
+    non-decoding account-key write is denied by both hooks independently, with its own reason string
+    on each side -- see [authorize.ml]'s own comment on [legs_of_batch]. The rule is "don't duplicate
+    a per-write check this hook does not itself need", not "this hook shares nothing with
+    {!authorize}".) Also not checked: anything about the business question -- whether the sender can afford the
     transfer -- which is the WASM guest's job and which no checkpoint here can see a balance for. A
     self-transfer's two legs are a perfectly matched pair by every criterion above and are [Allow]ed
     here; they are denied individually by {!authorize}'s [this_account = other_account] clause, which

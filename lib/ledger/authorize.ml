@@ -117,9 +117,14 @@ let authorize_batch (writes : Batch_commit.write list) : Batch_commit.decision =
   | [ (accepted, r) ] -> (
     (* The batch also carries this module's own decision record, so the legs are not merely required
        to be a matched pair -- they must be the matched pair THAT decision authorises, and a DECLINE
-       must authorise none. This is what makes the log's decision record and the money it moves
-       inseparable: no committed state exists in which a transfer is on record as accepted while its
-       legs are missing, or in which legs exist that no committed decision ever authorised. *)
+       must authorise none. This is the direction that is checkpoint-enforced: no committed state
+       exists in which a transfer is on record as ACCEPTED while its legs are missing or are a
+       different transfer's, nor in which a DECLINE carries legs. The converse is NOT enforced and
+       deliberately so (final whole-branch review, IMP-2 -- this comment used to claim it was): the
+       [] branch above [Allow]s a well-formed pair carrying no decision record at all, so "legs exist
+       that no committed decision authorised" IS a reachable committed state. That direction stays
+       construction-guaranteed for this module's own writes (Legs.batch_of_decision always emits the
+       record with the legs) rather than checkpoint-enforced. See authorize.mli. *)
     if not accepted then
       match legs with
       | [] -> Batch_commit.Allow

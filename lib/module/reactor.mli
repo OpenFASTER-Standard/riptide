@@ -175,10 +175,13 @@ val subscribe :
     module-failure signals today has to read this process's stderr; a future task owns deciding
     whether such events belong on Layer 0's replica-event channel or on a reactor-owned one.
 
-    {b Known, disclosed residual gap: a [~propose] closure wired to a FIXED
-    {!Riptide_batch_commit.Batch_commit.t} silently stops working when the primary moves, and
-    nothing here warns you.} (Task 6's own boundary friction, item 4; final whole-branch review
-    finding I9.) A {!Riptide_batch_commit.Batch_commit.t} is built over one
+    {b CLOSED by task-master Task 7 (the Layer 0/Layer 2 boundary revision): a [~propose] closure
+    wired to a FIXED {!Riptide_batch_commit.Batch_commit.t} used to stop working silently when the
+    primary moved, with nothing here to warn you.} (Task 6's own boundary friction, item 4; final
+    whole-branch review finding I9. Kept rather than deleted because the hazard itself is still
+    real -- what Task 7 shipped is the way to detect and report it, not its removal; a caller that
+    skips the check below gets exactly the pre-Task-7 behaviour described here.) A
+    {!Riptide_batch_commit.Batch_commit.t} is built over one
     {!Riptide_vsr.Replica.t}, and {!Riptide_batch_commit.Batch_commit.propose} through a replica
     that is not currently the primary in [Normal] status is a documented SILENT NO-OP -- not an
     error, not a [Deny], no counter, nothing. So the natural way to wire this parameter (build one
@@ -189,15 +192,42 @@ val subscribe :
     the closure was still holding a handle on the old one. A caller must re-derive the current
     primary on every single proposal, as a real client would, rather than caching one -- and because
     [propose]'s own result type here is [(unit, string) result], a closure that finds no live primary
-    has to decide between reporting [Error] (which the guest will see as a failure it cannot
-    distinguish from a real rejection) and [Ok] (which claims something happened). Neither is right.
-    This reactor cannot fix it: it deliberately holds no {!Riptide_vsr.Replica.t} at all. Giving
-    this interface a way to express "not now, retry" distinctly from "refused" belongs to the
-    boundary revision (task-master Task 7).
+    had to decide between reporting [Error] (which the guest will see as a failure it cannot
+    distinguish from a real rejection) and [Ok] (which claims something happened). Neither was right.
+    This reactor still cannot fix it from the inside: it deliberately holds no
+    {!Riptide_vsr.Replica.t} at all.
 
-    {b Known, disclosed residual gap: a write a guest proposes can be silently DISCARDED after
-    [~propose] returned [Ok], and the only recovery is to re-trigger the dispatch that produced
-    it.} (Task 6's own boundary friction, item 5; final whole-branch review finding I9.) A batch
+    {b What Task 7 shipped, and what a [~propose] closure must therefore do}: Layer 0 now exposes
+    {!Riptide_batch_commit.Batch_commit.is_primary} (design spec Decision 5), the predicate a
+    closure previously had to independently rediscover and reproduce. Check it IMMEDIATELY BEFORE
+    every {!Riptide_batch_commit.Batch_commit.propose} call -- never once at {!subscribe} time,
+    never cached, since primary/view status can change between any two calls -- and when it is
+    [false], return [Error "not primary, retry"] WITHOUT calling [propose] at all. That exact
+    [Error] string is the shipped answer to the "neither [Error] nor [Ok] is right" dilemma above:
+    the guest still sees only a nonzero status byte, but the refusal is now distinguishable from a
+    real rejection by its reason, attributable in the log stream, and -- crucially -- a write is no
+    longer silently swallowed by a no-op [propose] it never should have reached.
+    [lib/ledger/]'s own harness wires it exactly this way; see
+    [Riptide_ledger.Accumulator.handle_guest_decision]'s doc comment for why ONE up-front check
+    covers every outcome that has something to lose, and [test/test_ledger_dst_load.ml]'s own
+    non-primary scenario for the live evidence that the closure reports
+    [Error "not primary, retry"] rather than dropping the dispatch.
+
+    {b Residual, disclosed at {!Riptide_batch_commit.Batch_commit.is_primary} itself rather than
+    restated here}: the check-then-[propose] pair is not atomic, and [is_primary] does not predict
+    [propose]'s third (in-memory-log-gap) guard. So this narrows the window in which a closure
+    proposes blind; it does not close it. A durable, acknowledged propose path remains a later
+    task's job (see the fire-and-forget paragraph below).
+
+    {b CLOSED by task-master Task 7 (the Layer 0/Layer 2 boundary revision): a write a guest
+    proposes can still be silently DISCARDED after [~propose] returned [Ok], and re-triggering the
+    dispatch that produced it is still the only recovery -- what Task 7 added is the missing
+    CONTRACT that makes relying on that recovery sound, stated below as an obligation of this
+    interface rather than left for each module author to rediscover.} (Task 6's own boundary
+    friction, item 5; final whole-branch review finding I9. Item 5 offered two possible closures --
+    a durable, acknowledged propose path, or "at minimum a documented contract that a dispatched
+    guest must be idempotent under re-dispatch" -- and Task 7 shipped the second; the first is
+    still a later task's, see the fire-and-forget paragraph below.) A batch
     that has been appended but not yet committed is exactly what a VSR view change is entitled to
     throw away -- correctly, since nobody could yet have assumed it durable -- and nothing in this
     reactor, in {!Riptide_batch_commit.Batch_commit}, or anywhere else re-proposes it. Observed for
@@ -207,13 +237,27 @@ val subscribe :
     materialize of a subscribed key rather than on a merged-value change, re-materializing the
     already-committed write that triggered the guest the first time dispatches it again, and the
     guest proposes again. That means correctness here depends on a guest being safely
-    re-dispatchable, which is a real and non-obvious obligation this interface places on module
-    authors and currently states nowhere else: the ledger module had to add a host-side
-    first-decision-wins table to be safe under it, because re-running its guest against a
-    since-changed balance could otherwise reach a DIFFERENT decision and move money no client
-    asked to move (that module's own Critical finding). A durable, acknowledged propose path -- or
-    at minimum a documented contract that a dispatched guest must be idempotent under re-dispatch
-    -- belongs to the boundary revision (task-master Task 7).
+    re-dispatchable.
+
+    {b The contract, stated here because this is where a [~propose] closure author reads it.} A
+    dispatched guest, and the host closure wired to its [~propose], MUST be idempotent under
+    re-dispatch: the same underlying committed write may drive the same guest arbitrarily many
+    times, and every run after the first must reach the SAME externally-visible outcome as the
+    first, not merely a locally-plausible one. The subtlety that makes this non-obvious is that a
+    guest re-run later sees LATER materialized state: re-running against a since-changed balance can
+    legitimately reach a DIFFERENT decision and move money no client ever asked to move (the ledger
+    module's own Critical finding, reproduced for real). So "idempotent" here is not "the write is
+    harmless to replay" -- it is "the DECISION is pinned to its first committed form, and only the
+    re-proposal of that already-pinned form replays." The way to satisfy it is to make the first
+    COMMITTED outcome authoritative and re-derive every later run from it: query the committed log
+    for a decision already recorded under this request's own idempotency key
+    ({!Riptide_batch_commit.Batch_commit.committed_writes_for}, exported by Task 7 for exactly this)
+    and, if one is there, rebuild the batch from THAT record rather than from this dispatch's own
+    bytes. Explicitly not a host-side in-memory table: the ledger module's first attempt was one,
+    and a process's own memory is not a sound source of truth for a durable fact -- a restart lost
+    every decline it held, which is precisely the bug that made the committed-log query the shipped
+    answer. See [Riptide_ledger.Accumulator.handle_guest_decision] for the worked,
+    tested-against-a-view-change implementation of this contract.
 
     {b Known, disclosed residual gap: [~propose] is fire-and-forget from this reactor's own
     perspective.} {!wrap_materialize_sink} calls [propose] and relays only the [Ok]/[Error] shape
@@ -240,7 +284,10 @@ val wrap_materialize_sink :
   t ->
   Riptide_batch_commit.Batch_commit.materialize_sink ->
   Riptide_batch_commit.Batch_commit.materialize_sink
-(** Returns a sink whose [write ~merge_key v] first calls [inner.write ~merge_key v] --
+(** Returns a sink whose [write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation
+    v] first calls [inner.write] with every one of those arguments relayed VERBATIM -- nothing here
+    recomputes, re-derives, drops or reorders any of the write-identity parameters
+    {!Riptide_batch_commit.Batch_commit.materialize_sink}'s own [write] carries, and
     materialization is never skipped, delayed, or reordered by anything this function adds -- and
     then, for every module {!subscribe}d to [merge_key], in subscription order, ONE AT A TIME --
     {b sequentially, never concurrently; this is a real, load-bearing contract of this function,
@@ -268,7 +315,28 @@ val wrap_materialize_sink :
     again), and that nesting is bounded: once {!max_dispatch_depth} levels are already live, a
     further dispatch is refused and logged rather than attempted. See {!max_dispatch_depth} for the
     bound's own derivation and its disclosed limitation. The inner [write] above is never what gets
-    refused -- that call is unconditional at every depth. *)
+    refused -- that call is unconditional at every depth.
+
+    {b COMPOSITION ORDER IS LOAD-BEARING: any
+    {!Riptide_batch_commit.Batch_commit.deduplicate} gate belongs INSIDE this wrapper, never
+    outside it} (Task 7, Task 4's own review Critical 1 -- a live-reproduced liveness bug, not a
+    stylistic preference; {!Riptide_batch_commit.Batch_commit.deduplicate} states the same rule
+    from the other side). [deduplicate] makes a sink exactly-once per committed write by skipping
+    the wrapped sink's [write] ENTIRELY for a write it has already seen. Placed OUTSIDE the sink
+    this function returns, it therefore skips the DISPATCH too -- and re-dispatch is the one and
+    only recovery path a batch that a VSR view change discarded before it committed has (see the
+    item-5 paragraph under {!subscribe}). Observed consequence of getting it backwards: a transfer
+    whose legs batch was discarded pre-commit became PERMANENTLY unrecoverable. Nothing corrupted
+    and no money moved wrongly, which is exactly what makes it easy to ship unnoticed. Correct:
+    {[
+      let sink =
+        Reactor.wrap_materialize_sink reactor
+          (Batch_commit.deduplicate ~watermark_store (Accumulator.materialize_sink ...))
+    ]}
+    i.e. the gate wraps the inner, business-logic sink that genuinely needs exactly-once semantics,
+    and this dispatch-carrying wrapper stays outermost so dispatch fires on every materialize call
+    unconditionally. This function supplies no gate of its own and must not be given one: dispatch
+    being unconditional at every call is the property the recovery path rests on. *)
 
 module For_testing : sig
   val log_call_count : unit -> int

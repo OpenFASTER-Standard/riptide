@@ -99,9 +99,17 @@ val batch_of_decision :
 
     Atomicity is the point, not an incidental convenience: the record that a transfer was accepted
     and the legs that move its money either both commit or neither does, so no log state exists in
-    which a transfer is on record as accepted while its legs are absent (or the reverse).
-    {!Authorize.authorize_batch} enforces exactly that correspondence at the commit checkpoint, for
-    every batch, including ones this function did not build. *)
+    which a transfer is on record as accepted while its legs are absent.
+    {!Authorize.authorize_batch} enforces exactly that direction at the commit checkpoint, for
+    every batch, including ones this function did not build.
+
+    {b Not "or the reverse"} (final whole-branch review, IMP-2 -- this sentence used to claim both
+    directions). A committed batch carrying a well-formed leg PAIR and no decision record at all is
+    [Allow]ed by {!Authorize.authorize_batch}, by design. That direction -- every leg traceable to a
+    committed decision record -- is guaranteed only by construction, i.e. by the fact that this
+    function is the only thing {!Accumulator.handle_guest_decision} ever proposes and it always emits
+    the record alongside the legs. It is not a property the checkpoint makes unviolatable. See
+    {!Authorize.authorize_batch}'s own doc comment for the precise three-property statement. *)
 
 val decision_of_bytes :
   actor:Riptide.Envelope.actor_id ->
