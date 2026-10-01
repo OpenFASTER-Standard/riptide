@@ -127,8 +127,8 @@ let wrap_materialize_sink t (inner : Riptide_batch_commit.Batch_commit.materiali
     Riptide_batch_commit.Batch_commit.materialize_sink =
   {
     write =
-      (fun ~merge_key v ->
-        inner.write ~merge_key v;
+      (fun ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation v ->
+        inner.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation v;
         match Hashtbl.find_opt t.subscriptions merge_key with
         | None -> ()
         | Some subs ->

@@ -88,7 +88,7 @@ let materialize_sink t ~read_balance ~write_balance ~store_request :
     Riptide_batch_commit.Batch_commit.materialize_sink =
   {
     write =
-      (fun ~merge_key payload ->
+      (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload ->
         if merge_key = Schema.requests_merge_key then store_request payload
         else if Schema.is_account_key merge_key then
           match Schema.transfer_leg_of_value payload with

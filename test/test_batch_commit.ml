@@ -411,7 +411,7 @@ let test_an_empty_batch_is_never_proposed_and_never_burns_its_key () =
   (* The same shape WITH a sink is the supported drain idiom, so it does not raise -- and it still
      must not write an empty batch. Nothing is committed under this key yet, so it is simply
      inert. *)
-  Batch_commit.propose h ~idempotency_key:key ~materialize:{ write = (fun ~merge_key:_ _ -> assert false) } [];
+  Batch_commit.propose h ~idempotency_key:key ~materialize:{ write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> assert false) } [];
   Alcotest.(check int) "the drain idiom against an unknown key proposes nothing either" 0
     (List.length (Replica.entries t));
   (* And the key is still free: a real batch under it lands normally. *)
@@ -639,7 +639,7 @@ let test_catch_up_materialization_of_an_already_committed_key_is_exempt_from_aut
   allow_now := false;
   let materialized = ref [] in
   let sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key payload -> materialized := (merge_key, payload) :: !materialized) }
+    { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload -> materialized := (merge_key, payload) :: !materialized) }
   in
   let denials_before = Batch_commit.authorization_denials () in
   (* THE RETRY under test: same idempotency_key, same original writes, now with ~materialize. *)
@@ -701,7 +701,7 @@ let test_authorize_batch_not_consulted_for_empty_writes_drain () =
       ()
   in
   Batch_commit.propose h ~idempotency_key:"k-authz-batch-drain"
-    ~materialize:{ write = (fun ~merge_key:_ _ -> ()) }
+    ~materialize:{ write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) }
     []
 
 (* Review Focus item 3 (this task's own brief): [is_primary] combines

@@ -271,7 +271,10 @@ val committed_writes_for : Riptide_vsr.Replica.t -> idempotency_key:string -> wr
     re-implement this lookup a second time outside this module. *)
 
 type materialize_sink = {
-  write : merge_key:string -> Riptide.Value.value -> unit;
+  write :
+    merge_key:string -> idempotency_key:string -> position:int -> actor:Riptide.Envelope.actor_id ->
+    causation:Riptide.Envelope.event_id -> correlation:Riptide.Envelope.event_id ->
+    Riptide.Value.value -> unit;
 }
 (** An erased, pre-applied sink for one concrete {!Riptide_materialize.Materializer}, exactly the
     same "closure over an erased type" shape {!Riptide_vsr.Replica.storage_of_module}/[send]
@@ -288,7 +291,10 @@ type materialize_sink = {
     never sees [L] at all), e.g.:
     {[
       let sink : Batch_commit.materialize_sink =
-        { write = (fun ~merge_key payload -> M.write materializer ~merge_key (decode payload)) }
+        { write =
+            (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload ->
+              M.write materializer ~merge_key (decode payload))
+        }
     ]}
     By this module's own convention, a write's [payload] carrying [merge_key = Some _] IS the
     lattice value being written -- [decode] is a pure [Value.value -> L.t] projection of it, not a
@@ -296,24 +302,31 @@ type materialize_sink = {
     DIFFERENT pair, [string -> L.t]/[L.t -> string], for the materializer's own KV codec) are
     orthogonal to this one and not reused by it.
 
-    {b Known, disclosed residual gap: [write] is told the merge_key and the payload, and NOTHING
-    about the write or batch it came from} (Task 6's own boundary friction, item 3; final
-    whole-branch review finding I9). It does not receive the committing {!write}'s own [actor], its
-    [causation]/[correlation], its [idempotency_key], or its position within its batch. For a pure
-    lattice-join sink none of that matters. For an ACCUMULATING sink it matters a great deal,
-    because such a sink must dedup replays itself (see {!materialize_up_to} and {!propose} for why
-    replays happen and are not a caller error), and the only honest identity for "this committed
-    write has already been applied" is the [(idempotency_key, position)] pair this callback is not
-    given. The first real Layer 2 module built against this interface (a double-entry ledger,
-    [lib/ledger/]) is therefore forced to dedup on payload CONTENT instead, which is exact for
-    content that happens to be unique per write and silently wrong for content that is not -- it hit
-    the wrong case for real, collapsing two genuinely different account-credit legs into one and
-    destroying money while the committed log stayed perfectly correct. It also had to push an
-    [actor] field into its own payload schema, and enforce agreement with the real [actor] at the
-    authorization checkpoint, purely to recover information this callback already had and dropped.
-    Passing the write's own identity through to [write] is a small signature change with a real
-    consumer waiting for it, and belongs to the Layer 0/Layer 2 boundary revision (task-master
-    Task 7). *)
+    {b [write]'s 5 identity fields} (Task 7, the Layer 0/Layer 2 boundary revision, spec Decision
+    2 -- closes Task 6's own boundary friction item 3 / final whole-branch review finding I9, which
+    previously told [write] only [merge_key] and the payload, nothing about the committing write or
+    batch it came from): [idempotency_key] and [position] are the committing batch's own key and
+    this write's 0-based position within it (the same [(idempotency_key, position)] pair
+    {!redaction_event_id}/the watermark mechanism already use as this exact write's injective
+    identity); [actor]/[causation]/[correlation] are copied verbatim from the committing {!write}
+    itself, never recomputed or re-derived. For a pure lattice-join sink none of this matters, and
+    every existing call site accepts and ignores most or all of it (e.g.
+    [~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_], as in the worked example
+    above). For an ACCUMULATING sink it matters a great deal: such a sink must dedup replays itself
+    (see {!materialize_up_to} and {!propose} for why replays happen and are not a caller error), and
+    the only honest identity for "this committed write has already been applied" is the
+    [(idempotency_key, position)] pair now passed here. Independent of {!t}'s own
+    [materialize_watermark_store]: that field (if supplied) already makes a replay of this exact
+    write exactly-once regardless of what [write] itself does (see {!materialize_write_catching}),
+    but a sink's own business logic (e.g. the ledger's actor-matching authorization check) needs
+    this identity on every call it receives, watermarked or not. The first real Layer 2 module
+    built against the OLD shape (a double-entry ledger, [lib/ledger/]) had been forced to dedup on
+    payload CONTENT instead, which is exact for content that happens to be unique per write and
+    silently wrong for content that is not -- it hit the wrong case for real, collapsing two
+    genuinely different account-credit legs into one and destroying money while the committed log
+    stayed perfectly correct. It also had to push an [actor] field into its own payload schema, and
+    enforce agreement with the real [actor] at the authorization checkpoint, purely to recover
+    information this callback already had and dropped. *)
 
 type encryption_sink = {
   encrypt : event_id:string -> Riptide.Value.value -> Riptide.Value.value;

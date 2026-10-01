@@ -1465,7 +1465,7 @@ let make_lww_materializer ~env ~sw dir =
   let sink : Riptide_batch_commit.Batch_commit.materialize_sink =
     {
       write =
-        (fun ~merge_key payload ->
+        (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload ->
           Lww_materializer.write materializer ~merge_key (lww_of_value payload));
     }
   in

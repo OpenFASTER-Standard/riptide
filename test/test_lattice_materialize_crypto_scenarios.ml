@@ -137,7 +137,10 @@ let enc_sink store : Batch_commit.encryption_sink =
   { encrypt = (fun ~event_id v -> Redaction_store.encrypt_value store ~event_id v) }
 
 let mat_sink materializer : Batch_commit.materialize_sink =
-  { write = (fun ~merge_key payload -> M.write materializer ~merge_key (G_set.of_value payload)) }
+  { write =
+      (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload ->
+        M.write materializer ~merge_key (G_set.of_value payload))
+  }
 
 (* THE materializer constructor for this file -- every materializer below is built through it, and
    it is the shape any real caller would follow, since {!Riptide_materialize.Materializer.create}

@@ -92,7 +92,7 @@ let test_materialized_writes_survive_ring_eviction_that_destroys_the_raw_wal () 
               ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
           in
           let sink : Batch_commit.materialize_sink =
-            { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+            { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload -> M.write materializer ~merge_key (lww_of_value payload)) }
           in
           let merge_key = "the-merge-key" in
           let actor = "actor-1" in
@@ -165,7 +165,7 @@ let test_materialize_fires_on_a_later_retry_for_an_already_committed_batch () =
               ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
           in
           let sink : Batch_commit.materialize_sink =
-            { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+            { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload -> M.write materializer ~merge_key (lww_of_value payload)) }
           in
           let merge_key = "retry-merge-key" in
           let idempotency_key = "retry-key-1" in
@@ -265,7 +265,7 @@ let make_materializer kv_dir env sw =
     ~encode:(fun w -> Riptide.Value.canonical_encode (lww_to_value w))
 
 let make_sink materializer : Batch_commit.materialize_sink =
-  { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+  { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload -> M.write materializer ~merge_key (lww_of_value payload)) }
 
 let test_materialize_up_to_drains_the_whole_committed_prefix () =
   Eio_main.run @@ fun env ->
@@ -376,7 +376,7 @@ let test_materialize_up_to_skips_writes_with_no_merge_key () =
     (List.length (Batch_commit.committed_envelopes replica));
   let materialized_keys = ref [] in
   let sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+    { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _payload -> materialized_keys := merge_key :: !materialized_keys) }
   in
   Batch_commit.materialize_up_to replica ~materialize:sink
     ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
@@ -397,7 +397,7 @@ let test_materialize_up_to_and_write_at_op_number_skip_a_malformed_entry () =
     (List.length (Batch_commit.committed_envelopes replica));
   let materialized_keys = ref [] in
   let sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+    { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _payload -> materialized_keys := merge_key :: !materialized_keys) }
   in
   Batch_commit.materialize_up_to replica ~materialize:sink
     ~through_commit_number:(Replica.commit_number replica) ?watermark_store:None;
@@ -479,7 +479,7 @@ let test_materialize_up_to_clamps_to_commit_number_even_when_the_caller_asks_for
     (Replica.commit_number primary);
   let materialized_keys = ref [] in
   let sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key _payload -> materialized_keys := merge_key :: !materialized_keys) }
+    { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _payload -> materialized_keys := merge_key :: !materialized_keys) }
   in
   (* through_commit_number:1 is >= the appended-but-uncommitted op-number (1), deliberately NOT
      <= commit_number (0) -- so a caller-side bound alone would not protect this call; only the
@@ -713,7 +713,7 @@ let test_materialize_up_to_continues_to_a_sibling_write_within_the_same_poisoned
    Riptide.Value.value -> unit] -- since that type does not change until Task 3. *)
 
 let counting_sink (counter : int ref) : Batch_commit.materialize_sink =
-  { write = (fun ~merge_key:_ _payload -> incr counter) }
+  { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _payload -> incr counter) }
 
 let make_write ~merge_key ~tag : Batch_commit.write =
   {
@@ -855,6 +855,66 @@ let test_committed_writes_for_is_first_wins_per_key () =
     | _ -> Alcotest.fail "unexpected payload shape")
   | Some _ -> Alcotest.fail "expected exactly one write back"
 
+(* Layer 0/Layer 2 boundary revision, Task 3 (spec Decision 2): sink.write must receive the
+   committing write's own identity -- idempotency_key, position, actor, causation, correlation --
+   not just merge_key/payload. Proposes a real 2-write batch via Batch_commit.propose (which
+   always appends a synthetic authorization-decision write at the end -- actor =
+   "riptide.module.authz", merge_key = None -- see test_batch_commit.ml's own dedicated test for
+   that write's shape); a sink that records every argument it is called with must see EXACTLY the
+   two real writes' own identities at positions 0 and 1, and must never be called for the
+   synthetic write at all (merge_key = None writes never reach a sink -- Review Focus item 5). *)
+let test_sink_write_receives_the_committing_writes_own_identity () =
+  Eio_main.run @@ fun _env ->
+  let replica = create_solo_volatile () in
+  let idempotency_key = "identity-key" in
+  let actor = "author-x" in
+  let causation0 = fake_event_id "identity-c0" in
+  let correlation0 = fake_event_id "identity-r0" in
+  let causation1 = fake_event_id "identity-c1" in
+  let correlation1 = fake_event_id "identity-r1" in
+  let write0 : Batch_commit.write =
+    { actor; causation = causation0; correlation = correlation0;
+      payload = Riptide.Value.Scalar (Riptide.Value.String "payload-0");
+      merge_key = Some "mk0"
+    }
+  in
+  let write1 : Batch_commit.write =
+    { actor; causation = causation1; correlation = correlation1;
+      payload = Riptide.Value.Scalar (Riptide.Value.String "payload-1");
+      merge_key = Some "mk1"
+    }
+  in
+  let calls = ref [] in
+  let sink : Batch_commit.materialize_sink =
+    { write =
+        (fun ~merge_key:_ ~idempotency_key ~position ~actor ~causation ~correlation (_ : Riptide.Value.value) ->
+          calls := (idempotency_key, position, actor, causation, correlation) :: !calls)
+    }
+  in
+  Batch_commit.propose
+    (Batch_commit.create ~replica ~authorize:Batch_commit.allow_all ())
+    ~idempotency_key ~materialize:sink [ write0; write1 ];
+  let calls = List.rev !calls in
+  Alcotest.(check int) "sink.write was called exactly twice -- never for the synthetic authz write"
+    2 (List.length calls);
+  (match calls with
+  | [ (ik0, pos0, a0, c0, r0); (ik1, pos1, a1, c1, r1) ] ->
+    Alcotest.(check string) "position 0's idempotency_key is the batch's own key" idempotency_key ik0;
+    Alcotest.(check int) "position 0 is 0" 0 pos0;
+    Alcotest.(check string) "position 0's actor is write0's own actor, not the synthetic authz actor" actor a0;
+    Alcotest.(check bool) "position 0's causation matches write0's own causation" true
+      (String.equal c0 causation0);
+    Alcotest.(check bool) "position 0's correlation matches write0's own correlation" true
+      (String.equal r0 correlation0);
+    Alcotest.(check string) "position 1's idempotency_key is the batch's own key" idempotency_key ik1;
+    Alcotest.(check int) "position 1 is 1" 1 pos1;
+    Alcotest.(check string) "position 1's actor is write1's own actor, not the synthetic authz actor" actor a1;
+    Alcotest.(check bool) "position 1's causation matches write1's own causation" true
+      (String.equal c1 causation1);
+    Alcotest.(check bool) "position 1's correlation matches write1's own correlation" true
+      (String.equal r1 correlation1)
+  | _ -> Alcotest.fail "expected exactly two recorded calls")
+
 let tests =
   [
     ( "a write's own merge_key survives WAL ring eviction that genuinely destroys the raw entry",
@@ -908,4 +968,7 @@ let tests =
     ("committed_writes_for returns the committed writes", `Quick, test_committed_writes_for_returns_the_committed_writes);
     ( "committed_writes_for is first-wins per idempotency_key",
       `Quick, test_committed_writes_for_is_first_wins_per_key );
+    ( "sink.write receives the committing write's own identity, never the synthetic authz write's \
+       (Task 3, layer2-boundary-revision)",
+      `Quick, test_sink_write_receives_the_committing_writes_own_identity );
   ]

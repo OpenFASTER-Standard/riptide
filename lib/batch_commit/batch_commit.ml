@@ -152,7 +152,11 @@ let committed_writes_for (t : Riptide_vsr.Replica.t) ~(idempotency_key : string)
 let already_in_log (t : Riptide_vsr.Replica.t) ~(idempotency_key : string) : bool =
   List.exists (has_key ~idempotency_key) (Riptide_vsr.Replica.entries t)
 
-type materialize_sink = { write : merge_key:string -> Value.value -> unit }
+type materialize_sink = {
+  write :
+    merge_key:string -> idempotency_key:string -> position:int -> actor:Envelope.actor_id ->
+    causation:Envelope.event_id -> correlation:Envelope.event_id -> Value.value -> unit;
+}
 type encryption_sink = { encrypt : event_id:string -> Value.value -> Value.value }
 
 (* Universal authorization checkpoint (task-master Task 5, subtask 5) -- see batch_commit.mli's
@@ -336,7 +340,8 @@ let redaction_event_id ~idempotency_key ~index =
    today's behaviour: safe only for an idempotent sink, unconditionally re-applied on every
    replay. *)
 let materialize_write_catching (sink : materialize_sink) ?(watermark_store : Riptide_storage.File_kv_store.t option)
-    ~(idempotency_key : string) ~(position : int) ~(merge_key : string) (payload : Value.value) : unit =
+    ~(idempotency_key : string) ~(position : int) ~(merge_key : string) ~(actor : Envelope.actor_id)
+    ~(causation : Envelope.event_id) ~(correlation : Envelope.event_id) (payload : Value.value) : unit =
   let watermark_key () = redaction_event_id ~idempotency_key ~index:position in
   let already_applied =
     match watermark_store with
@@ -345,7 +350,7 @@ let materialize_write_catching (sink : materialize_sink) ?(watermark_store : Rip
   in
   if already_applied then ()
   else
-    match sink.write ~merge_key payload with
+    match sink.write ~merge_key ~idempotency_key ~position ~actor ~causation ~correlation payload with
     | () -> (
       match watermark_store with
       | None -> ()
@@ -407,7 +412,7 @@ let[@warning "-16"] materialize_up_to (t : Riptide_vsr.Replica.t) ~(materialize 
                 | None -> ()
                 | Some merge_key ->
                   materialize_write_catching materialize ?watermark_store ~idempotency_key ~position ~merge_key
-                    w.payload)
+                    ~actor:w.actor ~causation:w.causation ~correlation:w.correlation w.payload)
               writes
           end)
     entries
@@ -652,7 +657,7 @@ let propose (t : t) ~(idempotency_key : string) ?(require_encryption : bool opti
           | None -> ()
           | Some merge_key ->
             materialize_write_catching sink ?watermark_store:t.materialize_watermark_store ~idempotency_key ~position
-              ~merge_key w.payload)
+              ~merge_key ~actor:w.actor ~causation:w.causation ~correlation:w.correlation w.payload)
         committed_writes)
 
 let committed_envelopes_keyed (t : Riptide_vsr.Replica.t) : (string * Envelope.envelope) list =

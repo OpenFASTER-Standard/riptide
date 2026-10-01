@@ -89,7 +89,7 @@ let v s = Value.Scalar (Value.String s)
 let test_a_materialized_change_on_a_subscribed_key_invokes_the_module () =
   let invoked = ref [] in
   let inner_sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key v -> invoked := (`inner, merge_key, v) :: !invoked) }
+    { write = (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ v -> invoked := (`inner, merge_key, v) :: !invoked) }
   in
   let reactor = Reactor.create () in
   let read ~merge_key:_ = None and propose _ = Ok () in
@@ -97,7 +97,7 @@ let test_a_materialized_change_on_a_subscribed_key_invokes_the_module () =
     ~read ~propose;
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   let log_calls_before = Reactor.For_testing.log_call_count () in
-  wrapped.write ~merge_key:"k" (v "1");
+  wrapped.write ~merge_key:"k" ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "1");
   Alcotest.(check bool) "inner sink still ran" true
     (List.exists (fun (tag, _, _) -> tag = `inner) !invoked);
   (* Not just "the inner sink ran" (true regardless of any subscription at all) -- also assert the
@@ -112,10 +112,10 @@ let test_a_materialized_change_on_a_subscribed_key_invokes_the_module () =
 
 let test_a_change_on_an_unsubscribed_key_never_invokes_any_module () =
   let reactor = Reactor.create () in
-  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) } in
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   (* no subscription registered *)
-  wrapped.write ~merge_key:"unrelated" (v "1")
+  wrapped.write ~merge_key:"unrelated" ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "1")
   (* no exception, no module invocation -- nothing to assert beyond "this doesn't raise" *)
 
 (* ── Test 3 ───────────────────────────────────────────────────────────────────────────────────── *)
@@ -130,11 +130,11 @@ let test_a_module_that_calls_propose_write_zero_times_is_not_an_error () =
     Ok ()
   in
   let reactor = Reactor.create () in
-  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) } in
   Reactor.subscribe reactor ~merge_key:"k" ~module_:(verified_echo ()) ~protocol:allow_handle_from_init
     ~read ~propose;
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
-  wrapped.write ~merge_key:"k" (v "1");
+  wrapped.write ~merge_key:"k" ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "1");
   Alcotest.(check int) "propose was never called, and nothing raised" 0 !proposed
 
 (* ── Test 4 (written out in full -- the brief's own text was truncated with "...") ─────────────── *)
@@ -195,10 +195,10 @@ let test_one_subscribed_modules_denial_does_not_affect_a_sibling_module_on_the_s
     ~read:no_read ~propose:(propose_via deny_handle);
   Reactor.subscribe reactor ~merge_key:"k" ~module_:propose_write_module ~protocol:allow_handle_from_init
     ~read:no_read ~propose:(propose_via allow_handle);
-  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) } in
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   let denials_before_dispatch = Batch_commit.authorization_denials () in
-  wrapped.write ~merge_key:"k" (v "dispatch-me");
+  wrapped.write ~merge_key:"k" ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "dispatch-me");
   Alcotest.(check int) "exactly one of the two sibling modules was denied" 1
     (Batch_commit.authorization_denials () - denials_before_dispatch);
   Alcotest.(check int)
@@ -270,13 +270,13 @@ let test_dispatch_reraises_out_of_memory_and_stack_overflow_rather_than_swallowi
   let no_read ~merge_key:_ = None in
   Reactor.subscribe reactor ~merge_key:"k" ~module_:(verified_propose_write ())
     ~protocol:allow_handle_from_init ~read:no_read ~propose:(fun _ -> raise Stack_overflow);
-  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) } in
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   Alcotest.check_raises
     "Stack_overflow propagates out of wrap_materialize_sink's write rather than being caught and \
      logged like an ordinary dispatch failure"
     Stack_overflow
-    (fun () -> wrapped.write ~merge_key:"k" (v "trigger"))
+    (fun () -> wrapped.write ~merge_key:"k" ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "trigger"))
 
 (* Pins BOTH the swallow-and-log behavior (an ordinary exception must NOT propagate) and the
    log-attribution format (fix round 1, Finding 2): the real, actually-emitted log line for this
@@ -302,13 +302,13 @@ let test_dispatch_swallows_an_ordinary_exception_and_logs_it_with_merge_key_and_
   let merge_key = "distinct-merge-key-xyz" in
   Reactor.subscribe reactor ~merge_key ~module_:propose_module ~protocol:allow_handle_from_init
     ~read:no_read ~propose:(fun _ -> failwith "boom");
-  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ _ -> ()) } in
+  let inner_sink : Batch_commit.materialize_sink = { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> ()) } in
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   (* capture_stderr's own call to [f] running to completion at all -- rather than an exception
      escaping through it and failing this test via Alcotest's own uncaught-exception handling --
      is itself the proof that wrap_materialize_sink's write did not raise for an ordinary
      exception; there is no separate "did not raise" assertion form to call in addition to that. *)
-  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key (v "trigger")) in
+  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "trigger")) in
   Alcotest.(check bool) "the emitted log line identifies the merge_key responsible" true
     (string_contains ~needle:merge_key stderr_output);
   Alcotest.(check bool) "the emitted log line identifies the module responsible" true
@@ -342,7 +342,7 @@ let test_reentrant_dispatch_is_bounded_by_max_dispatch_depth () =
   let merge_key = "depth-chain-key" in
   let inner_writes = ref 0 in
   let inner_sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key:_ _ -> incr inner_writes) }
+    { write = (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ _ -> incr inner_writes) }
   in
   let wrapped = Reactor.wrap_materialize_sink reactor inner_sink in
   let dispatches = ref 0 in
@@ -368,13 +368,13 @@ let test_reentrant_dispatch_is_bounded_by_max_dispatch_depth () =
   let propose _ =
     incr dispatches;
     Unix.sleepf host_work_per_level;
-    if !recurse && !dispatches < own_ceiling then wrapped.write ~merge_key (v "retrigger");
+    if !recurse && !dispatches < own_ceiling then wrapped.write ~merge_key ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "retrigger");
     Ok ()
   in
   let no_read ~merge_key:_ = None in
   Reactor.subscribe reactor ~merge_key ~module_:(verified_propose_write ())
     ~protocol:allow_handle_from_init ~read:no_read ~propose;
-  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key (v "start")) in
+  let stderr_output = capture_stderr (fun () -> wrapped.write ~merge_key ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "start")) in
   Alcotest.(check int)
     "the reentrant chain stopped at exactly the documented depth bound, not at this test's own \
      ceiling (and not never)"
@@ -404,7 +404,7 @@ let test_reentrant_dispatch_is_bounded_by_max_dispatch_depth () =
      permanently wedged at its own limit. [recurse] off, so this second write is a single, plain
      dispatch and the expected count is exact rather than "at least". *)
   recurse := false;
-  ignore (capture_stderr (fun () -> wrapped.write ~merge_key (v "second-top-level-write")));
+  ignore (capture_stderr (fun () -> wrapped.write ~merge_key ~idempotency_key:"test-idempotency-key" ~position:0 ~actor:"test-actor" ~causation:"test-causation" ~correlation:"test-correlation" (v "second-top-level-write")));
   Alcotest.(check int)
     "a top-level write after the chain unwound dispatches normally -- the depth counter was \
      released on the way out, not leaked"

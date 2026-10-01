@@ -159,7 +159,10 @@ let test_a_real_module_reacts_commits_and_can_retrigger_itself () =
           ~encode:(fun w -> Value.canonical_encode (lww_to_value w))
       in
       let inner_sink : Batch_commit.materialize_sink =
-        { write = (fun ~merge_key payload -> M.write materializer ~merge_key (lww_of_value payload)) }
+        { write =
+            (fun ~merge_key ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ payload ->
+              M.write materializer ~merge_key (lww_of_value payload))
+        }
       in
       let reactor = Reactor.create () in
       let wrapped_sink = Reactor.wrap_materialize_sink reactor inner_sink in

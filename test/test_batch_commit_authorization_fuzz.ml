@@ -116,7 +116,10 @@ let run_program program =
   let handle = Batch_commit.create ~replica ~authorize () in
   let materialized = ref [] in
   let sink : Batch_commit.materialize_sink =
-    { write = (fun ~merge_key:_ v -> materialized := v :: !materialized) }
+    { write =
+        (fun ~merge_key:_ ~idempotency_key:_ ~position:_ ~actor:_ ~causation:_ ~correlation:_ v ->
+          materialized := v :: !materialized)
+    }
   in
   let keys_used = ref [] in
   let keys_in_log = Hashtbl.create 8 in
